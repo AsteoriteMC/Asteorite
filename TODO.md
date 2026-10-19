@@ -79,21 +79,22 @@ only transport changes (as documented in `server.zig`).
 - [ ] Acceptance: 500 idle + 100 moving bot conns, p99 tick flush < 2ms, `strace` shows batched syscalls (no per-packet `writev`)
 
 ## Phase C — Concurrency: region threading (Folia-style)
-
 Current state: `tickOnce` is sequential; `ShardPool` shards storage; MPSC exists but isn't wired to movement.
 
 - [ ] Grid sharding: `32x32`-chunk regions owned by worker threads (`src/sim/tick.zig` owns the registry; one region = one tick unit, never split mid-tick)
-- [ ] Thread pool sized to cores with `pthread_setaffinity_np` pinning, CCX-aware grouping (keep region neighbors on shared L3; document topology detection via `/sys`)
+- [ ] Thread pool sized to cores with `pthread_setaffinity_np` pinning, CCX-aware grouping (keep region neighbors on shared L3; document topology detection via `/sys`). On ARM big.LITTLE: prefer P-cores for region tick, park net/IO + compaction on E-cores; detect via `/sys/devices/system/cpu` (`capacity`, `cpu_capacity`); affinity is advisory under Android cpusets — measure, never assume
 - [ ] Cross-region handoff: entity/player border crossing pushes `Transfer` into target inbox (wire `playerChunk` changes into this — currently tracked but unused)
 - [ ] Per-region 50ms budget with overrun accounting (exists) + global tick barrier for time-of-day/weather sync only (never a global world lock)
+- [ ] Per-region load-shedding (circuit breaker): if a region's p99 tick >15ms over N ticks, degrade that region only — halve mob AI rate, skip particle/leaf block ticks, defer entity LoS queries; recover automatically when clear; expose a `region_shed` counter in the stats line. Lag machines must cost a region, never global TPS
 - [ ] Deterministic tick order within a region; out-of-order delivery across regions is fine
 - [ ] Acceptance: spread 200 bots across 8 regions on 8 cores — linear tick scaling vs single-thread, zero data races under ThreadSanitizer-equivalent review + stress test
 
 ## Phase D — Memory + CPU fast paths
 
 - [ ] Slab allocator for entities/block entities (fixed-size, contiguous), per-tick arena reset for transient tick data (replaces per-feed `allocator.dupe` in `feedData`/`queueRaw` — profiled hot)
-- [ ] SoA entity store / minimal ECS: contiguous pos/vel/AABB arrays; prefetcher-friendly tick (`src/sim/` new module; entities currently don't exist — build it SoA from day one, never AoS)
-- [ ] SIMD fast paths with Zig `@Vector`: entity integration `pos += vel*dt`, AABB overlap tests, VarInt/stream scanning — scalar-first with benchmarks, vectorize the top 2 via profiling
+- [ ] SoA entity store / minimal ECS: contiguous pos/vel/AABB arrays; prefetcher-friendly tick (A4's mob/player tracking is AoS today — migrate it, never add new AoS stores)
+- [ ] SIMD fast paths with Zig `@Vector`: entity integration `pos += vel*dt`, AABB overlap tests, VarInt/stream scanning — scalar-first with benchmarks, vectorize the top 2 via profiling. Must compile to NEON on aarch64 (inspect asm on both targets); byte-stream parsers are mostly branch-bound, so never assume a vector win — measure
+- [ ] Memory budget (phone claims stay measured, not promised): record RSS on fresh DB + 1 player (`/usr/bin/time -v`), set an explicit target (e.g. <100MB P1, squeeze later); per-subsystem accounting (LSM block cache, sent-sets, output rings) in the stats line
 - [ ] Seqlocks for read-heavy shared state (config, time-of-day, player count for status) so region threads never block on a mutex
 - [ ] Acceptance: `zig build bench` tick micro-benchmarks (entity tick ns/entity, AABB queries/s) with before/after numbers in comments
 
@@ -105,6 +106,7 @@ Current state: `tickOnce` is sequential; `ShardPool` shards storage; MPSC exists
 - [ ] Signed-BE key sort fix: offset x/z by 2^31 in `encodeKey` so lexicographic order matches numeric (noted in `store.zig` tests)
 - [ ] Repair/verify tool: `zig build check -- <db>` replays WAL, checks CRCs, lists orphans (`tools/` new binary; reuse `store.zig` open path)
 - [ ] Snapshot/backup: SST file-level snapshot while running (LSM makes this cheap — document procedure)
+- [ ] (Stretch) Per-tick input journal for forensics/anti-cheat: append compact {tick, player, action} records (separate from the store WAL); used to verify reach/speed claims post-hoc and debug desyncs. NOT instant crash recovery by itself — world durability still comes from LSM WAL/SST; replay needs a deterministic sim we don't have yet. Measure overhead before enabling by default
 - [ ] Acceptance: kill -9 mid-write storm → reopen recovers, zero CRC failures, `check` clean
 
 ## Phase F — Pure-Zig modding API (per plan §5)
@@ -117,16 +119,32 @@ Current state: `tickOnce` is sequential; `ShardPool` shards storage; MPSC exists
 - [ ] Example mod: `custom_ore` (register block + break→drop logic) as `mods/example/` + integration test
 - [ ] Acceptance: server boots with 0 and 3 mods identically when idle; example mod altera gameplay over real TCP
 
-## Phase G — GPU offload (last, behind flags — per plan)
+## Phase G — GPU offload (behind flags — desktop first, mobile second)
 
-Headless Vulkan compute on the RX 9070 XT via `Snektron/vulkan-zig` or `mach-vulkan`.
 Rule: async bulk jobs only, never on the critical 50ms path (dispatch latency alone is ~50–200µs).
+One job interface, two backends (discrete desktop GPU vs integrated mobile GPU).
+
+### G1. Desktop headless Vulkan (RX 9070 XT)
+
+Headless Vulkan compute via `Snektron/vulkan-zig` or `mach-vulkan`.
 
 - [ ] Headless compute context init at startup (`--gpu off|vulkan`), persistent device-local buffers for voxel data, pinned host-visible staging
 - [ ] Job queue with async readback wired to tick loop: submit → continue ticking → consume next tick
 - [ ] Candidates in order: terrain noise/gen (biggest win, pairs with missing worldgen) → explosion raycast → fluid cellular automata (ping-pong) → mass A* wave propagation → entity LoS/proximity queries
 - [ ] CPU fallback for every job (flag-off and queue-full paths must be correct, just slower)
 - [ ] Acceptance: 32×32 region gen ≥10× faster than CPU path; TNT chain doesn't skip ticks; `--gpu off` bit-identical results
+
+### G2. Mobile GPU — Adreno/Mali via Vulkan compute (ambitious)
+
+Same job queue as G1, separate memory strategy. UMA helps (no PCIe copy) but does
+not make mobile GPUs free: drivers are thinner, thermal/battery budget is real, and
+compute queues may be absent — so the GPU is opportunistic and the tick never waits.
+
+- [ ] Mobile backend via the same Vulkan binding: capability probe at boot (`--gpu off|vulkan|mobile-vulkan`), graceful CPU fallback when no compute queue/driver (Termux/proot or native wrapper both supported — probe, don't assume)
+- [ ] UMA-aware buffers: single coherent host-visible allocation shared CPU+GPU where `HOST_COHERENT` + UMA is present; keep the staged device-local path for desktop discrete GPUs — one job interface, two memory strategies
+- [ ] Power/thermal budget: small dispatches, tick-pacing, `--gpu-budget-ms` cap; tick never blocks past budget, overflow runs on CPU next tick
+- [ ] First mobile jobs in order: terrain noise/gen (pairs with Phase H) → light/propagation passes; fluid/explosion/A* only after gen proves out on-device
+- [ ] Acceptance: `--gpu off` bit-identical results on both backends; on-device bench recorded (gen ms/chunk CPU vs mobile-GPU, RSS, thermal note); server stays playable with the GPU killed mid-run (fallback exercised live)
 
 ## Phase H — World generation (needed for playability)
 
@@ -136,7 +154,39 @@ Rule: async bulk jobs only, never on the critical 50ms path (dispatch latency al
 - [ ] Spawn area pre-generation on boot (`--gen-spawn N` chunks)
 - [ ] Acceptance: fresh DB + no import → login shows terrain, F3 biomes sane
 
+## Phase I — Multi-version: one world, any client (ambitious)
+
+Goal: 1.7.10 and newer clients walking the same world simultaneously, served by one
+binary with zero external proxies. Shape: version-agnostic core + per-version
+adapters bound per connection from the handshake version; `--protocols 5,340,...`
+is only an allowlist. Staged: each stage must be playable before the next starts —
+the mapping work grows superlinearly past 1.13, so no skipping ahead.
+
+### I1. Canonical core + 1.12.2 (tractable — numeric IDs both sides)
+
+- [ ] Canonical internal model first: block state as internal `u16/u32` (not wire id+meta) at the `view.applyBlock`/ZC1 boundary; entity pos/vel/AABB version-free (the Phase D SoA store is the seam). No second protocol until the core stops speaking 1.7
+- [ ] `src/proto/v340/` (1.12.2) adapter behind the same `Conn` interface: packet IDs, chunk format, `v5 <-> internal <-> v340` mappings; block-entity/NBT mapping proven here before anything newer
+- [ ] Handshake-version routing: bind adapter per conn, reject unlisted versions with a JSON disconnect
+- [ ] Acceptance: same world serves a 1.7.10 and a 1.12.2 client (sequentially first, simultaneously later) with block round-trip tests `v5 -> internal -> v340 -> internal -> v5` for every mapped ID
+
+### I2. The Flattening — 1.13+ block states (the hard one, explicitly scoped)
+
+- [ ] Internal block-state registry: `namespace:id` + properties <-> compact `u32`; per-version palettes (1.13+ chunk sections are palette-encoded, not id+meta arrays)
+- [ ] Translation tables generated from `minecraft-data` JSON at comptime where possible (no hand-maintained 10k-line maps); unmapped states fall back to a visible placeholder (never crash, never corrupt)
+- [ ] Acceptance: Anvil-1.13+ import path + round-trip property tests for the full palette used by the test world
+
+### I3. Modern clients + embedded in-process routing (the moonshot)
+
+- [ ] Modern adapters (1.16/1.21 line): registry-driven codecs, login/config-phase flow, NBT-heavy packets, entity/particle/sound registries — one `src/proto/vXXX/` module per version behind the same `Conn` interface
+- [ ] Embedded translation core (the "proxy" is just routing, no separate process): single socket loop reads the handshake version, binds the matching adapter, and translates to/from the canonical model per conn — no Velocity/Bungee sidecar needed
+- [ ] Mixed-version acceptance: 1.7.10 + 1.12.2 + one modern client on the same world, same region, mutually visible (position/chat/block edits cross versions); per-version packet-log diffs checked in like the 1.7 harness demands
+
 ## Cross-cutting
+
+### Platform targets (ARM/mobile is a first-class target, CPU first / GPU opportunistic)
+- [ ] CPU baseline: release binary runs on an aarch64 phone (Termux) through the existing live E2E (login→move→chat) with RSS recorded in the stats line
+- [ ] GPU opportunistic: mobile Vulkan backend (Phase G2) probed at boot, never required — CPU-only remains a fully supported configuration, and every GPU job has a CPU fallback
+- [ ] Acceptance: same E2E passes on-device in both `--gpu off` and `--gpu mobile-vulkan` modes; on-device bench + thermal note checked in
 
 ### Protocol correctness (1.7.10 is full of quirks — verify each against a real client before calling done)
 - [ ] Real-client compat harness: scripted 1.7.10 client session (status→login→move→place→break→chat→disconnect) with packet log diffed against vanilla server behavior; check in logs/specs, not binaries
@@ -146,6 +196,7 @@ Rule: async bulk jobs only, never on the critical 50ms path (dispatch latency al
 
 ### Security / robustness
 - [x] RSA key file 0600, gitignored
+- [ ] Attack/use-entity validation (`0x02` Use Entity not yet implemented): reach check first; optional ~200ms hitbox history for high-ping fairness later. Scoped to hit validation only — no full rollback, no client reconciliation (1.7 protocol can't do it). Packet first, history later, both measured
 - [ ] Rate limits: login attempts/IP, chat rate, block-place rate (creative spam = chunk rewrite storm → LSM pressure)
 - [ ] Username/chat validation everywhere (charset + length; chat JSON validated — vanilla disconnects on malformed)
 - [ ] Decompression bomb guards on any client-controlled zlib (chunk packets are server→client today, but future-proof the limit)
@@ -157,7 +208,7 @@ Rule: async bulk jobs only, never on the critical 50ms path (dispatch latency al
 - [ ] Structured logging levels (currently `std.log.info` ad hoc) + per-tick stats line (tick ms p50/p99, players, regions, SST count)
 - [ ] Metrics endpoint or in-game `/tps` equivalent (tick histogram from existing overrun counters)
 - [ ] Benchmarks: `zig build bench` (codec roundtrip, chunk encode, LSM put/get, tick) — required before any Phase D/G claim
-- [ ] CI: `zig build test` + `zig build` (ReleaseFast) + fuzz smoke on every change; pin Zig version in README (currently 0.16.0)
+- [ ] CI: `zig build test` + `zig build` (ReleaseFast) + fuzz smoke on every change; pin Zig version in README (currently 0.16.0). Matrix must include `zig build -Dtarget=aarch64-linux-musl` (static, Termux/Linux phones; `aarch64-linux-android` only if Bionic issues appear)
 
 ### Tech debt already known (grep these)
 - [ ] `serveConn`/`feedData`/`queueRaw` per-feed heap dupes → arena slices (Phase D)
