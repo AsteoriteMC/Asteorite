@@ -64,7 +64,7 @@ Without these the client connects but the world is dead. All bodies are
 
 ---
 
-## Phase B — Network: async zero-copy (`io_uring`)
+## Phase B — Network: async zero-copy (`io_uring` on Linux, per-OS backends elsewhere)
 
 Current state: thread-per-conn blocking I/O (`src/net/server.zig`) with a
 per-conn output ring flushed per frame batch. The `Conn` interface stays;
@@ -76,6 +76,8 @@ only transport changes (as documented in `server.zig`).
 - [ ] Backpressure: per-conn cap on queued bytes (kick on overflow — slow-consumer protection, critical once bulks flow)
 - [ ] TCP_NODELAY + socket buffer tuning behind flags
 - [ ] Fallback path: keep blocking transport behind a `--transport blocking|uring` flag (matches Zig 0.16 reality: `std.Io.Evented` is still experimental — raw `std.os.linux.IORING_*` is the way, not `std.Io`)
+- [ ] Per-OS backends behind one transport interface: Linux `io_uring` (primary, above); macOS `kqueue` non-blocking; Windows IOCP, falling back to the thread-pool blocking transport with documented scale limits. `--transport` gains per-OS values (`auto|uring|kqueue|iocp|blocking`); `Conn` interface unchanged
+- [ ] NVMe storage path (distinct from net): `io_uring` registered buffers + fixed files for SST reads; complements the HDD-aware profile (slow big-iron) with the opposite tuning — smaller SSTs, parallel compaction
 - [ ] Acceptance: 500 idle + 100 moving bot conns, p99 tick flush < 2ms, `strace` shows batched syscalls (no per-packet `writev`)
 
 ## Phase C — Concurrency: region threading (Folia-style)
@@ -146,6 +148,14 @@ compute queues may be absent — so the GPU is opportunistic and the tick never 
 - [ ] First mobile jobs in order: terrain noise/gen (pairs with Phase H) → light/propagation passes; fluid/explosion/A* only after gen proves out on-device
 - [ ] Acceptance: `--gpu off` bit-identical results on both backends; on-device bench recorded (gen ms/chunk CPU vs mobile-GPU, RSS, thermal note); server stays playable with the GPU killed mid-run (fallback exercised live)
 
+### G3. Apple Silicon + x86 APUs (UMA without the phone constraints)
+
+Same shared-buffer trick as G2 — these are UMA parts too — without the thermal cap.
+
+- [ ] MoltenVK backend for M-series (Vulkan-on-Metal translation, probed like `mobile-vulkan` with caveats); native Vulkan on AMD/Intel iGPUs where drivers exist
+- [ ] Bigger dispatches than phones, still behind `--gpu-budget-ms`; CPU fallback identical to G1/G2
+- [ ] Acceptance: same bit-identical + fallback requirements as G2; bench on one M-series box + one AMD APU checked in
+
 ## Phase H — World generation (needed for playability)
 
 - [ ] Deterministic seedable terrain: heightmap + biomes per column (fills the current void holes — `completeLogin` skips missing today)
@@ -188,6 +198,59 @@ the mapping work grows superlinearly past 1.13, so no skipping ahead.
 - [ ] GPU opportunistic: mobile Vulkan backend (Phase G2) probed at boot, never required — CPU-only remains a fully supported configuration, and every GPU job has a CPU fallback
 - [ ] Acceptance: same E2E passes on-device in both `--gpu off` and `--gpu mobile-vulkan` modes; on-device bench + thermal note checked in
 
+### Slow big-iron (old Xeon / DDR3, no GPU — trade cheap cycles for bytes moved)
+
+Many slow cores, bandwidth-starved DDR3, spinning/SATA disks, often dual-socket NUMA.
+Everything GPU-shaped is irrelevant here; the wins all reduce bytes moved per tick.
+
+- [ ] NUMA: pin region threads + shard storage + allocations to the local node (first-touch, never serve remote-node chunks on the hot path); Phase C topology detection extended from CCX to NUMA nodes
+- [ ] Huge pages: 2MB THP (`madvise`) for LSM block cache + chunk buffers — fewer TLB misses on big-but-slow RAM
+- [ ] Storage compression (pure-Zig LZ4/Zstd for SSTs + ZC1 sections — wire zlib already exists, this is separate): disk IOPS is the bottleneck on these boxes, old-CPU cycles are cheap
+- [ ] ISA targeting: `-mcpu` matching the box (AVX on Sandy, AVX2 on Haswell+, never AVX-512); `@Vector` width chosen per target, asm-inspected like the NEON rule in Phase D
+- [ ] Internal palette + section dedup for 1.7 (I2 palettes are for 1.13+ wire format — this is a RAM optimization): paletted sections + shared air/empty sections with copy-on-write to cut DDR3 traffic
+- [ ] RAM-as-cache: size the LSM block cache to available RAM (these boxes often have 32–64GB ECC), keep hot regions resident, report hot-set hit rate in the stats line
+- [ ] HDD-aware LSM profile: bigger SSTs, fewer levels, sequential writes, WAL batching tuned for seek cost (alongside the existing fsync-policy item, not instead of it)
+- [ ] Compiler: PGO/LTO on top of ReleaseFast for the branchy packet/codec paths (CI does ReleaseFast only today)
+- [ ] OS runbook (docs, not code): performance governor, C-states off, NIC interrupt affinity — README ops section
+- [ ] Acceptance: bench on a representative box (e.g. E5-2670, spinning disk): tick p99, `get` p99 at 50 SSTs, gen ms/chunk, before/after per item — no item lands without numbers
+
+### Modern high-end (EPYC / Xeon Scalable, DDR5, NVMe — the inverse of slow big-iron)
+
+Bandwidth-rich, IOPS-rich, AVX-512-capable. The slow-iron advice inverts here:
+keep hot data resident instead of compressing it, split work smaller instead of batching it.
+
+- [ ] AVX-512 paths: `-mcpu` + runtime dispatch where the box supports it (goes beyond the AVX/AVX2-only slow-iron item); `@Vector` width per target, asm-inspected
+- [ ] NVMe storage profile (pairs with the Phase B registered-buffer item): smaller SSTs, parallel compaction, registered buffers + fixed files — selected by `--storage-profile hdd|ssd|nvme|auto`
+- [ ] Resident-first: full-res hot data over aggressive compression; compression stays for cold SSTs, off the hot path
+- [ ] Acceptance: same bench trio as slow big-iron (tick p99, `get` p99 at 50 SSTs, gen ms/chunk) on a representative box — numbers decide which profile wins
+
+### Apple Silicon (M-series — P/E cores + Metal, no native Vulkan)
+
+- [ ] `aarch64-macos` build target in the CI matrix (see Observability); P/E-aware pinning via `sysctl`/QoS classes instead of Linux `/sys` + `pthread_setaffinity_np` (Phase C pinning is Linux-specific today)
+- [ ] GPU via MoltenVK (Phase G3); CPU-only fully supported
+- [ ] Acceptance: E2E passes on one M-series box, CPU + MoltenVK modes, bench checked in
+
+### Windows hosts (many real operators run them)
+
+- [ ] `x86_64-windows` build in CI; IOCP backend (Phase B) with thread-pool blocking as the documented fallback including its scale limits
+- [ ] Service packaging (run as a Windows Service) + firewall/ops notes in README
+- [ ] Acceptance: E2E passes on Windows, IOCP + blocking modes
+
+### Low-end ARM SBCs (Pi 4/5 — tiny RAM, SD cards)
+
+Phone-adjacent but distinct: the storage is random-write-hostile and wear-limited,
+and the RAM budget is smaller than a phone's.
+
+- [ ] SD-card storage profile: aggressive WAL batching, minimal write amplification — the opposite of the HDD profile (`--storage-profile sd`)
+- [ ] Tiny-RAM tier below the phone target: smaller block cache + sent-set caps, RSS measured against a 1GB/2GB budget
+- [ ] Acceptance: E2E passes on a Pi with RSS + write-amplification numbers checked in
+
+### Cloud/VPS (contended vCPU, network-attached disks — assume hostile hardware)
+
+- [ ] No pinning assumptions: pinning can hurt under a hypervisor — detect steal time / vCPU migration and degrade to unpinned + load-shedding (the Phase C breaker does the work, this wires the signal)
+- [ ] Snapshot-to-object-storage next to the SST file-level snapshot item (Phase E)
+- [ ] Acceptance: E2E + 200-bot soak on a 4-vCPU VPS with neighbor noise; tick p99 recorded, no tuning that assumes bare metal
+
 ### Protocol correctness (1.7.10 is full of quirks — verify each against a real client before calling done)
 - [ ] Real-client compat harness: scripted 1.7.10 client session (status→login→move→place→break→chat→disconnect) with packet log diffed against vanilla server behavior; check in logs/specs, not binaries
 - [x] Slot/inventory *parsing* (`Slot_Data` id/damage/NBT-skip for creative + placement) — done in A3; full NBT-preserving *encoding* still open (needed for window contents `0x30`/`0x2F`)
@@ -208,7 +271,7 @@ the mapping work grows superlinearly past 1.13, so no skipping ahead.
 - [ ] Structured logging levels (currently `std.log.info` ad hoc) + per-tick stats line (tick ms p50/p99, players, regions, SST count)
 - [ ] Metrics endpoint or in-game `/tps` equivalent (tick histogram from existing overrun counters)
 - [ ] Benchmarks: `zig build bench` (codec roundtrip, chunk encode, LSM put/get, tick) — required before any Phase D/G claim
-- [ ] CI: `zig build test` + `zig build` (ReleaseFast) + fuzz smoke on every change; pin Zig version in README (currently 0.16.0). Matrix must include `zig build -Dtarget=aarch64-linux-musl` (static, Termux/Linux phones; `aarch64-linux-android` only if Bionic issues appear)
+- [ ] CI: `zig build test` + `zig build` (ReleaseFast) + fuzz smoke on every change; pin Zig version in README (currently 0.16.0). Build matrix: `x86_64-linux` (baseline), `aarch64-linux-musl` (static, Termux/Linux phones; `aarch64-linux-android` only if Bionic issues appear), `aarch64-macos`, `x86_64-windows`
 
 ### Tech debt already known (grep these)
 - [ ] `serveConn`/`feedData`/`queueRaw` per-feed heap dupes → arena slices (Phase D)
