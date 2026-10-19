@@ -156,13 +156,55 @@ Same shared-buffer trick as G2 — these are UMA parts too — without the therm
 - [ ] Bigger dispatches than phones, still behind `--gpu-budget-ms`; CPU fallback identical to G1/G2
 - [ ] Acceptance: same bit-identical + fallback requirements as G2; bench on one M-series box + one AMD APU checked in
 
-## Phase H — World generation (needed for playability)
+## Phase H — World generation (data-driven: vanilla parity + datapack-class custom terrain)
 
-- [ ] Deterministic seedable terrain: heightmap + biomes per column (fills the current void holes — `completeLogin` skips missing today)
-- [ ] Cave carver + decorations pass (keep cheap: 2D heightmap + 3D noise only where needed)
-- [ ] Chunk generation as a tick-loop job writing ZC1 into the pool (sync first, GPU job later per Phase G)
-- [ ] Spawn area pre-generation on boot (`--gen-spawn N` chunks)
-- [ ] Acceptance: fresh DB + no import → login shows terrain, F3 biomes sane
+Design: vanilla's own worldgen became data-driven over time (1.12 Customized-world
+JSON → 1.18 datapack JSON: noise settings, density functions, surface rules).
+So the pipeline is an **interpreter over versioned data definitions** — vanilla
+defaults ship as checked-in data (`data/worldgen/`), custom packs (Terralith /
+JJThunder-class) override the data, code only changes for new node *types*.
+Worldgen version follows the world's version, not the client's (ties to Phase I).
+
+### H1. Pipeline driver + RNG (parity foundation — build first)
+
+- [ ] `src/worldgen/pipeline.zig`: version-agnostic stage driver — biome source → terrain shaper → surface builder → carvers → features → structures. Every chunk is a pure function `f(worldSeed, chunkXZ)` (enables parallel gen + golden tests); features read a 3×3 shaped area, decorate the center
+- [ ] `src/worldgen/rng/java_random.zig`: exact `java.util.Random` 48-bit LCG port (≤1.17 parity) with tests against known Java outputs; exact per-chunk seed-mixing formulas
+- [ ] `src/worldgen/rng/xoroshiro.zig`: Xoroshiro128++ port for 1.18+ (needed by H4)
+- [ ] Hard rule (code review gate): RNG call order is part of the spec — one stray `nextInt()` shifts all downstream terrain; call sites versioned + counted in tests
+- [ ] `tools/worldgen_dump.zig`: gen chunk for seed+X/Z, dump bytes for golden tests
+- [ ] Acceptance: golden chunk hashes for known seeds checked in; same seed vs vanilla → identical terrain+biome bytes (quirks included, divergences on a documented exclusions list)
+
+### H2. 1.7.10 generator (v5 — fills today's void holes)
+
+- [ ] `src/worldgen/v5/`: GenLayer zoom chain, hill noise, per-biome surface map, tunnel-walk cave/ravine carvers, ore/tree decorators
+- [ ] Chunk gen as a background job writing ZC1 into the pool (sync first, never on the 50ms path); spawn pre-gen on boot (`--gen-spawn N` chunks)
+- [ ] Acceptance: fresh DB + no import → login shows terrain, F3 biomes sane, caves/ores/trees present; same-seed parity vs vanilla 1.7.10
+
+### H3. Data overlay: custom packs (Terralith / JJThunder-class terrain)
+
+- [ ] `data/worldgen/v5/default/...` vanilla defaults as data (same schema packs use)
+- [ ] `--worldgen-pack <dir>` datapack-style overlay: biome JSON, noise settings, surface rules, feature lists override defaults; unmapped states fall back to a visible placeholder (never crash, never corrupt)
+- [ ] Node registry: density-function ops, surface conditions, placement modifiers registered by name — packs compose shipped nodes freely; novel node types come from a Zig mod via Phase F hooks
+- [ ] Mod API: generation-stage events (`ChunkShaped`, `SurfaceBuilt`, `FeaturesPlaced`) + custom node registration — a Terralith-level overhaul ships as data pack + optional `.so`
+- [ ] Acceptance: example pack in `data/worldgen/packs/example/` visibly changes terrain live over TCP; vanilla-default run is byte-identical with and without the overlay machinery
+
+### H4. Newer versions (1.12 Customized → modern density functions)
+
+- [ ] `src/worldgen/v340/`: 1.12 generator with built-in Customized-world JSON schema support (vanilla's own custom-terrain lever for that era)
+- [ ] `src/worldgen/modern/`: density-function expression interpreter, splines, surface-rule tree, multi-noise biome picker — driven by datapack-style JSON so modern Terralith-style packs load as data
+- [ ] Acceptance: 1.12 Customized JSON round-trips; modern pipeline reproduces a reference datapack's terrain; per-version golden hashes like H1
+
+### H5. Generation performance (optimize around the noise, never inside it)
+
+Float noise math must match Java bit-for-bit, so: octave-result caching per column,
+column-major gen buffers matching ZC1 layout (no transpose), LUTs for fixed tables.
+SIMD only for the safe parts (surface-rule application across column batches,
+density-field thresholding) — never inside noise sampling.
+
+- [ ] Parallel fan-out across Phase C region threads, prioritized by viewer distance; LRU of shaped-but-undecorated columns for neighbor reads
+- [ ] Gen once → LSM/ZC1, never regenerate (cache is the primary optimization)
+- [ ] GPU plugs in at exactly one stage: density-field computation as a Phase G noise job (G1/G2/G3)
+- [ ] Acceptance: gen ms/chunk (CPU, per backend where present) checked in; background gen never blocks a tick (tick p99 unchanged with gen storm running)
 
 ## Phase I — Multi-version: one world, any client (ambitious)
 
