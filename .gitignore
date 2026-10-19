@@ -1,0 +1,7 @@
+.zig-cache/
+zig-out/
+server_rsa.key
+server_rsa.der
+*.key
+*.der
+tmp_rsa_gen.pem
