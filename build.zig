@@ -113,6 +113,32 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(check_tool);
 
+    const player_import_tool = b.addExecutable(.{
+        .name = "player_import",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/player_import.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zigcraft", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(player_import_tool);
+
+    const player_dump_tool = b.addExecutable(.{
+        .name = "player_dump",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/player_dump.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zigcraft", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(player_dump_tool);
+
     const run_step = b.step("run", "Run zigcraft server (stub)");
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -149,6 +175,18 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| check_cmd.addArgs(args);
     check_step.dependOn(&check_cmd.step);
 
+    const player_import_step = b.step("player-import", "Run player_import tool (vanilla player.dat -> LSM db)");
+    const player_import_cmd = b.addRunArtifact(player_import_tool);
+    player_import_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| player_import_cmd.addArgs(args);
+    player_import_step.dependOn(&player_import_cmd.step);
+
+    const player_dump_step = b.step("player-dump", "Run player_dump tool (inspect one LSM player row)");
+    const player_dump_cmd = b.addRunArtifact(player_dump_tool);
+    player_dump_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| player_dump_cmd.addArgs(args);
+    player_dump_step.dependOn(&player_dump_cmd.step);
+
     const mod_tests = b.addTest(.{ .root_module = mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
@@ -172,6 +210,12 @@ pub fn build(b: *std.Build) void {
     const check_tests = b.addTest(.{ .root_module = check_tool.root_module });
     const run_check_tests = b.addRunArtifact(check_tests);
 
+    const player_import_tests = b.addTest(.{ .root_module = player_import_tool.root_module });
+    const run_player_import_tests = b.addRunArtifact(player_import_tests);
+
+    const player_dump_tests = b.addTest(.{ .root_module = player_dump_tool.root_module });
+    const run_player_dump_tests = b.addRunArtifact(player_dump_tests);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
@@ -181,4 +225,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_seed_tests.step);
     test_step.dependOn(&run_genlayer_tests.step);
     test_step.dependOn(&run_check_tests.step);
+    test_step.dependOn(&run_player_import_tests.step);
+    test_step.dependOn(&run_player_dump_tests.step);
 }

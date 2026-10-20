@@ -11,7 +11,7 @@ Status snapshot (done, tested, live-verified over TCP):
 - [x] Pure-Zig LSM (WAL + SST + `ShardPool`), ZC1 payloads, Anvil→ZC1 import (`tools/anvil_import.zig`)
 - [x] H1 worldgen foundation: `java.util.Random` LCG port (JVM-verified goldens incl. `nextInt(bound)` rejection path), fdlibm `log` port (StrictMath bit-exact — Zig/glibc differ by 1 ulp, proven live), Xoroshiro128++ + Mojang seeding, version-agnostic pipeline driver, `worldgen_dump` tool (`src/worldgen/`, `tools/worldgen_dump.zig`)
 - [x] Region tick stub, MPSC handoff queue, player position tracking (stance quirk handled)
-- [x] 163/163 `zig build test` green (was 53/53 — count the real number when touching this line)
+- [x] 165/165 `zig build test` green (was 53/53 — count the real number when touching this line)
 
 Legend: `[ ]` todo, `[~]` partial. Each phase ends with acceptance criteria.
 
@@ -71,7 +71,8 @@ Without these the client connects but the world is dead. All bodies are
 - [x] Acceptance, live over TCP: permission gating (deny==unknown, grant/deny/wildcard, op/deop + notify); full gameplay loop (gamemode flags, give slots/damage, tp PosLook + chunks, time set/add/day, gamemode persist across restart); restart persistence (pos + staged dirt + perms matrix); inventory E2E still green
 - [x] RCON remote console (`src/net/rcon.zig`): vanilla-style Source framing (LE length/id/type + double-NUL), password auth with constant-time compare, fail-closed without `--rcon-password`, 3-strike auth cap, no-auth/oversize/unknown-type → close, single-packet truncated replies. Full console authority (all 14 commands incl. `/stop`, which saves + flushes + exits after the reply flushes). `--rcon-password` (short-password warning) / `--rcon-port` (default 25575); password never logged (localhost/SSH-tunnel posture documented)
 - [x] Acceptance, live: RCON auth/id-echo, no-auth close, 3-strike cap, roster/save-all/op/perm/unknown round-trips, oversize/unknown-type close, game conn undisturbed; in-game `/stop` (reply flushes, exit 0) + console `stop` re-verified after the executeCommand refactor
-- [ ] Follow-ups: playerdata migration tooling
+- [x] Playerdata migration tooling: `player_import <player.dat> <db> <name>` (gzip-NBT → ZPLR row, with human-readable summary + warnings) and `player_dump <db> <name>` (row inspection incl. NBT byte counts); `build.zig` gains `player-import` / `player-dump` steps + test targets
+- [x] Acceptance: real `player.dat` from the official 1.7.10 server jar (sha256-pinned, checked in as `src/sim/testdata/vanilla_player.dat` with a provenance README) round-trips through import → ZPLR golden asserts (pos, health, food, gamemode, hotbar stone + NBT-named sword, spawn fallback, zero skipped/dropped slots); save/load + console + inventory + RCON E2Es re-verified green on the final binary
 
 ---
 

@@ -159,7 +159,27 @@ pub const Reader = struct {
         if (t != .compound) return error.InvalidTag;
         return try self.readString();
     }
+
+    /// Verbatim bytes of the compound payload starting at the current
+    /// position (caller has just read the tag type + name). Used to
+    /// preserve opaque item NBT (`tag`) byte-for-byte.
+    pub fn readRawCompound(self: *Reader) NbtError![]const u8 {
+        const start = self.pos;
+        try self.skipPayload(.compound);
+        return self.buf[start..self.pos];
+    }
 };
+
+/// Gunzip a whole buffer (vanilla player.dat is gzip-NBT; region chunks
+/// are zlib-NBT and keep their own path in anvil.zig).
+pub fn gunzipAlloc(alloc: std.mem.Allocator, gz: []const u8) error{ OutOfMemory, DecompressFailed }![]u8 {
+    var in: std.Io.Reader = .fixed(gz);
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    errdefer aw.deinit();
+    var decomp = std.compress.flate.Decompress.init(&in, .gzip, &.{});
+    _ = decomp.reader.streamRemaining(&aw.writer) catch return error.DecompressFailed;
+    return aw.toOwnedSlice() catch return error.OutOfMemory;
+}
 
 test "nbt string + primitives" {
     // TAG_Compound("") { TAG_Short("x") = 0x0102, TAG_String("s") = "hi", TAG_End }
