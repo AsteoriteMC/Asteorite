@@ -17,12 +17,15 @@ const Conn = @import("conn.zig").Conn;
 const Config = @import("conn.zig").Config;
 const Action = @import("conn.zig").Action;
 const AttackEvent = @import("conn.zig").AttackEvent;
+const QDropEvent = @import("conn.zig").QDropEvent;
 const codec = @import("codec.zig");
 const view = @import("../sim/view.zig");
 const shard_mod = @import("../world/shard.zig");
 const player_db = @import("../sim/players.zig");
 const item_mod = @import("../item.zig");
 const perms_mod = @import("../sim/permissions.zig");const spin = @import("../sim/spin.zig");
+const drops_mod = @import("../sim/drops.zig");
+const java_random = @import("../worldgen/rng/java_random.zig");
 const packets = @import("../proto/v5/packets.zig");
 const ids = @import("../proto/v5/ids.zig");
 const entity = @import("../sim/entity.zig");
@@ -62,6 +65,14 @@ pub const Server = struct {
     /// Global mob list (ticker-owned; guarded by ent_lock).
     entities: std.ArrayList(entity.Mob) = .empty,
     ent_lock: spin.SpinLock = .{},
+    /// Global item-entity list (break drops + Q-drops; guarded by ent_lock).
+    items: std.ArrayList(entity.ItemEnt) = .empty,
+    /// Gameplay RNG stream (block-drop quantities/offsets, vanilla draw order).
+    /// Lazy-seeded from drop_seed under rand_lock; never held with other locks.
+    drop_rand: ?java_random.JavaRandom = null,
+    rand_lock: spin.SpinLock = .{},
+    /// Seed for the gameplay stream (world seed when --seed is given).
+    drop_seed: i64 = 0,
     pig_spawned: bool = false,
     /// Ticks until the demo pig respawns after death (tickOnce is 1Hz).
     /// Set on pig death; first spawn is immediate via pig_spawned.
@@ -78,6 +89,8 @@ pub const Server = struct {
     perm_lock: spin.SpinLock = .{},
     /// Autosave cadence in ticks (5 min at 1Hz).
     pub const autosave_ticks: u64 = 300;
+    /// Anti-DoS cap on live item entities (snapshot arrays are fixed-size).
+    pub const max_items: usize = 256;
 
     pub fn bind(io: std.Io, port: u16, config: Config) !Server {
         const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
@@ -1034,6 +1047,60 @@ pub const Server = struct {
             mobs[n_mobs] = .{ .id = m.id, .kind = m.kind, .x = m.x, .y = m.y, .z = m.z, .yaw = m.yaw, .health = m.health };
             n_mobs += 1;
         }
+        // Age item entities (ticks are 20tps units, +20 per 1Hz tick), tick
+        // down pickup delays, merge stacks (vanilla xk merge), and mark the
+        // 5-minute despawns. The item list is capped at max_items so the
+        // fixed snapshot below is always complete.
+        for (self.items.items) |*it| {
+            it.age +|= 20;
+            if (it.delay >= 20) it.delay -= 20 else it.delay = 0;
+        }
+        var mi2: usize = 0;
+        while (mi2 < self.items.items.len) {
+            var mj: usize = mi2 + 1;
+            var consumed = false;
+            while (mj < self.items.items.len) {
+                if (self.items.items[mi2].tryMerge(&self.items.items[mj])) {
+                    const dead = self.items.swapRemove(mj);
+                    var s: ?item_mod.Stack = dead.stack;
+                    item_mod.freeStack(self.gpa, &s);
+                } else if (self.items.items[mj].tryMerge(&self.items.items[mi2])) {
+                    const dead = self.items.swapRemove(mi2);
+                    var s: ?item_mod.Stack = dead.stack;
+                    item_mod.freeStack(self.gpa, &s);
+                    consumed = true;
+                    break;
+                } else {
+                    mj += 1;
+                }
+            }
+            if (!consumed) mi2 += 1;
+        }
+        var item_snaps: [Server.max_items]entity.ItemSnap = undefined;
+        var n_items: usize = 0;
+        var despawned: [Server.max_items]i32 = undefined;
+        var n_despawned: usize = 0;
+        for (self.items.items) |it| {
+            if (it.age >= 6000) {
+                despawned[n_despawned] = it.id;
+                n_despawned += 1;
+            }
+            if (n_items >= item_snaps.len) break;
+            item_snaps[n_items] = .{
+                .id = it.id,
+                .x = it.x,
+                .y = it.y,
+                .z = it.z,
+                .item_id = it.stack.id,
+                .count = it.stack.count,
+                .damage = it.stack.damage,
+                // Owned per-tick dupe (freed after the reconcile pass); OOM
+                // degrades to tagless metadata rather than dropping the item.
+                .nbt = if (it.stack.nbt) |n| self.gpa.dupe(u8, n) catch null else null,
+                .can_pickup = it.delay == 0,
+            };
+            n_items += 1;
+        }
         self.ent_lock.unlock();
 
         const PresentCtx = struct {
@@ -1052,6 +1119,7 @@ pub const Server = struct {
             }
         }.f;
 
+        var claims = entity.ClaimSet{};
         for (snap) |e| {
             e.conn.lock.lock();
             // Connections that never reach play: login timeout (anti-slowloris).
@@ -1092,7 +1160,7 @@ pub const Server = struct {
             const timed_out = action == .timeout;
             if (!timed_out) {
                 var pctx = PresentCtx{ .viewer = e.conn, .range_blocks = @as(f64, @floatFromInt(self.view_distance)) * 16.0 + 16.0 };
-                entity.reconcileViewer(e.conn, players[0..n_players], mobs[0..n_mobs], present, &pctx) catch {};
+                entity.reconcileViewer(e.conn, players[0..n_players], mobs[0..n_mobs], item_snaps[0..n_items], &claims, present, &pctx) catch {};
             }
             const pending = e.conn.takeOutput() catch {
                 e.conn.lock.unlock();
@@ -1104,6 +1172,33 @@ pub const Server = struct {
             e.conn.allocator.free(pending);
             if (timed_out) e.stream.shutdown(self.io, .both) catch {};
         }
+        // Apply pickup claims + despawns: remove under ent_lock (freeing owned
+        // NBT), then broadcast Collect (claims) + Destroy to trackers. The
+        // claimers themselves already got all three packets in reconcile,
+        // and their tracked sets no longer contain the id, so the rebroadcast
+        // naturally excludes them.
+        self.ent_lock.lock();
+        for (despawned[0..n_despawned]) |id| self.removeItemById(id);
+        for (claims.ids[0..claims.n]) |id| self.removeItemById(id);
+        self.ent_lock.unlock();
+        {
+            var fb: [32]u8 = undefined;
+            for (despawned[0..n_despawned]) |id| {
+                const f = packets.frameDestroyEntitiesFramed(&[_]i32{id}, &fb) catch continue;
+                self.broadcastToTrackers(id, f);
+            }
+            var cb: [16]u8 = undefined;
+            var i: usize = 0;
+            while (i < claims.n) : (i += 1) {
+                const id = claims.ids[i];
+                const who = claims.collectors[i];
+                const c = packets.frameCollect(id, who, &cb) catch continue;
+                self.broadcastToTrackers(id, c);
+                const f = packets.frameDestroyEntitiesFramed(&[_]i32{id}, &fb) catch continue;
+                self.broadcastToTrackers(id, f);
+            }
+        }
+        for (item_snaps[0..n_items]) |s| if (s.nbt) |n| self.gpa.free(n);
         // Periodic autosave (WAL-durable; save-all/stop flush SSTs on top).
         // Counter rolls over naturally; the modulo stays aligned.
         self.tick_counter += 1;
@@ -1157,6 +1252,135 @@ pub const Server = struct {
         const dy = ty - (ay + 1.62);
         const dz = tz - az;
         return dx * dx + dy * dy + dz * dz < 36.0;
+    }
+
+    /// Remove one item entity by id, freeing its owned stack. Caller MUST hold
+    /// ent_lock (leaf: takes no other lock).
+    fn removeItemById(self: *Server, id: i32) void {
+        var k: usize = 0;
+        while (k < self.items.items.len) : (k += 1) {
+            if (self.items.items[k].id == id) {
+                const dead = self.items.swapRemove(k);
+                var s: ?item_mod.Stack = dead.stack;
+                item_mod.freeStack(self.gpa, &s);
+                return;
+            }
+        }
+    }
+
+    /// Store an OWNED stack as a live item entity (always consumes `stack`:
+    /// merged into a neighbor, appended, or freed on cap-hit). Merge-on-spawn
+    /// mirrors the tick merge (same id/damage/NBT, centers within 1 block,
+    /// combined count within max stack; survivor keeps max delay).
+    /// Caller MUST hold ent_lock. Returns false when the cap dropped it.
+    fn spawnItem(self: *Server, stack: item_mod.Stack, x: f64, y: f64, z: f64, delay: u32) bool {
+        for (self.items.items) |*it| {
+            const dx = it.x - x;
+            const dz = it.z - z;
+            if (dx * dx + dz * dz > 1.0) continue;
+            if (!item_mod.canMerge(it.stack, stack)) continue;
+            if (@as(u16, @intCast(it.stack.count)) + @as(u16, @intCast(stack.count)) > item_mod.maxStackSize(it.stack.id)) continue;
+            it.stack.count += stack.count;
+            it.delay = @max(it.delay, delay);
+            var s: ?item_mod.Stack = stack;
+            item_mod.freeStack(self.gpa, &s);
+            return true;
+        }
+        if (self.items.items.len >= Server.max_items) {
+            var s: ?item_mod.Stack = stack;
+            item_mod.freeStack(self.gpa, &s);
+            return false;
+        }
+        const id = self.eid_counter.fetchAdd(1, .acq_rel);
+        self.items.append(self.gpa, .{
+            .id = id,
+            .x = x,
+            .y = y,
+            .z = z,
+            .stack = stack,
+            .delay = delay,
+        }) catch {
+            var s: ?item_mod.Stack = stack;
+            item_mod.freeStack(self.gpa, &s);
+            return false;
+        };
+        return true;
+    }
+
+    /// Roll + spawn vanilla drops for a survival break. Caller holds world_lock
+    /// (ground scan reads the pool); takes rand_lock then ent_lock, in order.
+    /// Per-single draw order mirrors harvestBlock: chance float (always 1.0
+    /// for player breaks, drawn anyway), then 3 position offsets
+    /// (rand*0.7+0.15 per axis, CFR `aji`/`alo` drop path). Resting y is the
+    /// first solid top + 0.125 (no per-tick physics in the 1Hz model).
+    fn spawnBreakDrops(self: *Server, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, x: i32, y: u8, z: i32, old_id: u16, old_meta: u4) void {
+        self.rand_lock.lock();
+        if (self.drop_rand == null) self.drop_rand = java_random.JavaRandom.init(self.drop_seed);
+        var rng = self.drop_rand.?;
+        var rolls: [2]drops_mod.DropRoll = undefined;
+        const n_rolls = drops_mod.rollDrops(old_id, old_meta, &rng, &rolls);
+        // Materialize per-single chance + offsets while holding rand_lock so
+        // the stream stays a single total order across serve threads.
+        // Bounded: the table yields at most 8 singles per break (lapis).
+        var offs: [8][3]f32 = undefined;
+        var n_spawn: usize = 0;
+        for (rolls[0..n_rolls]) |r| {
+            var k: u8 = 0;
+            while (k < r.singles and n_spawn < offs.len) : (k += 1) {
+                if (rng.nextFloat() > 1.0) continue; // chance, always 1.0
+                offs[n_spawn] = .{
+                    rng.nextFloat() * 0.7 + 0.15,
+                    rng.nextFloat() * 0.7 + 0.15,
+                    rng.nextFloat() * 0.7 + 0.15,
+                };
+                n_spawn += 1;
+            }
+        }
+        self.drop_rand = rng;
+        self.rand_lock.unlock();
+        // Re-walk rolls in order, consuming the materialized offsets.
+        // (Truncation at 8 is unreachable per the table bound above, and the
+        // chance draw never skips at 1.0 — oi always drains n_spawn.)
+        // Resting y is resolved once: first solid top + 0.125 (the 1Hz model
+        // has no per-tick physics; entities never move post-spawn).
+        const gy = view.groundBlockY(pool, allocator, x, z, y) catch null;
+        const ry: f64 = if (gy) |g| @as(f64, @floatFromInt(g)) + 1.125 else 0.125;
+        var oi: usize = 0;
+        var ri: usize = 0;
+        while (ri < n_rolls) : (ri += 1) {
+            const r = rolls[ri];
+            var k: u8 = 0;
+            while (k < r.singles and oi < n_spawn) : (k += 1) {
+                const o = offs[oi];
+                oi += 1;
+                const stack = item_mod.Stack{ .id = r.item_id, .count = 1, .damage = r.damage, .nbt = null };
+                self.ent_lock.lock();
+                _ = self.spawnItem(stack, @as(f64, @floatFromInt(x)) + o[0], ry, @as(f64, @floatFromInt(z)) + o[2], 10);
+                self.ent_lock.unlock();
+            }
+        }
+    }
+
+    /// Spawn a Q-drop entity in front of the player (always consumes the
+    /// event stack) + refresh the changed window slot. Leaf locks only.
+    fn spawnQDrop(self: *Server, conn: *Conn, q: QDropEvent) void {
+        const fx = -@sin(@as(f64, conn.yaw) * std.math.pi / 180.0);
+        const fz = @cos(@as(f64, conn.yaw) * std.math.pi / 180.0);
+        const sx = conn.pos_x + fx * 0.5;
+        const sy = conn.pos_y + 1.32;
+        const sz = conn.pos_z + fz * 0.5;
+        self.ent_lock.lock();
+        const ok = self.spawnItem(q.stack, sx, sy, sz, 40);
+        self.ent_lock.unlock();
+        conn.lock.lock();
+        const cur = conn.inv[@intCast(q.slot)];
+        const f = packets.frameSetSlotAlloc(conn.allocator, 0, q.slot, cur) catch null;
+        if (f) |fr| {
+            defer conn.allocator.free(fr);
+            conn.queueFramed(fr) catch {};
+        }
+        conn.lock.unlock();
+        _ = ok; // spawnItem always consumes (cap-hit frees); nothing to do
     }
 
     /// Queue one framed packet on every conn tracking `eid` (attacker
@@ -1381,7 +1605,7 @@ pub fn serveConn(
             const action = try conn.handleFrame(f);
             if (action == .entered_play) entered = true;
             switch (action) {
-                .block_set, .arm_swing, .chat, .attack, .command => try events.append(allocator, action),
+                .block_set, .arm_swing, .chat, .attack, .command, .qdrop => try events.append(allocator, action),
                 else => {},
             }
         }
@@ -1451,7 +1675,20 @@ pub fn serveConn(
                 server.world_lock.lock();
                 for (events.items) |ev| {
                     switch (ev) {
-                        .block_set => |b| view.applyBlock(pool, allocator, b.x, b.y, b.z, b.id, b.meta) catch {},
+                        .block_set => |b| {
+                            const old = view.peekBlock(pool, allocator, b.x, b.y, b.z) catch null;
+                            view.applyBlock(pool, allocator, b.x, b.y, b.z, b.id, b.meta) catch {};
+                            // Survival break of a real block: vanilla drops.
+                            // (Creative breaks drop nothing; missing chunks
+                            // peek null and stay dropless.)
+                            if (b.id == 0) {
+                                if (old) |o| {
+                                    if (o.id != 0 and conn.config.gamemode == 0) {
+                                        server.spawnBreakDrops(pool, allocator, b.x, b.y, b.z, o.id, o.meta);
+                                    }
+                                }
+                            }
+                        },
                         else => {},
                     }
                 }
@@ -1460,6 +1697,7 @@ pub fn serveConn(
             for (events.items) |ev| {
                 switch (ev) {
                     .block_set => |b| server.broadcastBlockChange(conn, b.x, b.y, b.z, b.id, b.meta) catch {},
+                    .qdrop => |q| server.spawnQDrop(conn, q),
                     .arm_swing => |a| server.broadcastArmSwing(conn, cc_now.cx, cc_now.cz, conn.eid, a) catch {},
                     .chat => |m| server.broadcastChat(conn.chat_buf[0..m.json_len]),
                     .attack => |a| server.resolveAttack(conn, a),

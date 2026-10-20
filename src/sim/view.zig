@@ -241,6 +241,45 @@ pub fn fullResync(
 
 /// Apply one block edit to the LSM store (ZC1 roundtrip). Missing chunks
 /// (holes) are ignored — generation is P-next. Callers hold the world lock.
+pub const PeekBlock = struct { id: u16, meta: u4 };
+
+/// Read one block without mutating. Null when the chunk/section is absent.
+pub fn peekBlock(pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, x: i32, y: u8, z: i32) !?PeekBlock {
+    const cx = @divFloor(x, 16);
+    const cz = @divFloor(z, 16);
+    const key = store_mod.encodeKey(0, cx, cz);
+    const raw = try pool.get(key) orelse return null;
+    defer allocator.free(raw);
+    const ch = chunk_mod.Chunk.decode(allocator, raw) catch return null;
+    defer ch.destroy(allocator);
+    const si: usize = @as(usize, y) >> 4;
+    const s = ch.sections[si] orelse return null;
+    const li: usize = chunk_mod.Section.index(@intCast(@as(u4, @truncate(@as(u32, @bitCast(x & 15))))), @truncate(y & 15), @truncate(@as(u32, @bitCast(z & 15))));
+    return .{ .id = s.blocks[li], .meta = chunk_mod.Section.getNibble(&s.meta, li) };
+}
+
+/// Highest solid block at (x,z) at or below from_y. Null when the column is
+/// missing or entirely air (over-void spawns rest at y 0).
+pub fn groundBlockY(pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, x: i32, z: i32, from_y: u8) !?u8 {
+    const cx = @divFloor(x, 16);
+    const cz = @divFloor(z, 16);
+    const key = store_mod.encodeKey(0, cx, cz);
+    const raw = try pool.get(key) orelse return null;
+    defer allocator.free(raw);
+    const ch = chunk_mod.Chunk.decode(allocator, raw) catch return null;
+    defer ch.destroy(allocator);
+    var y: i32 = from_y;
+    while (y >= 0) : (y -= 1) {
+        const yu: u8 = @intCast(y);
+        const si: usize = @as(usize, yu) >> 4;
+        if (ch.sections[si]) |s| {
+            const li: usize = chunk_mod.Section.index(@intCast(@as(u4, @truncate(@as(u32, @bitCast(x & 15))))), @truncate(yu & 15), @truncate(@as(u32, @bitCast(z & 15))));
+            if (s.blocks[li] != 0) return yu;
+        }
+    }
+    return null;
+}
+
 pub fn applyBlock(pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, x: i32, y: u8, z: i32, id: u16, meta: u4) !void {
     const cx = @divFloor(x, 16);
     const cz = @divFloor(z, 16);

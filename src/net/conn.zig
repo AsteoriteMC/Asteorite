@@ -46,6 +46,12 @@ pub const Config = struct {
 /// store, then broadcasts to viewers tracking the chunk.
 pub const BlockEvent = struct { x: i32, y: u8, z: i32, id: u16, meta: u4 };
 
+/// Q-key drop (digging status 3 = whole stack, 4 = one item). `stack` is
+/// OWNED (cloned at dig time, or the moved slot contents); the serve loop
+/// takes ownership into the item entity. `slot` is the window slot to refresh
+/// with a 0x2F after the inventory mutation.
+pub const QDropEvent = struct { stack: item_mod.Stack, slot: i16 };
+
 /// Outbound chat line (validated JSON in conn.chat_buf).
 pub const ChatEvent = struct {
     json_len: usize,
@@ -76,6 +82,8 @@ pub const Action = union(enum) {
     /// Validated melee attack: resolved by the tick thread against mobs +
     /// players (carries attacker snapshot so no locks are needed later).
     attack: AttackEvent,
+    /// Q-key item drop: serve loop spawns the entity + refreshes the slot.
+    qdrop: QDropEvent,
     /// Relay arm swing 0x0B to chunk viewers (not sender).
     arm_swing: i8,
     /// Broadcast formatted chat line to all play conns.
@@ -812,8 +820,31 @@ pub const Conn = struct {
         self.queueRaw(f) catch {};
     }
 
-    fn onDig(self: *Conn, status: i8, x: i32, y: u8, z: i32) Action {
+    fn onDig(self: *Conn, status: i8, x: i32, y: u8, z: i32) !Action {
         if (self.is_dead) return .none; // death screen: client sends nothing; drop anything
+        // Q-key: 3 = drop whole selected stack, 4 = drop one item.
+        // Vanilla `yz.a(boolean)` removes from inventory either way and pops
+        // the entity in front of the player with a 40-tick pickup delay.
+        if (status == 3 or status == 4) {
+            const slot: usize = 36 + self.selected;
+            const held = self.inv[slot] orelse return .none;
+            if (status == 3) {
+                self.inv[slot] = null;
+                return .{ .qdrop = .{ .stack = held, .slot = @intCast(slot) } };
+            }
+            if (held.count <= 1) {
+                self.inv[slot] = null;
+                return .{ .qdrop = .{ .stack = held, .slot = @intCast(slot) } };
+            }
+            const one = item_mod.Stack{
+                .id = held.id,
+                .count = 1,
+                .damage = held.damage,
+                .nbt = if (held.nbt) |n| try self.allocator.dupe(u8, n) else null,
+            };
+            self.inv[slot] = .{ .id = held.id, .count = held.count - 1, .damage = held.damage, .nbt = held.nbt };
+            return .{ .qdrop = .{ .stack = one, .slot = @intCast(slot) } };
+        }
         const creative = self.config.gamemode == 1;
         switch (status) {
             0 => { // start
@@ -842,7 +873,7 @@ pub const Conn = struct {
                 }
                 return .{ .block_set = .{ .x = x, .y = y, .z = z, .id = 0, .meta = 0 } };
             },
-            else => return .none, // drop-item / eat-finish: no entities yet
+            else => return .none, // eat-finish etc: ignored
         }
     }
 
@@ -1433,6 +1464,41 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
             return try feed(conn, 0x0E, w.written());
         }
     }.run;
+    // 0. Q-drop: status 4 drops one (slot decrements, event owns one),
+    // status 3 drops the whole stack (slot empties).
+    c.inv[36] = .{ .id = 264, .count = 5, .damage = 0, .nbt = null };
+    {
+        var qb: [32]u8 = undefined;
+        var qw = codec.PacketWriter.init(&qb);
+        try qw.writeByte(4); // status: drop one
+        try qw.writeInt(@as(i32, 0));
+        try qw.writeByte(64);
+        try qw.writeInt(@as(i32, 0));
+        try qw.writeByte(1); // face
+        const act = try feed(&c, 0x07, qw.written());
+        const q = act.?.qdrop;
+        try std.testing.expectEqual(@as(i16, 36), q.slot);
+        try std.testing.expectEqual(@as(u16, 264), q.stack.id);
+        try std.testing.expectEqual(@as(i8, 1), q.stack.count);
+        try std.testing.expectEqual(@as(i8, 4), c.inv[36].?.count);
+        var owned: ?item_mod.Stack = q.stack;
+        item_mod.freeStack(a, &owned);
+    }
+    {
+        var qb: [32]u8 = undefined;
+        var qw = codec.PacketWriter.init(&qb);
+        try qw.writeByte(3); // status: drop whole stack
+        try qw.writeInt(@as(i32, 0));
+        try qw.writeByte(64);
+        try qw.writeInt(@as(i32, 0));
+        try qw.writeByte(1);
+        const act = try feed(&c, 0x07, qw.written());
+        const q = act.?.qdrop;
+        try std.testing.expectEqual(@as(i8, 4), q.stack.count);
+        try std.testing.expect(c.inv[36] == null);
+        var owned: ?item_mod.Stack = q.stack;
+        item_mod.freeStack(a, &owned);
+    }
     // 1. pickup all (left on stack, empty cursor) -> slot empty, cursor full
     c.inv[10] = .{ .id = 1, .count = 64, .damage = 0, .nbt = null };
     try std.testing.expect((try click(&c, 10, 0, 1, 0)).? == .none);

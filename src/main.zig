@@ -68,6 +68,7 @@ pub fn main(init: std.process.Init) !void {
         var srv = try zigcraft.server.Server.bindAny(io, port, cfg);
         defer srv.deinit();
         srv.view_distance = view_distance;
+        if (seed) |s| srv.drop_seed = s;
         var db_dir: ?std.Io.Dir = null;
         defer if (db_dir) |*d| d.close(io);
         var pool: ?*zigcraft.shard.ShardPool = null;

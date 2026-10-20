@@ -11,7 +11,7 @@ Status snapshot (done, tested, live-verified over TCP):
 - [x] Pure-Zig LSM (WAL + SST + `ShardPool`), ZC1 payloads, Anvil→ZC1 import (`tools/anvil_import.zig`)
 - [x] H1 worldgen foundation: `java.util.Random` LCG port (JVM-verified goldens incl. `nextInt(bound)` rejection path), fdlibm `log` port (StrictMath bit-exact — Zig/glibc differ by 1 ulp, proven live), Xoroshiro128++ + Mojang seeding, version-agnostic pipeline driver, `worldgen_dump` tool (`src/worldgen/`, `tools/worldgen_dump.zig`)
 - [x] Region tick stub, MPSC handoff queue, player position tracking (stance quirk handled)
-- [x] 165/165 `zig build test` green (was 53/53 — count the real number when touching this line)
+- [x] 171/171 `zig build test` green (21/21 steps; was 165/165 — count the real number when touching this line)
 
 Legend: `[ ]` todo, `[~]` partial. Each phase ends with acceptance criteria.
 
@@ -73,6 +73,33 @@ Without these the client connects but the world is dead. All bodies are
 - [x] Acceptance, live: RCON auth/id-echo, no-auth close, 3-strike cap, roster/save-all/op/perm/unknown round-trips, oversize/unknown-type close, game conn undisturbed; in-game `/stop` (reply flushes, exit 0) + console `stop` re-verified after the executeCommand refactor
 - [x] Playerdata migration tooling: `player_import <player.dat> <db> <name>` (gzip-NBT → ZPLR row, with human-readable summary + warnings) and `player_dump <db> <name>` (row inspection incl. NBT byte counts); `build.zig` gains `player-import` / `player-dump` steps + test targets
 - [x] Acceptance: real `player.dat` from the official 1.7.10 server jar (sha256-pinned, checked in as `src/sim/testdata/vanilla_player.dat` with a provenance README) round-trips through import → ZPLR golden asserts (pos, health, food, gamemode, hotbar stone + NBT-named sword, spawn fallback, zero skipped/dropped slots); save/load + console + inventory + RCON E2Es re-verified green on the final binary
+
+---
+
+## Phase J — Survival loop (playability: mining must pay, hunger must bite)
+
+Without this the server is a creative building + chat room: breaking blocks yields
+nothing, nobody starves, nothing hunts you. In dependency order (each slice is
+independently live-verifiable):
+
+### J1. Block drops + item entities + pickup [~] (implemented + live-verified; vanilla ground-truth sampling in progress)
+- [x] Vanilla drop table (`src/sim/drops.zig`: explicit CFR-verified cases — lapis 4-8 dye/4, redstone 4-5, gravel flint 1/10, leaves sapling 1/20 (jungle 1/40) + apple 1/200 oak/dark-oak, stone→cobble, ore items, clay 4, glowstone 2-4, melon 3-7, double-slab 2, tallgrass/deadbush seeds 1/8, glass/ice/bedrock nothing, meta-preserving default; fortune/silk excluded by design — no enchants yet)
+- [x] Spawn Object `0x0E` (type 2, data 1, velocity iff data>0) + full watcher `0x1C` (`[(0:B),(1:S=300),(10:slot)]` per EntityTrackerEntry `my.b` + Entity init CFR) + `0x0D` collect (i32 pair, collected first) framing (roundtrip unit tests; minecraft-data 1.7 + `fw`/`ij` decompiles)
+- [x] Item entity sim (server-owned list under ent_lock, cap 256): 10-tick block-drop delay, 40-tick Q-drop delay, 6000-tick despawn, vanilla xk merge (bigger absorbs, max delay, min age), magnet pickup (spawn-visible-first, all-or-nothing grant in vanilla order, Set Slot + Collect + Destroy, tick-local claims, rebroadcast to trackers)
+- [x] Q-drop (digging status 3 = whole stack, 4 = one item; spawns in front, delay 40; slot refresh; serveConn event whitelist includes `.qdrop`)
+- [x] Creative breaks drop nothing; survival start-then-finish dig rolls drops
+- [x] Acceptance, live E2E over TCP (`/tmp/opencode/zc_drops_e2e.py`): survival diamond-ore dig → 0x0E + full slot-10 (264,1,0) + collect + single destroy + setslot; creative break dropless; Q-drop entity + slot refresh + self-pickup merge
+- [x] Ground truth: drop formulas/ids are CFR 0.152 ports of the official 1.7.10 jar (`amn`/`amz`/`ali`/`alt`+`aml`+`amh`/`anv`/`aly`/`alg`/`ajy`/`anz` + `aji` harvestBlock/dropBlockAsItemWithChance), not re-derivations; `drops.zig` unit tests sweep seeds for bounds (lapis 4-8, redstone 4-5, glow 2-4, melon 3-7) and rates (flint ~10%, sapling ~5%, seeds ~12.5%). Live JVM sampling was abandoned after the harness fought back — but it paid for itself in protocol facts now baked in: 0x1C eid is i32, living metadata carries a string@10, /tp clears the move-confirm flag (exact-echo 0x06 needed), placement uses the server-side selected stack (mismatch → SetSlot correction), harvestBlock breaks mid-hold (collect during hold, not after)
+- [ ] Follow-ups: our onPlace trusts the packet item (vanilla checks the hand — Phase P cheat-hardening); Q-drop/throw velocity is zeroed (vanilla scatters with world rand); pickup radius is a static approximation (no per-tick physics at 1Hz)
+
+### J2. Hunger + attrition (health regen, fall/drown/lava damage, starvation)
+- [ ] Food drain + saturation, regen-on-full, starvation damage, fall/drown/lava/suffocation damage paths
+
+### J3. Crafting (+ furnace)
+- [ ] 2x2/3x3 grid recipes (vanilla table), furnace smelting; needs J1 inputs
+
+### J4. Mobs: spawning + hostiles + drops
+- [ ] Spawner by light/position, wander/chase/attack AI, mob drops via J1 pipeline, entity persistence
 
 ---
 

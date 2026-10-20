@@ -1013,6 +1013,58 @@ pub fn frameEntityHeadLook(eid: i32, yaw: f32, out: []u8) codec.CodecError![]con
     return try codec.framePacket(@intFromEnum(ids.PlayClient.entity_head_look), w.written(), out);
 }
 
+/// Spawn Object 0x0E. Vanilla EntityTrackerEntry (`my.c()`): items spawn as
+/// type 2 with data 1 (CFR-verified against the official 1.7.10 server jar),
+/// which makes the client read 3 velocity shorts (clamped x8000 server-side).
+/// Pitch is written before yaw on the wire.
+pub fn frameSpawnObject(eid: i32, obj_type: u8, x: f64, y: f64, z: f64, pitch: f32, yaw: f32, data: i32, vel: ?[3]i16, out: []u8) codec.CodecError![]const u8 {
+    var payload: [64]u8 = undefined;
+    var w = codec.PacketWriter.init(&payload);
+    try w.writeVarInt(eid);
+    try w.writeByte(obj_type);
+    try w.writeInt(toFixed(x));
+    try w.writeInt(toFixed(y));
+    try w.writeInt(toFixed(z));
+    try w.writeByte(@bitCast(toPackedByte(pitch)));
+    try w.writeByte(@bitCast(toPackedByte(yaw)));
+    try w.writeInt(data);
+    if (data > 0) {
+        const v = vel orelse [3]i16{ 0, 0, 0 };
+        try w.writeShort(v[0]);
+        try w.writeShort(v[1]);
+        try w.writeShort(v[2]);
+    }
+    return try codec.framePacket(@intFromEnum(ids.PlayClient.spawn_object), w.written(), out);
+}
+
+/// Collect Item 0x0D: collected eid first, collector eid second (both i32 —
+/// NOT varints; verified against minecraft-data 1.7 + `ij` decompile).
+pub fn frameCollect(collected_eid: i32, collector_eid: i32, out: []u8) codec.CodecError![]const u8 {
+    var payload: [8]u8 = undefined;
+    var w = codec.PacketWriter.init(&payload);
+    try w.writeInt(collected_eid);
+    try w.writeInt(collector_eid);
+    return try codec.framePacket(@intFromEnum(ids.PlayClient.collect_item), w.written(), out);
+}
+
+/// Item-stack Entity Metadata 0x1C: full watcher `[(0: byte 0), (1: short
+/// 300), (10: slot)]` + 0x7F end. Vanilla EntityTrackerEntry (`my.b`)
+/// sends the spawn packet then the FULL DataWatcher list (`new hw(eid,
+/// watcher, true)`); the base Entity inits 0/1 and EntityItem adds slot 10.
+/// The spawn packet itself carries no metadata.
+pub fn frameItemMetadata(eid: i32, stack: item_mod.Stack, out: []u8) codec.CodecError![]const u8 {
+    var payload: [512]u8 = undefined;
+    var w = codec.PacketWriter.init(&payload);
+    try w.writeInt(eid);
+    try w.writeByte((0 << 5) | 0); // type byte(0), index 0: flags
+    try w.writeByte(0);
+    try w.writeByte((1 << 5) | 1); // type short(1), index 1: air
+    try w.writeShort(300);
+    try w.writeByte((5 << 5) | 10); // type slot(5), index 10: the stack
+    try slot_mod.writeSlot(&w, stack);
+    try w.writeByte(0x7F); // end
+    return try codec.framePacket(@intFromEnum(ids.PlayClient.entity_metadata), w.written(), out);
+}
 /// Entity Metadata 0x1C with a living-entity baseline body.
 pub fn frameEntityMetadata(eid: i32, health: f32, out: []u8) codec.CodecError![]const u8 {
     var payload: [32]u8 = undefined;
@@ -1086,6 +1138,73 @@ test "entity packets roundtrip" {
         const md = try frameEntityMetadata(9, 20.0, &b2);
         var r6 = codec.PacketReader.init(md);
         try std.testing.expectEqual(@as(i32, 0x1C), (try codec.decodeFrame(&r6)).id);
+    }
+}
+
+test "item entity packets roundtrip (spawn/collect/slot-10)" {
+    var buf: [1024]u8 = undefined;
+    // spawn object type 2 (item), data 1 -> 3 velocity shorts present
+    {
+        const f = try frameSpawnObject(51, 2, 8.5, 64.0, -3.25, 0.0, 90.0, 1, .{ 10, -20, 30 }, &buf);
+        var r = codec.PacketReader.init(f);
+        try std.testing.expectEqual(@as(i32, 0x0E), (try codec.decodeFrame(&r)).id);
+        try std.testing.expectEqual(@as(i32, 51), try r.readVarInt());
+        try std.testing.expectEqual(@as(u8, 2), try r.readByte());
+        try std.testing.expectEqual(@as(i32, 272), try r.readInt()); // 8.5*32
+        try std.testing.expectEqual(@as(i32, 2048), try r.readInt()); // 64*32
+        try std.testing.expectEqual(@as(i32, -104), try r.readInt()); // floor(-3.25*32)
+        try std.testing.expectEqual(@as(u8, 0), try r.readByte()); // pitch first
+        try std.testing.expectEqual(@as(u8, 64), try r.readByte()); // yaw 90 -> 64
+        try std.testing.expectEqual(@as(i32, 1), try r.readInt()); // data
+        try std.testing.expectEqual(@as(i16, 10), try r.readShort());
+        try std.testing.expectEqual(@as(i16, -20), try r.readShort());
+        try std.testing.expectEqual(@as(i16, 30), try r.readShort());
+        try std.testing.expectEqual(@as(usize, 0), r.remaining());
+    }
+    // data 0 -> no velocity tail (minecart-style); explicit null vel is zeroed
+    {
+        const f = try frameSpawnObject(52, 2, 0.0, 64.0, 0.0, 0.0, 0.0, 1, null, &buf);
+        var r = codec.PacketReader.init(f);
+        try std.testing.expectEqual(@as(i32, 0x0E), (try codec.decodeFrame(&r)).id);
+        _ = try r.readVarInt();
+        _ = try r.readByte();
+        _ = try r.readInt();
+        _ = try r.readInt();
+        _ = try r.readInt();
+        _ = try r.readByte();
+        _ = try r.readByte();
+        try std.testing.expectEqual(@as(i32, 1), try r.readInt());
+        try std.testing.expectEqual(@as(i16, 0), try r.readShort());
+        try std.testing.expectEqual(@as(i16, 0), try r.readShort());
+        try std.testing.expectEqual(@as(i16, 0), try r.readShort());
+        try std.testing.expectEqual(@as(usize, 0), r.remaining());
+    }
+    // collect: two i32s, collected first
+    {
+        const f = try frameCollect(51, 7, &buf);
+        var r = codec.PacketReader.init(f);
+        try std.testing.expectEqual(@as(i32, 0x0D), (try codec.decodeFrame(&r)).id);
+        try std.testing.expectEqual(@as(i32, 51), try r.readInt());
+        try std.testing.expectEqual(@as(i32, 7), try r.readInt());
+        try std.testing.expectEqual(@as(usize, 0), r.remaining());
+    }
+    // item metadata: eid + flags/air baseline + 0xAA head + slot + 0x7F end
+    {
+        const stack = item_mod.Stack{ .id = 264, .count = 1, .damage = 0, .nbt = null };
+        const f = try frameItemMetadata(51, stack, &buf);
+        var r = codec.PacketReader.init(f);
+        try std.testing.expectEqual(@as(i32, 0x1C), (try codec.decodeFrame(&r)).id);
+        try std.testing.expectEqual(@as(i32, 51), try r.readInt());
+        try std.testing.expectEqual(@as(u8, 0x00), try r.readByte());
+        try std.testing.expectEqual(@as(u8, 0x00), try r.readByte());
+        try std.testing.expectEqual(@as(u8, 0x21), try r.readByte());
+        try std.testing.expectEqual(@as(i16, 300), try r.readShort());
+        try std.testing.expectEqual(@as(u8, 0xAA), try r.readByte());
+        const back = try slot_mod.readSlot(&r);
+        try std.testing.expect(back != null);
+        try std.testing.expect(item_mod.stacksEqual(back, stack));
+        try std.testing.expectEqual(@as(u8, 0x7F), try r.readByte());
+        try std.testing.expectEqual(@as(usize, 0), r.remaining());
     }
 }
 
