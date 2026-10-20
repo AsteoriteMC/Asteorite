@@ -16,6 +16,8 @@ pub fn main(init: std.process.Init) !void {
         var view_distance: u8 = 4;
         var seed: ?i64 = null;
         var gen_spawn: ?i32 = null;
+        var ops: std.ArrayList([]const u8) = .empty;
+        defer ops.deinit(arena);
         var i: usize = 2;
         while (i < args.len) : (i += 1) {
             const a = args[i];
@@ -37,6 +39,10 @@ pub fn main(init: std.process.Init) !void {
                 i += 1;
                 if (i >= args.len) return error.MissingGenSpawn;
                 gen_spawn = try std.fmt.parseInt(i32, args[i], 10);
+            } else if (std.mem.eql(u8, a, "--op")) {
+                i += 1;
+                if (i >= args.len) return error.MissingOpName;
+                try ops.append(arena, args[i]);
             } else {
                 port = try std.fmt.parseInt(u16, a, 10);
             }
@@ -76,6 +82,24 @@ pub fn main(init: std.process.Init) !void {
         if (gen_spawn) |r| {
             const n = try zigcraft.v5serve.preGen(pool.?, &gen.?, &srv.world_lock, arena, r);
             try w.print("gen: pre-generated {d} chunks around spawn\n", .{n});
+        }
+        // Permissions: load the matrix, then apply --op bootstraps (level 4,
+        // persisted immediately so restarts keep them without the flag).
+        // No --op and no stored ops: secure default, console-only admin.
+        srv.gpa = arena;
+        srv.loadPerms();
+        for (ops.items) |name| {
+            if (!zigcraft.conn.Conn.validPlayerName(name)) {
+                try w.print("ignoring --op {s}: bad player name\n", .{name});
+                continue;
+            }
+            srv.grantOp(name);
+        }
+        {
+            srv.perm_lock.lock();
+            const n = if (srv.perms) |*db| db.countOps() else 0;
+            srv.perm_lock.unlock();
+            if (n == 0) try w.print("perms: no ops stored (console only). use --op <name> to bootstrap.\n", .{});
         }
         try w.print("zigcraft listening on 0.0.0.0:{d} (proto 5, online={}, db={s}, view={d}, seed={?d})\n", .{ port, online, db_path orelse "none", view_distance, seed });
         try w.flush();
@@ -122,6 +146,6 @@ pub fn main(init: std.process.Init) !void {
         try srv.serveForever(arena);
         return;
     }
-    try w.print("zigcraft 1.7.10 proto v5. Try `zig build run -- serve [port] [--online] [--db <path>] [--view N]`, `zig build test`, `zig build dump -- <region.mca>`, `zig build import -- <region.mca> <db> [dim] [shards]`\n", .{});
+    try w.print("zigcraft 1.7.10 proto v5. Try `zig build run -- serve [port] [--online] [--db <path>] [--view N] [--seed S] [--gen-spawn N] [--op <name>...]`, `zig build test`, `zig build dump -- <region.mca>`, `zig build import -- <region.mca> <db> [dim] [shards]`\n", .{});
     try w.flush();
 }

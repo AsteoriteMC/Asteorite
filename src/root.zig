@@ -58,6 +58,8 @@ pub const view = @import("sim/view.zig");
 pub const entity = @import("sim/entity.zig");
 /// Player persistence (position/inventory/health across restarts, LSM-backed).
 pub const players = @import("sim/players.zig");
+/// Permission model: op levels + per-player node grants/denies (LSM-backed).
+pub const permissions = @import("sim/permissions.zig");
 /// Test-and-set spinlock for short critical sections.
 pub const spin = @import("sim/spin.zig");
 
@@ -97,5 +99,6 @@ test {
     _ = @import("sim/view.zig");
     _ = @import("sim/entity.zig");
     _ = @import("sim/players.zig");
+    _ = @import("sim/permissions.zig");
     _ = @import("sim/spin.zig");
 }

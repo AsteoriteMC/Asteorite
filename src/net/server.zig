@@ -22,6 +22,7 @@ const view = @import("../sim/view.zig");
 const shard_mod = @import("../world/shard.zig");
 const player_db = @import("../sim/players.zig");
 const item_mod = @import("../item.zig");
+const perms_mod = @import("../sim/permissions.zig");
 const spin = @import("../sim/spin.zig");
 const packets = @import("../proto/v5/packets.zig");
 const ids = @import("../proto/v5/ids.zig");
@@ -70,6 +71,12 @@ pub const Server = struct {
     time_of_day: std.atomic.Value(i64) = std.atomic.Value(i64).init(6000),
     /// Ticks since boot (1Hz ticker). Periodic player save every 300.
     tick_counter: u64 = 0,
+    /// Permission matrix (lazy-init on first use; guarded by perm_lock).
+    /// Null until loadPerms runs or a command touches it.
+    perms: ?perms_mod.Db = null,
+    /// Guards the permission matrix only (leaf lock; encode happens here,
+    /// the LSM put itself goes under world_lock afterwards).
+    perm_lock: spin.SpinLock = .{},
     /// Autosave cadence in ticks (5 min at 1Hz).
     pub const autosave_ticks: u64 = 300;
 
@@ -371,16 +378,110 @@ pub const Server = struct {
         return n;
     }
 
+    /// Lazy permission matrix (allocator = server gpa). Caller need hold no
+    /// locks; the matrix has its own leaf lock.
+    fn permDb(self: *Server) *perms_mod.Db {
+        self.perm_lock.lock();
+        defer self.perm_lock.unlock();
+        if (self.perms == null) self.perms = perms_mod.Db.init(self.gpa);
+        return &self.perms.?;
+    }
+
+    /// Gate: deny-match wins, then grant-match, then level gate. Unknown
+    /// commands fail closed (same reply as denied — no oracle). Console
+    /// bypasses the matrix entirely.
+    fn commandAllowed(self: *Server, sender: ?*Conn, desc: *const perms_mod.Command) bool {
+        if (sender == null) return true;
+        const c = sender.?;
+        c.lock.lock();
+        const name = c.username[0..c.username_len];
+        const has_name = c.username_len > 0;
+        c.lock.unlock();
+        if (!has_name) return false;
+        self.perm_lock.lock();
+        defer self.perm_lock.unlock();
+        if (self.perms) |*db| return db.allows(name, desc.node, desc.min_level);
+        return perms_mod.DEFAULT_LEVEL >= desc.min_level;
+    }
+
+    /// Persist the matrix (single row). Encode under perm_lock, put under
+    /// world_lock — one at a time, never nested (matches player rows).
+    pub fn savePerms(self: *Server) void {
+        const pool = self.world orelse return;
+        self.perm_lock.lock();
+        const enc = if (self.perms) |*db| perms_mod.encode(pool.allocator, db) catch null else null;
+        self.perm_lock.unlock();
+        if (enc) |e| {
+            defer pool.allocator.free(e);
+            self.world_lock.lock();
+            defer self.world_lock.unlock();
+            pool.put(perms_mod.perm_key, e) catch {};
+        }
+    }
+
+    /// Load the matrix at boot (single-threaded; no locks needed). Corrupt
+    /// rows fail closed to an empty matrix (logged; the next mutation
+    /// overwrites the bad row).
+    pub fn loadPerms(self: *Server) void {
+        const pool = self.world orelse return;
+        const loaded = perms_mod.load(pool, self.gpa) catch |err| blk: {
+            std.log.warn("permissions row unreadable ({}) — starting empty", .{err});
+            break :blk null;
+        };
+        if (loaded) |db| {
+            self.perm_lock.lock();
+            defer self.perm_lock.unlock();
+            if (self.perms) |*old| old.deinit();
+            self.perms = db;
+        }
+    }
+
+    /// Grant level 4 to a validated name (bootstrap + /op path helper).
+    /// Persists immediately. Name validity is the caller's job.
+    pub fn grantOp(self: *Server, name: []const u8) void {
+        _ = self.permDb();
+        self.perm_lock.lock();
+        self.permsDbLocked().setLevel(name, 4) catch {};
+        self.perm_lock.unlock();
+        self.savePerms();
+    }
+
     /// In-game + console command core. `sender` null = server console (reply
     /// goes to stdout); otherwise the reply is a chat message to the sender
     /// only. Unknown commands get a usage hint, never a kick.
     pub fn handleCommand(self: *Server, sender: ?*Conn, text: []const u8) void {
         // Split "/cmd args..." (text[0] == '/' guaranteed by caller).
         var cmd = text[1..];
-        if (std.mem.indexOfScalar(u8, cmd, ' ')) |sp| cmd = cmd[0..sp];
-        if (std.mem.eql(u8, cmd, "help")) {
-            self.reply(sender, "Commands: /help /list /save-all");
-        } else if (std.mem.eql(u8, cmd, "list")) {
+        var args: []const u8 = "";
+        if (std.mem.indexOfScalar(u8, cmd, ' ')) |sp| {
+            args = std.mem.trim(u8, cmd[sp + 1 ..], " ");
+            cmd = cmd[0..sp];
+        }
+        const desc = perms_mod.findCommand(cmd) orelse {
+            self.reply(sender, "Unknown command. Try /help");
+            return;
+        };
+        if (!self.commandAllowed(sender, desc)) {
+            // Same reply as unknown: failures never oracle command existence
+            // or the caller's level.
+            self.reply(sender, "Unknown command. Try /help");
+            return;
+        }
+        _ = self.permDb(); // matrix from here on (mutations persist below)
+        if (std.mem.eql(u8, desc.name, "help")) {
+            var out: [512]u8 = undefined;
+            var ow: usize = 0;
+            ow += (std.fmt.bufPrint(out[ow..], "Commands:", .{}) catch {
+                self.reply(sender, "Commands: /help");
+                return;
+            }).len;
+            for (&perms_mod.commands) |*d| {
+                const ok = if (sender == null) true else self.commandAllowed(sender, d);
+                if (!ok) continue;
+                ow += (std.fmt.bufPrint(out[ow..], " {s}", .{d.usage}) catch break).len;
+            }
+            self.reply(sender, out[0..ow]);
+        } else if (std.mem.eql(u8, desc.name, "list")) {
             var batch: [256]RegistryEntry = undefined;
             const snap = self.snapshot(&batch);
             defer releaseSnap(snap);
@@ -410,16 +511,184 @@ pub const Server = struct {
                 ow += (std.fmt.bufPrint(out[ow..], "{s} {s}", .{ pre, nm }) catch break).len;
             }
             self.reply(sender, out[0..ow]);
-        } else if (std.mem.eql(u8, cmd, "save-all")) {
+        } else if (std.mem.eql(u8, desc.name, "save-all")) {
             const n = self.saveAllPlayers();
             if (self.world) |pool| pool.flushAll() catch {};
             var msg: [64]u8 = undefined;
             const s = std.fmt.bufPrint(&msg, "Saved {d} player(s).", .{n}) catch "Saved.";
             self.reply(sender, s);
+        } else if (std.mem.eql(u8, desc.name, "op")) {
+            const target = firstArg(args) orelse {
+                self.reply(sender, "Usage: /op <player>");
+                return;
+            };
+            if (!Conn.validPlayerName(target)) {
+                self.reply(sender, "Usage: /op <player>");
+                return;
+            }
+            self.grantOp(target);
+            var msg: [64]u8 = undefined;
+            const s = std.fmt.bufPrint(&msg, "Opped {s}.", .{target}) catch "Opped.";
+            self.reply(sender, s);
+            self.notifyPlayer(target, "You are now op.");
+        } else if (std.mem.eql(u8, desc.name, "deop")) {
+            const target = firstArg(args) orelse {
+                self.reply(sender, "Usage: /deop <player>");
+                return;
+            };
+            if (!Conn.validPlayerName(target)) {
+                self.reply(sender, "Usage: /deop <player>");
+                return;
+            }
+            self.perm_lock.lock();
+            if (self.perms) |*db| db.clearPlayer(target);
+            self.perm_lock.unlock();
+            self.savePerms();
+            var msg: [64]u8 = undefined;
+            const s = std.fmt.bufPrint(&msg, "Deopped {s}.", .{target}) catch "Deopped.";
+            self.reply(sender, s);
+            self.notifyPlayer(target, "You are no longer op.");
+        } else if (std.mem.eql(u8, desc.name, "perm")) {
+            self.handlePerm(sender, args);
         } else {
             self.reply(sender, "Unknown command. Try /help");
         }
     }
+
+    fn firstArg(args: []const u8) ?[]const u8 {
+        if (args.len == 0) return null;
+        const end = std.mem.indexOfScalar(u8, args, ' ') orelse args.len;
+        if (end == 0) return null;
+        return args[0..end];
+    }
+
+    /// Matrix must already be initialized (permDb called in handleCommand).
+    fn permsDbLocked(self: *Server) *perms_mod.Db {
+        return &self.perms.?;
+    }
+
+    /// Tell an online player something (exact-name match — a direct message,
+    /// not a broadcast).
+    fn notifyPlayer(self: *Server, name: []const u8, text: []const u8) void {
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        for (snap) |e| {
+            e.conn.lock.lock();
+            const match = e.conn.state == .play and std.mem.eql(u8, e.conn.username[0..e.conn.username_len], name);
+            e.conn.lock.unlock();
+            if (!match) continue;
+            self.reply(e.conn, text);
+        }
+    }
+
+    fn handlePerm(self: *Server, sender: ?*Conn, args: []const u8) void {
+        var parts = std.mem.splitScalar(u8, args, ' ');
+        const sub = parts.next() orelse {
+            self.reply(sender, "Usage: /perm <grant|deny|clear|show|reload> [player] [node]");
+            return;
+        };
+        if (sub.len == 0) {
+            self.reply(sender, "Usage: /perm <grant|deny|clear|show|reload> [player] [node]");
+            return;
+        }
+        if (std.mem.eql(u8, sub, "reload")) {
+            self.loadPerms();
+            self.reply(sender, "Permissions reloaded.");
+            return;
+        }
+        const player = parts.next() orelse {
+            self.reply(sender, "Usage: /perm <grant|deny|clear|show> <player> [node]");
+            return;
+        };
+        if (!Conn.validPlayerName(player)) {
+            self.reply(sender, "Usage: /perm <grant|deny|clear|show> <player> [node]");
+            return;
+        }
+        if (std.mem.eql(u8, sub, "show")) {
+            // Build the whole reply under perm_lock, release, then send
+            // (reply takes the sender's conn lock — never nest the two).
+            var out: [1024]u8 = undefined;
+            const built: ?usize = blk: {
+                self.perm_lock.lock();
+                defer self.perm_lock.unlock();
+                const db = self.permsDbLocked();
+                const p = db.players.get(player);
+                var ow: usize = 0;
+                {
+                    const s = std.fmt.bufPrint(out[ow..], "{s}: level {d}", .{ player, if (p) |pp| pp.level else perms_mod.DEFAULT_LEVEL }) catch break :blk null;
+                    ow += s.len;
+                }
+                if (p) |pp| {
+                    var gi = pp.grants.iterator();
+                    while (gi.next()) |e| {
+                        const s = std.fmt.bufPrint(out[ow..], " +{s}", .{e.key_ptr.*}) catch break :blk ow;
+                        ow += s.len;
+                    }
+                    var di = pp.denies.iterator();
+                    while (di.next()) |e| {
+                        const s = std.fmt.bufPrint(out[ow..], " -{s}", .{e.key_ptr.*}) catch break :blk ow;
+                        ow += s.len;
+                    }
+                }
+                break :blk ow;
+            };
+            if (built) |n| {
+                self.reply(sender, out[0..n]);
+            } else {
+                self.reply(sender, "Show failed.");
+            }
+            return;
+        }
+        const node = parts.next() orelse {
+            if (std.mem.eql(u8, sub, "clear")) {
+                // /perm clear <player>: drop all nodes, keep level.
+                self.perm_lock.lock();
+                if (self.perms) |*db| {
+                    if (db.players.get(player)) |pp| {
+                        var gi = pp.grants.iterator();
+                        while (gi.next()) |e| db.alloc.free(e.key_ptr.*);
+                        pp.grants.clearRetainingCapacity();
+                        var di = pp.denies.iterator();
+                        while (di.next()) |e| db.alloc.free(e.key_ptr.*);
+                        pp.denies.clearRetainingCapacity();
+                    }
+                }
+                self.perm_lock.unlock();
+                self.savePerms();
+                self.reply(sender, "Nodes cleared.");
+                return;
+            }
+            self.reply(sender, "Usage: /perm <grant|deny> <player> <node>");
+            return;
+        };
+        if (!perms_mod.validNode(node)) {
+            self.reply(sender, "Bad node. Use [a-z0-9_.-], optional trailing .*");
+            return;
+        }
+        if (std.mem.eql(u8, sub, "grant")) {
+            self.perm_lock.lock();
+            self.permsDbLocked().grant(player, node) catch {};
+            self.perm_lock.unlock();
+            self.savePerms();
+            self.reply(sender, "Granted.");
+        } else if (std.mem.eql(u8, sub, "deny")) {
+            self.perm_lock.lock();
+            self.permsDbLocked().deny(player, node) catch {};
+            self.perm_lock.unlock();
+            self.savePerms();
+            self.reply(sender, "Denied.");
+        } else if (std.mem.eql(u8, sub, "clear")) {
+            self.perm_lock.lock();
+            _ = self.permsDbLocked().clearNode(player, node) catch false;
+            self.perm_lock.unlock();
+            self.savePerms();
+            self.reply(sender, "Cleared.");
+        } else {
+            self.reply(sender, "Usage: /perm <grant|deny|clear|show|reload> [player] [node]");
+        }
+    }
+
 
     fn reply(self: *Server, sender: ?*Conn, text: []const u8) void {
         _ = self;
@@ -1673,6 +1942,7 @@ test "commands help/list/save-all/unknown (+ console null-sender)" {
     const io = std.testing.io;
     var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
     defer srv.registry.deinit(a);
+    defer if (srv.perms) |*db| db.deinit();
     const mk = struct {
         fn run(name: []const u8, id: i32) !*Conn {
             const c = try a.create(Conn);
@@ -1721,29 +1991,193 @@ test "commands help/list/save-all/unknown (+ console null-sender)" {
         defer a.free(pending);
         try std.testing.expectEqual(@as(usize, 0), pending.len);
     }
-    // /help (extra args ignored)
+    // /help (extra args ignored): level-0 callers only see level-0 commands.
     srv.handleCommand(bob, "/help with extra args ignored");
     const h1 = try readChat(bob);
     defer a.free(h1);
-    try std.testing.expectEqualStrings("{\"text\":\"Commands: /help /list /save-all\"}", h1);
+    try std.testing.expectEqualStrings("{\"text\":\"Commands: /help /list\"}", h1);
     // unknown
     srv.handleCommand(alice, "/frobnicate");
     const unk = try readChat(alice);
     defer a.free(unk);
     try std.testing.expectEqualStrings("{\"text\":\"Unknown command. Try /help\"}", unk);
+    // denied == unknown (no oracle): level-0 /save-all gets the same reply.
+    srv.handleCommand(alice, "/save-all");
+    const denied = try readChat(alice);
+    defer a.free(denied);
+    try std.testing.expectEqualStrings(unk, denied);
     // console sender (null) must not crash; no chat goes out.
     srv.handleCommand(null, "/list");
     srv.handleCommand(null, "/nope");
     srv.handleCommand(null, "/help");
     // /save-all without a world still replies (0 players, no flush).
-    srv.handleCommand(alice, "/save-all");
-    const s1 = try readChat(alice);
-    defer a.free(s1);
-    try std.testing.expectEqualStrings("{\"text\":\"Saved 2 player(s).\"}", s1);
+    // NOTE: still denied for level-0 Alice; op-gated path is covered below.
     _ = srv.registry.pop();
     _ = srv.registry.pop();
     alice.deinit();
     a.destroy(alice);
     bob.deinit();
     a.destroy(bob);
+}
+
+test "permissions gate commands: op/deop/grant/deny/show/clear/reload" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.registry.deinit(a);
+    defer if (srv.perms) |*db| db.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    srv.world = pool;
+    const mk = struct {
+        fn run(name: []const u8, id: i32) !*Conn {
+            const c = try a.create(Conn);
+            errdefer a.destroy(c);
+            c.* = Conn.init(a, io, .{}, id);
+            c.state = .play;
+            @memcpy(c.username[0..name.len], name);
+            c.username_len = name.len;
+            return c;
+        }
+    };
+    const readChat = struct {
+        fn run(c: *Conn) ![]u8 {
+            c.lock.lock();
+            const raw = try c.takeOutput();
+            c.lock.unlock();
+            defer a.free(raw);
+            var r = codec.PacketReader.init(raw);
+            const h = try codec.decodeFrame(&r);
+            try std.testing.expectEqual(@as(i32, 0x02), h.id);
+            var pr = codec.PacketReader.init(r.buffer[r.index..]);
+            return try a.dupe(u8, try pr.readString());
+        }
+    }.run;
+    var alice = try mk.run("AliceP", 1);
+    defer {
+        alice.deinit();
+        a.destroy(alice);
+    }
+    // Non-op /op is denied exactly like unknown (no leak of the op path).
+    srv.handleCommand(alice, "/op AliceP");
+    const d0 = try readChat(alice);
+    defer a.free(d0);
+    try std.testing.expectEqualStrings("{\"text\":\"Unknown command. Try /help\"}", d0);
+    srv.handleCommand(alice, "/perm show AliceP");
+    const d0b = try readChat(alice);
+    defer a.free(d0b);
+    try std.testing.expectEqualStrings(d0, d0b);
+    // Console ops Alice (null sender): no chat, level applies immediately.
+    srv.handleCommand(null, "/op AliceP");
+    {
+        srv.perm_lock.lock();
+        defer srv.perm_lock.unlock();
+        try std.testing.expectEqual(@as(u8, 4), srv.perms.?.levelFor("AliceP"));
+    }
+    // /help now lists privileged commands for Alice.
+    srv.handleCommand(alice, "/help");
+    const h1 = try readChat(alice);
+    defer a.free(h1);
+    try std.testing.expectEqualStrings("{\"text\":\"Commands: /help /list /save-all /op <player> /deop <player> /perm <grant|deny|clear|show|reload> [player] [node]\"}", h1);
+    // /save-all allowed now (pool present; flushes).
+    srv.handleCommand(alice, "/save-all");
+    const s1 = try readChat(alice);
+    defer a.free(s1);
+    try std.testing.expectEqualStrings("{\"text\":\"Saved 0 player(s).\"}", s1);
+    // /perm show
+    srv.handleCommand(alice, "/perm show AliceP");
+    const sh1 = try readChat(alice);
+    defer a.free(sh1);
+    try std.testing.expectEqualStrings("{\"text\":\"AliceP: level 4\"}", sh1);
+    // Targeted notify: op Bob while Bob is online -> Bob gets told.
+    var bob = try mk.run("BobP", 2);
+    defer {
+        bob.deinit();
+        a.destroy(bob);
+    }
+    try srv.registry.append(a, .{ .conn = alice, .stream = undefined });
+    try srv.registry.append(a, .{ .conn = bob, .stream = undefined });
+    srv.handleCommand(alice, "/op BobP");
+    const opb = try readChat(alice);
+    defer a.free(opb);
+    try std.testing.expectEqualStrings("{\"text\":\"Opped BobP.\"}", opb);
+    const noteb = try readChat(bob);
+    defer a.free(noteb);
+    try std.testing.expectEqualStrings("{\"text\":\"You are now op.\"}", noteb);
+    // Node grant to a level-0 player: /save-all via node, not level.
+    srv.handleCommand(null, "/deop BobP"); // back to 0, nodes cleared
+    const db1 = try readChat(bob);
+    defer a.free(db1);
+    try std.testing.expectEqualStrings("{\"text\":\"You are no longer op.\"}", db1);
+    srv.handleCommand(bob, "/save-all");
+    const denied = try readChat(bob);
+    defer a.free(denied);
+    try std.testing.expectEqualStrings(d0, denied);
+    srv.handleCommand(alice, "/perm grant BobP zigcraft.command.save-all");
+    const g1 = try readChat(alice);
+    defer a.free(g1);
+    try std.testing.expectEqualStrings("{\"text\":\"Granted.\"}", g1);
+    srv.handleCommand(bob, "/save-all");
+    const s2 = try readChat(bob);
+    defer a.free(s2);
+    try std.testing.expectEqualStrings("{\"text\":\"Saved 2 player(s).\"}", s2);
+    // Deny beats grant.
+    srv.handleCommand(alice, "/perm deny BobP zigcraft.command.save-all");
+    const denyack = try readChat(alice);
+    defer a.free(denyack);
+    srv.handleCommand(bob, "/save-all");
+    const denied2 = try readChat(bob);
+    defer a.free(denied2);
+    try std.testing.expectEqualStrings(d0, denied2);
+    // Clear restores denial-by-default.
+    srv.handleCommand(alice, "/perm clear BobP zigcraft.command.save-all");
+    const clearack = try readChat(alice);
+    defer a.free(clearack);
+    srv.handleCommand(bob, "/save-all");
+    const denied3 = try readChat(bob);
+    defer a.free(denied3);
+    try std.testing.expectEqualStrings(d0, denied3);
+    // Wildcard grant covers save-all.
+    srv.handleCommand(alice, "/perm grant BobP zigcraft.command.*");
+    const wildack = try readChat(alice);
+    defer a.free(wildack);
+    srv.handleCommand(bob, "/save-all");
+    const s3 = try readChat(bob);
+    defer a.free(s3);
+    try std.testing.expectEqualStrings("{\"text\":\"Saved 2 player(s).\"}", s3);
+    // /perm show lists nodes.
+    srv.handleCommand(alice, "/perm show BobP");
+    const sh2 = try readChat(alice);
+    defer a.free(sh2);
+    try std.testing.expectEqualStrings("{\"text\":\"BobP: level 0 +zigcraft.command.*\"}", sh2);
+    // Reload round-trips the matrix through the LSM row.
+    srv.handleCommand(alice, "/perm reload");
+    const rl = try readChat(alice);
+    defer a.free(rl);
+    try std.testing.expectEqualStrings("{\"text\":\"Permissions reloaded.\"}", rl);
+    srv.handleCommand(bob, "/save-all");
+    const s4 = try readChat(bob);
+    defer a.free(s4);
+    try std.testing.expectEqualStrings("{\"text\":\"Saved 2 player(s).\"}", s4);
+    // Malformed inputs get usage, not crashes.
+    srv.handleCommand(alice, "/op");
+    const usage1 = try readChat(alice);
+    defer a.free(usage1);
+    try std.testing.expectEqualStrings("{\"text\":\"Usage: /op <player>\"}", usage1);
+    srv.handleCommand(alice, "/op Bad!Name");
+    const usage2 = try readChat(alice);
+    defer a.free(usage2);
+    try std.testing.expectEqualStrings("{\"text\":\"Usage: /op <player>\"}", usage2);
+    srv.handleCommand(alice, "/perm grant BobP HAS SPACE");
+    const usage3 = try readChat(alice);
+    defer a.free(usage3);
+    try std.testing.expectEqualStrings("{\"text\":\"Bad node. Use [a-z0-9_.-], optional trailing .*\"}", usage3);
+    srv.handleCommand(alice, "/perm frobnicate BobP zigcraft.command.list");
+    const usage4 = try readChat(alice);
+    defer a.free(usage4);
+    try std.testing.expectEqualStrings("{\"text\":\"Usage: /perm <grant|deny|clear|show|reload> [player] [node]\"}", usage4);
+    _ = srv.registry.pop();
+    _ = srv.registry.pop();
 }

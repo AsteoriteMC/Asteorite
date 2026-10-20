@@ -345,6 +345,12 @@ pub const Conn = struct {
         return true;
     }
 
+    /// Login + command-target name policy (shared so /op can't smuggle
+    /// anything the login gate would reject).
+    pub fn validPlayerName(name: []const u8) bool {
+        return name.len > 0 and name.len <= 16 and validNameChars(name);
+    }
+
     fn sendLoginSuccess(self: *Conn, uuid_str: []const u8, name: []const u8) !void {
         var out: [128]u8 = undefined;
         try self.queueRaw(try packets.frameLoginSuccess(uuid_str, name, &out));
@@ -359,7 +365,7 @@ pub const Conn = struct {
     fn handleLogin(self: *Conn, frame: Frame) !Action {
         if (frame.id == @as(i32, @intFromEnum(ids.LoginServer.login_start))) {
             const name = try packets.parseLoginStart(frame.body);
-            if (name.len == 0 or name.len > 16 or !validNameChars(name)) {
+            if (!validPlayerName(name)) {
                 return try self.disconnect("{\"text\":\"Bad username\"}");
             }
             @memcpy(self.username[0..name.len], name);
