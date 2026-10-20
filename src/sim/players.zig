@@ -25,7 +25,8 @@ const item_mod = @import("../item.zig");
 
 pub const player_dim: u8 = 255;
 pub const magic = "ZPLR";
-pub const version: u8 = 1;
+/// v2 adds trailing gamemode (v1 rows decode with gamemode defaulting to 1).
+pub const version: u8 = 2;
 pub const inv_size = 45;
 
 pub const Data = struct {
@@ -44,6 +45,9 @@ pub const Data = struct {
     food: i16 = 20,
     saturation: f32 = 5.0,
     selected: u8 = 0,
+    /// Effective gamemode (0 survival, 1 creative). v1 rows lack the byte
+    /// and decode with the old default (creative).
+    gamemode: u8 = 1,
     inv: [inv_size]?item_mod.Stack = [_]?item_mod.Stack{null} ** inv_size,
     cursor: ?item_mod.Stack = null,
 };
@@ -75,6 +79,7 @@ pub fn encode(alloc: std.mem.Allocator, d: *const Data) ![]u8 {
     var n: usize = 4 + 1 + 1 + d.username_len + 8 * 3 + 4 * 2 + 1 + 4 * 3 + 4 + 2 + 4 + 1;
     for (d.inv) |s| n += slotSize(s);
     n += slotSize(d.cursor);
+    n += 1; // v2 trailing gamemode
     const out = try alloc.alloc(u8, n);
     errdefer alloc.free(out);
     var i: usize = 0;
@@ -114,6 +119,8 @@ pub fn encode(alloc: std.mem.Allocator, d: *const Data) ![]u8 {
     i += 1;
     for (d.inv) |s| i = writeSlot(out, i, s);
     i = writeSlot(out, i, d.cursor);
+    out[i] = d.gamemode;
+    i += 1;
     std.debug.assert(i == n);
     return out;
 }
@@ -159,7 +166,8 @@ pub fn decode(alloc: std.mem.Allocator, bytes: []const u8, expect_username: []co
         }
     }.run;
     if (!std.mem.eql(u8, try take(&r, 4), magic)) return error.CorruptPlayer;
-    if ((try take(&r, 1))[0] != version) return error.CorruptPlayer;
+    const ver = (try take(&r, 1))[0];
+    if (ver != 1 and ver != version) return error.CorruptPlayer;
     const ulen: usize = (try take(&r, 1))[0];
     if (ulen == 0 or ulen > 16) return error.CorruptPlayer;
     const uname = try take(&r, ulen);
@@ -186,6 +194,12 @@ pub fn decode(alloc: std.mem.Allocator, bytes: []const u8, expect_username: []co
     if (!std.math.isFinite(d.saturation) or d.saturation < 0) return error.CorruptPlayer;
     for (&d.inv) |*s| s.* = try readSlot(alloc, &r, take);
     d.cursor = try readSlot(alloc, &r, take);
+    if (ver == 1) {
+        if (r.len != 0) return error.CorruptPlayer;
+        return d; // gamemode stays at the v1 default (creative)
+    }
+    d.gamemode = (try take(&r, 1))[0];
+    if (d.gamemode > 1) return error.CorruptPlayer;
     if (r.len != 0) return error.CorruptPlayer;
     return d;
 }
@@ -244,6 +258,7 @@ test "player roundtrip incl NBT, cursor, selected, spawn" {
     d.food = 17;
     d.saturation = 3.25;
     d.selected = 4;
+    d.gamemode = 0;
     const tag = [_]u8{ 0x0A, 0x00, 0x03, 0x64, 0x75, 0x6D };
     d.inv[36] = .{ .id = 276, .count = 1, .damage = 0, .nbt = &tag };
     d.inv[10] = .{ .id = 1, .count = 64, .damage = 0, .nbt = null };
@@ -260,10 +275,40 @@ test "player roundtrip incl NBT, cursor, selected, spawn" {
     try std.testing.expectApproxEqAbs(@as(f32, 13.5), back.health, 1e-6);
     try std.testing.expectEqual(@as(i16, 17), back.food);
     try std.testing.expectEqual(@as(u8, 4), back.selected);
+    try std.testing.expectEqual(@as(u8, 0), back.gamemode);
     try std.testing.expect(item_mod.stacksEqual(d.inv[36], back.inv[36]));
     try std.testing.expect(back.inv[36].?.nbt.?.ptr != tag[0..].ptr);
     try std.testing.expect(item_mod.stacksEqual(d.cursor, back.cursor));
     try std.testing.expect(back.inv[0] == null);
+}
+
+test "player v1 rows decode with gamemode default" {
+    const a = std.testing.allocator;
+    var d = Data{};
+    @memcpy(d.username[0.."Al".len], "Al");
+    d.username_len = 2;
+    d.gamemode = 0;
+    const enc = try encode(a, &d);
+    defer a.free(enc);
+    // Downgrade to v1 on the wire: version byte 1, drop trailing gamemode.
+    const v1 = try a.alloc(u8, enc.len - 1);
+    defer a.free(v1);
+    @memcpy(v1, enc[0 .. enc.len - 1]);
+    v1[4] = 1;
+    var back = try decode(a, v1, "Al");
+    defer freeData(a, &back);
+    try std.testing.expectEqual(@as(u8, 1), back.gamemode);
+    // v2 garbage gamemode rejected (2 = neither survival nor creative).
+    const bad = try a.dupe(u8, enc);
+    defer a.free(bad);
+    bad[bad.len - 1] = 7;
+    var r_bad = decode(a, bad, "Al");
+    if (r_bad) |*b| {
+        freeData(a, b);
+        try std.testing.expect(false);
+    } else |err| {
+        try std.testing.expect(err == error.CorruptPlayer);
+    }
 }
 
 test "player decode rejects corrupt/truncated/mismatched" {

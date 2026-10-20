@@ -53,6 +53,10 @@ pub const commands = [_]Command{
     .{ .name = "op", .node = "zigcraft.command.op", .min_level = 4, .usage = "/op <player>" },
     .{ .name = "deop", .node = "zigcraft.command.deop", .min_level = 4, .usage = "/deop <player>" },
     .{ .name = "perm", .node = "zigcraft.command.perm", .min_level = 4, .usage = "/perm <grant|deny|clear|show|reload> [player] [node]" },
+    .{ .name = "gamemode", .node = "zigcraft.command.gamemode", .min_level = 2, .usage = "/gamemode <0|1|survival|creative> [player]" },
+    .{ .name = "give", .node = "zigcraft.command.give", .min_level = 2, .usage = "/give <player> <id> [count] [damage]" },
+    .{ .name = "tp", .node = "zigcraft.command.tp", .min_level = 2, .usage = "/tp <target|x> [y] [z] | /tp <victim> <target>" },
+    .{ .name = "time", .node = "zigcraft.command.time", .min_level = 2, .usage = "/time <set|add> <value|day|night>" },
 };
 
 pub fn findCommand(name: []const u8) ?*const Command {

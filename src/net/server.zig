@@ -22,8 +22,7 @@ const view = @import("../sim/view.zig");
 const shard_mod = @import("../world/shard.zig");
 const player_db = @import("../sim/players.zig");
 const item_mod = @import("../item.zig");
-const perms_mod = @import("../sim/permissions.zig");
-const spin = @import("../sim/spin.zig");
+const perms_mod = @import("../sim/permissions.zig");const spin = @import("../sim/spin.zig");
 const packets = @import("../proto/v5/packets.zig");
 const ids = @import("../proto/v5/ids.zig");
 const entity = @import("../sim/entity.zig");
@@ -317,6 +316,7 @@ pub const Server = struct {
         item_mod.freeStack(conn.allocator, &conn.cursor);
         conn.cursor = item_mod.cloneStack(conn.allocator, d.cursor) catch null;
         conn.selected = d.selected;
+        conn.config.gamemode = d.gamemode;
         conn.click_seq = 0;
         conn.click_seen = false;
         return true;
@@ -349,6 +349,7 @@ pub const Server = struct {
         d.food = conn.food;
         d.saturation = conn.saturation;
         d.selected = conn.selected;
+        d.gamemode = conn.config.gamemode;
         // Clone NBT into server-owned buffers (conn dies under us in the
         // unregister path; encode only borrows while world_lock is held).
         for (&d.inv, conn.inv) |*dst, src| {
@@ -550,8 +551,310 @@ pub const Server = struct {
             self.notifyPlayer(target, "You are no longer op.");
         } else if (std.mem.eql(u8, desc.name, "perm")) {
             self.handlePerm(sender, args);
+        } else if (std.mem.eql(u8, desc.name, "gamemode")) {
+            self.cmdGamemode(sender, args);
+        } else if (std.mem.eql(u8, desc.name, "give")) {
+            self.cmdGive(sender, args);
+        } else if (std.mem.eql(u8, desc.name, "tp")) {
+            self.cmdTp(sender, args);
+        } else if (std.mem.eql(u8, desc.name, "time")) {
+            self.cmdTime(sender, args);
         } else {
             self.reply(sender, "Unknown command. Try /help");
+        }
+    }
+
+    fn splitArgs(args: []const u8, out: [][]const u8) usize {
+        var n: usize = 0;
+        var it = std.mem.splitScalar(u8, args, ' ');
+        while (it.next()) |tok| {
+            if (tok.len == 0) continue;
+            if (n >= out.len) break;
+            out[n] = tok;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// Find an online (.play) conn by exact name within a caller-held
+    /// snapshot (refs keep it alive for the caller's critical section).
+    fn findInSnap(snap: []RegistryEntry, name: []const u8) ?*Conn {
+        for (snap) |e| {
+            e.conn.lock.lock();
+            const match = e.conn.state == .play and std.mem.eql(u8, e.conn.username[0..e.conn.username_len], name);
+            e.conn.lock.unlock();
+            if (match) return e.conn;
+        }
+        return null;
+    }
+
+    /// Sender's own login name (empty when console). Copied under lock.
+    fn senderName(sender: ?*Conn, out: *[16]u8) []const u8 {
+        const c = sender orelse return "";
+        c.lock.lock();
+        defer c.lock.unlock();
+        if (c.username_len == 0) return "";
+        @memcpy(out[0..c.username_len], c.username[0..c.username_len]);
+        return out[0..c.username_len];
+    }
+
+    fn cmdGamemode(self: *Server, sender: ?*Conn, args: []const u8) void {
+        var toks: [3][]const u8 = undefined;
+        const n = splitArgs(args, &toks);
+        if (n == 0 or n > 2) {
+            self.reply(sender, "Usage: /gamemode <0|1|survival|creative> [player]");
+            return;
+        }
+        const mode: u8 = if (std.mem.eql(u8, toks[0], "0") or std.mem.eql(u8, toks[0], "survival")) 0 else if (std.mem.eql(u8, toks[0], "1") or std.mem.eql(u8, toks[0], "creative")) 1 else {
+            self.reply(sender, "Usage: /gamemode <0|1|survival|creative> [player]");
+            return;
+        };
+        var self_name: [16]u8 = undefined;
+        const target: []const u8 = if (n == 2) toks[1] else senderName(sender, &self_name);
+        if (!Conn.validPlayerName(target)) {
+            self.reply(sender, "Usage: /gamemode <0|1|survival|creative> [player]");
+            return;
+        }
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        const c = findInSnap(snap, target) orelse {
+            self.reply(sender, "Player not found.");
+            return;
+        };
+        c.lock.lock();
+        c.config.gamemode = mode;
+        const creative = mode == 1;
+        var ab: [32]u8 = undefined;
+        const f = packets.framePlayerAbilities(if (creative) 0x07 else 0x00, 0.05, 0.1, &ab) catch {
+            c.lock.unlock();
+            return;
+        };
+        c.queueFramed(f) catch {};
+        c.lock.unlock();
+        var msg: [64]u8 = undefined;
+        const s = std.fmt.bufPrint(&msg, "Set {s} to {s}.", .{ target, if (mode == 1) "creative" else "survival" }) catch "Gamemode set.";
+        self.reply(sender, s);
+    }
+
+    fn cmdGive(self: *Server, sender: ?*Conn, args: []const u8) void {
+        var toks: [4][]const u8 = undefined;
+        const n = splitArgs(args, &toks);
+        if (n < 2 or n > 4) {
+            self.reply(sender, "Usage: /give <player> <id> [count] [damage]");
+            return;
+        }
+        const target = toks[0];
+        if (!Conn.validPlayerName(target)) {
+            self.reply(sender, "Usage: /give <player> <id> [count] [damage]");
+            return;
+        }
+        const id = std.fmt.parseInt(u16, toks[1], 10) catch {
+            self.reply(sender, "Usage: /give <player> <id> [count] [damage]");
+            return;
+        };
+        if (id == 0 or id > 4095) {
+            self.reply(sender, "Usage: /give <player> <id> [count] [damage]");
+            return;
+        }
+        var count: i32 = 1;
+        if (n >= 3) {
+            count = std.fmt.parseInt(i32, toks[2], 10) catch {
+                self.reply(sender, "Usage: /give <player> <id> [count] [damage]");
+                return;
+            };
+            if (count < 1 or count > 64) {
+                self.reply(sender, "Count must be 1..64.");
+                return;
+            }
+        }
+        var damage: i16 = 0;
+        if (n >= 4) {
+            damage = std.fmt.parseInt(i16, toks[3], 10) catch {
+                self.reply(sender, "Usage: /give <player> <id> [count] [damage]");
+                return;
+            };
+        }
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        const c = findInSnap(snap, target) orelse {
+            self.reply(sender, "Player not found.");
+            return;
+        };
+        // Fill like vanilla addItemStackToInventory: merge into main-inventory
+        // stacks (slots 9..44) first, then empties; NBT stacks never merge.
+        c.lock.lock();
+        var remaining = count;
+        var dirty: [45]bool = [_]bool{false} ** 45;
+        const limit: i32 = item_mod.maxStackSize(id);
+        for (9..45) |s| {
+            if (remaining <= 0) break;
+            const st = c.inv[s] orelse continue;
+            if (st.id != id or st.damage != damage or st.nbt != null) continue;
+            if (st.count >= limit) continue;
+            const room = limit - @as(i32, st.count);
+            const take = @min(room, remaining);
+            c.inv[s].?.count += @intCast(take);
+            remaining -= take;
+            dirty[s] = true;
+        }
+        var s: usize = 9;
+        while (remaining > 0 and s < 45) : (s += 1) {
+            if (c.inv[s] != null) continue;
+            const put: i8 = @intCast(@min(@as(i32, limit), remaining));
+            c.inv[s] = .{ .id = id, .count = put, .damage = damage, .nbt = null };
+            remaining -= put;
+            dirty[s] = true;
+        }
+        // Sync every touched slot (client has no other way to learn).
+        for (9..45) |ds| {
+            if (!dirty[ds]) continue;
+            const f = packets.frameSetSlotAlloc(self.gpa, 0, @intCast(ds), c.inv[ds]) catch continue;
+            defer self.gpa.free(f);
+            c.queueFramed(f) catch {};
+        }
+        c.lock.unlock();
+        const placed = count - remaining;
+        var msg: [96]u8 = undefined;
+        if (remaining == 0) {
+            const m = std.fmt.bufPrint(&msg, "Gave {d}x{d} to {s}.", .{ placed, id, target }) catch "Gave items.";
+            self.reply(sender, m);
+        } else {
+            const m = std.fmt.bufPrint(&msg, "Gave {d} of {d} (no space for {d}).", .{ placed, count, remaining }) catch "Gave items.";
+            self.reply(sender, m);
+        }
+    }
+
+    fn cmdTp(self: *Server, sender: ?*Conn, args: []const u8) void {
+        var toks: [3][]const u8 = undefined;
+        const n = splitArgs(args, &toks);
+        if (n == 0 or n > 3) {
+            self.reply(sender, "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>");
+            return;
+        }
+        // Resolve (mover, destination). Console has no self: it must name
+        // players (1-arg and 3-arg forms need a sender).
+        var mover_name: [16]u8 = undefined;
+        var mover: []const u8 = "";
+        var dx: f64 = 0;
+        var dy: f64 = 0;
+        var dz: f64 = 0;
+        var by_name: []const u8 = "";
+        if (n == 1) {
+            if (sender == null) {
+                self.reply(sender, "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>");
+                return;
+            }
+            mover = senderName(sender, &mover_name);
+            by_name = toks[0];
+        } else if (n == 2) {
+            mover = toks[0];
+            by_name = toks[1];
+        } else {
+            if (sender == null) {
+                self.reply(sender, "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>");
+                return;
+            }
+            mover = senderName(sender, &mover_name);
+            dx = std.fmt.parseFloat(f64, toks[0]) catch {
+                self.reply(sender, "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>");
+                return;
+            };
+            dy = std.fmt.parseFloat(f64, toks[1]) catch {
+                self.reply(sender, "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>");
+                return;
+            };
+            dz = std.fmt.parseFloat(f64, toks[2]) catch {
+                self.reply(sender, "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>");
+                return;
+            };
+            if (!std.math.isFinite(dx) or !std.math.isFinite(dy) or !std.math.isFinite(dz) or dy < 0 or dy > 256) {
+                self.reply(sender, "Bad coordinates (y must be 0..256).");
+                return;
+            }
+        }
+        if (mover.len == 0 or !Conn.validPlayerName(mover)) {
+            self.reply(sender, "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>");
+            return;
+        }
+        if (by_name.len > 0 and !Conn.validPlayerName(by_name)) {
+            self.reply(sender, "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>");
+            return;
+        }
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        const mc = findInSnap(snap, mover) orelse {
+            self.reply(sender, "Player not found.");
+            return;
+        };
+        if (by_name.len > 0) {
+            const tc = findInSnap(snap, by_name) orelse {
+                self.reply(sender, "Player not found.");
+                return;
+            };
+            tc.lock.lock();
+            const tx = tc.pos_x;
+            const ty = tc.pos_y;
+            const tz = tc.pos_z;
+            tc.lock.unlock();
+            dx = tx;
+            dy = ty;
+            dz = tz;
+        }
+        mc.lock.lock();
+        mc.pos_x = dx;
+        mc.pos_y = dy;
+        mc.pos_z = dz;
+        mc.chunks_dirty = true;
+        mc.queuePlayerPosLook() catch {};
+        // Stream the destination area immediately: chunk follow-up is
+        // otherwise frame-driven and would stall until the client's next
+        // packet (the client has no reason to send one right after /tp).
+        // Same lock order as the serve loop (conn.lock held, world_lock
+        // inside the chunk source) — never the reverse.
+        if (self.world) |pool| {
+            const radius: u8 = @min(mc.client_view orelse self.view_distance, self.view_distance);
+            view.syncPlayerChunks(mc, self.chunkSource(pool), 0, radius, true) catch {};
+        }
+        mc.lock.unlock();
+        var msg: [96]u8 = undefined;
+        if (by_name.len > 0) {
+            const m = std.fmt.bufPrint(&msg, "Teleported {s} to {s}.", .{ mover, by_name }) catch "Teleported.";
+            self.reply(sender, m);
+        } else {
+            const m = std.fmt.bufPrint(&msg, "Teleported {s} to {d:.1}, {d:.1}, {d:.1}.", .{ mover, dx, dy, dz }) catch "Teleported.";
+            self.reply(sender, m);
+        }
+    }
+
+    fn cmdTime(self: *Server, sender: ?*Conn, args: []const u8) void {
+        var toks: [2][]const u8 = undefined;
+        const n = splitArgs(args, &toks);
+        if (n != 2) {
+            self.reply(sender, "Usage: /time <set|add> <value|day|night>");
+            return;
+        }
+        const delta: ?i64 = if (std.mem.eql(u8, toks[1], "day")) 1000 else if (std.mem.eql(u8, toks[1], "night")) 13000 else std.fmt.parseInt(i64, toks[1], 10) catch null;
+        if (delta == null) {
+            self.reply(sender, "Usage: /time <set|add> <value|day|night>");
+            return;
+        }
+        if (std.mem.eql(u8, toks[0], "set")) {
+            self.time_of_day.store(@mod(delta.?, 24000), .release);
+            var msg: [64]u8 = undefined;
+            const s = std.fmt.bufPrint(&msg, "Set time to {d}.", .{@mod(delta.?, 24000)}) catch "Time set.";
+            self.reply(sender, s);
+        } else if (std.mem.eql(u8, toks[0], "add")) {
+            const now = self.time_of_day.load(.acquire);
+            const v = @mod(now + delta.?, 24000);
+            self.time_of_day.store(v, .release);
+            var msg: [64]u8 = undefined;
+            const s = std.fmt.bufPrint(&msg, "Time is now {d}.", .{v}) catch "Time set.";
+            self.reply(sender, s);
+        } else {
+            self.reply(sender, "Usage: /time <set|add> <value|day|night>");
         }
     }
 
@@ -1883,6 +2186,7 @@ test "player save/load roundtrip via pool (pos/health/inv/NBT)" {
     c.food = 17;
     c.saturation = 3.25;
     c.selected = 4;
+    c.config.gamemode = 0;
     c.config.spawn_x = 8;
     c.config.spawn_y = 70;
     c.config.spawn_z = 8;
@@ -1900,6 +2204,7 @@ test "player save/load roundtrip via pool (pos/health/inv/NBT)" {
     c.inv[10] = null;
     c.cursor = null;
     c.selected = 0;
+    c.config.gamemode = 1;
     c.lock.lock();
     try std.testing.expect(srv.loadPlayer(c));
     c.lock.unlock();
@@ -1908,6 +2213,7 @@ test "player save/load roundtrip via pool (pos/health/inv/NBT)" {
     try std.testing.expectApproxEqAbs(@as(f32, 13.5), c.health, 1e-6);
     try std.testing.expectEqual(@as(i16, 17), c.food);
     try std.testing.expectEqual(@as(u8, 4), c.selected);
+    try std.testing.expectEqual(@as(u8, 0), c.config.gamemode);
     try std.testing.expectEqual(@as(u16, 276), c.inv[36].?.id);
     try std.testing.expectEqualSlices(u8, &tag, c.inv[36].?.nbt.?);
     try std.testing.expectEqual(@as(u16, 1), c.inv[10].?.id);
@@ -2080,7 +2386,7 @@ test "permissions gate commands: op/deop/grant/deny/show/clear/reload" {
     srv.handleCommand(alice, "/help");
     const h1 = try readChat(alice);
     defer a.free(h1);
-    try std.testing.expectEqualStrings("{\"text\":\"Commands: /help /list /save-all /op <player> /deop <player> /perm <grant|deny|clear|show|reload> [player] [node]\"}", h1);
+    try std.testing.expectEqualStrings("{\"text\":\"Commands: /help /list /save-all /op <player> /deop <player> /perm <grant|deny|clear|show|reload> [player] [node] /gamemode <0|1|survival|creative> [player] /give <player> <id> [count] [damage] /tp <target|x> [y] [z] | /tp <victim> <target> /time <set|add> <value|day|night>\"}", h1);
     // /save-all allowed now (pool present; flushes).
     srv.handleCommand(alice, "/save-all");
     const s1 = try readChat(alice);
@@ -2181,3 +2487,278 @@ test "permissions gate commands: op/deop/grant/deny/show/clear/reload" {
     _ = srv.registry.pop();
     _ = srv.registry.pop();
 }
+
+test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.registry.deinit(a);
+    defer if (srv.perms) |*db| db.deinit();
+    const mk = struct {
+        fn run(name: []const u8, id: i32) !*Conn {
+            const c = try a.create(Conn);
+            errdefer a.destroy(c);
+            c.* = Conn.init(a, io, .{}, id);
+            c.state = .play;
+            @memcpy(c.username[0..name.len], name);
+            c.username_len = name.len;
+            return c;
+        }
+    };
+    const Frame = struct { id: i32, body: []u8 };
+    const Drain = struct {
+        fn run(c: *Conn) !std.ArrayList(Frame) {
+            var out = std.ArrayList(Frame).empty;
+            errdefer {
+                for (out.items) |f| a.free(f.body);
+                out.deinit(a);
+            }
+            c.lock.lock();
+            const raw = try c.takeOutput();
+            c.lock.unlock();
+            defer a.free(raw);
+            var r = codec.PacketReader.init(raw);
+            while (r.remaining() > 0) {
+                const h = try codec.decodeFrame(&r);
+                // decodeFrame consumed length+id; body excludes the id bytes.
+                const blen: usize = @intCast(h.length - @as(i32, @intCast(codec.PacketWriter.varIntLen(h.id))));
+                try out.append(a, .{ .id = h.id, .body = try a.dupe(u8, r.buffer[r.index..][0..blen]) });
+                r.index += blen;
+            }
+            return out;
+        }
+        fn free(list: *std.ArrayList(Frame)) void {
+            for (list.items) |f| a.free(f.body);
+            list.deinit(a);
+        }
+        fn find(list: *const std.ArrayList(Frame), id: i32) ?[]const u8 {
+            for (list.items) |f| {
+                if (f.id == id) return f.body;
+            }
+            return null;
+        }
+    };
+    const readChat = struct {
+        fn run(c: *Conn) ![]u8 {
+            var fr = try Drain.run(c);
+            defer Drain.free(&fr);
+            const body = Drain.find(&fr, 0x02) orelse return error.NoChat;
+            var pr = codec.PacketReader.init(body);
+            return try a.dupe(u8, try pr.readString());
+        }
+    }.run;
+    var alice = try mk.run("AliceG", 1);
+    defer {
+        alice.deinit();
+        a.destroy(alice);
+    }
+    var bob = try mk.run("BobG", 2);
+    defer {
+        bob.deinit();
+        a.destroy(bob);
+    }
+    try srv.registry.append(a, .{ .conn = alice, .stream = undefined });
+    try srv.registry.append(a, .{ .conn = bob, .stream = undefined });
+    // Bob (level 0) is denied the new commands, same as unknown.
+    srv.handleCommand(bob, "/gamemode 0");
+    const _r1 = try readChat(bob);
+    defer a.free(_r1);
+    try std.testing.expectEqualStrings("{\"text\":\"Unknown command. Try /help\"}", _r1);
+    // Op Alice via console; Bob stays level 0.
+    srv.handleCommand(null, "/op AliceG");
+    // Alice got the op notify (she was already registered).
+    const _r2 = try readChat(alice);
+    defer a.free(_r2);
+    try std.testing.expectEqualStrings("{\"text\":\"You are now op.\"}", _r2);
+    // /gamemode on Bob by Alice: config flips + 0x39 abilities (flags 0x00).
+    srv.handleCommand(alice, "/gamemode 0 BobG");
+    try std.testing.expectEqual(@as(u8, 0), bob.config.gamemode);
+    {
+        var fr = try Drain.run(bob);
+        defer Drain.free(&fr);
+        const ab = Drain.find(&fr, 0x39) orelse return error.NoAbilities;
+        try std.testing.expectEqual(@as(u8, 0x00), ab[0]);
+    }
+    const gm = try readChat(alice);
+    defer a.free(gm);
+    try std.testing.expectEqualStrings("{\"text\":\"Set BobG to survival.\"}", gm);
+    // /gamemode self form + invalid forms.
+    srv.handleCommand(alice, "/gamemode creative");
+    try std.testing.expectEqual(@as(u8, 1), alice.config.gamemode);
+    const _d1 = try readChat(alice);
+    defer a.free(_d1);
+    srv.handleCommand(alice, "/gamemode");
+    const _r3 = try readChat(alice);
+    defer a.free(_r3);
+    try std.testing.expectEqualStrings("{\"text\":\"Usage: /gamemode <0|1|survival|creative> [player]\"}", _r3);
+    srv.handleCommand(alice, "/gamemode 7");
+    const _r4 = try readChat(alice);
+    defer a.free(_r4);
+    try std.testing.expectEqualStrings("{\"text\":\"Usage: /gamemode <0|1|survival|creative> [player]\"}", _r4);
+    srv.handleCommand(alice, "/gamemode 0 NobodyHere");
+    const _r5 = try readChat(alice);
+    defer a.free(_r5);
+    try std.testing.expectEqualStrings("{\"text\":\"Player not found.\"}", _r5);
+    // /give: 64 dirt to Bob (first empty main slot = 9).
+    srv.handleCommand(alice, "/give BobG 1 64");
+    {
+        try std.testing.expectEqual(@as(u16, 1), bob.inv[9].?.id);
+        try std.testing.expectEqual(@as(i8, 64), bob.inv[9].?.count);
+        var fr = try Drain.run(bob);
+        defer Drain.free(&fr);
+        const sb = Drain.find(&fr, 0x2F) orelse return error.NoSetSlot;
+        var r = codec.PacketReader.init(sb);
+        _ = try r.readByte();
+        try std.testing.expectEqual(@as(i16, 9), try r.readShort());
+        const it = (try packets.parseSlot(&r)).?;
+        try std.testing.expectEqual(@as(i16, 1), it.id);
+        try std.testing.expectEqual(@as(i8, 64), it.count);
+    }
+    const gv = try readChat(alice);
+    defer a.free(gv);
+    try std.testing.expectEqualStrings("{\"text\":\"Gave 64x1 to BobG.\"}", gv);
+    // /give validation: bad id/count/damage, offline target, defaults.
+    srv.handleCommand(alice, "/give BobG 0 1");
+    const _r6 = try readChat(alice);
+    defer a.free(_r6);
+    try std.testing.expectEqualStrings("{\"text\":\"Usage: /give <player> <id> [count] [damage]\"}", _r6);
+    srv.handleCommand(alice, "/give BobG 4096 1");
+    const _r7 = try readChat(alice);
+    defer a.free(_r7);
+    try std.testing.expectEqualStrings("{\"text\":\"Usage: /give <player> <id> [count] [damage]\"}", _r7);
+    srv.handleCommand(alice, "/give BobG 1 0");
+    const _r8 = try readChat(alice);
+    defer a.free(_r8);
+    try std.testing.expectEqualStrings("{\"text\":\"Count must be 1..64.\"}", _r8);
+    srv.handleCommand(alice, "/give BobG 1 65");
+    const _r9 = try readChat(alice);
+    defer a.free(_r9);
+    try std.testing.expectEqualStrings("{\"text\":\"Count must be 1..64.\"}", _r9);
+    srv.handleCommand(alice, "/give Ghost 1 1");
+    const _r10 = try readChat(alice);
+    defer a.free(_r10);
+    try std.testing.expectEqualStrings("{\"text\":\"Player not found.\"}", _r10);
+    // Node grant lets level-0 Bob /give; deny revokes it again.
+    srv.handleCommand(alice, "/perm grant BobG zigcraft.command.give");
+    const _d2 = try readChat(alice);
+    defer a.free(_d2);
+    srv.handleCommand(bob, "/give BobG 3 5");
+    {
+        // dirt merges into slot 9 (64/64 full) -> first empty slot 10.
+        try std.testing.expectEqual(@as(u16, 3), bob.inv[10].?.id);
+        try std.testing.expectEqual(@as(i8, 5), bob.inv[10].?.count);
+    }
+    const _d3 = try readChat(bob);
+    defer a.free(_d3);
+    srv.handleCommand(alice, "/perm deny BobG zigcraft.command.give");
+    const _d4 = try readChat(alice);
+    defer a.free(_d4);
+    srv.handleCommand(bob, "/give BobG 3 1");
+    const _r11 = try readChat(bob);
+    defer a.free(_r11);
+    try std.testing.expectEqualStrings("{\"text\":\"Unknown command. Try /help\"}", _r11);
+    // /tp Alice -> Bob (1-arg), then coords, then victim form.
+    bob.pos_x = 100.0;
+    bob.pos_y = 70.0;
+    bob.pos_z = -40.0;
+    srv.handleCommand(alice, "/tp BobG");
+    try std.testing.expectApproxEqAbs(100.0, alice.pos_x, 1e-9);
+    try std.testing.expect(alice.chunks_dirty);
+    {
+        var fr = try Drain.run(alice);
+        defer Drain.free(&fr);
+        const pl = Drain.find(&fr, 0x08) orelse return error.NoPosLook;
+        const pux = std.mem.readInt(u64, pl[0..8], .big);
+        try std.testing.expectApproxEqAbs(100.0, @as(f64, @bitCast(pux)), 1e-9);
+        const rp = Drain.find(&fr, 0x02) orelse return error.NoReply;
+        var pr = codec.PacketReader.init(rp);
+        try std.testing.expectEqualStrings("{\"text\":\"Teleported AliceG to BobG.\"}", try pr.readString());
+    }
+    srv.handleCommand(alice, "/perm grant BobG zigcraft.command.tp");
+    const _d5 = try readChat(alice);
+    defer a.free(_d5);
+    srv.handleCommand(bob, "/tp 10 70 10");
+    try std.testing.expectApproxEqAbs(10.0, bob.pos_x, 1e-9);
+    try std.testing.expectApproxEqAbs(70.0, bob.pos_y, 1e-9);
+    const tp2 = try readChat(bob);
+    defer a.free(tp2);
+    try std.testing.expectEqualStrings("{\"text\":\"Teleported BobG to 10.0, 70.0, 10.0.\"}", tp2);
+    srv.handleCommand(alice, "/tp BobG AliceG");
+    try std.testing.expectApproxEqAbs(100.0, bob.pos_x, 1e-9);
+    const tpv = try readChat(alice);
+    defer a.free(tpv);
+    try std.testing.expectEqualStrings("{\"text\":\"Teleported BobG to AliceG.\"}", tpv);
+    // /tp usage + bad coords + unknown players.
+    srv.handleCommand(alice, "/tp");
+    const _r12 = try readChat(alice);
+    defer a.free(_r12);
+    try std.testing.expectEqualStrings("{\"text\":\"Usage: /tp <target|x> [y] [z] | /tp <victim> <target>\"}", _r12);
+    srv.handleCommand(alice, "/tp one two three");
+    const _r13 = try readChat(alice);
+    defer a.free(_r13);
+    try std.testing.expectEqualStrings("{\"text\":\"Usage: /tp <target|x> [y] [z] | /tp <victim> <target>\"}", _r13);
+    srv.handleCommand(alice, "/tp 0 nan 0");
+    const _r14 = try readChat(alice);
+    defer a.free(_r14);
+    try std.testing.expectEqualStrings("{\"text\":\"Bad coordinates (y must be 0..256).\"}", _r14);
+    srv.handleCommand(alice, "/tp 0 999 0");
+    const _r15 = try readChat(alice);
+    defer a.free(_r15);
+    try std.testing.expectEqualStrings("{\"text\":\"Bad coordinates (y must be 0..256).\"}", _r15);
+    srv.handleCommand(alice, "/tp Ghost");
+    const _r16 = try readChat(alice);
+    defer a.free(_r16);
+    try std.testing.expectEqualStrings("{\"text\":\"Player not found.\"}", _r16);
+    // /time set/add, keywords, usage, denial for level 0.
+    srv.handleCommand(bob, "/time set 0");
+    const _r17 = try readChat(bob);
+    defer a.free(_r17);
+    try std.testing.expectEqualStrings("{\"text\":\"Unknown command. Try /help\"}", _r17);
+    srv.handleCommand(alice, "/time set 13000");
+    try std.testing.expectEqual(@as(i64, 13000), srv.time_of_day.load(.acquire));
+    const _r18 = try readChat(alice);
+    defer a.free(_r18);
+    try std.testing.expectEqualStrings("{\"text\":\"Set time to 13000.\"}", _r18);
+    srv.handleCommand(alice, "/time add 1000");
+    try std.testing.expectEqual(@as(i64, 14000), srv.time_of_day.load(.acquire));
+    const _r19 = try readChat(alice);
+    defer a.free(_r19);
+    try std.testing.expectEqualStrings("{\"text\":\"Time is now 14000.\"}", _r19);
+    srv.handleCommand(alice, "/time set day");
+    try std.testing.expectEqual(@as(i64, 1000), srv.time_of_day.load(.acquire));
+    const _d6 = try readChat(alice);
+    defer a.free(_d6);
+    srv.handleCommand(alice, "/time set night");
+    try std.testing.expectEqual(@as(i64, 13000), srv.time_of_day.load(.acquire));
+    const _d7 = try readChat(alice);
+    defer a.free(_d7);
+    srv.handleCommand(alice, "/time");
+    const _r20 = try readChat(alice);
+    defer a.free(_r20);
+    try std.testing.expectEqualStrings("{\"text\":\"Usage: /time <set|add> <value|day|night>\"}", _r20);
+    srv.handleCommand(alice, "/time frobnicate 1");
+    const _r21 = try readChat(alice);
+    defer a.free(_r21);
+    try std.testing.expectEqualStrings("{\"text\":\"Usage: /time <set|add> <value|day|night>\"}", _r21);
+    srv.handleCommand(alice, "/time set xyz");
+    const _r22 = try readChat(alice);
+    defer a.free(_r22);
+    try std.testing.expectEqualStrings("{\"text\":\"Usage: /time <set|add> <value|day|night>\"}", _r22);
+    // Full inventory: /give reports partial with leftover.
+    for (9..45) |s| bob.inv[s] = .{ .id = 5, .count = 64, .damage = 0, .nbt = null };
+    srv.handleCommand(alice, "/perm clear BobG zigcraft.command.give");
+    const _d8 = try readChat(alice);
+    defer a.free(_d8);
+    srv.handleCommand(alice, "/op BobG");
+    const _d9 = try readChat(alice);
+    defer a.free(_d9);
+    const _d10 = try readChat(bob);
+    defer a.free(_d10); // "You are now op."
+    srv.handleCommand(bob, "/give BobG 1 10");
+    const nospace = try readChat(bob);
+    defer a.free(nospace);
+    try std.testing.expectEqualStrings("{\"text\":\"Gave 0 of 10 (no space for 10).\"}", nospace);
+    _ = srv.registry.pop();
+    _ = srv.registry.pop();
+}
+
