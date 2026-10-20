@@ -18,6 +18,20 @@ pub const store = @import("world/store.zig");
 pub const chunk = @import("world/chunk.zig");
 /// Region-sharded LSM pool (Folia-style ownership, no global lock).
 pub const shard = @import("world/shard.zig");
+/// Worldgen pipeline driver (version-agnostic stage order + context).
+pub const worldgen = @import("worldgen/pipeline.zig");
+/// Exact java.util.Random port (<=1.17 worldgen parity, JVM-verified goldens).
+pub const java_random = @import("worldgen/rng/java_random.zig");
+/// Xoroshiro128++ + Mojang seeding (1.18+ worldgen; H4 gate for full use).
+pub const xoroshiro = @import("worldgen/rng/xoroshiro.zig");
+/// fdlibm log port: StrictMath.log bit-exact (gaussian parity is load-bearing).
+pub const strict_math = @import("worldgen/rng/strict_math.zig");
+/// 1.7.10 worldgen noise (Improved + simplex, octave stacks). JVM-verified.
+pub const v5noise = @import("worldgen/v5/noise.zig");
+/// 1.7.10 biome table (ids, heights, temp categories). JVM-verified.
+pub const v5biome = @import("worldgen/v5/biome.zig");
+/// 1.7.10 GenLayer biome chain (CFR-verified ports + JVM goldens).
+pub const v5genlayer = @import("worldgen/v5/genlayer.zig");
 /// Lock-free cross-region handoff queue.
 pub const mpsc = @import("sim/mpsc.zig");
 /// Deterministic 20 TPS region tick loop.
@@ -45,6 +59,13 @@ test {
     _ = @import("world/store.zig");
     _ = @import("world/chunk.zig");
     _ = @import("world/shard.zig");
+    _ = @import("worldgen/pipeline.zig");
+    _ = @import("worldgen/rng/java_random.zig");
+    _ = @import("worldgen/rng/xoroshiro.zig");
+    _ = @import("worldgen/rng/strict_math.zig");
+    _ = @import("worldgen/v5/noise.zig");
+    _ = @import("worldgen/v5/biome.zig");
+    _ = @import("worldgen/v5/genlayer.zig");
     _ = @import("sim/mpsc.zig");
     _ = @import("sim/tick.zig");
     _ = @import("sim/view.zig");

@@ -9,8 +9,9 @@ Status snapshot (done, tested, live-verified over TCP):
 - [x] Handshake/status/login, offline UUID, AES-CFB8 (`src/net/cfb8.zig`), RSA-2048 decrypt + Mojang verify (`src/net/rsa.zig`, `src/net/mojang.zig`), online mode behind `--online`
 - [x] Play bootstrap: JoinGame/SpawnPosition/MapChunkBulk/PlayerPosLook (`src/proto/v5/chunks.zig`, `src/sim/view.zig`), `--db` world serving
 - [x] Pure-Zig LSM (WAL + SST + `ShardPool`), ZC1 payloads, Anvil→ZC1 import (`tools/anvil_import.zig`)
+- [x] H1 worldgen foundation: `java.util.Random` LCG port (JVM-verified goldens incl. `nextInt(bound)` rejection path), fdlibm `log` port (StrictMath bit-exact — Zig/glibc differ by 1 ulp, proven live), Xoroshiro128++ + Mojang seeding, version-agnostic pipeline driver, `worldgen_dump` tool (`src/worldgen/`, `tools/worldgen_dump.zig`)
 - [x] Region tick stub, MPSC handoff queue, player position tracking (stance quirk handled)
-- [x] 53/53 `zig build test` green
+- [x] 90/90 `zig build test` green (was 53/53 — count the real number when touching this line)
 
 Legend: `[ ]` todo, `[~]` partial. Each phase ends with acceptance criteria.
 
@@ -165,14 +166,14 @@ defaults ship as checked-in data (`data/worldgen/`), custom packs (Terralith /
 JJThunder-class) override the data, code only changes for new node *types*.
 Worldgen version follows the world's version, not the client's (ties to Phase I).
 
-### H1. Pipeline driver + RNG (parity foundation — build first)
+### H1. Pipeline driver + RNG (parity foundation — build first) ✅ (done — RNG goldens JVM-verified, chunk parity pending H2)
 
-- [ ] `src/worldgen/pipeline.zig`: version-agnostic stage driver — biome source → terrain shaper → surface builder → carvers → features → structures. Every chunk is a pure function `f(worldSeed, chunkXZ)` (enables parallel gen + golden tests); features read a 3×3 shaped area, decorate the center
-- [ ] `src/worldgen/rng/java_random.zig`: exact `java.util.Random` 48-bit LCG port (≤1.17 parity) with tests against known Java outputs; exact per-chunk seed-mixing formulas
-- [ ] `src/worldgen/rng/xoroshiro.zig`: Xoroshiro128++ port for 1.18+ (needed by H4)
-- [ ] Hard rule (code review gate): RNG call order is part of the spec — one stray `nextInt()` shifts all downstream terrain; call sites versioned + counted in tests
-- [ ] `tools/worldgen_dump.zig`: gen chunk for seed+X/Z, dump bytes for golden tests
-- [ ] Acceptance: golden chunk hashes for known seeds checked in; same seed vs vanilla → identical terrain+biome bytes (quirks included, divergences on a documented exclusions list)
+- [x] `src/worldgen/pipeline.zig`: version-agnostic stage driver — biome source → terrain shaper → surface builder → carvers → features → structures. Every chunk is a pure function `f(worldSeed, chunkXZ)` (enables parallel gen + golden tests); features read a 3×3 shaped area, decorate the center
+- [x] `src/worldgen/rng/java_random.zig`: exact `java.util.Random` 48-bit LCG port (≤1.17 parity) with tests against known Java outputs; exact per-chunk seed-mixing formulas. Includes fdlibm `log` port (`strict_math.zig`) — proven necessary: StrictMath.log differs from Zig/glibc by 1 ulp on real inputs, caught by the seed-42 gaussian golden
+- [x] `src/worldgen/rng/xoroshiro.zig`: Xoroshiro128++ port for 1.18+ (needed by H4)
+- [x] Hard rule (code review gate): RNG call order is part of the spec — one stray `nextInt()` shifts all downstream terrain; call sites versioned + counted in tests
+- [x] `tools/worldgen_dump.zig`: gen chunk for seed+X/Z, dump bytes for golden tests (`zig build wgen -- <seed> <x> <z>`; fresh-stream section diffs directly against Goldens.java)
+- [~] Acceptance (partial): RNG-level golden hashes checked in and JVM-verified; same-seed-vs-vanilla **chunk-byte** parity needs H2's real stages
 
 ### H2. 1.7.10 generator (v5 — fills today's void holes)
 
