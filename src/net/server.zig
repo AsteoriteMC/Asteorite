@@ -18,8 +18,11 @@ const Config = @import("conn.zig").Config;
 const Action = @import("conn.zig").Action;
 const AttackEvent = @import("conn.zig").AttackEvent;
 const QDropEvent = @import("conn.zig").QDropEvent;
+const FurnaceClick = @import("conn.zig").FurnaceClick;
 const TableClose = @import("conn.zig").TableClose;
 const BlockEvent = @import("conn.zig").BlockEvent;
+const furnace_mod = @import("../sim/furnace.zig");
+const smelting_mod = @import("../sim/smelting.zig");
 const codec = @import("codec.zig");
 const view = @import("../sim/view.zig");
 const shard_mod = @import("../world/shard.zig");
@@ -69,6 +72,12 @@ pub const Server = struct {
     ent_lock: spin.SpinLock = .{},
     /// Global item-entity list (break drops + Q-drops; guarded by ent_lock).
     items: std.ArrayList(entity.ItemEnt) = .empty,
+    /// Furnace tile entities (server-owned; in-memory only, lost on restart —
+    /// no chunk unloading exists so lifetime matches the loaded world).
+    /// Guarded by furn_lock (leaf; furn is never held while acquiring conn,
+    /// so nesting conn->furn is deadlock-free by construction).
+    furnaces: std.ArrayList(FurnaceEnt) = .empty,
+    furn_lock: spin.SpinLock = .{},
     /// Gameplay RNG stream (block-drop quantities/offsets, vanilla draw order).
     /// Lazy-seeded from drop_seed under rand_lock; never held with other locks.
     drop_rand: ?java_random.JavaRandom = null,
@@ -1106,6 +1115,62 @@ pub const Server = struct {
         }
         self.ent_lock.unlock();
 
+        // Furnaces: 20-tick quanta under furn_lock; snapshot progress + slots
+        // for viewer sync, record lit/unlit swaps for the world pass.
+        // (NBT duped per tick, freed after the reconcile pass like items.)
+        const FurnSnap = struct {
+            x: i32,
+            y: u8,
+            z: i32,
+            burn: u32,
+            total: u32,
+            cook: u32,
+            in: ?item_mod.Stack = null,
+            fuel: ?item_mod.Stack = null,
+            out: ?item_mod.Stack = null,
+        };
+        var furn_snaps: [256]FurnSnap = undefined;
+        var n_furn: usize = 0;
+        var furn_swaps: [256]struct { x: i32, y: u8, z: i32, lit: bool } = undefined;
+        var n_swaps: usize = 0;
+        self.furn_lock.lock();
+        for (self.furnaces.items) |*f| {
+            const was_burning = f.burn > 0;
+            var slots = furnace_mod.Slots{ .input = f.input, .fuel = f.fuel, .output = f.output };
+            const prev_in_nbt: ?[]const u8 = if (f.input) |s| s.nbt else null;
+            const prev_fuel_nbt: ?[]const u8 = if (f.fuel) |s| s.nbt else null;
+            _ = furnace_mod.tick(&slots, &f.burn, &f.total, &f.cook);
+            // tick() never allocates NBT: stacks keep their buffers, swap
+            // to a container item (null NBT), or are nulled. Free prev iff dropped.
+            const new_in_nbt: ?[]const u8 = if (slots.input) |ns| ns.nbt else null;
+            const in_dropped = if (prev_in_nbt) |p| (if (new_in_nbt) |n| n.ptr != p.ptr else true) else false;
+            if (in_dropped) self.gpa.free(prev_in_nbt.?);
+            const new_nbt: ?[]const u8 = if (slots.fuel) |ns| ns.nbt else null;
+            const dropped = if (prev_fuel_nbt) |p| (if (new_nbt) |n| n.ptr != p.ptr else true) else false;
+            if (dropped) self.gpa.free(prev_fuel_nbt.?);
+            f.input = slots.input;
+            f.output = slots.output;
+            f.fuel = slots.fuel;
+            if (was_burning != (f.burn > 0) and n_swaps < furn_swaps.len) {
+                furn_swaps[n_swaps] = .{ .x = f.x, .y = f.y, .z = f.z, .lit = f.burn > 0 };
+                n_swaps += 1;
+            }
+            if (n_furn >= furn_snaps.len) continue;
+            furn_snaps[n_furn] = .{
+                .x = f.x,
+                .y = f.y,
+                .z = f.z,
+                .burn = f.burn,
+                .total = f.total,
+                .cook = f.cook,
+                .in = if (f.input) |s| .{ .id = s.id, .count = s.count, .damage = s.damage, .nbt = if (s.nbt) |n| self.gpa.dupe(u8, n) catch null else null } else null,
+                .fuel = if (f.fuel) |s| .{ .id = s.id, .count = s.count, .damage = s.damage, .nbt = if (s.nbt) |n| self.gpa.dupe(u8, n) catch null else null } else null,
+                .out = if (f.output) |s| .{ .id = s.id, .count = s.count, .damage = s.damage, .nbt = if (s.nbt) |n| self.gpa.dupe(u8, n) catch null else null } else null,
+            };
+            n_furn += 1;
+        }
+        self.furn_lock.unlock();
+
         const PresentCtx = struct {
             viewer: *Conn,
             range_blocks: f64,
@@ -1209,6 +1274,37 @@ pub const Server = struct {
                         .z = e.conn.pos_z,
                     }) catch {};
                 }
+                // Furnace window sync (open window 2 at a snapped furnace).
+                if (e.conn.open_win) |ow| {
+                    if (ow.id == 2) {
+                        for (furn_snaps[0..n_furn]) |fs| {
+                            if (fs.x != ow.x or fs.y != ow.y or fs.z != ow.z) continue;
+                            // 39 slots: 0-2 furnace, 3-38 alias inv 9..44.
+                            var all: [39]?item_mod.Stack = [_]?item_mod.Stack{null} ** 39;
+                            all[0] = fs.in;
+                            all[1] = fs.fuel;
+                            all[2] = fs.out;
+                            for (9..45) |i| all[i - 6] = e.conn.inv[i];
+                            const wf = packets.frameWindowItemsAlloc(e.conn.allocator, 2, &all) catch null;
+                            if (wf) |f| {
+                                defer e.conn.allocator.free(f);
+                                e.conn.queueFramed(f) catch {};
+                            }
+                            var pb: [16]u8 = undefined;
+                            const props = [_]struct { p: i16, v: i16 }{
+                                .{ .p = 0, .v = @intCast(@min(fs.cook, 32767)) },
+                                .{ .p = 1, .v = @intCast(@min(fs.burn, 32767)) },
+                                .{ .p = 2, .v = @intCast(@min(fs.total, 32767)) },
+                            };
+                            for (props) |pr| {
+                                if (packets.frameProgressBar(2, pr.p, pr.v, &pb)) |f| {
+                                    e.conn.queueFramed(f) catch {};
+                                } else |_| {}
+                            }
+                            break;
+                        }
+                    }
+                }
                 var pctx = PresentCtx{ .viewer = e.conn, .range_blocks = @as(f64, @floatFromInt(self.view_distance)) * 16.0 + 16.0 };
                 entity.reconcileViewer(e.conn, players[0..n_players], mobs[0..n_mobs], item_snaps[0..n_items], &claims, present, &pctx) catch {};
             }
@@ -1249,6 +1345,31 @@ pub const Server = struct {
             }
         }
         for (item_snaps[0..n_items]) |s| if (s.nbt) |n| self.gpa.free(n);
+        // Furnace lit/unlit swaps (world write + broadcast, never nested).
+        // Guarded by peek: a concurrently broken furnace stays broken.
+        if (self.world != null and n_swaps > 0) {
+            var applied: [256]bool = [_]bool{false} ** 256;
+            self.world_lock.lock();
+            for (furn_swaps[0..n_swaps], 0..) |sw, i| {
+                if (self.world) |pool| {
+                    const cur = view.peekBlock(pool, self.gpa, sw.x, sw.y, sw.z) catch null;
+                    if (cur) |c| if (c.id == 61 or c.id == 62) {
+                        view.applyBlock(pool, self.gpa, sw.x, sw.y, sw.z, if (sw.lit) 62 else 61, 0) catch {};
+                        applied[i] = true;
+                    };
+                }
+            }
+            self.world_lock.unlock();
+            for (furn_swaps[0..n_swaps], 0..) |sw, i| {
+                if (!applied[i]) continue;
+                self.broadcastBlockChange(null, sw.x, sw.y, sw.z, if (sw.lit) 62 else 61, 0) catch {};
+            }
+        }
+        for (furn_snaps[0..n_furn]) |s| {
+            if (s.in) |st| if (st.nbt) |n| self.gpa.free(n);
+            if (s.fuel) |st| if (st.nbt) |n| self.gpa.free(n);
+            if (s.out) |st| if (st.nbt) |n| self.gpa.free(n);
+        }
         // Deaths from hunger/environment this tick: spawn drops (ent_lock),
         // persist emptied rows (savePlayer locks), broadcast death metadata.
         for (deaths.items) |*di| {
@@ -1533,6 +1654,46 @@ pub const Server = struct {
         }
     }
 
+    /// Furnace tile entity (server-owned shared state; slots OWNED).
+    const FurnaceEnt = struct {
+        x: i32,
+        y: u8,
+        z: i32,
+        input: ?item_mod.Stack = null,
+        fuel: ?item_mod.Stack = null,
+        output: ?item_mod.Stack = null,
+        burn: u32 = 0,
+        total: u32 = 0,
+        cook: u32 = 0,
+    };
+
+    /// Find a furnace by block pos. Caller MUST hold furn_lock.
+    fn findFurnace(self: *Server, x: i32, y: u8, z: i32) ?*FurnaceEnt {
+        for (self.furnaces.items) |*f| {
+            if (f.x == x and f.y == y and f.z == z) return f;
+        }
+        return null;
+    }
+
+    /// Ensure furnace state exists (placement + first open). Caller holds furn_lock.
+    fn ensureFurnace(self: *Server, x: i32, y: u8, z: i32) void {
+        if (self.findFurnace(x, y, z) != null) return;
+        self.furnaces.append(self.gpa, .{ .x = x, .y = y, .z = z }) catch {};
+    }
+
+    /// Remove furnace state, returning owned contents (block break).
+    /// Caller MUST hold furn_lock.
+    fn removeFurnace(self: *Server, x: i32, y: u8, z: i32) FurnaceEnt {
+        var i: usize = 0;
+        while (i < self.furnaces.items.len) : (i += 1) {
+            const f = &self.furnaces.items[i];
+            if (f.x == x and f.y == y and f.z == z) {
+                return self.furnaces.swapRemove(i);
+            }
+        }
+        return .{ .x = x, .y = y, .z = z };
+    }
+
     /// Remove one item entity by id, freeing its owned stack. Caller MUST hold
     /// ent_lock (leaf: takes no other lock).
     fn removeItemById(self: *Server, id: i32) void {
@@ -1694,9 +1855,266 @@ pub const Server = struct {
         return true;
     }
 
-    /// Break-driven close: every conn with this table open drops its grid
-    /// as entities + gets 0x2E. Caller holds world_lock.
-    fn closeTableWindowsAt(self: *Server, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, x: i32, y: u8, z: i32) void {
+    /// Right-click routing: furnace (61/62) + not sneaking opens window 2.
+    /// Ensures server state, then queues 0x2D + full 0x30. Same locking as
+    /// tryOpenTable. Returns true when the click became a UI open.
+    fn tryOpenFurnace(self: *Server, conn: *Conn, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, b: *BlockEvent) bool {
+        var cx = b.x;
+        var cy: i32 = b.y;
+        var cz = b.z;
+        switch (b.face) {
+            0 => cy += 1,
+            1 => cy -= 1,
+            2 => cz += 1,
+            3 => cz -= 1,
+            4 => cx += 1,
+            5 => cx -= 1,
+            else => return false,
+        }
+        if (cy < 0 or cy > 255) return false;
+        const clicked = view.peekBlock(pool, allocator, cx, @intCast(cy), cz) catch null;
+        if (clicked == null or (clicked.?.id != 61 and clicked.?.id != 62)) return false;
+        conn.lock.lock();
+        const sneak = conn.sneaking;
+        conn.lock.unlock();
+        if (sneak) return false;
+        self.furn_lock.lock();
+        self.ensureFurnace(cx, @intCast(cy), cz);
+        const f = self.findFurnace(cx, @intCast(cy), cz).?;
+        // Dupe NBT under the lock (states can be removed concurrently).
+        const fin: ?item_mod.Stack = if (f.input) |s| item_mod.cloneStack(self.gpa, s) catch null else null;
+        const ffu: ?item_mod.Stack = if (f.fuel) |s| item_mod.cloneStack(self.gpa, s) catch null else null;
+        const fout: ?item_mod.Stack = if (f.output) |s| item_mod.cloneStack(self.gpa, s) catch null else null;
+        self.furn_lock.unlock();
+        conn.lock.lock();
+        conn.open_win = .{ .id = 2, .x = cx, .y = @intCast(cy), .z = cz };
+        var ob: [128]u8 = undefined;
+        if (packets.frameOpenWindow(2, 2, "container.furnace", 3, &ob)) |of| {
+            conn.queueFramed(of) catch {};
+        } else |_| {}
+        // Window 2 has 39 slots: 0-2 furnace, 3-38 alias inv 9..44.
+        // (A 46-count dump would overrun the client's 39-slot container.)
+        var all: [39]?item_mod.Stack = [_]?item_mod.Stack{null} ** 39;
+        all[0] = fin;
+        all[1] = ffu;
+        all[2] = fout;
+        for (9..45) |i| all[i - 6] = conn.inv[i];
+        const wf = packets.frameWindowItemsAlloc(conn.allocator, 2, &all) catch null;
+        if (wf) |wfr| {
+            defer conn.allocator.free(wfr);
+            conn.queueFramed(wfr) catch {};
+        }
+        conn.lock.unlock();
+        var ff: ?item_mod.Stack = fin;
+        item_mod.freeStack(self.gpa, &ff);
+        var fu: ?item_mod.Stack = ffu;
+        item_mod.freeStack(self.gpa, &fu);
+        var fo: ?item_mod.Stack = fout;
+        item_mod.freeStack(self.gpa, &fo);
+        return true;
+    }
+
+    /// Window-2 click (slots 0-2 furnace, 3-38 alias inv 9-44). Runs on the
+    /// serve thread with conn.lock held, taking furn_lock nested inside.
+    /// (Safe: furn is never held while acquiring conn anywhere, and the
+    /// ticker never nests. Documented exception to one-lock-at-a-time.)
+    /// Mode-0 merges reuse Conn.clickPickupImplCell (same rules as window 0);
+    /// shift/number-key moves are inlined below with item primitives.
+    fn applyFurnaceClick(self: *Server, conn: *Conn, fc: FurnaceClick) void {
+        conn.lock.lock();
+        defer conn.lock.unlock();
+        const ow = conn.open_win orelse return;
+        if (ow.id != 2) return;
+        self.furn_lock.lock();
+        defer self.furn_lock.unlock();
+        const f = self.findFurnace(ow.x, ow.y, ow.z) orelse return;
+        switch (fc.mode) {
+            0 => {
+                if (fc.button != 0 and fc.button != 1) return;
+                if (fc.slot == 2) {
+                    // take output (cursor must be empty; no consume — the
+                    // tick already consumed the input)
+                    const out = f.output orelse return;
+                    if (conn.cursor != null) return;
+                    conn.cursor = out;
+                    f.output = null;
+                    const sf = packets.frameSetSlotAlloc(conn.allocator, 2, 2, null) catch return;
+                    defer conn.allocator.free(sf);
+                    conn.queueFramed(sf) catch {};
+                    const cf = packets.frameSetSlotAlloc(conn.allocator, 0, -1, conn.cursor) catch return;
+                    defer conn.allocator.free(cf);
+                    conn.queueFramed(cf) catch {};
+                    return;
+                }
+                const cell: *?item_mod.Stack = if (fc.slot == 0) &f.input else if (fc.slot == 1) &f.fuel else if (fc.slot >= 3 and fc.slot <= 38) &conn.inv[@as(usize, @intCast(fc.slot)) - 3 + 9] else return;
+                if (!(conn.clickPickupImplCell(cell, fc.button) catch return)) return;
+                const sf = packets.frameSetSlotAlloc(conn.allocator, 2, fc.slot, cell.*) catch return;
+                defer conn.allocator.free(sf);
+                conn.queueFramed(sf) catch {};
+                const cf = packets.frameSetSlotAlloc(conn.allocator, 0, -1, conn.cursor) catch return;
+                defer conn.allocator.free(cf);
+                conn.queueFramed(cf) catch {};
+            },
+            1 => {
+                // shift-click: output/input/fuel -> player inv; player inv ->
+                // smeltable to input, fuel to fuel, else hotbar<->main.
+                if (fc.button != 0 and fc.button != 1) return;
+                var changed = false;
+                if (fc.slot == 2 or fc.slot == 0 or fc.slot == 1) {
+                    // move whole furnace stack into inv 9..44 (merge, then fill)
+                    const cell: *?item_mod.Stack = if (fc.slot == 2) &f.output else if (fc.slot == 0) &f.input else &f.fuel;
+                    if (cell.* != null) {
+                        var i: usize = 9;
+                        while (i <= 44) : (i += 1) {
+                            const dst = conn.inv[i] orelse continue;
+                            const src = cell.* orelse break;
+                            if (!item_mod.canMerge(dst, src)) continue;
+                            const room: i16 = @as(i16, item_mod.maxStackSize(dst.id)) - dst.count;
+                            if (room <= 0) continue;
+                            const n: i16 = @min(room, @as(i16, src.count));
+                            if (n <= 0) continue;
+                            conn.inv[i].?.count += @as(i8, @intCast(n));
+                            cell.*.?.count -= @as(i8, @intCast(n));
+                            changed = true;
+                            if (cell.*.?.count <= 0) {
+                                item_mod.freeStack(conn.allocator, cell);
+                                break;
+                            }
+                        }
+                        if (cell.* != null) {
+                            var j: usize = 9;
+                            while (j <= 44) : (j += 1) {
+                                if (conn.inv[j] != null) continue;
+                                conn.inv[j] = cell.*;
+                                cell.* = null;
+                                changed = true;
+                                break;
+                            }
+                        }
+                    }
+                } else if (fc.slot >= 3 and fc.slot <= 38) {
+                    const islot: usize = @as(usize, @intCast(fc.slot)) - 3 + 9;
+                    const st = conn.inv[islot] orelse return;
+                    if (smelting_mod.findResult(st.id, st.damage) != null) {
+                        // smeltable -> input slot (merge, else fill if empty)
+                        if (f.input) |dst| {
+                            if (item_mod.canMerge(dst, st)) {
+                                const room: i16 = @as(i16, item_mod.maxStackSize(dst.id)) - dst.count;
+                                const n: i16 = @min(room, @as(i16, st.count));
+                                if (n > 0) {
+                                    f.input.?.count += @as(i8, @intCast(n));
+                                    conn.inv[islot].?.count -= @as(i8, @intCast(n));
+                                    changed = true;
+                                    if (conn.inv[islot].?.count <= 0) item_mod.freeStack(conn.allocator, &conn.inv[islot]);
+                                }
+                            }
+                        } else {
+                            f.input = conn.inv[islot];
+                            conn.inv[islot] = null;
+                            changed = true;
+                        }
+                    } else if (smelting_mod.burnTime(st.id) > 0) {
+                        // fuel -> fuel slot (merge, else fill)
+                        if (f.fuel) |dst| {
+                            if (item_mod.canMerge(dst, st)) {
+                                const room: i16 = @as(i16, item_mod.maxStackSize(dst.id)) - dst.count;
+                                const n: i16 = @min(room, @as(i16, st.count));
+                                if (n > 0) {
+                                    f.fuel.?.count += @as(i8, @intCast(n));
+                                    conn.inv[islot].?.count -= @as(i8, @intCast(n));
+                                    changed = true;
+                                    if (conn.inv[islot].?.count <= 0) item_mod.freeStack(conn.allocator, &conn.inv[islot]);
+                                }
+                            }
+                        } else {
+                            f.fuel = conn.inv[islot];
+                            conn.inv[islot] = null;
+                            changed = true;
+                        }
+                    } else {
+                        // hotbar<->main within the player range
+                        const in_hotbar = islot >= 36;
+                        const lo: usize = if (in_hotbar) 9 else 36;
+                        const hi: usize = if (in_hotbar) 35 else 44;
+                        var i: usize = lo;
+                        while (i <= hi) : (i += 1) {
+                            if (i == islot) continue;
+                            const dst = conn.inv[i] orelse continue;
+                            const s = conn.inv[islot] orelse break;
+                            if (!item_mod.canMerge(dst, s)) continue;
+                            const room: i16 = @as(i16, item_mod.maxStackSize(dst.id)) - dst.count;
+                            if (room <= 0) continue;
+                            const n: i16 = @min(room, @as(i16, s.count));
+                            if (n <= 0) continue;
+                            conn.inv[i].?.count += @as(i8, @intCast(n));
+                            conn.inv[islot].?.count -= @as(i8, @intCast(n));
+                            changed = true;
+                            if (conn.inv[islot].?.count <= 0) {
+                                item_mod.freeStack(conn.allocator, &conn.inv[islot]);
+                                break;
+                            }
+                        }
+                        if (conn.inv[islot] != null) {
+                            var j: usize = lo;
+                            while (j <= hi) : (j += 1) {
+                                if (j == islot or conn.inv[j] != null) continue;
+                                conn.inv[j] = conn.inv[islot];
+                                conn.inv[islot] = null;
+                                changed = true;
+                                break;
+                            }
+                        }
+                    }
+                } else return;
+                if (!changed) return;
+                var all: [39]?item_mod.Stack = [_]?item_mod.Stack{null} ** 39;
+                all[0] = f.input;
+                all[1] = f.fuel;
+                all[2] = f.output;
+                for (9..45) |i| all[i - 6] = conn.inv[i];
+                const wf = packets.frameWindowItemsAlloc(conn.allocator, 2, &all) catch return;
+                defer conn.allocator.free(wf);
+                conn.queueFramed(wf) catch {};
+            },
+            2 => {
+                if (fc.slot == 2) return; // no number-key on the output
+                if (fc.button < 0 or fc.button > 8) return;
+                if (conn.cursor != null) return;
+                const h: usize = 36 + @as(usize, @intCast(fc.button));
+                if (fc.slot >= 0 and fc.slot <= 1) {
+                    const cell: *?item_mod.Stack = if (fc.slot == 0) &f.input else &f.fuel;
+                    const t = cell.*;
+                    cell.* = conn.inv[h];
+                    conn.inv[h] = t;
+                    const sfa = packets.frameSetSlotAlloc(conn.allocator, 2, fc.slot, cell.*) catch return;
+                    defer conn.allocator.free(sfa);
+                    conn.queueFramed(sfa) catch {};
+                    const sfb = packets.frameSetSlotAlloc(conn.allocator, 2, @as(i16, @intCast(h - 6)), conn.inv[h]) catch return;
+                    defer conn.allocator.free(sfb);
+                    conn.queueFramed(sfb) catch {};
+                } else if (fc.slot >= 3 and fc.slot <= 38) {
+                    const islot: usize = @as(usize, @intCast(fc.slot)) - 3 + 9;
+                    if (islot == h) return;
+                    const t = conn.inv[islot];
+                    conn.inv[islot] = conn.inv[h];
+                    conn.inv[h] = t;
+                    const sfa = packets.frameSetSlotAlloc(conn.allocator, 2, fc.slot, conn.inv[islot]) catch return;
+                    defer conn.allocator.free(sfa);
+                    conn.queueFramed(sfa) catch {};
+                    const sfb = packets.frameSetSlotAlloc(conn.allocator, 2, @as(i16, @intCast(h - 6)), conn.inv[h]) catch return;
+                    defer conn.allocator.free(sfb);
+                    conn.queueFramed(sfb) catch {};
+                }
+            },
+            else => {},
+        }
+        _ = fc.action;
+    }
+
+    /// Break-driven close: every conn with a window open AT this block gets
+    /// 0x2E; crafting grids drop as entities (furnace contents are dropped
+    /// by the break handler itself via removeFurnace). Caller holds world_lock.
+    fn closeWindowsAt(self: *Server, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, x: i32, y: u8, z: i32) void {
         _ = pool;
         _ = allocator;
         var batch: [256]RegistryEntry = undefined;
@@ -1712,7 +2130,9 @@ pub const Server = struct {
                 e.conn.lock.unlock();
                 continue;
             }
-            var stacks = e.conn.takeTableGrid();
+            var stacks: [9]?item_mod.Stack = [_]?item_mod.Stack{null} ** 9;
+            if (ow.id == 1) stacks = e.conn.takeTableGrid();
+            if (ow.id == 2) e.conn.open_win = null;
             const px = e.conn.pos_x;
             const py = e.conn.pos_y;
             const pz = e.conn.pos_z;
@@ -1731,9 +2151,11 @@ pub const Server = struct {
         }
     }
 
-    /// Client-initiated close (0x0D): drop the grid in front of the player.
+    /// Client-initiated close (0x0D): drop the crafting grid in front of the
+    /// player. Furnace closes drop nothing (contents persist server-side).
     /// No 0x2E ack — the client already closed locally (vanilla flow).
     fn spawnTableClose(self: *Server, conn: *Conn, tc: TableClose) void {
+        if (tc.window != 1) return;
         var stacks = tc.stacks;
         conn.lock.lock();
         const px = conn.pos_x;
@@ -1982,7 +2404,7 @@ pub fn serveConn(
             const action = try conn.handleFrame(f);
             if (action == .entered_play) entered = true;
             switch (action) {
-                .block_set, .arm_swing, .chat, .attack, .command, .qdrop, .table_close => try events.append(allocator, action),
+                .block_set, .arm_swing, .chat, .attack, .command, .qdrop, .table_close, .furnace_click => try events.append(allocator, action),
                 else => {},
             }
         }
@@ -2060,6 +2482,12 @@ pub fn serveConn(
                                     events.items[i] = .none;
                                     continue;
                                 }
+                                // Right-click on a furnace (not sneaking)
+                                // opens window 2 instead of placing.
+                                if (server.tryOpenFurnace(conn, pool, allocator, b)) {
+                                    events.items[i] = .none;
+                                    continue;
+                                }
                             }
                             const old = view.peekBlock(pool, allocator, b.x, b.y, b.z) catch null;
                             view.applyBlock(pool, allocator, b.x, b.y, b.z, b.id, b.meta) catch {};
@@ -2073,7 +2501,24 @@ pub fn serveConn(
                                     }
                                     // Table break with viewers: drop their
                                     // grids + close the windows.
-                                    if (o.id == 58) server.closeTableWindowsAt(pool, allocator, b.x, b.y, b.z);
+                                    if (o.id == 58) server.closeWindowsAt(pool, allocator, b.x, b.y, b.z);
+                                    // Furnace break: close viewer windows and
+                                    // drop input/fuel/output as entities
+                                    // (both modes, like table grids; the
+                                    // block itself drops only in survival
+                                    // via spawnBreakDrops above).
+                                    if (o.id == 61 or o.id == 62) {
+                                        server.closeWindowsAt(pool, allocator, b.x, b.y, b.z);
+                                        var removed = server.removeFurnace(b.x, b.y, b.z);
+                                        const fstacks = [_]*?item_mod.Stack{ &removed.input, &removed.fuel, &removed.output };
+                                        for (fstacks) |st| {
+                                            const s = st.* orelse continue;
+                                            st.* = null;
+                                            server.ent_lock.lock();
+                                            _ = server.spawnItem(s, @as(f64, @floatFromInt(b.x)) + 0.5, @as(f64, @floatFromInt(b.y)) + 0.5, @as(f64, @floatFromInt(b.z)) + 0.5, 10);
+                                            server.ent_lock.unlock();
+                                        }
+                                    }
                                 }
                             }
                         },
@@ -2095,6 +2540,7 @@ pub fn serveConn(
                     },
                     .qdrop => |q| server.spawnQDrop(conn, q),
                     .table_close => |t| server.spawnTableClose(conn, t),
+                    .furnace_click => |f| server.applyFurnaceClick(conn, f),
                     .arm_swing => |a| server.broadcastArmSwing(conn, cc_now.cx, cc_now.cz, conn.eid, a) catch {},
                     .chat => |m| server.broadcastChat(conn.chat_buf[0..m.json_len]),
                     .attack => |a| server.resolveAttack(conn, a),
@@ -3463,3 +3909,25 @@ test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
     _ = srv.registry.pop();
 }
 
+
+test "furnace: take output moves stack to cursor + syncs" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.registry.deinit(a);
+    defer srv.furnaces.deinit(a);
+    var conn = Conn.init(a, io, .{}, 7);
+    defer conn.deinit();
+    conn.open_win = .{ .id = 2, .x = 2, .y = 69, .z = 0 };
+    srv.ensureFurnace(2, 69, 0);
+    const f = srv.findFurnace(2, 69, 0).?;
+    f.output = .{ .id = 265, .count = 3, .damage = 0, .nbt = null };
+    srv.applyFurnaceClick(&conn, .{ .slot = 2, .button = 0, .action = 601, .mode = 0 });
+    try std.testing.expect(conn.cursor != null);
+    try std.testing.expectEqual(@as(u16, 265), conn.cursor.?.id);
+    try std.testing.expectEqual(@as(i8, 3), conn.cursor.?.count);
+    try std.testing.expect(srv.findFurnace(2, 69, 0).?.output == null);
+    const out = try conn.takeOutput();
+    defer a.free(out);
+    try std.testing.expect(out.len > 0);
+}

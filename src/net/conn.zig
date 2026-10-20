@@ -62,9 +62,17 @@ pub const BlockEvent = struct {
 /// with a 0x2F after the inventory mutation.
 pub const QDropEvent = struct { stack: item_mod.Stack, slot: i16 };
 
+/// Furnace click (window 2): resolved by the serve thread (furnace state is
+/// server-owned under furn_lock). Click validation happened in handleFrame.
+pub const FurnaceClick = struct { slot: i16, button: i8, action: i16, mode: i8 };
+
 /// Crafting-table close: OWNED grid stacks (result slot is virtual and
 /// vanishes) for the serve loop to drop as entities + 0x2E the window.
-pub const TableClose = struct { stacks: [9]?item_mod.Stack };
+/// Crafting-table close (0x0D or block break): grid contents (result slot
+/// is virtual and vanishes) drop as entities; serve loop sends 0x2E + spawns.
+/// Furnace close reuses this with window=2 and empty stacks (contents stay
+/// in the server furnace — only the UI closes).
+pub const TableClose = struct { window: u8, stacks: [9]?item_mod.Stack };
 
 /// Outbound chat line (validated JSON in conn.chat_buf).
 pub const ChatEvent = struct {
@@ -98,6 +106,8 @@ pub const Action = union(enum) {
     attack: AttackEvent,
     /// Q-key item drop: serve loop spawns the entity + refreshes the slot.
     qdrop: QDropEvent,
+    /// Furnace click (window 2): serve loop mutates server state + syncs.
+    furnace_click: FurnaceClick,
     /// Crafting-table close (0x0D or table break): grid contents drop as
     /// entities in front of the player; serve loop sends 0x2E + spawns.
     table_close: TableClose,
@@ -679,13 +689,19 @@ pub const Conn = struct {
         }
         if (frame.id == @as(i32, @intFromEnum(ids.PlayServer.click_window))) {
             const u = try packets.parseClickWindow(frame.body);
-            try self.onClickWindow(u.window, u.slot, u.button, u.action, u.mode);
+            if (try self.onClickWindow(u.window, u.slot, u.button, u.action, u.mode)) |fc| {
+                return .{ .furnace_click = fc };
+            }
             return .none;
         }
         if (frame.id == @as(i32, @intFromEnum(ids.PlayServer.close_window))) {
             const w = try packets.parseCloseWindow(frame.body);
             if (self.open_win) |ow| {
-                if (w == ow.id) return .{ .table_close = .{ .stacks = self.takeTableGrid() } };
+                if (w == ow.id and ow.id == 1) return .{ .table_close = .{ .window = 1, .stacks = self.takeTableGrid() } };
+                if (w == ow.id and ow.id == 2) {
+                    self.open_win = null;
+                    return .{ .table_close = .{ .window = 2, .stacks = [_]?item_mod.Stack{null} ** 9 } };
+                }
             }
             return .none;
         }
@@ -735,54 +751,69 @@ pub const Conn = struct {
     /// (creative pick, drop, drag, collect) are no-ops: drop/drag/collect
     /// need item entities (0x15 Spawn Object, follow-up), so nothing happens
     /// rather than deleting or duplicating the player's items.
-    fn onClickWindow(self: *Conn, window: i8, slot: i16, button: i8, action: i16, mode: i8) !void {
-        if (self.is_dead) return;
+    fn onClickWindow(self: *Conn, window: i8, slot: i16, button: i8, action: i16, mode: i8) !?FurnaceClick {
+        if (self.is_dead) return null;
         if (window == 1) {
             if (self.open_win == null) {
                 self.sendWindow();
-                return;
+                return null;
             }
             // Click validation shared across windows (desync -> refresh).
             if (!self.click_seen) {
                 self.click_seen = true;
             } else if (action != self.click_seq) {
                 self.queueTableWindow();
-                return;
+                return null;
             }
             self.click_seq = action +% 1;
-            if (slot == -999) return;
+            if (slot == -999) return null;
             try self.onClickTable(slot, button, action, mode);
-            return;
+            return null;
         }
-        if (window != 0) return;
-        if (slot < -999 or slot > 44) return;
+        if (window == 2) {
+            if (self.open_win == null or self.open_win.?.id != 2) {
+                self.sendWindow();
+                return null;
+            }
+            if (!self.click_seen) {
+                self.click_seen = true;
+            } else if (action != self.click_seq) {
+                self.sendWindow();
+                return null;
+            }
+            self.click_seq = action +% 1;
+            if (slot == -999 or slot < 0 or slot > 38) return null;
+            return FurnaceClick{ .slot = slot, .button = button, .action = action, .mode = mode };
+        }
+        if (window != 0) return null;
+        if (slot < -999 or slot > 44) return null;
         // First click seeds the expectation; later clicks must increment.
         // Mismatch = desynced/replayed client: refresh, ignore the click.
         if (!self.click_seen) {
             self.click_seen = true;
         } else if (action != self.click_seq) {
             self.sendWindow();
-            return;
+            return null;
         }
         self.click_seq = action +% 1;
-        if (slot == -999) return; // outside click: drop path needs entities
+        if (slot == -999) return null; // outside click: drop path needs entities
         const s: usize = @intCast(slot);
         if (s == 0) {
             // Crafting result slot (2x2).
             if (mode == 0) {
                 _ = try self.takeResult(0, self.inv[1..5], &self.inv[0], false);
-                return;
+                return null;
             }
             if (mode == 1) {
                 try self.craftAll(self.inv[1..5], &self.inv[0], false);
-                return;
+                return null;
             }
-            return; // number-key on the result: no-op
+            return null; // number-key on the result: no-op
         }
         switch (mode) {
             0 => {
-                if (button != 0 and button != 1) return;
-                if (!(try self.clickPickupImplCell(&self.inv[s], button))) return;
+                if (button != 0 and button != 1) return null;
+                if (!(try self.clickPickupImplCell(&self.inv[s], button))) return null;
                 self.sendSlot(@intCast(s));
                 self.sendCursor();
                 if (s >= 1 and s <= 4) {
@@ -798,6 +829,7 @@ pub const Conn = struct {
             2 => self.clickNumberKey(s, button),
             else => {},
         }
+        return null;
     }
 
     /// Mode 0: left (all) / right (one) pickup, place, merge, swap.
@@ -812,7 +844,7 @@ pub const Conn = struct {
 
     /// Returns true when anything moved (caller syncs slot + cursor then).
     /// Operates on any resolved cell (window-0 inv or table slot).
-    fn clickPickupImplCell(self: *Conn, cell: *?item_mod.Stack, button: i8) !bool {
+    pub fn clickPickupImplCell(self: *Conn, cell: *?item_mod.Stack, button: i8) !bool {
         if (cell.* == null and self.cursor == null) return false;
         if (cell.* == null) {
             // Place from cursor.

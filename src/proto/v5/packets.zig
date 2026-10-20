@@ -456,6 +456,17 @@ pub fn frameCloseWindow(window: u8, out: []u8) codec.CodecError![]const u8 {
     return try codec.framePacket(@intFromEnum(ids.PlayClient.close_window), w.written(), out);
 }
 
+/// Window Property 0x31 (craft progress bar): window id + property + value.
+/// Furnace properties: 0 = burn time left, 1 = cook progress, 2 = burn total.
+pub fn frameProgressBar(window: u8, property: i16, value: i16, out: []u8) codec.CodecError![]const u8 {
+    var payload: [8]u8 = undefined;
+    var w = codec.PacketWriter.init(&payload);
+    try w.writeByte(window);
+    try w.writeShort(property);
+    try w.writeShort(value);
+    return try codec.framePacket(@intFromEnum(ids.PlayClient.window_property), w.written(), out);
+}
+
 /// Serverbound 0x08 placement. NBT in held item is skipped.
 pub fn parsePlacement(body: []const u8) codec.CodecError!struct {
     x: i32,
