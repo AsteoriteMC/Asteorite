@@ -11,7 +11,7 @@ Status snapshot (done, tested, live-verified over TCP):
 - [x] Pure-Zig LSM (WAL + SST + `ShardPool`), ZC1 payloads, Anvil→ZC1 import (`tools/anvil_import.zig`)
 - [x] H1 worldgen foundation: `java.util.Random` LCG port (JVM-verified goldens incl. `nextInt(bound)` rejection path), fdlibm `log` port (StrictMath bit-exact — Zig/glibc differ by 1 ulp, proven live), Xoroshiro128++ + Mojang seeding, version-agnostic pipeline driver, `worldgen_dump` tool (`src/worldgen/`, `tools/worldgen_dump.zig`)
 - [x] Region tick stub, MPSC handoff queue, player position tracking (stance quirk handled)
-- [x] 174/174 `zig build test` green (21/21 steps; was 165/165 — count the real number when touching this line)
+- [x] 179/179 `zig build test` green (21/21 steps; was 165/165 — count the real number when touching this line)
 
 Legend: `[ ]` todo, `[~]` partial. Each phase ends with acceptance criteria.
 
@@ -101,8 +101,13 @@ independently live-verifiable):
 - [x] Acceptance, live E2E: fall 6 → 17.0, regen → 20, lethal fall → 0 + 2 drops, respawn → 20 + Window Items, suffocate 4/tick → death + drops + re-pickup path
 - [ ] Live gaps (unit-covered): drown/lava/fire timing, starvation TTK, fall-into-water cancel, peaceful; swim exhaustion unimplemented
 
-### J3. Crafting (+ furnace)
-- [ ] 2x2/3x3 grid recipes (vanilla table), furnace smelting; needs J1 inputs
+### J3. Crafting (+ furnace) [~] (J3a containers+crafting done + live-verified; furnace J3b next)
+- [x] Vanilla recipe table (312 entries, machine-extracted from CFR 0.152 `afh`/`afi`/`afe`/`afj`/`afk`/`afl`/`aev`/`aex`/`aez`/`afd` + `aka.c` dye inversion; aff sort order; id/damage rules: bare-block wildcard, explicit-add exact, shapeless block-inputs damage-0; NBT specials deferred: map extend/clone, book clone, armor dye, fireworks)
+- [x] Matcher (`src/sim/recipes.zig`): shaped slide+mirror, shapeless multiset, repair (maxDur formula, generated per-item table from minecraft-data names x jar-verified material enums), NBT-copy flag
+- [x] 2x2 player grid live in window 0 (result recompute on grid change, take consumes, shift craft-all, 0x10 rejects slot 0)
+- [x] Container window 1 (crafting table): right-click opens 0x2D type 1 + full 0x30, sneak bypass places instead, click routing incl. shift/number, 0x0D close drops grid, table-break force-closes viewers + drops + 0x2E
+- [x] Acceptance, live E2E: 2x2 planks take, table open, 3x3 pickaxe take, close drops, break-close ack, sneak bypass (fresh-DB runs; note: E2E reruns on a dirty DB can desync — restart server per run)
+- [ ] J3b furnace: tile-entity storage (new LSM dim vs in-memory), burn/smelt recipe tables, window 2 UI, progress bars 0x21; needs container work above
 
 ### J4. Mobs: spawning + hostiles + drops
 - [ ] Spawner by light/position, wander/chase/attack AI, mob drops via J1 pipeline, entity persistence

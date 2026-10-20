@@ -18,6 +18,8 @@ const Config = @import("conn.zig").Config;
 const Action = @import("conn.zig").Action;
 const AttackEvent = @import("conn.zig").AttackEvent;
 const QDropEvent = @import("conn.zig").QDropEvent;
+const TableClose = @import("conn.zig").TableClose;
+const BlockEvent = @import("conn.zig").BlockEvent;
 const codec = @import("codec.zig");
 const view = @import("../sim/view.zig");
 const shard_mod = @import("../world/shard.zig");
@@ -332,6 +334,7 @@ pub const Server = struct {
         conn.config.gamemode = d.gamemode;
         conn.click_seq = 0;
         conn.click_seen = false;
+        conn.refreshCrafting();
         return true;
     }
 
@@ -1659,6 +1662,96 @@ pub const Server = struct {
         _ = ok; // spawnItem always consumes (cap-hit frees); nothing to do
     }
 
+    /// Right-click routing: crafting table (58) + not sneaking opens window 1.
+    /// Caller holds world_lock (pool peek). Returns true when the click became
+    /// a UI open (serve loop must skip placement + broadcast for the event).
+    fn tryOpenTable(self: *Server, conn: *Conn, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, b: *BlockEvent) bool {
+        _ = self;
+        var cx = b.x;
+        var cy: i32 = b.y;
+        var cz = b.z;
+        switch (b.face) {
+            // clicked = target - face offset
+            0 => cy += 1,
+            1 => cy -= 1,
+            2 => cz += 1,
+            3 => cz -= 1,
+            4 => cx += 1,
+            5 => cx -= 1,
+            else => return false,
+        }
+        if (cy < 0 or cy > 255) return false;
+        const clicked = view.peekBlock(pool, allocator, cx, @intCast(cy), cz) catch null;
+        if (clicked == null or clicked.?.id != 58) return false;
+        conn.lock.lock();
+        const sneak = conn.sneaking;
+        conn.lock.unlock();
+        if (sneak) return false; // sneak+click places against the table
+        // Open UI (leaf conn lock; world_lock held by caller: world->conn).
+        conn.lock.lock();
+        conn.openTableUI(cx, @intCast(cy), cz);
+        conn.lock.unlock();
+        return true;
+    }
+
+    /// Break-driven close: every conn with this table open drops its grid
+    /// as entities + gets 0x2E. Caller holds world_lock.
+    fn closeTableWindowsAt(self: *Server, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, x: i32, y: u8, z: i32) void {
+        _ = pool;
+        _ = allocator;
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        for (snap) |e| {
+            e.conn.lock.lock();
+            const ow = e.conn.open_win orelse {
+                e.conn.lock.unlock();
+                continue;
+            };
+            if (ow.x != x or ow.y != y or ow.z != z) {
+                e.conn.lock.unlock();
+                continue;
+            }
+            var stacks = e.conn.takeTableGrid();
+            const px = e.conn.pos_x;
+            const py = e.conn.pos_y;
+            const pz = e.conn.pos_z;
+            var cb: [8]u8 = undefined;
+            const cf = packets.frameCloseWindow(ow.id, &cb) catch null;
+            if (cf) |f| e.conn.queueFramed(f) catch {};
+            e.conn.lock.unlock();
+            for (stacks[0..]) |*st| {
+                const s = st.* orelse continue;
+                st.* = null;
+                self.ent_lock.lock();
+                _ = self.spawnItem(s, px + 0.5, py + 1.0, pz + 0.5, 10);
+                self.ent_lock.unlock();
+            }
+            flushEntry(e, self.io);
+        }
+    }
+
+    /// Client-initiated close (0x0D): drop the grid in front of the player.
+    /// No 0x2E ack — the client already closed locally (vanilla flow).
+    fn spawnTableClose(self: *Server, conn: *Conn, tc: TableClose) void {
+        var stacks = tc.stacks;
+        conn.lock.lock();
+        const px = conn.pos_x;
+        const py = conn.pos_y;
+        const pz = conn.pos_z;
+        const yaw_rad = @as(f64, conn.yaw) * std.math.pi / 180.0;
+        conn.lock.unlock();
+        const fx = -@sin(yaw_rad);
+        const fz = @cos(yaw_rad);
+        for (stacks[0..]) |*st| {
+            const s = st.* orelse continue;
+            st.* = null;
+            self.ent_lock.lock();
+            _ = self.spawnItem(s, px + fx * 0.5 + 0.5, py + 1.32, pz + fz * 0.5 + 0.5, 10);
+            self.ent_lock.unlock();
+        }
+    }
+
     /// Queue one framed packet on every conn tracking `eid` (attacker
     /// included — the attacker gets no client-side prediction for damage).
     /// One conn lock at a time; never nested with ent_lock/world_lock.
@@ -1889,7 +1982,7 @@ pub fn serveConn(
             const action = try conn.handleFrame(f);
             if (action == .entered_play) entered = true;
             switch (action) {
-                .block_set, .arm_swing, .chat, .attack, .command, .qdrop => try events.append(allocator, action),
+                .block_set, .arm_swing, .chat, .attack, .command, .qdrop, .table_close => try events.append(allocator, action),
                 else => {},
             }
         }
@@ -1957,9 +2050,17 @@ pub fn serveConn(
         if (events.items.len > 0) {
             if (server.world) |pool| {
                 server.world_lock.lock();
-                for (events.items) |ev| {
-                    switch (ev) {
-                        .block_set => |b| {
+                for (events.items, 0..) |*ev, i| {
+                    switch (ev.*) {
+                        .block_set => |*b| {
+                            // Right-click on a crafting table (not sneaking)
+                            // opens the 3x3 UI instead of placing.
+                            if (b.id != 0) {
+                                if (server.tryOpenTable(conn, pool, allocator, b)) {
+                                    events.items[i] = .none;
+                                    continue;
+                                }
+                            }
                             const old = view.peekBlock(pool, allocator, b.x, b.y, b.z) catch null;
                             view.applyBlock(pool, allocator, b.x, b.y, b.z, b.id, b.meta) catch {};
                             // Survival break of a real block: vanilla drops.
@@ -1970,6 +2071,9 @@ pub fn serveConn(
                                     if (o.id != 0 and conn.config.gamemode == 0) {
                                         server.spawnBreakDrops(pool, allocator, b.x, b.y, b.z, o.id, o.meta);
                                     }
+                                    // Table break with viewers: drop their
+                                    // grids + close the windows.
+                                    if (o.id == 58) server.closeTableWindowsAt(pool, allocator, b.x, b.y, b.z);
                                 }
                             }
                         },
@@ -1990,6 +2094,7 @@ pub fn serveConn(
                         }
                     },
                     .qdrop => |q| server.spawnQDrop(conn, q),
+                    .table_close => |t| server.spawnTableClose(conn, t),
                     .arm_swing => |a| server.broadcastArmSwing(conn, cc_now.cx, cc_now.cz, conn.eid, a) catch {},
                     .chat => |m| server.broadcastChat(conn.chat_buf[0..m.json_len]),
                     .attack => |a| server.resolveAttack(conn, a),

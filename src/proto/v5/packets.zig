@@ -435,6 +435,27 @@ pub fn parseDigging(body: []const u8) codec.CodecError!struct { status: i8, x: i
     return .{ .status = status, .x = x, .y = y, .z = z, .face = face };
 }
 
+/// Open Window 0x2D (crafting table = type 1, 9 slots; title + slot count).
+/// use_provided_title is always true here (vanilla sends the container name).
+pub fn frameOpenWindow(window: u8, inv_type: u8, title: []const u8, slot_count: u8, out: []u8) codec.CodecError![]const u8 {
+    var payload: [128]u8 = undefined;
+    var w = codec.PacketWriter.init(&payload);
+    try w.writeByte(window);
+    try w.writeByte(inv_type);
+    try w.writeString(title);
+    try w.writeByte(slot_count);
+    try w.writeByte(1); // useProvidedTitle
+    return try codec.framePacket(@intFromEnum(ids.PlayClient.open_window), w.written(), out);
+}
+
+/// Close Window 0x2E (clientbound ack so the client drops its container UI).
+pub fn frameCloseWindow(window: u8, out: []u8) codec.CodecError![]const u8 {
+    var payload: [2]u8 = undefined;
+    var w = codec.PacketWriter.init(&payload);
+    try w.writeByte(window);
+    return try codec.framePacket(@intFromEnum(ids.PlayClient.close_window), w.written(), out);
+}
+
 /// Serverbound 0x08 placement. NBT in held item is skipped.
 pub fn parsePlacement(body: []const u8) codec.CodecError!struct {
     x: i32,

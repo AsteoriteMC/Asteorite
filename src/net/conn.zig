@@ -13,6 +13,7 @@ const ids = @import("../proto/v5/ids.zig");
 const packets = @import("../proto/v5/packets.zig");
 const slot_mod = @import("../proto/v5/slot.zig");
 const item_mod = @import("../item.zig");
+const recipes_mod = @import("../sim/recipes.zig");
 const uuid_mod = @import("uuid.zig");
 const cfb8 = @import("cfb8.zig");
 const rsa_mod = @import("rsa.zig");
@@ -44,13 +45,26 @@ pub const Config = struct {
 
 /// Block mutation request (break = id 0). Serve loop applies to the world
 /// store, then broadcasts to viewers tracking the chunk.
-pub const BlockEvent = struct { x: i32, y: u8, z: i32, id: u16, meta: u4 };
+pub const BlockEvent = struct {
+    x: i32,
+    y: u8,
+    z: i32,
+    id: u16,
+    meta: u4,
+    /// Clicked face (0-5) for right-clicks; tells serve which cell was
+    /// clicked (table-vs-place decision). Breaks leave the default.
+    face: i8 = 1,
+};
 
 /// Q-key drop (digging status 3 = whole stack, 4 = one item). `stack` is
 /// OWNED (cloned at dig time, or the moved slot contents); the serve loop
 /// takes ownership into the item entity. `slot` is the window slot to refresh
 /// with a 0x2F after the inventory mutation.
 pub const QDropEvent = struct { stack: item_mod.Stack, slot: i16 };
+
+/// Crafting-table close: OWNED grid stacks (result slot is virtual and
+/// vanishes) for the serve loop to drop as entities + 0x2E the window.
+pub const TableClose = struct { stacks: [9]?item_mod.Stack };
 
 /// Outbound chat line (validated JSON in conn.chat_buf).
 pub const ChatEvent = struct {
@@ -84,6 +98,9 @@ pub const Action = union(enum) {
     attack: AttackEvent,
     /// Q-key item drop: serve loop spawns the entity + refreshes the slot.
     qdrop: QDropEvent,
+    /// Crafting-table close (0x0D or table break): grid contents drop as
+    /// entities in front of the player; serve loop sends 0x2E + spawns.
+    table_close: TableClose,
     /// Relay arm swing 0x0B to chunk viewers (not sender).
     arm_swing: i8,
     /// Broadcast formatted chat line to all play conns.
@@ -134,6 +151,11 @@ pub const Conn = struct {
     cursor: ?item_mod.Stack = null,
     click_seq: i16 = 0,
     click_seen: bool = false,
+    /// Window 1 (crafting table): slot 0 = result, 1-9 = 3x3 grid.
+    /// Owned stacks (NBT duped). open_win records the table block pos.
+    table: [10]?item_mod.Stack = [_]?item_mod.Stack{null} ** 10,
+    open_win: ?struct { id: u8, x: i32, y: u8, z: i32 } = null,
+    sneaking: bool = false,
     /// Survival state. Damage resolution lives in the tick thread
     /// (server.zig); the serve thread only records validated attack events.
     /// While is_dead the client shows the death screen: block/entity
@@ -237,6 +259,7 @@ pub const Conn = struct {
         self.sent.deinit();
         self.tracked.deinit();
         for (&self.inv) |*s| item_mod.freeStack(self.allocator, s);
+        for (&self.table) |*s| item_mod.freeStack(self.allocator, s);
         item_mod.freeStack(self.allocator, &self.cursor);
     }
 
@@ -609,15 +632,21 @@ pub const Conn = struct {
             const a = try packets.parseEntityAction(frame.body);
             if (a.entity_id == self.eid) {
                 if (a.action == 4) self.sprinting = true else if (a.action == 5) self.sprinting = false;
+                if (a.action == 1) self.sneaking = true else if (a.action == 2) self.sneaking = false;
             }
             return .none;
         }
         if (frame.id == @as(i32, @intFromEnum(ids.PlayServer.creative_inventory_action))) {
             const c = try packets.parseCreativeSlot(frame.body);
-            if (c.slot >= 0 and c.slot < 45) {
+            // Vanilla rejects the output slot (slot 0); grid edits recompute.
+            if (c.slot >= 1 and c.slot < 45) {
                 const idx: usize = @intCast(c.slot);
                 item_mod.freeStack(self.allocator, &self.inv[idx]);
                 self.inv[idx] = try item_mod.cloneStack(self.allocator, c.item);
+                if (idx >= 1 and idx <= 4) {
+                    self.refreshCrafting();
+                    self.sendSlot(0);
+                }
             }
             return .none;
         }
@@ -654,8 +683,10 @@ pub const Conn = struct {
             return .none;
         }
         if (frame.id == @as(i32, @intFromEnum(ids.PlayServer.close_window))) {
-            // Only the player inventory (window 0) exists; it cannot close.
-            // Other windows don't exist yet (containers are P-next).
+            const w = try packets.parseCloseWindow(frame.body);
+            if (self.open_win) |ow| {
+                if (w == ow.id) return .{ .table_close = .{ .stacks = self.takeTableGrid() } };
+            }
             return .none;
         }
         // P-next: actions.
@@ -699,13 +730,30 @@ pub const Conn = struct {
         self.queueRaw(f) catch {};
     }
 
-    /// Serverbound 0x0E click window. Only the player inventory (window 0)
-    /// exists; other windows are P-next (containers). Modes 3/4/5/6
+    /// Serverbound 0x0E click window. Window 0 = player inventory (2x2 grid
+    /// live in slots 0-4); window 1 = open crafting table. Modes 3/4/5/6
     /// (creative pick, drop, drag, collect) are no-ops: drop/drag/collect
     /// need item entities (0x15 Spawn Object, follow-up), so nothing happens
     /// rather than deleting or duplicating the player's items.
     fn onClickWindow(self: *Conn, window: i8, slot: i16, button: i8, action: i16, mode: i8) !void {
         if (self.is_dead) return;
+        if (window == 1) {
+            if (self.open_win == null) {
+                self.sendWindow();
+                return;
+            }
+            // Click validation shared across windows (desync -> refresh).
+            if (!self.click_seen) {
+                self.click_seen = true;
+            } else if (action != self.click_seq) {
+                self.queueTableWindow();
+                return;
+            }
+            self.click_seq = action +% 1;
+            if (slot == -999) return;
+            try self.onClickTable(slot, button, action, mode);
+            return;
+        }
         if (window != 0) return;
         if (slot < -999 or slot > 44) return;
         // First click seeds the expectation; later clicks must increment.
@@ -719,9 +767,34 @@ pub const Conn = struct {
         self.click_seq = action +% 1;
         if (slot == -999) return; // outside click: drop path needs entities
         const s: usize = @intCast(slot);
+        if (s == 0) {
+            // Crafting result slot (2x2).
+            if (mode == 0) {
+                _ = try self.takeResult(0, self.inv[1..5], &self.inv[0], false);
+                return;
+            }
+            if (mode == 1) {
+                try self.craftAll(self.inv[1..5], &self.inv[0], false);
+                return;
+            }
+            return; // number-key on the result: no-op
+        }
         switch (mode) {
-            0 => try self.clickPickup(s, button),
-            1 => self.clickQuickMove(s, button),
+            0 => {
+                if (button != 0 and button != 1) return;
+                if (!(try self.clickPickupImplCell(&self.inv[s], button))) return;
+                self.sendSlot(@intCast(s));
+                self.sendCursor();
+                if (s >= 1 and s <= 4) {
+                    self.refreshCrafting();
+                    self.sendSlot(0);
+                }
+            },
+            1 => {
+                self.clickQuickMove(s, button);
+                self.refreshCrafting();
+                self.sendSlot(0);
+            },
             2 => self.clickNumberKey(s, button),
             else => {},
         }
@@ -732,14 +805,14 @@ pub const Conn = struct {
     /// stacks can't merge the two sides swap (both buttons).
     fn clickPickup(self: *Conn, s: usize, button: i8) !void {
         if (button != 0 and button != 1) return;
-        if (!(try self.clickPickupImpl(s, button))) return;
+        if (!(try self.clickPickupImplCell(&self.inv[s], button))) return;
         self.sendSlot(@intCast(s));
         self.sendCursor();
     }
 
     /// Returns true when anything moved (caller syncs slot + cursor then).
-    fn clickPickupImpl(self: *Conn, s: usize, button: i8) !bool {
-        const cell = &self.inv[s];
+    /// Operates on any resolved cell (window-0 inv or table slot).
+    fn clickPickupImplCell(self: *Conn, cell: *?item_mod.Stack, button: i8) !bool {
         if (cell.* == null and self.cursor == null) return false;
         if (cell.* == null) {
             // Place from cursor.
@@ -850,6 +923,261 @@ pub const Conn = struct {
         self.sendSlot(@intCast(h));
     }
 
+    // ---------- crafting (2x2 player grid + window-1 table) ----------
+
+    /// Recompute the window-0 2x2 result into inv[0] (owned clone; null when
+    /// no match). Vanilla refreshes the output on every grid change.
+    pub fn refreshCrafting(self: *Conn) void {
+        const r = recipes_mod.findMatch(self.inv[1..5], 2, 2);
+        item_mod.freeStack(self.allocator, &self.inv[0]);
+        if (r) |o| self.inv[0] = item_mod.cloneStack(self.allocator, o) catch null;
+    }
+
+    /// Recompute the window-1 3x3 result into table[0].
+    fn refreshTable(self: *Conn) void {
+        const r = recipes_mod.findMatch(self.table[1..10], 3, 3);
+        item_mod.freeStack(self.allocator, &self.table[0]);
+        if (r) |o| self.table[0] = item_mod.cloneStack(self.allocator, o) catch null;
+    }
+
+    /// Resolve a window slot to its storage cell. Window 0: inv directly.
+    /// Window 1: 0-9 = table, 10-45 = alias inv[9..44].
+    fn cellAt(self: *Conn, window: i8, slot: i16) ?*?item_mod.Stack {
+        if (window == 0) {
+            if (slot < 0 or slot > 44) return null;
+            return &self.inv[@intCast(slot)];
+        }
+        if (window == 1) {
+            if (slot < 0 or slot > 45) return null;
+            const s: usize = @intCast(slot);
+            if (s <= 9) return &self.table[s];
+            return &self.inv[s - 1];
+        }
+        return null;
+    }
+
+    /// Window-aware Set Slot (0x2F carries the window id).
+    fn sendSlotWin(self: *Conn, window: i8, slot: i16) void {
+        const st: ?item_mod.Stack = if (window == 1)
+            (if (slot >= 0 and slot <= 9) self.table[@as(usize, @intCast(slot))] else if (slot >= 10 and slot <= 45) self.inv[@as(usize, @intCast(slot)) - 1] else null)
+        else if (slot >= 0 and slot <= 44)
+            self.inv[@intCast(slot)]
+        else if (slot == -1)
+            self.cursor
+        else
+            null;
+        const f = packets.frameSetSlotAlloc(self.allocator, window, slot, st) catch return;
+        defer self.allocator.free(f);
+        self.queueRaw(f) catch {};
+    }
+
+    /// Take the computed result (left-click on slot 0, empty cursor):
+    /// result moves to cursor, one unit consumed per grid cell.
+    /// `grid` borrows inv[1..5] or table[1..10]; `is_table` picks refresh.
+    fn takeResult(self: *Conn, window: i8, grid: []?item_mod.Stack, result: *?item_mod.Stack, is_table: bool) !bool {
+        const res = result.* orelse return false;
+        if (self.cursor != null) return false;
+        self.cursor = res;
+        result.* = null;
+        for (grid, 0..) |*cell, i| {
+            if (cell.*) |_| {
+                cell.*.?.count -= 1;
+                if (cell.*.?.count <= 0) item_mod.freeStack(self.allocator, cell);
+                self.sendSlotWin(window, @intCast(1 + i));
+            }
+        }
+        if (is_table) self.refreshTable() else self.refreshCrafting();
+        self.sendSlotWin(window, 0);
+        self.sendSlotWin(0, -1); // cursor is window-agnostic
+        return true;
+    }
+
+    /// Shift-click on a result slot: craft repeatedly into the player
+    /// inventory (window-0 slots 9..44) until no match or no fit.
+    fn craftAll(self: *Conn, grid: []?item_mod.Stack, result: *?item_mod.Stack, is_table: bool) !void {
+        var made = false;
+        while (true) {
+            if (is_table) self.refreshTable() else self.refreshCrafting();
+            const res = result.* orelse break;
+            // grant into player range (merge first, then empty)
+            var placed = false;
+            var i: usize = 9;
+            while (i <= 44) : (i += 1) {
+                const dst = self.inv[i] orelse continue;
+                if (!item_mod.canMerge(dst, res)) continue;
+                if (@as(u16, @intCast(dst.count)) + @as(u16, @intCast(res.count)) > item_mod.maxStackSize(dst.id)) continue;
+                self.inv[i].?.count += res.count;
+                placed = true;
+                break;
+            }
+            if (!placed) {
+                i = 9;
+                while (i <= 44) : (i += 1) {
+                    if (self.inv[i] != null) continue;
+                    self.inv[i] = try item_mod.cloneStack(self.allocator, res);
+                    placed = true;
+                    break;
+                }
+            }
+            if (!placed) break;
+            for (grid) |*cell| {
+                if (cell.*) |_| {
+                    cell.*.?.count -= 1;
+                    if (cell.*.?.count <= 0) item_mod.freeStack(self.allocator, cell);
+                }
+            }
+            made = true;
+        }
+        if (made) {
+            if (is_table) self.refreshTable() else self.refreshCrafting();
+            // many slots may have changed: full refresh of the window.
+            if (is_table) {
+                self.queueTableWindow();
+            } else {
+                self.sendWindow();
+            }
+        }
+    }
+
+    /// Assemble + queue a full Window Items 0x30 for the open table window
+    /// (slots 0-9 table, 10-45 alias inv 9-44).
+    fn queueTableWindow(self: *Conn) void {
+        var all: [46]?item_mod.Stack = [_]?item_mod.Stack{null} ** 46;
+        for (0..10) |i| all[i] = self.table[i];
+        for (9..45) |i| all[i + 1] = self.inv[i];
+        const f = packets.frameWindowItemsAlloc(self.allocator, 1, &all) catch return;
+        defer self.allocator.free(f);
+        self.queueRaw(f) catch {};
+    }
+
+    /// Open the crafting-table UI (window id 1, type 1, 9 grid slots).
+    pub fn openTableUI(self: *Conn, x: i32, y: u8, z: i32) void {
+        self.open_win = .{ .id = 1, .x = x, .y = y, .z = z };
+        for (&self.table) |*s| item_mod.freeStack(self.allocator, s);
+        var ob: [128]u8 = undefined;
+        if (packets.frameOpenWindow(1, 1, "Crafting", 9, &ob)) |f| {
+            self.queueRaw(f) catch {};
+        } else |_| {}
+        self.queueTableWindow();
+    }
+
+    /// Move the table grid out (ownership transfer), clear table + result +
+    /// open state. Serve loop drops the stacks as entities.
+    pub fn takeTableGrid(self: *Conn) [9]?item_mod.Stack {
+        var out: [9]?item_mod.Stack = [_]?item_mod.Stack{null} ** 9;
+        for (1..10) |i| {
+            out[i - 1] = self.table[i];
+            self.table[i] = null;
+        }
+        item_mod.freeStack(self.allocator, &self.table[0]);
+        self.open_win = null;
+        return out;
+    }
+
+    /// Window-1 click router (slots 0-9 table, 10-45 player alias).
+    fn onClickTable(self: *Conn, slot: i16, button: i8, action: i16, mode: i8) !void {
+        if (slot < 0 or slot > 45) return;
+        const s: usize = @intCast(slot);
+        switch (mode) {
+            0 => {
+                if (s == 0) {
+                    _ = try self.takeResult(1, self.table[1..10], &self.table[0], true);
+                    return;
+                }
+                if (slot >= 1 and slot <= 9) {
+                    if (!(try self.clickPickupImplCell(&self.table[s], button))) return;
+                    self.sendSlotWin(1, slot);
+                    self.sendSlotWin(0, -1);
+                    self.refreshTable();
+                    self.sendSlotWin(1, 0);
+                    return;
+                }
+                // player range 10-45 -> inv 9-44
+                const islot: usize = s - 1;
+                if (!(try self.clickPickupImplCell(&self.inv[islot], button))) return;
+                self.sendSlotWin(1, slot);
+                self.sendSlotWin(0, -1);
+            },
+            1 => {
+                if (s == 0) {
+                    try self.craftAll(self.table[1..10], &self.table[0], true);
+                    return;
+                }
+                if (slot >= 1 and slot <= 9) {
+                    // shift grid cell -> player range (merge then empty)
+                    if (self.table[s] == null) return;
+                    if (self.quickMoveCellToInv(&self.table[s])) {
+                        self.refreshTable();
+                        self.queueTableWindow();
+                    }
+                    return;
+                }
+                // player range: hotbar<->main within inv indices
+                const islot: usize = s - 1;
+                self.clickQuickMove(islot, button);
+            },
+            2 => {
+                if (s == 0) return; // no number-key on the result
+                if (button < 0 or button > 8) return;
+                if (self.cursor != null) return;
+                // swap resolved cell with hotbar (inv 36+button)
+                const h: usize = 36 + @as(usize, @intCast(button));
+                if (slot >= 1 and slot <= 9) {
+                    const t = self.table[s];
+                    self.table[s] = self.inv[h];
+                    self.inv[h] = t;
+                    self.refreshTable();
+                    self.queueTableWindow();
+                } else {
+                    const islot: usize = s - 1;
+                    if (islot == h) return;
+                    const t = self.inv[islot];
+                    self.inv[islot] = self.inv[h];
+                    self.inv[h] = t;
+                    self.sendSlotWin(1, slot);
+                    self.sendSlotWin(1, @as(i16, @intCast(h + 1)));
+                }
+            },
+            else => {},
+        }
+        _ = action;
+    }
+
+    /// Shift-click helper: move a source cell into player range 9..44
+    /// (merge first, then first empty). Returns true when anything moved.
+    fn quickMoveCellToInv(self: *Conn, src: *?item_mod.Stack) bool {
+        if (src.* == null) return false;
+        var moved = false;
+        var i: usize = 9;
+        while (i <= 44) : (i += 1) {
+            const dst = self.inv[i] orelse continue;
+            const s = src.* orelse break;
+            if (!item_mod.canMerge(dst, s)) continue;
+            const room: i16 = @as(i16, item_mod.maxStackSize(dst.id)) - dst.count;
+            if (room <= 0) continue;
+            const n: i16 = @min(room, @as(i16, s.count));
+            if (n <= 0) continue;
+            self.inv[i].?.count += @as(i8, @intCast(n));
+            src.*.?.count -= @as(i8, @intCast(n));
+            moved = true;
+            if (src.*.?.count <= 0) {
+                item_mod.freeStack(self.allocator, src);
+                break;
+            }
+        }
+        if (src.* != null) {
+            i = 9;
+            while (i <= 44) : (i += 1) {
+                if (self.inv[i] != null) continue;
+                self.inv[i] = src.*;
+                src.* = null;
+                moved = true;
+                break;
+            }
+        }
+        return moved;
+    }
+
     fn sendCursor(self: *Conn) void {
         const f = packets.frameSetSlotAlloc(self.allocator, 0, -1, self.cursor) catch return;
         defer self.allocator.free(f);
@@ -936,7 +1264,7 @@ pub const Conn = struct {
         if (ty < 0 or ty > 255) return .none;
         // creative damage value doubles as block metadata (low nibble)
         const m: u4 = @truncate(@as(u16, @bitCast(held.damage)) & 0x0F);
-        return .{ .block_set = .{ .x = tx, .y = @intCast(ty), .z = tz, .id = @intCast(held.id), .meta = m } };
+        return .{ .block_set = .{ .x = tx, .y = @intCast(ty), .z = tz, .id = @intCast(held.id), .meta = m, .face = direction } };
     }
 
     fn markChunkDirty(self: *Conn) void {
@@ -1508,6 +1836,116 @@ test "use entity: attack validation, damage table, dead gates, respawn" {
     }
 }
 
+test "crafting table: 3x3 take, shift-craft, close drops grid" {
+    const a = std.testing.allocator;
+    var c = Conn.init(a, std.testing.io, .{ .gamemode = 0, .spawn_x = 8, .spawn_y = 64, .spawn_z = 8 }, 7);
+    defer c.deinit();
+    c.state = .play;
+    const feed = struct {
+        fn run(conn: *Conn, id: i32, body: []const u8) !?Action {
+            var f: [64]u8 = undefined;
+            try conn.feedData(try codec.framePacket(id, body, &f));
+            const fr = (try conn.poll()).?;
+            return try conn.handleFrame(fr);
+        }
+    }.run;
+    // open + iron pickaxe shape (row0 iron, stick col1 rows1-2)
+    c.openTableUI(8, 64, 8);
+    try std.testing.expect(c.open_win != null);
+    c.table[1] = .{ .id = 265, .count = 1, .damage = 0, .nbt = null };
+    c.table[2] = .{ .id = 265, .count = 1, .damage = 0, .nbt = null };
+    c.table[3] = .{ .id = 265, .count = 1, .damage = 0, .nbt = null };
+    c.table[5] = .{ .id = 280, .count = 1, .damage = 0, .nbt = null };
+    c.table[8] = .{ .id = 280, .count = 1, .damage = 0, .nbt = null };
+    c.refreshTable();
+    try std.testing.expect(c.table[0] != null);
+    try std.testing.expectEqual(@as(u16, 257), c.table[0].?.id);
+    // take via mode-0 click on window-1 slot 0 (action 1 seeds)
+    {
+        var cb: [64]u8 = undefined;
+        var w = codec.PacketWriter.init(&cb);
+        try w.writeByte(1); // window 1
+        try w.writeShort(0);
+        try w.writeByte(0);
+        try w.writeShort(1);
+        try w.writeByte(0);
+        try w.writeShort(-1);
+        try w.writeShort(-1);
+        _ = try feed(&c, 0x0E, w.written());
+        try std.testing.expect(c.cursor != null);
+        try std.testing.expectEqual(@as(u16, 257), c.cursor.?.id);
+        try std.testing.expect(c.table[1] == null); // consumed
+        try std.testing.expect(c.table[0] == null); // no longer matches
+        var owned: ?item_mod.Stack = c.cursor;
+        item_mod.freeStack(a, &owned);
+        c.cursor = null;
+        { const o = try c.takeOutput(); defer a.free(o); }
+    }
+    // shift-craft sticks x64: grid col0 rows0-2... use 3-high column? sticks need 2x1; fill col0
+    c.table[1] = .{ .id = 5, .count = 64, .damage = 0, .nbt = null };
+    c.table[4] = .{ .id = 5, .count = 64, .damage = 0, .nbt = null };
+    {
+        var cb: [64]u8 = undefined;
+        var w = codec.PacketWriter.init(&cb);
+        try w.writeByte(1);
+        try w.writeShort(0);
+        try w.writeByte(0);
+        try w.writeShort(2);
+        try w.writeByte(1); // shift
+        try w.writeShort(-1);
+        try w.writeShort(-1);
+        _ = try feed(&c, 0x0E, w.written());
+        var total: i32 = 0;
+        for (9..45) |i| if (c.inv[i]) |st| if (st.id == 280) {
+            total += st.count;
+        };
+        try std.testing.expectEqual(@as(i32, 256), total);
+        { const o = try c.takeOutput(); defer a.free(o); }
+    }
+    // close (0x0D) drops remaining grid stacks as entities
+    c.table[6] = .{ .id = 1, .count = 7, .damage = 0, .nbt = null };
+    {
+        var cb: [8]u8 = undefined;
+        var w = codec.PacketWriter.init(&cb);
+        try w.writeByte(1);
+        const act = try feed(&c, 0x0D, w.written());
+        const tc = act.?.table_close;
+        var n: usize = 0;
+        for (tc.stacks) |st| if (st != null) {
+            n += 1;
+            try std.testing.expectEqual(@as(u16, 1), st.?.id);
+        };
+        try std.testing.expectEqual(@as(usize, 1), n);
+        try std.testing.expect(c.open_win == null);
+        var owned = tc.stacks;
+        for (&owned) |*st| item_mod.freeStack(a, st);
+        { const o = try c.takeOutput(); defer a.free(o); }
+    }
+    // table shift-craft (craftAll path, window 1): sticks from 2x64 planks
+    {
+        c.openTableUI(8, 64, 8);
+        c.table[1] = .{ .id = 5, .count = 64, .damage = 0, .nbt = null };
+        c.table[4] = .{ .id = 5, .count = 64, .damage = 0, .nbt = null };
+        c.refreshTable();
+        var cb: [64]u8 = undefined;
+        var w = codec.PacketWriter.init(&cb);
+        try w.writeByte(1);
+        try w.writeShort(0);
+        try w.writeByte(0);
+        try w.writeShort(2);
+        try w.writeByte(1); // shift
+        try w.writeShort(-1);
+        try w.writeShort(-1);
+        _ = try feed(&c, 0x0E, w.written());
+        var total: i32 = 0;
+        for (9..45) |i| if (c.inv[i]) |st| if (st.id == 280) {
+            total += st.count;
+        };
+        try std.testing.expectEqual(@as(i32, 256), total);
+        { const o = try c.takeOutput(); defer a.free(o); }
+    }
+}
+
 test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
     const a = std.testing.allocator;
     var c = Conn.init(a, std.testing.io, .{ .gamemode = 0, .spawn_x = 8, .spawn_y = 64, .spawn_z = 8 }, 7);
@@ -1581,6 +2019,84 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
         m.exhaustion = 0;
         m.addExhaustion(3.0);
         try std.testing.expectEqual(@as(f32, 0), m.exhaustion);
+    }
+    // 0. Crafting 2x2: sticks from 2 planks, take consumes grid.
+    {
+        c.inv[1] = .{ .id = 5, .count = 1, .damage = 0, .nbt = null };
+        c.inv[3] = .{ .id = 5, .count = 1, .damage = 0, .nbt = null };
+        c.refreshCrafting();
+        try std.testing.expect(c.inv[0] != null);
+        try std.testing.expectEqual(@as(u16, 280), c.inv[0].?.id);
+        try std.testing.expectEqual(@as(i8, 4), c.inv[0].?.count);
+        // take with left-click on slot 0 (mode 0, empty cursor)
+        var cb: [64]u8 = undefined;
+        var w = codec.PacketWriter.init(&cb);
+        try w.writeByte(0);
+        try w.writeShort(0);
+        try w.writeByte(0);
+        try w.writeShort(4);
+        try w.writeByte(0);
+        try w.writeShort(-1);
+        try w.writeShort(-1); // clicked item: empty
+        _ = try feed(&c, 0x0E, w.written());
+        try std.testing.expect(c.cursor != null);
+        try std.testing.expectEqual(@as(u16, 280), c.cursor.?.id);
+        try std.testing.expect(c.inv[1] == null and c.inv[3] == null);
+        try std.testing.expect(c.inv[0] == null); // grid empty -> no match
+        var owned: ?item_mod.Stack = c.cursor;
+        item_mod.freeStack(a, &owned);
+        c.cursor = null;
+        { const o = try c.takeOutput(); defer a.free(o); }
+    }
+    // 0b. Shift-click result crafts repeatedly into the pack.
+    {
+        c.inv[1] = .{ .id = 5, .count = 64, .damage = 0, .nbt = null };
+        c.inv[3] = .{ .id = 5, .count = 64, .damage = 0, .nbt = null };
+        c.refreshCrafting();
+        var cb: [64]u8 = undefined;
+        var w = codec.PacketWriter.init(&cb);
+        try w.writeByte(0);
+        try w.writeShort(0);
+        try w.writeByte(0);
+        try w.writeShort(5);
+        try w.writeByte(1); // shift
+        try w.writeShort(-1); // clicked item: empty
+        _ = try feed(&c, 0x0E, w.written());
+        // 64 crafts x4 sticks = 256 sticks across 4+ stacks in main
+        var total: i32 = 0;
+        for (9..45) |i| if (c.inv[i]) |st| if (st.id == 280) {
+            total += st.count;
+        };
+        try std.testing.expectEqual(@as(i32, 256), total);
+        try std.testing.expect(c.inv[1] == null and c.inv[3] == null);
+        { const o = try c.takeOutput(); defer a.free(o); }
+        c.click_seq = 1; // restore the action counter for the steps below
+        for (9..45) |i| item_mod.freeStack(a, &c.inv[i]); // clear crafted stacks
+    }
+    // 0. Creative 0x10 rejects the result slot (vanilla parity).
+    {
+        // two planks vertical = sticks (a lone plank is a button)
+        c.inv[1] = .{ .id = 5, .count = 1, .damage = 0, .nbt = null };
+        c.inv[3] = .{ .id = 5, .count = 1, .damage = 0, .nbt = null };
+        c.refreshCrafting();
+        try std.testing.expect(c.inv[0] != null); // sticks offered
+        var cb: [32]u8 = undefined;
+        var w = codec.PacketWriter.init(&cb);
+        try w.writeShort(0); // slot 0: rejected
+        try w.writeShort(999);
+        try w.writeByte(1);
+        try w.writeShort(0);
+        try w.writeShort(-1);
+        var f: [64]u8 = undefined;
+        try c.feedData(try codec.framePacket(0x10, w.written(), &f));
+        const fr = (try c.poll()).?;
+        _ = try c.handleFrame(fr);
+        try std.testing.expect(c.inv[0] != null); // recompute untouched it
+        try std.testing.expectEqual(@as(u16, 280), c.inv[0].?.id);
+        c.inv[0] = null;
+        c.inv[1] = null;
+        c.inv[3] = null;
+        { const o = try c.takeOutput(); defer a.free(o); }
     }
     // 0. Q-drop: status 4 drops one (slot decrements, event owns one),
     // status 3 drops the whole stack (slot empties).
