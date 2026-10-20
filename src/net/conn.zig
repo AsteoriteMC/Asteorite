@@ -80,6 +80,10 @@ pub const Action = union(enum) {
     arm_swing: i8,
     /// Broadcast formatted chat line to all play conns.
     chat: ChatEvent,
+    /// Serverbound chat starting with "/" (raw text in chat_buf, cmd_len
+    /// bytes). Handled by the serve thread (server.handleCommand), which may
+    /// reply to the sender and/or broadcast. Spam-cooldown applies first.
+    command: ChatEvent,
 };
 
 /// Minimum gap between chat packets (vanilla-style spam kick otherwise).
@@ -453,14 +457,16 @@ pub const Conn = struct {
     }
 
     /// Final login step; view.completeLogin calls this after chunk bulks.
+    /// Sends the player's actual position (persisted across restarts, or
+    /// spawn on first login — serveConn syncs pos to spawn before calling).
     pub fn queuePlayerPosLook(self: *Conn) !void {
         var pb: [64]u8 = undefined;
         try self.queueRaw(try packets.framePlayerPosLook(.{
-            .x = @as(f64, @floatFromInt(self.config.spawn_x)) + 0.5,
-            .y = @as(f64, @floatFromInt(self.config.spawn_y)),
-            .z = @as(f64, @floatFromInt(self.config.spawn_z)) + 0.5,
-            .yaw = 0,
-            .pitch = 0,
+            .x = self.pos_x,
+            .y = self.pos_y,
+            .z = self.pos_z,
+            .yaw = self.yaw,
+            .pitch = self.pitch,
             .on_ground = false,
         }, &pb));
     }
@@ -572,6 +578,15 @@ pub const Conn = struct {
                 if (now - last < chat_cooldown_ms) {
                     return try self.disconnect("{\"text\":\"Kicked for spamming\"}");
                 }
+            }
+            // Commands ride the chat packet (vanilla behavior): "/" prefix
+            // routes to server.handleCommand instead of broadcast. Raw bytes
+            // go in chat_buf (not JSON); length cap is parseChat's own.
+            if (text.len > 0 and text[0] == '/') {
+                if (text.len > self.chat_buf.len) return .none;
+                @memcpy(self.chat_buf[0..text.len], text);
+                self.last_chat_ms = now;
+                return .{ .command = .{ .json_len = text.len } };
             }
             const json = packets.formatChatJson(self.username[0..self.username_len], text, &self.chat_buf) catch {
                 return .none; // invalid/overlong: drop, don't broadcast, don't kick

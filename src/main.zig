@@ -79,6 +79,45 @@ pub fn main(init: std.process.Init) !void {
         }
         try w.print("zigcraft listening on 0.0.0.0:{d} (proto 5, online={}, db={s}, view={d}, seed={?d})\n", .{ port, online, db_path orelse "none", view_distance, seed });
         try w.flush();
+        // Operator console (stdin): help | list | save-all | stop.
+        // Detached; in-game commands share Server.handleCommand.
+        const Console = struct {
+            fn run(s: *zigcraft.server.Server) void {
+                var fbuf: [256]u8 = undefined;
+                var reader = std.Io.File.stdin().reader(s.io, &fbuf);
+                const rin = &reader.interface;
+                var line: [256]u8 = undefined;
+                var len: usize = 0;
+                while (true) {
+                    const b = rin.takeByte() catch return;
+                    if (b == '\n') {
+                        var cmd = line[0..len];
+                        len = 0;
+                        while (cmd.len > 0 and (cmd[cmd.len - 1] == '\r' or cmd[cmd.len - 1] == ' ')) cmd = cmd[0 .. cmd.len - 1];
+                        if (cmd.len == 0) continue;
+                        if (std.mem.eql(u8, cmd, "stop")) {
+                            const n = s.saveAllPlayers();
+                            if (s.world) |pl| pl.flushAll() catch {};
+                            std.log.info("stop: saved {d} player(s), flushed. bye.", .{n});
+                            std.process.exit(0);
+                        }
+                        // Route through the same core (null sender = console).
+                        var tmp: [257]u8 = undefined;
+                        tmp[0] = '/';
+                        const n = @min(cmd.len, tmp.len - 1);
+                        @memcpy(tmp[1..][0..n], cmd[0..n]);
+                        s.handleCommand(null, tmp[0 .. n + 1]);
+                    } else {
+                        if (len < line.len) {
+                            line[len] = b;
+                            len += 1;
+                        }
+                    }
+                }
+            }
+        };
+        const console_th = std.Thread.spawn(.{}, Console.run, .{&srv}) catch null;
+        if (console_th) |th| th.detach();
         // serveForever never returns; per-conn arenas hang off the process arena.
         try srv.serveForever(arena);
         return;

@@ -20,6 +20,8 @@ const AttackEvent = @import("conn.zig").AttackEvent;
 const codec = @import("codec.zig");
 const view = @import("../sim/view.zig");
 const shard_mod = @import("../world/shard.zig");
+const player_db = @import("../sim/players.zig");
+const item_mod = @import("../item.zig");
 const spin = @import("../sim/spin.zig");
 const packets = @import("../proto/v5/packets.zig");
 const ids = @import("../proto/v5/ids.zig");
@@ -66,6 +68,10 @@ pub const Server = struct {
     pig_cooldown: u32 = 0,
     world_age: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     time_of_day: std.atomic.Value(i64) = std.atomic.Value(i64).init(6000),
+    /// Ticks since boot (1Hz ticker). Periodic player save every 300.
+    tick_counter: u64 = 0,
+    /// Autosave cadence in ticks (5 min at 1Hz).
+    pub const autosave_ticks: u64 = 300;
 
     pub fn bind(io: std.Io, port: u16, config: Config) !Server {
         const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
@@ -218,6 +224,10 @@ pub const Server = struct {
     /// Remove + broadcast leave (iff announced) + wait for temp refs + destroy.
     /// No locks held on return.
     pub fn unregister(self: *Server, conn: *Conn) void {
+        // Persist first: conn is still fully readable here (destroyed below).
+        // Skips conns that never reached play. Lock discipline: savePlayer
+        // takes conn.lock then world_lock, one at a time, never nested.
+        self.savePlayer(conn);
         self.reg_lock.lock();
         for (self.registry.items, 0..) |e, i| {
             if (e.conn == conn) {
@@ -254,6 +264,177 @@ pub const Server = struct {
         const a = conn.allocator;
         conn.deinit();
         a.destroy(conn);
+    }
+
+    /// Load persisted state into a freshly logged-in conn. Caller holds
+    /// conn.lock and the pool is present. Returns true when a save applied
+    /// (pos/health/inv/selected/cursor restored); false = first login
+    /// (caller runs land-spawn search + pos sync instead).
+    /// Corrupt saves are ignored (fresh spawn); the row is overwritten on
+    /// next save. Dead-at-save normalizes to alive-at-spawn on load.
+    pub fn loadPlayer(self: *Server, conn: *Conn) bool {
+        const pool = self.world orelse return false;
+        if (conn.username_len == 0) return false;
+        const name = conn.username[0..conn.username_len];
+        const data = player_db.load(pool, self.gpa, name) catch return false;
+        if (data == null) return false;
+        var d = data.?;
+        defer player_db.freeData(self.gpa, &d);
+        conn.pos_x = d.pos_x;
+        conn.pos_y = d.pos_y;
+        conn.pos_z = d.pos_z;
+        conn.yaw = d.yaw;
+        conn.pitch = d.pitch;
+        conn.on_ground = d.on_ground;
+        conn.config.spawn_x = d.spawn_x;
+        conn.config.spawn_y = d.spawn_y;
+        conn.config.spawn_z = d.spawn_z;
+        if (d.health <= 0) {
+            // Died before saving (server was killed mid-death-screen or the
+            // client never respawned): respawn rules — full health at spawn.
+            conn.health = 20.0;
+            conn.pos_x = @as(f64, @floatFromInt(d.spawn_x)) + 0.5;
+            conn.pos_y = @as(f64, @floatFromInt(d.spawn_y));
+            conn.pos_z = @as(f64, @floatFromInt(d.spawn_z)) + 0.5;
+            conn.is_dead = false;
+        } else {
+            conn.health = d.health;
+            conn.is_dead = false;
+        }
+        conn.food = d.food;
+        conn.saturation = d.saturation;
+        for (&conn.inv, d.inv) |*slot, saved| {
+            item_mod.freeStack(conn.allocator, slot);
+            slot.* = item_mod.cloneStack(conn.allocator, saved) catch null;
+        }
+        item_mod.freeStack(conn.allocator, &conn.cursor);
+        conn.cursor = item_mod.cloneStack(conn.allocator, d.cursor) catch null;
+        conn.selected = d.selected;
+        conn.click_seq = 0;
+        conn.click_seen = false;
+        return true;
+    }
+
+    /// Snapshot one conn (conn.lock taken here) and persist under world_lock.
+    /// Skips conns that never reached play or have no username. Safe to call
+    /// with no locks held (unregister, console, ticker all qualify).
+    pub fn savePlayer(self: *Server, conn: *Conn) void {
+        const pool = self.world orelse return;
+        conn.lock.lock();
+        if (conn.state != .play or conn.username_len == 0) {
+            conn.lock.unlock();
+            return;
+        }
+        var d = player_db.Data{};
+        const name = conn.username[0..conn.username_len];
+        @memcpy(d.username[0..name.len], name);
+        d.username_len = name.len;
+        d.pos_x = conn.pos_x;
+        d.pos_y = conn.pos_y;
+        d.pos_z = conn.pos_z;
+        d.yaw = conn.yaw;
+        d.pitch = conn.pitch;
+        d.on_ground = conn.on_ground;
+        d.spawn_x = conn.config.spawn_x;
+        d.spawn_y = conn.config.spawn_y;
+        d.spawn_z = conn.config.spawn_z;
+        d.health = conn.health;
+        d.food = conn.food;
+        d.saturation = conn.saturation;
+        d.selected = conn.selected;
+        // Clone NBT into server-owned buffers (conn dies under us in the
+        // unregister path; encode only borrows while world_lock is held).
+        for (&d.inv, conn.inv) |*dst, src| {
+            dst.* = item_mod.cloneStack(self.gpa, src) catch null;
+        }
+        d.cursor = item_mod.cloneStack(self.gpa, conn.cursor) catch null;
+        conn.lock.unlock();
+        defer player_db.freeData(self.gpa, &d);
+        self.world_lock.lock();
+        defer self.world_lock.unlock();
+        player_db.save(pool, name, &d) catch {};
+    }
+
+    /// Persist every logged-in player (disconnect path calls savePlayer per
+    /// conn; this is the periodic + save-all + stop path). One world_lock
+    /// for the batch; per-conn locks taken one at a time, never nested.
+    pub fn saveAllPlayers(self: *Server) usize {
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        var n: usize = 0;
+        for (snap) |e| {
+            const before = e.conn.username_len;
+            self.savePlayer(e.conn);
+            if (before > 0) n += 1;
+        }
+        return n;
+    }
+
+    /// In-game + console command core. `sender` null = server console (reply
+    /// goes to stdout); otherwise the reply is a chat message to the sender
+    /// only. Unknown commands get a usage hint, never a kick.
+    pub fn handleCommand(self: *Server, sender: ?*Conn, text: []const u8) void {
+        // Split "/cmd args..." (text[0] == '/' guaranteed by caller).
+        var cmd = text[1..];
+        if (std.mem.indexOfScalar(u8, cmd, ' ')) |sp| cmd = cmd[0..sp];
+        if (std.mem.eql(u8, cmd, "help")) {
+            self.reply(sender, "Commands: /help /list /save-all");
+        } else if (std.mem.eql(u8, cmd, "list")) {
+            var batch: [256]RegistryEntry = undefined;
+            const snap = self.snapshot(&batch);
+            defer releaseSnap(snap);
+            // Collect play-state names first (snapshot refs keep conns alive
+            // across the lock-free build below).
+            var names: [256][]const u8 = undefined;
+            var n: usize = 0;
+            for (snap) |e| {
+                if (n >= names.len) break;
+                e.conn.lock.lock();
+                const play = e.conn.state == .play;
+                e.conn.lock.unlock();
+                if (!play) continue;
+                names[n] = e.conn.username[0..e.conn.username_len];
+                n += 1;
+            }
+            // Usernames are charset-validated at login ([A-Za-z0-9_]), so no
+            // JSON escaping is needed here.
+            var out: [1024]u8 = undefined;
+            var ow: usize = 0;
+            ow += (std.fmt.bufPrint(out[ow..], "Connected ({d}):", .{n}) catch {
+                self.reply(sender, "Connected (?)");
+                return;
+            }).len;
+            for (names[0..n], 0..) |nm, i| {
+                const pre: []const u8 = if (i == 0) "" else ",";
+                ow += (std.fmt.bufPrint(out[ow..], "{s} {s}", .{ pre, nm }) catch break).len;
+            }
+            self.reply(sender, out[0..ow]);
+        } else if (std.mem.eql(u8, cmd, "save-all")) {
+            const n = self.saveAllPlayers();
+            if (self.world) |pool| pool.flushAll() catch {};
+            var msg: [64]u8 = undefined;
+            const s = std.fmt.bufPrint(&msg, "Saved {d} player(s).", .{n}) catch "Saved.";
+            self.reply(sender, s);
+        } else {
+            self.reply(sender, "Unknown command. Try /help");
+        }
+    }
+
+    fn reply(self: *Server, sender: ?*Conn, text: []const u8) void {
+        _ = self;
+        if (sender) |c| {
+            var jb: [1090]u8 = undefined;
+            var fb: [1152]u8 = undefined;
+            const json = std.fmt.bufPrint(&jb, "{{\"text\":\"{s}\"}}", .{text}) catch return;
+            const f = packets.frameChat(json, &fb) catch return;
+            c.lock.lock();
+            defer c.lock.unlock();
+            if (c.state != .play or c.dead) return;
+            c.queueFramed(f) catch {};
+        } else {
+            std.log.info("(console) {s}", .{text});
+        }
     }
 
     /// One server tick: advance clock, queue per-conn tick packets, flush,
@@ -400,6 +581,12 @@ pub const Server = struct {
             if (had_output) writeFramed(e, self.io, pending);
             e.conn.allocator.free(pending);
             if (timed_out) e.stream.shutdown(self.io, .both) catch {};
+        }
+        // Periodic autosave (WAL-durable; save-all/stop flush SSTs on top).
+        // Counter rolls over naturally; the modulo stays aligned.
+        self.tick_counter += 1;
+        if (self.world != null and self.tick_counter % autosave_ticks == 0) {
+            _ = self.saveAllPlayers();
         }
     }
 
@@ -672,7 +859,7 @@ pub fn serveConn(
             const action = try conn.handleFrame(f);
             if (action == .entered_play) entered = true;
             switch (action) {
-                .block_set, .arm_swing, .chat, .attack => try events.append(allocator, action),
+                .block_set, .arm_swing, .chat, .attack, .command => try events.append(allocator, action),
                 else => {},
             }
         }
@@ -681,20 +868,39 @@ pub fn serveConn(
             const age = server.world_age.load(.acquire);
             const tod = server.time_of_day.load(.acquire);
             // Worldgen spawn: ensure land spawn before Join/SpawnPosition go out.
+            // Returning players skip the search: loadPlayer restores pos.
             if (server.world) |pool| {
-                if (server.gen) |gen| {
-                    const sp = v5serve.findSpawn(pool, gen, &server.world_lock, allocator, 24) catch null;
-                    if (sp) |p| {
-                        conn.config.spawn_x = @intFromFloat(@floor(p.x));
-                        conn.config.spawn_y = @intFromFloat(@floor(p.y));
-                        conn.config.spawn_z = @intFromFloat(@floor(p.z));
+                const loaded = server.loadPlayer(conn);
+                if (!loaded) {
+                    if (server.gen) |gen| {
+                        const sp = v5serve.findSpawn(pool, gen, &server.world_lock, allocator, 24) catch null;
+                        if (sp) |p| {
+                            conn.config.spawn_x = @intFromFloat(@floor(p.x));
+                            conn.config.spawn_y = @intFromFloat(@floor(p.y));
+                            conn.config.spawn_z = @intFromFloat(@floor(p.z));
+                        }
                     }
+                    // First login (or no save): land at spawn. (Returning
+                    // players keep their saved pos from loadPlayer.)
+                    conn.pos_x = @as(f64, @floatFromInt(conn.config.spawn_x)) + 0.5;
+                    conn.pos_y = @as(f64, @floatFromInt(conn.config.spawn_y));
+                    conn.pos_z = @as(f64, @floatFromInt(conn.config.spawn_z)) + 0.5;
+                    conn.yaw = 0;
+                    conn.pitch = 0;
                 }
             }
             try conn.queueJoinPackets(age, tod);
-            // Login completion: chunks first, PosLook last.
+            // Login completion: inventory sync, chunks, PosLook last.
             // (announceJoin runs after unlock — it takes conn.lock itself).
             if (server.world) |pool| {
+                // Persisted inventory (or empty for fresh players): full
+                // Window Items + cursor so the client starts in sync.
+                const wf = try packets.frameWindowItemsAlloc(allocator, 0, &conn.inv);
+                defer allocator.free(wf);
+                try conn.queueFramed(wf);
+                const cf = try packets.frameSetSlotAlloc(allocator, 0, -1, conn.cursor);
+                defer allocator.free(cf);
+                try conn.queueFramed(cf);
                 const cc = conn.playerChunk();
                 try view.completeLogin(conn, server.chunkSource(pool), 0, cc.cx, cc.cz, server.view_distance, true);
             } else {
@@ -735,6 +941,7 @@ pub fn serveConn(
                     .arm_swing => |a| server.broadcastArmSwing(conn, cc_now.cx, cc_now.cz, conn.eid, a) catch {},
                     .chat => |m| server.broadcastChat(conn.chat_buf[0..m.json_len]),
                     .attack => |a| server.resolveAttack(conn, a),
+                    .command => |m| server.handleCommand(conn, conn.chat_buf[0..m.json_len]),
                     else => {},
                 }
             }
@@ -1380,4 +1587,163 @@ test "broadcastChat reaches all play conns; login timeout kicks stale logins" {
     srv.unregister(bob.conn);
     srv.unregister(stuck.conn);
     try std.testing.expectEqual(@as(usize, 0), srv.registry.items.len);
+}
+
+test "player save/load roundtrip via pool (pos/health/inv/NBT)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.registry.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    srv.world = pool;
+    const c = try a.create(Conn);
+    defer a.destroy(c);
+    c.* = Conn.init(a, io, .{}, 7);
+    c.state = .play;
+    @memcpy(c.username[0.."Bo".len], "Bo");
+    c.username_len = 2;
+    c.pos_x = -12.5;
+    c.pos_y = 70.0;
+    c.pos_z = 44.25;
+    c.yaw = 90.0;
+    c.pitch = -15.0;
+    c.health = 13.5;
+    c.food = 17;
+    c.saturation = 3.25;
+    c.selected = 4;
+    c.config.spawn_x = 8;
+    c.config.spawn_y = 70;
+    c.config.spawn_z = 8;
+    const tag = [_]u8{ 0x0A, 0x00, 0x03, 0x64, 0x75, 0x6D };
+    const owned = try a.dupe(u8, &tag);
+    c.inv[36] = .{ .id = 276, .count = 1, .damage = 0, .nbt = owned };
+    c.inv[10] = .{ .id = 1, .count = 64, .damage = 0, .nbt = null };
+    c.cursor = .{ .id = 3, .count = 5, .damage = 0, .nbt = null };
+    srv.savePlayer(c);
+    // Mutate everything; load must restore.
+    c.pos_x = 999;
+    c.health = 1.0;
+    item_mod.freeStack(a, &c.inv[36]);
+    c.inv[36] = null;
+    c.inv[10] = null;
+    c.cursor = null;
+    c.selected = 0;
+    c.lock.lock();
+    try std.testing.expect(srv.loadPlayer(c));
+    c.lock.unlock();
+    try std.testing.expectApproxEqAbs(-12.5, c.pos_x, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f32, 90.0), c.yaw, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 13.5), c.health, 1e-6);
+    try std.testing.expectEqual(@as(i16, 17), c.food);
+    try std.testing.expectEqual(@as(u8, 4), c.selected);
+    try std.testing.expectEqual(@as(u16, 276), c.inv[36].?.id);
+    try std.testing.expectEqualSlices(u8, &tag, c.inv[36].?.nbt.?);
+    try std.testing.expectEqual(@as(u16, 1), c.inv[10].?.id);
+    try std.testing.expectEqual(@as(u16, 3), c.cursor.?.id);
+    try std.testing.expectEqual(@as(i32, 8), c.config.spawn_x);
+    // No save -> false. Corrupt row -> false (treated as fresh spawn).
+    const c2 = try a.create(Conn);
+    defer a.destroy(c2);
+    c2.* = Conn.init(a, io, .{}, 8);
+    c2.state = .play;
+    @memcpy(c2.username[0.."Al".len], "Al");
+    c2.username_len = 2;
+    c2.lock.lock();
+    try std.testing.expect(!srv.loadPlayer(c2));
+    c2.lock.unlock();
+    try pool.put(player_db.keyFor("Al"), "junk-bytes");
+    c2.lock.lock();
+    try std.testing.expect(!srv.loadPlayer(c2));
+    c2.lock.unlock();
+    // Non-play conns are never persisted (junk row from above untouched).
+    c2.state = .login;
+    srv.savePlayer(c2);
+    const still = try pool.get(player_db.keyFor("Al"));
+    defer if (still) |s| a.free(s);
+    try std.testing.expectEqualStrings("junk-bytes", still.?);
+    c.deinit();
+    c2.deinit();
+}
+
+test "commands help/list/save-all/unknown (+ console null-sender)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.registry.deinit(a);
+    const mk = struct {
+        fn run(name: []const u8, id: i32) !*Conn {
+            const c = try a.create(Conn);
+            errdefer a.destroy(c);
+            c.* = Conn.init(a, io, .{}, id);
+            c.state = .play;
+            @memcpy(c.username[0..name.len], name);
+            c.username_len = name.len;
+            return c;
+        }
+    };
+    // Replies are queued to the sender's outbox (flushed by serve/tick
+    // loops live); tests drain the outbox directly, no sockets needed.
+    const readChat = struct {
+        fn run(c: *Conn) ![]u8 {
+            c.lock.lock();
+            const raw = try c.takeOutput();
+            c.lock.unlock();
+            defer a.free(raw);
+            var r = codec.PacketReader.init(raw);
+            const h = try codec.decodeFrame(&r);
+            try std.testing.expectEqual(@as(i32, 0x02), h.id);
+            var pr = codec.PacketReader.init(r.buffer[r.index..]);
+            return try a.dupe(u8, try pr.readString());
+        }
+    }.run;
+    var alice = try mk.run("AliceD", 1);
+    var bob = try mk.run("BobD", 2);
+    // /list with nobody registered: empty roster, still well-formed.
+    srv.handleCommand(alice, "/list");
+    const l0 = try readChat(alice);
+    defer a.free(l0);
+    try std.testing.expectEqualStrings("{\"text\":\"Connected (0):\"}", l0);
+    // Register both (commands never touch streams; leave them undefined).
+    try srv.registry.append(a, .{ .conn = alice, .stream = undefined });
+    try srv.registry.append(a, .{ .conn = bob, .stream = undefined });
+    // /list to Alice: both names, sender-only (Bob's outbox stays empty).
+    srv.handleCommand(alice, "/list");
+    const l1 = try readChat(alice);
+    defer a.free(l1);
+    try std.testing.expectEqualStrings("{\"text\":\"Connected (2): AliceD, BobD\"}", l1);
+    {
+        bob.lock.lock();
+        const pending = try bob.takeOutput();
+        bob.lock.unlock();
+        defer a.free(pending);
+        try std.testing.expectEqual(@as(usize, 0), pending.len);
+    }
+    // /help (extra args ignored)
+    srv.handleCommand(bob, "/help with extra args ignored");
+    const h1 = try readChat(bob);
+    defer a.free(h1);
+    try std.testing.expectEqualStrings("{\"text\":\"Commands: /help /list /save-all\"}", h1);
+    // unknown
+    srv.handleCommand(alice, "/frobnicate");
+    const unk = try readChat(alice);
+    defer a.free(unk);
+    try std.testing.expectEqualStrings("{\"text\":\"Unknown command. Try /help\"}", unk);
+    // console sender (null) must not crash; no chat goes out.
+    srv.handleCommand(null, "/list");
+    srv.handleCommand(null, "/nope");
+    srv.handleCommand(null, "/help");
+    // /save-all without a world still replies (0 players, no flush).
+    srv.handleCommand(alice, "/save-all");
+    const s1 = try readChat(alice);
+    defer a.free(s1);
+    try std.testing.expectEqualStrings("{\"text\":\"Saved 2 player(s).\"}", s1);
+    _ = srv.registry.pop();
+    _ = srv.registry.pop();
+    alice.deinit();
+    a.destroy(alice);
+    bob.deinit();
+    a.destroy(bob);
 }

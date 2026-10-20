@@ -11,7 +11,7 @@ Status snapshot (done, tested, live-verified over TCP):
 - [x] Pure-Zig LSM (WAL + SST + `ShardPool`), ZC1 payloads, Anvil→ZC1 import (`tools/anvil_import.zig`)
 - [x] H1 worldgen foundation: `java.util.Random` LCG port (JVM-verified goldens incl. `nextInt(bound)` rejection path), fdlibm `log` port (StrictMath bit-exact — Zig/glibc differ by 1 ulp, proven live), Xoroshiro128++ + Mojang seeding, version-agnostic pipeline driver, `worldgen_dump` tool (`src/worldgen/`, `tools/worldgen_dump.zig`)
 - [x] Region tick stub, MPSC handoff queue, player position tracking (stance quirk handled)
-- [x] 147/147 `zig build test` green (was 53/53 — count the real number when touching this line)
+- [x] 152/152 `zig build test` green (was 53/53 — count the real number when touching this line)
 
 Legend: `[ ]` todo, `[~]` partial. Each phase ends with acceptance criteria.
 
@@ -56,13 +56,20 @@ Without these the client connects but the world is dead. All bodies are
 - [x] Acceptance, all live with echoing clients: mutual player spawns with correct offline UUIDs/names/positions, wandering pig visible to both (relmove stream), despawn on leaving view, re-spawn on return, relmove on small moves, destroy on disconnect
 - [ ] Follow-ups: 20tps movement smoothing, mob AI beyond patrol, persistence of entities, riding/velocity/projectiles, equipment slots (health/damage/death/respawn + Use Entity reach validation done, live-verified — see protocol quirks validation below)
 
-### A5. Chat + disconnect hygiene ✅ (done, live-verified)
-- [x] Serverbound Chat `0x01` (plain string) → broadcast Chat Message `0x02` to all play conns including sender (1.7 has no position byte); JSON escaped (`"`, `\`, control chars → `\u00XX`), UTF-8 validated, 100-codepoint cap; invalid/overlong dropped silently (no kick — can't be weaponized)
+### A5. Chat + disconnect hygiene ✅ (done, live-verified)- [x] Serverbound Chat `0x01` (plain string) → broadcast Chat Message `0x02` to all play conns including sender (1.7 has no position byte); JSON escaped (`"`, `\`, control chars → `\u00XX`), UTF-8 validated, 100-codepoint cap; invalid/overlong dropped silently (no kick — can't be weaponized)
 - [x] Spam throttle: 750ms min gap, `Kicked for spamming` disconnect on violation (unit + live verified)
 - [x] Login timeout: conns stuck in handshake/login dropped after 30s of no progress (login state gets `0x00` disconnect + close; handshaking/status just closed — no disconnect packet exists in those states). Verified live: handshake-only conn gets clean EOF at ~31s
 - [x] Disconnect audit: all paths use JSON reason with the right packet — `0x00` in login, `0x40` in play, keepalive timeout `0x40 "Timed out"`, login timeout `0x00`. Ticker shuts the socket down (unblocks serve loops); close happens exactly once in serveConn's defer
 - [x] Acceptance, all live with echoing clients: broadcast reaches sender + others with byte-exact vanilla-style JSON (unicode preserved, not `\uXXXX`-escaped); spam → `0x40`; invalid UTF-8 → silent drop; idle handshake → clean drop at 30s
-- [ ] Follow-ups: per-IP connection rate limiting, RCON/console kick, chat reporting/muting hooks for the mod API (F), tab-complete `0x3A`
+- [ ] Follow-ups: per-IP connection rate limiting, RCON (remote) kick, chat reporting/muting hooks for the mod API (F), tab-complete `0x3A` (local stdin console done — see A6)
+
+### A6. Player persistence + commands/console ✅ (done, live-verified)
+- [x] LSM-backed player rows (`src/sim/players.zig`): `ZPLR` v1 binary (pos/yaw/pitch, spawn, health/food/saturation, 45-slot NBT-verbatim inventory + cursor + selected), key `encodeKey(255, Wyhash(name))` with stored-username mismatch guard; corrupt rows treated as fresh spawn (overwritten on next save)
+- [x] Save triggers: disconnect (`unregister`), in-game `/save-all`, console `save-all`, ticker autosave every 300 ticks (WAL-durable; save-all/stop flush SSTs). Load on login (conn.lock held): restores pos/health/inv/cursor/selected, skips land-spawn search; dead-at-save normalizes to alive-at-spawn on load
+- [x] Login inventory sync: full Window Items `0x30` + cursor Set Slot after chunk burst; PosLook now sends actual player pos (fresh logins land at found spawn via pos sync — burst center + PosLook consistent)
+- [x] Commands on the chat packet (`0x01` leading `/`, vanilla-compatible): `/help`, `/list` (sender-only roster), `/save-all` (saves + flushes), unknown → hint (never a kick); spam cooldown applies. Operator stdin console: `help|list|save-all|stop` (stop saves + flushes + exits)
+- [x] Acceptance, live over TCP with restart: move + stage 64-dirt in slot 40 + `/save-all` → disconnect → reboot same DB → PosLook at moved pos, `0x30` shows slot 40 = 64 dirt; `/list` shows the player; console `list/save-all/stop` verified; existing inventory E2E still green
+- [ ] Follow-ups: permission levels (currently all players are ops), `/tp`/`/give`/`/gamemode`/`/time`, RCON, playerdata migration tooling
 
 ---
 
