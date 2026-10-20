@@ -23,6 +23,7 @@ const store_mod = @import("../world/store.zig");
 const shard_mod = @import("../world/shard.zig");
 const item_mod = @import("../item.zig");
 const nbt_mod = @import("../world/nbt.zig");
+const ids = @import("../ids.zig");
 
 pub const player_dim: u8 = 255;
 pub const magic = "ZPLR";
@@ -213,7 +214,7 @@ fn readSlot(alloc: std.mem.Allocator, r: *[]const u8, take: fn (*[]const u8, usi
     const nlen = std.mem.readInt(i32, (try take(r, 4))[0..4], .big);
     if (nlen < -1) return error.CorruptPlayer;
     // id 0 is air: only legal as an empty slot, never as a stack.
-    if (id == 0) return error.CorruptPlayer;
+    if (id == ids.air) return error.CorruptPlayer;
     if (nlen == -1) return .{ .id = id, .count = count, .damage = damage, .nbt = null };
     if (nlen > 1024 * 1024) return error.CorruptPlayer;
     const nb = try take(r, @intCast(nlen));
@@ -261,9 +262,9 @@ test "player roundtrip incl NBT, cursor, selected, spawn" {
     d.selected = 4;
     d.gamemode = 0;
     const tag = [_]u8{ 0x0A, 0x00, 0x03, 0x64, 0x75, 0x6D };
-    d.inv[36] = .{ .id = 276, .count = 1, .damage = 0, .nbt = &tag };
-    d.inv[10] = .{ .id = 1, .count = 64, .damage = 0, .nbt = null };
-    d.cursor = .{ .id = 3, .count = 5, .damage = 0, .nbt = null };
+    d.inv[36] = .{ .id = ids.diamond_sword, .count = 1, .damage = 0, .nbt = &tag };
+    d.inv[10] = .{ .id = ids.stone, .count = 64, .damage = 0, .nbt = null };
+    d.cursor = .{ .id = ids.dirt, .count = 5, .damage = 0, .nbt = null };
     const enc = try encode(a, &d);
     defer a.free(enc);
     var back = try decode(a, enc, "Bo");

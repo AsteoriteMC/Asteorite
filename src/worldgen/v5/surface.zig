@@ -8,16 +8,7 @@ const std = @import("std");
 const java_random = @import("../rng/java_random.zig");
 const noise = @import("noise.zig");
 const biome = @import("biome.zig");
-
-// Block ids (aji.b registry, JVM-probed).
-pub const BEDROCK: u16 = 7;
-pub const SAND: u16 = 12;
-pub const GRAVEL: u16 = 13;
-pub const SANDSTONE: u16 = 24;
-pub const ICE: u16 = 79;
-pub const WATER: u16 = 9;
-pub const STONE: u16 = 1;
-pub const AIR: u16 = 0;
+const ids = @import("../../ids.zig");
 
 /// Base-game surface tables (ids 0..39). Full 256-entry versions with
 /// mutated variants live in biome.zig (TOP256/FILLER256/TEMPF256).
@@ -77,33 +68,33 @@ pub fn buildColumn(
         const idx = (lz * 16 + lx) * stride + @as(usize, @intCast(y));
         const r5: i32 = rand.nextIntBound(5) catch unreachable;
         if (y <= 0 + r5) {
-            blocks[idx] = BEDROCK;
+            blocks[idx] = ids.bedrock;
             continue;
         }
         const b = blocks[idx];
         // NOTE: vanilla checks block material == air; at this stage only
         // id 0 qualifies (stone/water/fill only). Documented narrowing.
-        if (b == AIR) {
+        if (b == ids.air) {
             filler_depth = -1;
             continue;
         }
-        if (b != STONE) continue;
+        if (b != ids.stone) continue;
         if (filler_depth == -1) {
             if (depth <= 0) {
-                top = AIR;
+                top = ids.air;
                 top_meta = 0;
-                filler = STONE;
+                filler = ids.stone;
             } else if (y >= 59 and y <= 64) {
                 top = biome.TOP256[@as(usize, @intCast(bio_id))];
                 top_meta = biome.TOPMETA256[@as(usize, @intCast(bio_id))];
                 filler = biome.FILLER256[@as(usize, @intCast(bio_id))];
             }
-            if (y < 63 and top == AIR) {
+            if (y < 63 and top == ids.air) {
                 if (temp_eval.tempAt(bio_temp, wx, y, wz) < 0.15) {
-                    top = ICE;
+                    top = ids.ice;
                     top_meta = 0;
                 } else {
-                    top = WATER;
+                    top = ids.water;
                     top_meta = 0;
                 }
             }
@@ -114,9 +105,9 @@ pub fn buildColumn(
                 continue;
             }
             if (y < 56 - depth) {
-                top = AIR;
-                filler = STONE;
-                blocks[idx] = GRAVEL;
+                top = ids.air;
+                filler = ids.stone;
+                blocks[idx] = ids.gravel;
                 continue;
             }
             blocks[idx] = filler;
@@ -125,10 +116,10 @@ pub fn buildColumn(
         if (filler_depth <= 0) continue;
         blocks[idx] = filler;
         filler_depth -= 1;
-        if (filler_depth != 0 or filler != SAND) continue;
+        if (filler_depth != 0 or filler != ids.sand) continue;
         const r4: i32 = rand.nextIntBound(4) catch unreachable;
         filler_depth = r4 + @max(0, y - 63);
-        filler = SANDSTONE;
+        filler = ids.sandstone;
     }
 }
 
@@ -251,9 +242,9 @@ pub fn mesaBuildColumn(
             d2 += 64.0;
         }
     }
-    var top: u16 = 12;
+    var top: u16 = ids.sand;
     var top_meta: u8 = 1;
-    var filler: u16 = 159;
+    var filler: u16 = ids.stained_hardened_clay;
     var filler_depth: i32 = -1;
     // NOTE: method-scoped in vanilla (set in the surface block, read by
     // later subsurface rows of the same column).
@@ -263,30 +254,30 @@ pub fn mesaBuildColumn(
     var y: i32 = 255;
     while (y >= 0) : (y -= 1) {
         const idx = (lz * 16 + lx) * stride + @as(usize, @intCast(y));
-        if (blocks[idx] == 0 and @as(f64, @floatFromInt(y)) < d2) blocks[idx] = STONE;
+        if (blocks[idx] == ids.air and @as(f64, @floatFromInt(y)) < d2) blocks[idx] = ids.stone;
         const r5: i32 = rand.nextIntBound(5) catch unreachable;
         if (y <= 0 + r5) {
-            blocks[idx] = BEDROCK;
+            blocks[idx] = ids.bedrock;
             continue;
         }
         const b = blocks[idx];
-        if (b == AIR) {
+        if (b == ids.air) {
             filler_depth = -1;
             continue;
         }
-        if (b != STONE) continue;
+        if (b != ids.stone) continue;
         if (filler_depth == -1) {
             bl2 = false;
             if (depth <= 0) {
-                top = AIR;
+                top = ids.air;
                 top_meta = 0;
-                filler = STONE;
+                filler = ids.stone;
             } else if (y >= 59 and y <= 64) {
-                top = 159;
-                filler = 159;
+                top = ids.stained_hardened_clay;
+                filler = ids.stained_hardened_clay;
             }
-            if (y < 63 and top == AIR) {
-                top = WATER;
+            if (y < 63 and top == ids.air) {
+                top = ids.water;
                 top_meta = 0;
             }
             filler_depth = depth + @max(0, y - 63);
@@ -308,10 +299,10 @@ pub fn mesaBuildColumn(
                         n9 = mesa.band(wx, y, wz);
                     }
                     if (n9 < 16) {
-                        blocks[idx] = 159;
+                        blocks[idx] = ids.stained_hardened_clay;
                         meta[idx] = n9;
                     } else {
-                        blocks[idx] = 172;
+                        blocks[idx] = ids.hardened_clay;
                     }
                     continue;
                 }
@@ -321,23 +312,23 @@ pub fn mesaBuildColumn(
                 continue;
             }
             blocks[idx] = filler;
-            if (filler != 159) continue;
+            if (filler != ids.stained_hardened_clay) continue;
             meta[idx] = 1;
             continue;
         }
         if (filler_depth <= 0) continue;
         filler_depth -= 1;
         if (bl2) {
-            blocks[idx] = 159;
+            blocks[idx] = ids.stained_hardened_clay;
             meta[idx] = 1;
             continue;
         }
         const n9 = mesa.band(wx, y, wz);
         if (n9 < 16) {
-            blocks[idx] = 159;
+            blocks[idx] = ids.stained_hardened_clay;
             meta[idx] = n9;
         } else {
-            blocks[idx] = 172;
+            blocks[idx] = ids.hardened_clay;
         }
     }
 }

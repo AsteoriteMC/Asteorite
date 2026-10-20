@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const JavaRandom = @import("../worldgen/rng/java_random.zig").JavaRandom;
+const ids = @import("../ids.zig");
 
 /// One drop roll: spawn `singles` separate single-item entities of this stack.
 pub const DropRoll = struct {
@@ -35,99 +36,99 @@ pub fn rollDrops(block_id: u16, meta: u4, rand: *JavaRandom, out: *[2]DropRoll) 
     var n: usize = 0;
     switch (block_id) {
         // Lapis ore: dye/4, 4 + nextInt(5) (amn, fortune 0).
-        21 => {
+        ids.lapis_ore => {
             const q: u8 = @intCast(4 + (rand.nextIntBound(5) catch unreachable));
-            out[0] = .{ .item_id = 351, .damage = 4, .singles = q };
+            out[0] = .{ .item_id = ids.dye, .damage = 4, .singles = q };
             n = 1;
         },
         // Redstone ore (lit or not): dust, 4 + nextInt(2) (amz).
-        73, 74 => {
+        ids.redstone_ore, ids.lit_redstone_ore => {
             const q: u8 = @intCast(4 + (rand.nextIntBound(2) catch unreachable));
-            out[0] = .{ .item_id = 331, .damage = 0, .singles = q };
+            out[0] = .{ .item_id = ids.redstone, .damage = 0, .singles = q };
             n = 1;
         },
         // Gravel: flint iff nextInt(10) == 0, else the block (ali, fortune 0).
-        13 => {
+        ids.gravel => {
             if (rand.nextIntBound(10) catch unreachable == 0) {
-                out[0] = .{ .item_id = 318, .damage = 0, .singles = 1 };
+                out[0] = .{ .item_id = ids.flint, .damage = 0, .singles = 1 };
             } else {
-                out[0] = .{ .item_id = 13, .damage = 0, .singles = 1 };
+                out[0] = .{ .item_id = ids.gravel, .damage = 0, .singles = 1 };
             }
             n = 1;
         },
         // Leaves: sapling 1/20 (jungle 1/40), damage meta&3; apple 1/200 for
         // oak (old leaves) / dark oak (new leaves) (alt/aml/amh, fortune 0).
-        18, 161 => {
+        ids.leaves, ids.leaves2 => {
             const m: u4 = @truncate(meta & 3);
-            const rate: i32 = if (block_id == 18 and m == 3) 40 else 20;
+            const rate: i32 = if (block_id == ids.leaves and m == 3) 40 else 20;
             if (rand.nextIntBound(rate) catch unreachable == 0) {
-                out[n] = .{ .item_id = 6, .damage = m, .singles = 1 };
+                out[n] = .{ .item_id = ids.sapling, .damage = m, .singles = 1 };
                 n += 1;
             }
-            const apple_tree = (block_id == 18 and m == 0) or (block_id == 161 and m == 1);
+            const apple_tree = (block_id == ids.leaves and m == 0) or (block_id == ids.leaves2 and m == 1);
             if (apple_tree and rand.nextIntBound(200) catch unreachable == 0) {
-                out[n] = .{ .item_id = 260, .damage = 0, .singles = 1 };
+                out[n] = .{ .item_id = ids.apple, .damage = 0, .singles = 1 };
                 n += 1;
             }
         },
         // Stone -> cobblestone (anv).
-        1 => {
-            out[0] = .{ .item_id = 4, .damage = 0, .singles = 1 };
+        ids.stone => {
+            out[0] = .{ .item_id = ids.cobblestone, .damage = 0, .singles = 1 };
             n = 1;
         },
         // Ores that drop themselves or a fixed item, qty 1 (amn).
-        16 => {
-            out[0] = .{ .item_id = 263, .damage = 0, .singles = 1 };
+        ids.coal_ore => {
+            out[0] = .{ .item_id = ids.coal, .damage = 0, .singles = 1 };
             n = 1;
         },
-        56 => {
-            out[0] = .{ .item_id = 264, .damage = 0, .singles = 1 };
+        ids.diamond_ore => {
+            out[0] = .{ .item_id = ids.diamond, .damage = 0, .singles = 1 };
             n = 1;
         },
-        129 => {
-            out[0] = .{ .item_id = 388, .damage = 0, .singles = 1 };
+        ids.emerald_ore => {
+            out[0] = .{ .item_id = ids.emerald, .damage = 0, .singles = 1 };
             n = 1;
         },
         // Gold/iron ore drop themselves (no furnace yet); quartz drops the item.
-        14, 15 => {
+        ids.gold_ore, ids.iron_ore => {
             out[0] = .{ .item_id = block_id, .damage = 0, .singles = 1 };
             n = 1;
         },
-        153 => {
-            out[0] = .{ .item_id = 406, .damage = 0, .singles = 1 };
+        ids.quartz_ore => {
+            out[0] = .{ .item_id = ids.quartz, .damage = 0, .singles = 1 };
             n = 1;
         },
         // Clay -> 4 balls (ajy).
-        82 => {
-            out[0] = .{ .item_id = 337, .damage = 0, .singles = 4 };
+        ids.clay => {
+            out[0] = .{ .item_id = ids.clay_ball, .damage = 0, .singles = 4 };
             n = 1;
         },
         // Glowstone -> 2 + nextInt(3) dust (alg, fortune 0).
-        89 => {
+        ids.glowstone => {
             const q: u8 = @intCast(2 + (rand.nextIntBound(3) catch unreachable));
-            out[0] = .{ .item_id = 348, .damage = 0, .singles = q };
+            out[0] = .{ .item_id = ids.glowstone_dust, .damage = 0, .singles = q };
             n = 1;
         },
         // Melon -> 3 + nextInt(5) slices (aly).
-        103 => {
+        ids.melon_block => {
             const q: u8 = @intCast(3 + (rand.nextIntBound(5) catch unreachable));
-            out[0] = .{ .item_id = 360, .damage = 0, .singles = q };
+            out[0] = .{ .item_id = ids.melon, .damage = 0, .singles = q };
             n = 1;
         },
         // Double stone slab -> 2 single slabs.
-        43 => {
-            out[0] = .{ .item_id = 44, .damage = 0, .singles = 2 };
+        ids.double_stone_slab => {
+            out[0] = .{ .item_id = ids.stone_slab, .damage = 0, .singles = 2 };
             n = 1;
         },
         // Tall grass / dead bush: seeds iff nextInt(8) == 0, else nothing (anz).
-        31, 32 => {
+        ids.tallgrass, ids.deadbush => {
             if (rand.nextIntBound(8) catch unreachable == 0) {
-                out[0] = .{ .item_id = 295, .damage = 0, .singles = 1 };
+                out[0] = .{ .item_id = ids.wheat_seeds, .damage = 0, .singles = 1 };
                 n = 1;
             }
         },
         // Glass, ice, bedrock: nothing (quantityDropped 0 / unbreakable).
-        7, 20, 79 => {},
+        ids.bedrock, ids.glass, ids.ice => {},
         else => {
             out[0] = .{ .item_id = block_id, .damage = if (preservesMeta(block_id)) meta else 0, .singles = 1 };
             n = 1;
@@ -140,7 +141,7 @@ pub fn rollDrops(block_id: u16, meta: u4, rand: *JavaRandom, out: *[2]DropRoll) 
 /// overrides returning meta — same item, meta matters). Spot-checked in CFR.
 fn preservesMeta(id: u16) bool {
     return switch (id) {
-        5, 6, 17, 24, 35, 44, 98, 125, 126, 155, 159, 162, 171, 175 => true,
+        ids.planks, ids.sapling, ids.log, ids.sandstone, ids.wool, ids.stone_slab, ids.stonebrick, ids.double_wooden_slab, ids.wooden_slab, ids.quartz_block, ids.stained_hardened_clay, ids.log2, ids.carpet, ids.double_plant => true,
         else => false,
     };
 }
@@ -149,32 +150,32 @@ test "fixed drops: stone/cobble/ores/clay/glass" {
     var rng = JavaRandom.init(12345);
     var out: [2]DropRoll = undefined;
     // stone -> cobble
-    try std.testing.expectEqual(@as(usize, 1), rollDrops(1, 0, &rng, &out));
-    try std.testing.expectEqual(DropRoll{ .item_id = 4, .damage = 0, .singles = 1 }, out[0]);
+    try std.testing.expectEqual(@as(usize, 1), rollDrops(ids.stone, 0, &rng, &out));
+    try std.testing.expectEqual(DropRoll{ .item_id = ids.cobblestone, .damage = 0, .singles = 1 }, out[0]);
     // coal/diamond/emerald/gold/iron/quartz
-    for ([_]struct { b: u16, i: u16 }{ .{ .b = 16, .i = 263 }, .{ .b = 56, .i = 264 }, .{ .b = 129, .i = 388 }, .{ .b = 14, .i = 14 }, .{ .b = 15, .i = 15 } }) |c| {
+    for ([_]struct { b: u16, i: u16 }{ .{ .b = ids.coal_ore, .i = ids.coal }, .{ .b = ids.diamond_ore, .i = ids.diamond }, .{ .b = ids.emerald_ore, .i = ids.emerald }, .{ .b = ids.gold_ore, .i = ids.gold_ore }, .{ .b = ids.iron_ore, .i = ids.iron_ore } }) |c| {
         try std.testing.expectEqual(@as(usize, 1), rollDrops(c.b, 0, &rng, &out));
         try std.testing.expectEqual(c.i, out[0].item_id);
         try std.testing.expectEqual(@as(u8, 1), out[0].singles);
     }
     // clay -> 4 balls
-    try std.testing.expectEqual(@as(usize, 1), rollDrops(82, 0, &rng, &out));
-    try std.testing.expectEqual(DropRoll{ .item_id = 337, .damage = 0, .singles = 4 }, out[0]);
+    try std.testing.expectEqual(@as(usize, 1), rollDrops(ids.clay, 0, &rng, &out));
+    try std.testing.expectEqual(DropRoll{ .item_id = ids.clay_ball, .damage = 0, .singles = 4 }, out[0]);
     // glass / ice / bedrock -> nothing
-    try std.testing.expectEqual(@as(usize, 0), rollDrops(20, 0, &rng, &out));
-    try std.testing.expectEqual(@as(usize, 0), rollDrops(79, 0, &rng, &out));
+    try std.testing.expectEqual(@as(usize, 0), rollDrops(ids.glass, 0, &rng, &out));
+    try std.testing.expectEqual(@as(usize, 0), rollDrops(ids.ice, 0, &rng, &out));
     // quartz ore -> quartz item (not the block)
-    try std.testing.expectEqual(@as(usize, 1), rollDrops(153, 0, &rng, &out));
-    try std.testing.expectEqual(DropRoll{ .item_id = 406, .damage = 0, .singles = 1 }, out[0]);
-    try std.testing.expectEqual(@as(usize, 0), rollDrops(7, 0, &rng, &out));
+    try std.testing.expectEqual(@as(usize, 1), rollDrops(ids.quartz_ore, 0, &rng, &out));
+    try std.testing.expectEqual(DropRoll{ .item_id = ids.quartz, .damage = 0, .singles = 1 }, out[0]);
+    try std.testing.expectEqual(@as(usize, 0), rollDrops(ids.bedrock, 0, &rng, &out));
     // double slab -> 2 singles
-    try std.testing.expectEqual(@as(usize, 1), rollDrops(43, 0, &rng, &out));
-    try std.testing.expectEqual(DropRoll{ .item_id = 44, .damage = 0, .singles = 2 }, out[0]);
+    try std.testing.expectEqual(@as(usize, 1), rollDrops(ids.double_stone_slab, 0, &rng, &out));
+    try std.testing.expectEqual(DropRoll{ .item_id = ids.stone_slab, .damage = 0, .singles = 2 }, out[0]);
     // default: self-drop; wool keeps color
-    try std.testing.expectEqual(@as(usize, 1), rollDrops(3, 0, &rng, &out));
-    try std.testing.expectEqual(DropRoll{ .item_id = 3, .damage = 0, .singles = 1 }, out[0]);
-    try std.testing.expectEqual(@as(usize, 1), rollDrops(35, 11, &rng, &out));
-    try std.testing.expectEqual(DropRoll{ .item_id = 35, .damage = 11, .singles = 1 }, out[0]);
+    try std.testing.expectEqual(@as(usize, 1), rollDrops(ids.dirt, 0, &rng, &out));
+    try std.testing.expectEqual(DropRoll{ .item_id = ids.dirt, .damage = 0, .singles = 1 }, out[0]);
+    try std.testing.expectEqual(@as(usize, 1), rollDrops(ids.wool, 11, &rng, &out));
+    try std.testing.expectEqual(DropRoll{ .item_id = ids.wool, .damage = 11, .singles = 1 }, out[0]);
 }
 
 test "ranged drops stay in vanilla bounds (seed sweep)" {
@@ -194,24 +195,24 @@ test "ranged drops stay in vanilla bounds (seed sweep)" {
     while (seed <= N) : (seed += 1) {
         var rng = JavaRandom.init(seed * 7919);
         var out: [2]DropRoll = undefined;
-        _ = rollDrops(21, 0, &rng, &out);
+        _ = rollDrops(ids.lapis_ore, 0, &rng, &out);
         lapis_min = @min(lapis_min, out[0].singles);
         lapis_max = @max(lapis_max, out[0].singles);
-        try std.testing.expectEqual(@as(u16, 351), out[0].item_id);
+        try std.testing.expectEqual(@as(u16, ids.dye), out[0].item_id);
         try std.testing.expectEqual(@as(i16, 4), out[0].damage);
-        _ = rollDrops(73, 0, &rng, &out);
+        _ = rollDrops(ids.redstone_ore, 0, &rng, &out);
         red_min = @min(red_min, out[0].singles);
         red_max = @max(red_max, out[0].singles);
-        _ = rollDrops(89, 0, &rng, &out);
+        _ = rollDrops(ids.glowstone, 0, &rng, &out);
         glow_min = @min(glow_min, out[0].singles);
         glow_max = @max(glow_max, out[0].singles);
-        _ = rollDrops(103, 0, &rng, &out);
+        _ = rollDrops(ids.melon_block, 0, &rng, &out);
         melon_min = @min(melon_min, out[0].singles);
         melon_max = @max(melon_max, out[0].singles);
-        _ = rollDrops(13, 0, &rng, &out);
-        if (out[0].item_id == 318) flint += 1 else try std.testing.expectEqual(@as(u16, 13), out[0].item_id);
-        if (rollDrops(18, 0, &rng, &out) > 0 and out[0].item_id == 6) sap += 1;
-        if (rollDrops(31, 1, &rng, &out) > 0) seeds += 1;
+        _ = rollDrops(ids.gravel, 0, &rng, &out);
+        if (out[0].item_id == ids.flint) flint += 1 else try std.testing.expectEqual(@as(u16, ids.gravel), out[0].item_id);
+        if (rollDrops(ids.leaves, 0, &rng, &out) > 0 and out[0].item_id == ids.sapling) sap += 1;
+        if (rollDrops(ids.tallgrass, 1, &rng, &out) > 0) seeds += 1;
     }
     try std.testing.expectEqual(@as(u8, 4), lapis_min);
     try std.testing.expectEqual(@as(u8, 8), lapis_max);
@@ -234,7 +235,7 @@ test "leaves damage + apple gating" {
     var s: i64 = 0;
     while (s < 500) : (s += 1) {
         var r = JavaRandom.init(s);
-        if (rollDrops(18, 3, &r, &out) > 0 and out[0].item_id == 6) {
+        if (rollDrops(ids.leaves, 3, &r, &out) > 0 and out[0].item_id == ids.sapling) {
             try std.testing.expectEqual(@as(i16, 3), out[0].damage);
             found = true;
             break;
@@ -247,9 +248,9 @@ test "leaves damage + apple gating" {
         var seed: i64 = 0;
         while (seed < 300) : (seed += 1) {
             var r = JavaRandom.init(seed * 31 + m);
-            const k = rollDrops(18, m, &r, &out);
+            const k = rollDrops(ids.leaves, m, &r, &out);
             var i: usize = 0;
-            while (i < k) : (i += 1) try std.testing.expect(out[i].item_id != 260);
+            while (i < k) : (i += 1) try std.testing.expect(out[i].item_id != ids.apple);
         }
     }
 }

@@ -11,6 +11,7 @@ const shaper_mod = @import("shaper.zig");
 const decor_mod = @import("decor.zig");
 const surface_mod = @import("surface.zig");
 const carve_mod = @import("carve.zig");
+const ids = @import("../../ids.zig");
 
 pub const SEA_LEVEL: i32 = 63;
 
@@ -112,7 +113,7 @@ pub const Gen = struct {
                         const lsi = chunk_mod.Section.index(@intCast(lx), @intCast(uy % 16), @intCast(lz));
                         chunk_mod.Section.setNibble(&sec.sky, lsi, sky);
                     }
-                    if (blocks[(lx * 4096 + lz * 256) + uy] != 0 and blocks[(lx * 4096 + lz * 256) + uy] != surface_mod.WATER) sky = 0;
+                    if (blocks[(lx * 4096 + lz * 256) + uy] != ids.air and blocks[(lx * 4096 + lz * 256) + uy] != ids.water) sky = 0;
                 }
             }
         }

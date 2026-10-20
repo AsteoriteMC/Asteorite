@@ -8,6 +8,7 @@
 const std = @import("std");
 const codec = @import("../../net/codec.zig");
 const item = @import("../../item.zig");
+const ids = @import("../../ids.zig");
 
 /// Read one slot. NBT bytes are borrowed from the reader buffer (dupe via
 /// `item.cloneStack` before storing past the current frame). Zero-length NBT
@@ -49,7 +50,7 @@ test "slot roundtrip incl NBT bytes" {
     var buf: [64]u8 = undefined;
     var w = codec.PacketWriter.init(&buf);
     const nbt = [_]u8{ 0x0A, 0x00, 0x00, 0x09 };
-    const s: ?item.Stack = .{ .id = 276, .count = 1, .damage = 0, .nbt = &nbt };
+    const s: ?item.Stack = .{ .id = ids.diamond_sword, .count = 1, .damage = 0, .nbt = &nbt };
     try writeSlot(&w, s);
     try writeSlot(&w, null);
     var r = codec.PacketReader.init(w.written());
@@ -61,7 +62,7 @@ test "slot roundtrip incl NBT bytes" {
     // zero-length NBT normalizes to null
     var b2: [32]u8 = undefined;
     var w2 = codec.PacketWriter.init(&b2);
-    try writeSlot(&w2, .{ .id = 1, .count = 64, .damage = 0, .nbt = &.{} });
+    try writeSlot(&w2, .{ .id = ids.stone, .count = 64, .damage = 0, .nbt = &.{} });
     var r2 = codec.PacketReader.init(w2.written());
     const back2 = (try readSlot(&r2)).?;
     try std.testing.expect(back2.nbt == null);

@@ -9,6 +9,7 @@
 const std = @import("std");
 const item_mod = @import("../item.zig");
 const smelting = @import("smelting.zig");
+const ids = @import("../ids.zig");
 
 /// Owned stacks live in the server entity; this operates on borrowed views
 /// (mutations write back counts in place, like vanilla).
@@ -88,8 +89,8 @@ fn doSmelt(slots: *Slots) void {
 
 test "furnace: coal smelts iron on vanilla timing" {
     var s = Slots{
-        .input = .{ .id = 15, .count = 1, .damage = 0, .nbt = null },
-        .fuel = .{ .id = 263, .count = 1, .damage = 0, .nbt = null },
+        .input = .{ .id = ids.iron_ore, .count = 1, .damage = 0, .nbt = null },
+        .fuel = .{ .id = ids.coal, .count = 1, .damage = 0, .nbt = null },
         .output = null,
     };
     var burn: u32 = 0;
@@ -118,7 +119,7 @@ test "furnace: coal smelts iron on vanilla timing" {
 
 test "furnace: no fuel/input/output-full stalls, lava bucket leaves bucket" {
     // no fuel: nothing happens, cook stays 0
-    var s = Slots{ .input = .{ .id = 15, .count = 1, .damage = 0, .nbt = null } };
+    var s = Slots{ .input = .{ .id = ids.iron_ore, .count = 1, .damage = 0, .nbt = null } };
     var burn: u32 = 0;
     var total: u32 = 0;
     var cook: u32 = 0;
@@ -126,9 +127,9 @@ test "furnace: no fuel/input/output-full stalls, lava bucket leaves bucket" {
     try std.testing.expectEqual(@as(u32, 0), cook);
     // output full: cook resets, no consume
     s = .{
-        .input = .{ .id = 15, .count = 1, .damage = 0, .nbt = null },
-        .fuel = .{ .id = 263, .count = 1, .damage = 0, .nbt = null },
-        .output = .{ .id = 265, .count = 64, .damage = 0, .nbt = null },
+        .input = .{ .id = ids.iron_ore, .count = 1, .damage = 0, .nbt = null },
+        .fuel = .{ .id = ids.coal, .count = 1, .damage = 0, .nbt = null },
+        .output = .{ .id = ids.iron_ingot, .count = 64, .damage = 0, .nbt = null },
     };
     // force burning first
     burn = 100;
@@ -139,8 +140,8 @@ test "furnace: no fuel/input/output-full stalls, lava bucket leaves bucket" {
     try std.testing.expect(s.input.?.count == 1); // unconsumed
     // lava bucket leaves an empty bucket
     s = .{
-        .input = .{ .id = 15, .count = 1, .damage = 0, .nbt = null },
-        .fuel = .{ .id = 327, .count = 1, .damage = 0, .nbt = null },
+        .input = .{ .id = ids.iron_ore, .count = 1, .damage = 0, .nbt = null },
+        .fuel = .{ .id = ids.lava_bucket, .count = 1, .damage = 0, .nbt = null },
     };
     burn = 0;
     total = 0;

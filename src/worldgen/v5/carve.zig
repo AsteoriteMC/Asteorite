@@ -10,6 +10,7 @@ const java_random = @import("../rng/java_random.zig");
 const genlayer = @import("genlayer.zig");
 const biome = @import("biome.zig");
 const surface_mod = @import("surface.zig");
+const ids = @import("../../ids.zig");
 
 pub const RANGE: i32 = 8;
 pub const LAVA_Y: i32 = 10;
@@ -227,7 +228,7 @@ pub const Carver = struct {
                     if (jy < 0 or jy >= 256) continue;
                     const cell: usize = @as(usize, @intCast(nx * 16 + nz)) * 256 + @as(usize, @intCast(jy));
                     const id = blocks[cell];
-                    if (id == 8 or id == 9) bl3 = true;
+                    if (id == ids.flowing_water or id == ids.water) bl3 = true;
                     if (jy == n11 - 1 or nx == n9 or nx == n10 - 1 or nz == n13 or nz == n14 - 1) continue;
                     jy = n11;
                 }

@@ -14,6 +14,7 @@ const noise = @import("noise.zig");
 const genlayer = @import("genlayer.zig");
 const biome = @import("biome.zig");
 const surface = @import("surface.zig");
+const ids = @import("../../ids.zig");
 
 pub const SEA_LEVEL: i32 = 63;
 pub const Q_LEN: usize = 5 * 33 * 5;
@@ -324,7 +325,7 @@ test "shaper density+fill match JVM (seed 1 chunk 0,0)" {
     var sum: i64 = 0;
     var stone: usize = 0;
     var water: usize = 0;
-    for (blocks) |v| { sum += @as(i64, v); if (v == 1) stone += 1; if (v == 9) water += 1; }
+    for (blocks) |v| { sum += @as(i64, v); if (v == ids.stone) stone += 1; if (v == ids.water) water += 1; }
     try std.testing.expectEqual(@as(i64, 50432), sum);
     try std.testing.expectEqual(@as(usize, 11840), stone);
     try std.testing.expectEqual(@as(usize, 4288), water);
@@ -346,7 +347,7 @@ test "shaper density+fill match JVM (seed 42 chunk 3,-5)" {
     var sum: i64 = 0;
     var stone: usize = 0;
     var water: usize = 0;
-    for (blocks) |v| { sum += @as(i64, v); if (v == 1) stone += 1; if (v == 9) water += 1; }
+    for (blocks) |v| { sum += @as(i64, v); if (v == ids.stone) stone += 1; if (v == ids.water) water += 1; }
     try std.testing.expectEqual(@as(i64, 18016), sum);
     try std.testing.expectEqual(@as(usize, 18016), stone);
     try std.testing.expectEqual(@as(usize, 0), water);
@@ -368,7 +369,7 @@ test "shaper density+fill match JVM (seed 12345 chunk -7,11)" {
     var sum: i64 = 0;
     var stone: usize = 0;
     var water: usize = 0;
-    for (blocks) |v| { sum += @as(i64, v); if (v == 1) stone += 1; if (v == 9) water += 1; }
+    for (blocks) |v| { sum += @as(i64, v); if (v == ids.stone) stone += 1; if (v == ids.water) water += 1; }
     try std.testing.expectEqual(@as(i64, 20579), sum);
     try std.testing.expectEqual(@as(usize, 20579), stone);
     try std.testing.expectEqual(@as(usize, 0), water);

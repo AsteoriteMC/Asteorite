@@ -19,6 +19,7 @@ const cfb8 = @import("cfb8.zig");
 const rsa_mod = @import("rsa.zig");
 const mojang = @import("mojang.zig");
 const spin = @import("../sim/spin.zig");
+const game_ids = @import("../ids.zig");
 
 /// Server-driven tick intervals.
 pub const keepalive_interval_ms: i64 = 15000;
@@ -1245,7 +1246,7 @@ pub const Conn = struct {
         switch (status) {
             0 => { // start
                 if (!self.inReach(x, y, z)) return .none;
-                if (creative) return .{ .block_set = .{ .x = x, .y = y, .z = z, .id = 0, .meta = 0 } };
+                if (creative) return .{ .block_set = .{ .x = x, .y = y, .z = z, .id = game_ids.air, .meta = 0 } };
                 self.pending_dig = .{ .x = x, .y = y, .z = z };
                 return .none;
             },
@@ -1267,7 +1268,7 @@ pub const Conn = struct {
                 } else {
                     self.pending_dig = null;
                 }
-                return .{ .block_set = .{ .x = x, .y = y, .z = z, .id = 0, .meta = 0 } };
+                return .{ .block_set = .{ .x = x, .y = y, .z = z, .id = game_ids.air, .meta = 0 } };
             },
             else => return .none, // eat-finish etc: ignored
         }
@@ -1678,7 +1679,7 @@ test "dig/place/held/creative/arm behavior" {
     // creative: finish also breaks
     {
         const act = try feed(&c, 0x07, digBody(2, 8, 64, 9, &db));
-        try std.testing.expect(act.?.block_set.id == 0);
+        try std.testing.expect(act.?.block_set.id == game_ids.air);
     }
     // far away: ignored
     {
@@ -1693,7 +1694,7 @@ test "dig/place/held/creative/arm behavior" {
         try std.testing.expect((try feed(&s, 0x07, digBody(2, 8, 64, 9, &db))).? == .none);
         try std.testing.expect((try feed(&s, 0x07, digBody(0, 8, 64, 9, &db))).? == .none); // start
         const act = try feed(&s, 0x07, digBody(2, 8, 64, 9, &db));
-        try std.testing.expect(act.?.block_set.id == 0);
+        try std.testing.expect(act.?.block_set.id == game_ids.air);
         // cancel clears pending: start then cancel then finish -> none
         _ = try feed(&s, 0x07, digBody(0, 8, 64, 10, &db));
         var cb: [32]u8 = undefined;
@@ -1711,7 +1712,7 @@ test "dig/place/held/creative/arm behavior" {
         try w.writeShort(3);
         try w.writeShort(-1);
         _ = try feed(&c, 0x10, w.written());
-        try std.testing.expect(c.inv[38].?.id == 1);
+        try std.testing.expect(c.inv[38].?.id == game_ids.stone);
         // select hotbar slot 2
         var hb: [8]u8 = undefined;
         var hw = codec.PacketWriter.init(&hb);
@@ -1816,10 +1817,10 @@ test "use entity: attack validation, damage table, dead gates, respawn" {
     // self-hit dropped
     try std.testing.expect((try feed(&c, 0x02, useBody(7, 1, &ub))).? == .none);
     // damage table: diamond sword 7, iron axe 5, stick 1
-    try std.testing.expectApproxEqAbs(@as(f32, 7.0), item_mod.meleeDamage(276), 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 5.0), item_mod.meleeDamage(258), 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), item_mod.meleeDamage(280), 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), item_mod.meleeDamage(0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 7.0), item_mod.meleeDamage(game_ids.diamond_sword), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), item_mod.meleeDamage(game_ids.iron_axe), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), item_mod.meleeDamage(game_ids.stick), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), item_mod.meleeDamage(game_ids.air), 1e-6);
     // diamond sword in hand -> 7.0 event
     {
         var cb: [32]u8 = undefined;
@@ -1829,7 +1830,7 @@ test "use entity: attack validation, damage table, dead gates, respawn" {
         try w.writeByte(1);
         try w.writeShort(0);
         try w.writeShort(-1);
-        c.inv[36] = .{ .id = 276, .count = 1, .damage = 0, .nbt = null };
+        c.inv[36] = .{ .id = game_ids.diamond_sword, .count = 1, .damage = 0, .nbt = null };
         c.selected = 0;
         const act = try feed(&c, 0x02, useBody(100, 1, &ub));
         try std.testing.expectApproxEqAbs(@as(f32, 7.0), act.?.attack.dmg, 1e-6);
@@ -1884,11 +1885,11 @@ test "crafting table: 3x3 take, shift-craft, close drops grid" {
     // open + iron pickaxe shape (row0 iron, stick col1 rows1-2)
     c.openTableUI(8, 64, 8);
     try std.testing.expect(c.open_win != null);
-    c.table[1] = .{ .id = 265, .count = 1, .damage = 0, .nbt = null };
-    c.table[2] = .{ .id = 265, .count = 1, .damage = 0, .nbt = null };
-    c.table[3] = .{ .id = 265, .count = 1, .damage = 0, .nbt = null };
-    c.table[5] = .{ .id = 280, .count = 1, .damage = 0, .nbt = null };
-    c.table[8] = .{ .id = 280, .count = 1, .damage = 0, .nbt = null };
+    c.table[1] = .{ .id = game_ids.iron_ingot, .count = 1, .damage = 0, .nbt = null };
+    c.table[2] = .{ .id = game_ids.iron_ingot, .count = 1, .damage = 0, .nbt = null };
+    c.table[3] = .{ .id = game_ids.iron_ingot, .count = 1, .damage = 0, .nbt = null };
+    c.table[5] = .{ .id = game_ids.stick, .count = 1, .damage = 0, .nbt = null };
+    c.table[8] = .{ .id = game_ids.stick, .count = 1, .damage = 0, .nbt = null };
     c.refreshTable();
     try std.testing.expect(c.table[0] != null);
     try std.testing.expectEqual(@as(u16, 257), c.table[0].?.id);
@@ -1914,8 +1915,8 @@ test "crafting table: 3x3 take, shift-craft, close drops grid" {
         { const o = try c.takeOutput(); defer a.free(o); }
     }
     // shift-craft sticks x64: grid col0 rows0-2... use 3-high column? sticks need 2x1; fill col0
-    c.table[1] = .{ .id = 5, .count = 64, .damage = 0, .nbt = null };
-    c.table[4] = .{ .id = 5, .count = 64, .damage = 0, .nbt = null };
+    c.table[1] = .{ .id = game_ids.planks, .count = 64, .damage = 0, .nbt = null };
+    c.table[4] = .{ .id = game_ids.planks, .count = 64, .damage = 0, .nbt = null };
     {
         var cb: [64]u8 = undefined;
         var w = codec.PacketWriter.init(&cb);
@@ -1928,14 +1929,14 @@ test "crafting table: 3x3 take, shift-craft, close drops grid" {
         try w.writeShort(-1);
         _ = try feed(&c, 0x0E, w.written());
         var total: i32 = 0;
-        for (9..45) |i| if (c.inv[i]) |st| if (st.id == 280) {
+        for (9..45) |i| if (c.inv[i]) |st| if (st.id == game_ids.stick) {
             total += st.count;
         };
         try std.testing.expectEqual(@as(i32, 256), total);
         { const o = try c.takeOutput(); defer a.free(o); }
     }
     // close (0x0D) drops remaining grid stacks as entities
-    c.table[6] = .{ .id = 1, .count = 7, .damage = 0, .nbt = null };
+    c.table[6] = .{ .id = game_ids.stone, .count = 7, .damage = 0, .nbt = null };
     {
         var cb: [8]u8 = undefined;
         var w = codec.PacketWriter.init(&cb);
@@ -1956,8 +1957,8 @@ test "crafting table: 3x3 take, shift-craft, close drops grid" {
     // table shift-craft (craftAll path, window 1): sticks from 2x64 planks
     {
         c.openTableUI(8, 64, 8);
-        c.table[1] = .{ .id = 5, .count = 64, .damage = 0, .nbt = null };
-        c.table[4] = .{ .id = 5, .count = 64, .damage = 0, .nbt = null };
+        c.table[1] = .{ .id = game_ids.planks, .count = 64, .damage = 0, .nbt = null };
+        c.table[4] = .{ .id = game_ids.planks, .count = 64, .damage = 0, .nbt = null };
         c.refreshTable();
         var cb: [64]u8 = undefined;
         var w = codec.PacketWriter.init(&cb);
@@ -1970,7 +1971,7 @@ test "crafting table: 3x3 take, shift-craft, close drops grid" {
         try w.writeShort(-1);
         _ = try feed(&c, 0x0E, w.written());
         var total: i32 = 0;
-        for (9..45) |i| if (c.inv[i]) |st| if (st.id == 280) {
+        for (9..45) |i| if (c.inv[i]) |st| if (st.id == game_ids.stick) {
             total += st.count;
         };
         try std.testing.expectEqual(@as(i32, 256), total);
@@ -2054,8 +2055,8 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
     }
     // 0. Crafting 2x2: sticks from 2 planks, take consumes grid.
     {
-        c.inv[1] = .{ .id = 5, .count = 1, .damage = 0, .nbt = null };
-        c.inv[3] = .{ .id = 5, .count = 1, .damage = 0, .nbt = null };
+        c.inv[1] = .{ .id = game_ids.planks, .count = 1, .damage = 0, .nbt = null };
+        c.inv[3] = .{ .id = game_ids.planks, .count = 1, .damage = 0, .nbt = null };
         c.refreshCrafting();
         try std.testing.expect(c.inv[0] != null);
         try std.testing.expectEqual(@as(u16, 280), c.inv[0].?.id);
@@ -2082,8 +2083,8 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
     }
     // 0b. Shift-click result crafts repeatedly into the pack.
     {
-        c.inv[1] = .{ .id = 5, .count = 64, .damage = 0, .nbt = null };
-        c.inv[3] = .{ .id = 5, .count = 64, .damage = 0, .nbt = null };
+        c.inv[1] = .{ .id = game_ids.planks, .count = 64, .damage = 0, .nbt = null };
+        c.inv[3] = .{ .id = game_ids.planks, .count = 64, .damage = 0, .nbt = null };
         c.refreshCrafting();
         var cb: [64]u8 = undefined;
         var w = codec.PacketWriter.init(&cb);
@@ -2096,7 +2097,7 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
         _ = try feed(&c, 0x0E, w.written());
         // 64 crafts x4 sticks = 256 sticks across 4+ stacks in main
         var total: i32 = 0;
-        for (9..45) |i| if (c.inv[i]) |st| if (st.id == 280) {
+        for (9..45) |i| if (c.inv[i]) |st| if (st.id == game_ids.stick) {
             total += st.count;
         };
         try std.testing.expectEqual(@as(i32, 256), total);
@@ -2108,8 +2109,8 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
     // 0. Creative 0x10 rejects the result slot (vanilla parity).
     {
         // two planks vertical = sticks (a lone plank is a button)
-        c.inv[1] = .{ .id = 5, .count = 1, .damage = 0, .nbt = null };
-        c.inv[3] = .{ .id = 5, .count = 1, .damage = 0, .nbt = null };
+        c.inv[1] = .{ .id = game_ids.planks, .count = 1, .damage = 0, .nbt = null };
+        c.inv[3] = .{ .id = game_ids.planks, .count = 1, .damage = 0, .nbt = null };
         c.refreshCrafting();
         try std.testing.expect(c.inv[0] != null); // sticks offered
         var cb: [32]u8 = undefined;
@@ -2132,7 +2133,7 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
     }
     // 0. Q-drop: status 4 drops one (slot decrements, event owns one),
     // status 3 drops the whole stack (slot empties).
-    c.inv[36] = .{ .id = 264, .count = 5, .damage = 0, .nbt = null };
+    c.inv[36] = .{ .id = game_ids.diamond, .count = 5, .damage = 0, .nbt = null };
     {
         var qb: [32]u8 = undefined;
         var qw = codec.PacketWriter.init(&qb);
@@ -2166,7 +2167,7 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
         item_mod.freeStack(a, &owned);
     }
     // 1. pickup all (left on stack, empty cursor) -> slot empty, cursor full
-    c.inv[10] = .{ .id = 1, .count = 64, .damage = 0, .nbt = null };
+    c.inv[10] = .{ .id = game_ids.stone, .count = 64, .damage = 0, .nbt = null };
     try std.testing.expect((try click(&c, 10, 0, 1, 0)).? == .none);
     try std.testing.expect(c.inv[10] == null);
     try std.testing.expectEqual(@as(i8, 64), c.cursor.?.count);
@@ -2201,7 +2202,7 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
     try std.testing.expect(c.cursor == null);
     { const o = try c.takeOutput(); defer a.free(o); }
     // 3. right-click pickup half (ceil): 10 -> cursor 5, slot 5
-    c.inv[12] = .{ .id = 1, .count = 10, .damage = 0, .nbt = null };
+    c.inv[12] = .{ .id = game_ids.stone, .count = 10, .damage = 0, .nbt = null };
     try std.testing.expect((try click(&c, 12, 1, 3, 0)).? == .none);
     try std.testing.expectEqual(@as(i8, 5), c.cursor.?.count);
     try std.testing.expectEqual(@as(i8, 5), c.inv[12].?.count);
@@ -2212,15 +2213,15 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
     try std.testing.expectEqual(@as(i8, 4), c.cursor.?.count);
     { const o = try c.takeOutput(); defer a.free(o); }
     // 5. merge: slot has 60, cursor has 10 of same -> slot 64, cursor 6
-    c.inv[14] = .{ .id = 1, .count = 60, .damage = 0, .nbt = null };
-    c.cursor = .{ .id = 1, .count = 10, .damage = 0, .nbt = null };
+    c.inv[14] = .{ .id = game_ids.stone, .count = 60, .damage = 0, .nbt = null };
+    c.cursor = .{ .id = game_ids.stone, .count = 10, .damage = 0, .nbt = null };
     try std.testing.expect((try click(&c, 14, 0, 5, 0)).? == .none);
     try std.testing.expectEqual(@as(i8, 64), c.inv[14].?.count);
     try std.testing.expectEqual(@as(i8, 6), c.cursor.?.count);
     { const o = try c.takeOutput(); defer a.free(o); }
     // 6. swap: cursor stone vs slot dirt
-    c.inv[16] = .{ .id = 3, .count = 5, .damage = 0, .nbt = null };
-    c.cursor = .{ .id = 1, .count = 6, .damage = 0, .nbt = null };
+    c.inv[16] = .{ .id = game_ids.dirt, .count = 5, .damage = 0, .nbt = null };
+    c.cursor = .{ .id = game_ids.stone, .count = 6, .damage = 0, .nbt = null };
     try std.testing.expect((try click(&c, 16, 0, 6, 0)).? == .none);
     try std.testing.expectEqual(@as(u16, 1), c.inv[16].?.id);
     try std.testing.expectEqual(@as(i8, 6), c.inv[16].?.count);
@@ -2229,32 +2230,32 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
     // 7. shift-click merge: main slot 20 (dirt 32) into hotbar 36 (dirt 32)
     // exact fill: source empties, no remainder to place
     c.cursor = null;
-    c.inv[20] = .{ .id = 1, .count = 32, .damage = 0, .nbt = null };
-    c.inv[36] = .{ .id = 1, .count = 32, .damage = 0, .nbt = null };
-    c.inv[37] = .{ .id = 2, .count = 1, .damage = 0, .nbt = null };
+    c.inv[20] = .{ .id = game_ids.stone, .count = 32, .damage = 0, .nbt = null };
+    c.inv[36] = .{ .id = game_ids.stone, .count = 32, .damage = 0, .nbt = null };
+    c.inv[37] = .{ .id = game_ids.grass, .count = 1, .damage = 0, .nbt = null };
     try std.testing.expect((try click(&c, 20, 0, 7, 1)).? == .none);
     try std.testing.expect(c.inv[20] == null);
     try std.testing.expectEqual(@as(i8, 64), c.inv[36].?.count);
     try std.testing.expect(c.inv[38] == null);
     // 7b. shift-click fill: no merge target -> first empty dest slot (38)
-    c.inv[24] = .{ .id = 1, .count = 10, .damage = 0, .nbt = null };
+    c.inv[24] = .{ .id = game_ids.stone, .count = 10, .damage = 0, .nbt = null };
     try std.testing.expect((try click(&c, 24, 0, 8, 1)).? == .none);
     try std.testing.expect(c.inv[24] == null);
     try std.testing.expectEqual(@as(i8, 10), c.inv[38].?.count);
     { const o = try c.takeOutput(); defer a.free(o); }
     // 8. number key: swap slot 21 with hotbar 0 (button 0); ignored w/ cursor
-    c.inv[21] = .{ .id = 5, .count = 1, .damage = 0, .nbt = null };
-    c.inv[36] = .{ .id = 1, .count = 64, .damage = 0, .nbt = null };
+    c.inv[21] = .{ .id = game_ids.planks, .count = 1, .damage = 0, .nbt = null };
+    c.inv[36] = .{ .id = game_ids.stone, .count = 64, .damage = 0, .nbt = null };
     try std.testing.expect((try click(&c, 21, 0, 9, 2)).? == .none);
     try std.testing.expectEqual(@as(u16, 1), c.inv[21].?.id);
     try std.testing.expectEqual(@as(u16, 5), c.inv[36].?.id);
-    c.cursor = .{ .id = 1, .count = 1, .damage = 0, .nbt = null };
+    c.cursor = .{ .id = game_ids.stone, .count = 1, .damage = 0, .nbt = null };
     try std.testing.expect((try click(&c, 21, 1, 10, 2)).? == .none);
     try std.testing.expectEqual(@as(u16, 1), c.inv[21].?.id); // unchanged
     c.cursor = null;
     { const o = try c.takeOutput(); defer a.free(o); }
     // 9. desync: reused action number triggers full Window Items + ignore
-    c.inv[22] = .{ .id = 7, .count = 3, .damage = 0, .nbt = null };
+    c.inv[22] = .{ .id = game_ids.bedrock, .count = 3, .damage = 0, .nbt = null };
     try std.testing.expect((try click(&c, 22, 0, 10, 0)).? == .none); // stale action
     try std.testing.expectEqual(@as(u16, 7), c.inv[22].?.id); // untouched
     try std.testing.expectEqual(@as(i8, 3), c.inv[22].?.count);
@@ -2270,7 +2271,7 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
     // (same allocation, no copy); split-half copies them (no aliasing).
     const tag = [_]u8{ 0x0A, 0x00, 0x03, 0x64, 0x75, 0x6D };
     const owned_tag = try a.dupe(u8, &tag);
-    c.inv[30] = .{ .id = 276, .count = 1, .damage = 0, .nbt = owned_tag };
+    c.inv[30] = .{ .id = game_ids.diamond_sword, .count = 1, .damage = 0, .nbt = owned_tag };
     try std.testing.expect((try click(&c, 30, 0, 11, 0)).? == .none); // pickup
     try std.testing.expect(c.inv[30] == null);
     try std.testing.expectEqualSlices(u8, &tag, c.cursor.?.nbt.?);
@@ -2283,7 +2284,7 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
     { const o = try c.takeOutput(); defer a.free(o); }
     // two-stack split: fresh enchanted stack of 2, right-click takes half
     const tag2 = try a.dupe(u8, &tag);
-    c.inv[32] = .{ .id = 276, .count = 2, .damage = 0, .nbt = tag2 };
+    c.inv[32] = .{ .id = game_ids.diamond_sword, .count = 2, .damage = 0, .nbt = tag2 };
     try std.testing.expect((try click(&c, 32, 1, 13, 0)).? == .none);
     try std.testing.expectEqual(@as(i8, 1), c.cursor.?.count);
     try std.testing.expectEqual(@as(i8, 1), c.inv[32].?.count);

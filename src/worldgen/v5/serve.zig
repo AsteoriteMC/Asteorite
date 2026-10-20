@@ -14,6 +14,7 @@ const view_mod = @import("../../sim/view.zig");
 const spin_mod = @import("../../sim/spin.zig");
 const gen_mod = @import("gen.zig");
 const shaper_mod = @import("shaper.zig");
+const ids = @import("../../ids.zig");
 
 /// Get-or-generate one column's ZC1 bytes (owned by `alloc`).
 /// Lock must serialize concurrent gen (chain states) + pool RMW.
@@ -134,7 +135,7 @@ pub fn findSpawn(
                     const id = sec.blocks[lsi] & 0x0FFF;
                     // NOTE: water/snow-covered tops don't count; need solid ground.
                     // Water surface also exceeds sea level — skip it.
-                    if (id == 0 or id == 9) continue;
+                    if (id == ids.air or id == ids.water) continue;
                     break :blk .{
                         .x = @as(f64, @floatFromInt(cx * 16 + @as(i32, @intCast(lx)))) + 0.5,
                         .y = @as(f64, @floatFromInt(top + 1)),

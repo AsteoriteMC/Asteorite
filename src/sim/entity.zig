@@ -10,6 +10,7 @@ const std = @import("std");
 const packets = @import("../proto/v5/packets.zig");
 const conn_mod = @import("../net/conn.zig");
 const item_mod = @import("../item.zig");
+const ids = @import("../ids.zig");
 
 pub const MOB_PIG: u8 = 90;
 pub const MOB_SHEEP: u8 = 91;
@@ -407,25 +408,25 @@ pub fn reconcileViewer(
 }
 
 test "item merge rules (vanilla xk semantics)" {
-    var big = ItemEnt{ .id = 1, .x = 0, .y = 64, .z = 0, .stack = .{ .id = 264, .count = 60, .damage = 0, .nbt = null }, .delay = 5, .age = 100 };
-    var small = ItemEnt{ .id = 2, .x = 0, .y = 64, .z = 0, .stack = .{ .id = 264, .count = 4, .damage = 0, .nbt = null }, .delay = 40, .age = 10 };
+    var big = ItemEnt{ .id = 1, .x = 0, .y = 64, .z = 0, .stack = .{ .id = ids.diamond, .count = 60, .damage = 0, .nbt = null }, .delay = 5, .age = 100 };
+    var small = ItemEnt{ .id = 2, .x = 0, .y = 64, .z = 0, .stack = .{ .id = ids.diamond, .count = 4, .damage = 0, .nbt = null }, .delay = 40, .age = 10 };
     try std.testing.expect(big.tryMerge(&small));
     try std.testing.expectEqual(@as(i8, 64), big.stack.count);
     try std.testing.expectEqual(@as(u32, 40), big.delay); // max
     try std.testing.expectEqual(@as(u32, 10), big.age); // min
     // small-into-big direction refuses (caller tries the other way)
-    var a = ItemEnt{ .id = 3, .x = 0, .y = 64, .z = 0, .stack = .{ .id = 264, .count = 4, .damage = 0, .nbt = null } };
-    var b = ItemEnt{ .id = 4, .x = 0, .y = 64, .z = 0, .stack = .{ .id = 264, .count = 60, .damage = 0, .nbt = null } };
+    var a = ItemEnt{ .id = 3, .x = 0, .y = 64, .z = 0, .stack = .{ .id = ids.diamond, .count = 4, .damage = 0, .nbt = null } };
+    var b = ItemEnt{ .id = 4, .x = 0, .y = 64, .z = 0, .stack = .{ .id = ids.diamond, .count = 60, .damage = 0, .nbt = null } };
     try std.testing.expect(!a.tryMerge(&b));
     try std.testing.expect(b.tryMerge(&a));
     // over max stack refuses
-    var c = ItemEnt{ .id = 5, .x = 0, .y = 64, .z = 0, .stack = .{ .id = 264, .count = 64, .damage = 0, .nbt = null } };
-    var d = ItemEnt{ .id = 6, .x = 0, .y = 64, .z = 0, .stack = .{ .id = 264, .count = 1, .damage = 0, .nbt = null } };
+    var c = ItemEnt{ .id = 5, .x = 0, .y = 64, .z = 0, .stack = .{ .id = ids.diamond, .count = 64, .damage = 0, .nbt = null } };
+    var d = ItemEnt{ .id = 6, .x = 0, .y = 64, .z = 0, .stack = .{ .id = ids.diamond, .count = 1, .damage = 0, .nbt = null } };
     try std.testing.expect(!c.tryMerge(&d));
     // different id / damage refuse
-    var e = ItemEnt{ .id = 7, .x = 0, .y = 64, .z = 0, .stack = .{ .id = 263, .count = 1, .damage = 0, .nbt = null } };
+    var e = ItemEnt{ .id = 7, .x = 0, .y = 64, .z = 0, .stack = .{ .id = ids.coal, .count = 1, .damage = 0, .nbt = null } };
     try std.testing.expect(!c.tryMerge(&e));
-    var f = ItemEnt{ .id = 8, .x = 0, .y = 64, .z = 0, .stack = .{ .id = 264, .count = 1, .damage = 1, .nbt = null } };
+    var f = ItemEnt{ .id = 8, .x = 0, .y = 64, .z = 0, .stack = .{ .id = ids.diamond, .count = 1, .damage = 1, .nbt = null } };
     try std.testing.expect(!c.tryMerge(&f));
     // claims: first wins, full rejects
     var claims = ClaimSet{};
@@ -444,7 +445,7 @@ test "pickup grants to inventory with collect + destroy" {
         .x = 0.5,
         .y = 64.1,
         .z = 0.5,
-        .item_id = 264,
+        .item_id = ids.diamond,
         .count = 3,
         .damage = 0,
         .can_pickup = true,

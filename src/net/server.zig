@@ -36,6 +36,7 @@ const ids = @import("../proto/v5/ids.zig");
 const entity = @import("../sim/entity.zig");
 const v5gen = @import("../worldgen/v5/gen.zig");
 const v5serve = @import("../worldgen/v5/serve.zig");
+const game_ids = @import("../ids.zig");
 
 /// Handshake/login must complete within this window (anti-slowloris).
 pub const login_timeout_ms: i64 = 30000;
@@ -663,7 +664,7 @@ pub const Server = struct {
         const id = std.fmt.parseInt(u16, toks[1], 10) catch {
             return "Usage: /give <player> <id> [count] [damage]";
         };
-        if (id == 0 or id > 4095) {
+        if (id == game_ids.air or id > 4095) {
             return "Usage: /give <player> <id> [count] [damage]";
         }
         var count: i32 = 1;
@@ -1203,12 +1204,12 @@ pub const Server = struct {
                 const eyes: u8 = @intFromFloat(@max(0, @min(255, p.y + 1.62)));
                 const feet: u8 = @intFromFloat(@max(0, @min(255, p.y)));
                 if (view.peekBlock(pool, self.gpa, ex, eyes, ez) catch null) |b| {
-                    envs[i].water = b.id == 8 or b.id == 9;
+                    envs[i].water = b.id == game_ids.flowing_water or b.id == game_ids.water;
                     envs[i].suff = view.isOpaqueCube(b.id);
-                    if (b.id == 10 or b.id == 11) envs[i].lava = true;
+                    if (b.id == game_ids.flowing_lava or b.id == game_ids.lava) envs[i].lava = true;
                 }
                 if (view.peekBlock(pool, self.gpa, ex, feet, ez) catch null) |b| {
-                    if (b.id == 10 or b.id == 11) envs[i].lava = true;
+                    if (b.id == game_ids.flowing_lava or b.id == game_ids.lava) envs[i].lava = true;
                 }
             }
             self.world_lock.unlock();
@@ -1353,8 +1354,8 @@ pub const Server = struct {
             for (furn_swaps[0..n_swaps], 0..) |sw, i| {
                 if (self.world) |pool| {
                     const cur = view.peekBlock(pool, self.gpa, sw.x, sw.y, sw.z) catch null;
-                    if (cur) |c| if (c.id == 61 or c.id == 62) {
-                        view.applyBlock(pool, self.gpa, sw.x, sw.y, sw.z, if (sw.lit) 62 else 61, 0) catch {};
+                    if (cur) |c| if (c.id == game_ids.furnace or c.id == game_ids.lit_furnace) {
+                        view.applyBlock(pool, self.gpa, sw.x, sw.y, sw.z, if (sw.lit) game_ids.lit_furnace else game_ids.furnace, 0) catch {};
                         applied[i] = true;
                     };
                 }
@@ -1362,7 +1363,7 @@ pub const Server = struct {
             self.world_lock.unlock();
             for (furn_swaps[0..n_swaps], 0..) |sw, i| {
                 if (!applied[i]) continue;
-                self.broadcastBlockChange(null, sw.x, sw.y, sw.z, if (sw.lit) 62 else 61, 0) catch {};
+                self.broadcastBlockChange(null, sw.x, sw.y, sw.z, if (sw.lit) game_ids.lit_furnace else game_ids.furnace, 0) catch {};
             }
         }
         for (furn_snaps[0..n_furn]) |s| {
@@ -1634,7 +1635,7 @@ pub const Server = struct {
             const feet: u8 = @intFromFloat(@max(0, @min(255, fall.y)));
             const blk = view.peekBlock(pool, self.gpa, @intFromFloat(@floor(fall.x)), feet, @intFromFloat(@floor(fall.z))) catch null;
             self.world_lock.unlock();
-            if (blk) |b| water = b.id == 8 or b.id == 9;
+            if (blk) |b| water = b.id == game_ids.flowing_water or b.id == game_ids.water;
         }
         if (water) return; // splash landing: vanilla resets fallDistance
         const dmg = @ceil(fall.dist - 3.0);
@@ -1843,7 +1844,7 @@ pub const Server = struct {
         }
         if (cy < 0 or cy > 255) return false;
         const clicked = view.peekBlock(pool, allocator, cx, @intCast(cy), cz) catch null;
-        if (clicked == null or clicked.?.id != 58) return false;
+        if (clicked == null or clicked.?.id != game_ids.crafting_table) return false;
         conn.lock.lock();
         const sneak = conn.sneaking;
         conn.lock.unlock();
@@ -1873,7 +1874,7 @@ pub const Server = struct {
         }
         if (cy < 0 or cy > 255) return false;
         const clicked = view.peekBlock(pool, allocator, cx, @intCast(cy), cz) catch null;
-        if (clicked == null or (clicked.?.id != 61 and clicked.?.id != 62)) return false;
+        if (clicked == null or (clicked.?.id != game_ids.furnace and clicked.?.id != game_ids.lit_furnace)) return false;
         conn.lock.lock();
         const sneak = conn.sneaking;
         conn.lock.unlock();
@@ -2477,7 +2478,7 @@ pub fn serveConn(
                         .block_set => |*b| {
                             // Right-click on a crafting table (not sneaking)
                             // opens the 3x3 UI instead of placing.
-                            if (b.id != 0) {
+                            if (b.id != game_ids.air) {
                                 if (server.tryOpenTable(conn, pool, allocator, b)) {
                                     events.items[i] = .none;
                                     continue;
@@ -2494,20 +2495,20 @@ pub fn serveConn(
                             // Survival break of a real block: vanilla drops.
                             // (Creative breaks drop nothing; missing chunks
                             // peek null and stay dropless.)
-                            if (b.id == 0) {
+                            if (b.id == game_ids.air) {
                                 if (old) |o| {
-                                    if (o.id != 0 and conn.config.gamemode == 0) {
+                                    if (o.id != game_ids.air and conn.config.gamemode == 0) {
                                         server.spawnBreakDrops(pool, allocator, b.x, b.y, b.z, o.id, o.meta);
                                     }
                                     // Table break with viewers: drop their
                                     // grids + close the windows.
-                                    if (o.id == 58) server.closeWindowsAt(pool, allocator, b.x, b.y, b.z);
+                                    if (o.id == game_ids.crafting_table) server.closeWindowsAt(pool, allocator, b.x, b.y, b.z);
                                     // Furnace break: close viewer windows and
                                     // drop input/fuel/output as entities
                                     // (both modes, like table grids; the
                                     // block itself drops only in survival
                                     // via spawnBreakDrops above).
-                                    if (o.id == 61 or o.id == 62) {
+                                    if (o.id == game_ids.furnace or o.id == game_ids.lit_furnace) {
                                         server.closeWindowsAt(pool, allocator, b.x, b.y, b.z);
                                         var removed = server.removeFurnace(b.x, b.y, b.z);
                                         const fstacks = [_]*?item_mod.Stack{ &removed.input, &removed.fuel, &removed.output };
@@ -2532,7 +2533,7 @@ pub fn serveConn(
                     .block_set => |b| {
                         server.broadcastBlockChange(conn, b.x, b.y, b.z, b.id, b.meta) catch {};
                         // Survival break: vanilla 0.025 exhaustion per block.
-                        if (b.id == 0) {
+                        if (b.id == game_ids.air) {
                             conn.lock.lock();
                             if (conn.config.gamemode == 0 and !conn.is_dead) conn.addExhaustion(0.025);
                             conn.lock.unlock();
@@ -3339,9 +3340,9 @@ test "player save/load roundtrip via pool (pos/health/inv/NBT)" {
     c.config.spawn_z = 8;
     const tag = [_]u8{ 0x0A, 0x00, 0x03, 0x64, 0x75, 0x6D };
     const owned = try a.dupe(u8, &tag);
-    c.inv[36] = .{ .id = 276, .count = 1, .damage = 0, .nbt = owned };
-    c.inv[10] = .{ .id = 1, .count = 64, .damage = 0, .nbt = null };
-    c.cursor = .{ .id = 3, .count = 5, .damage = 0, .nbt = null };
+    c.inv[36] = .{ .id = game_ids.diamond_sword, .count = 1, .damage = 0, .nbt = owned };
+    c.inv[10] = .{ .id = game_ids.stone, .count = 64, .damage = 0, .nbt = null };
+    c.cursor = .{ .id = game_ids.dirt, .count = 5, .damage = 0, .nbt = null };
     srv.savePlayer(c);
     // Mutate everything; load must restore.
     c.pos_x = 999;
@@ -3892,7 +3893,7 @@ test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
     defer a.free(_r22);
     try std.testing.expectEqualStrings("{\"text\":\"Usage: /time <set|add> <value|day|night>\"}", _r22);
     // Full inventory: /give reports partial with leftover.
-    for (9..45) |s| bob.inv[s] = .{ .id = 5, .count = 64, .damage = 0, .nbt = null };
+    for (9..45) |s| bob.inv[s] = .{ .id = game_ids.planks, .count = 64, .damage = 0, .nbt = null };
     srv.handleCommand(alice, "/perm clear BobG zigcraft.command.give");
     const _d8 = try readChat(alice);
     defer a.free(_d8);
@@ -3921,7 +3922,7 @@ test "furnace: take output moves stack to cursor + syncs" {
     conn.open_win = .{ .id = 2, .x = 2, .y = 69, .z = 0 };
     srv.ensureFurnace(2, 69, 0);
     const f = srv.findFurnace(2, 69, 0).?;
-    f.output = .{ .id = 265, .count = 3, .damage = 0, .nbt = null };
+    f.output = .{ .id = game_ids.iron_ingot, .count = 3, .damage = 0, .nbt = null };
     srv.applyFurnaceClick(&conn, .{ .slot = 2, .button = 0, .action = 601, .mode = 0 });
     try std.testing.expect(conn.cursor != null);
     try std.testing.expectEqual(@as(u16, 265), conn.cursor.?.id);

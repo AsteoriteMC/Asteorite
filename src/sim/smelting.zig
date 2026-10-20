@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const data = @import("smelting_data.zig");
+const ids = @import("../ids.zig");
 
 pub const WILD: i16 = 32767;
 
@@ -30,47 +31,47 @@ pub fn burnTime(id: u16) u16 {
 
 /// Container left after burning one fuel item (lava bucket -> empty bucket).
 pub fn containerItem(id: u16) ?u16 {
-    if (id == 327) return 325; // lava_bucket -> bucket
+    if (id == ids.lava_bucket) return ids.bucket; // lava_bucket -> bucket
     return null;
 }
 
 test "smelting table spot checks" {
     // iron/gold/diamond ore (wildcard damage)
-    try std.testing.expectEqual(@as(u16, 265), findResult(15, 3).?.id);
-    try std.testing.expectEqual(@as(u16, 266), findResult(14, 0).?.id);
-    try std.testing.expectEqual(@as(u16, 264), findResult(56, 0).?.id);
+    try std.testing.expectEqual(@as(u16, ids.iron_ingot), findResult(ids.iron_ore, 3).?.id);
+    try std.testing.expectEqual(@as(u16, ids.gold_ingot), findResult(ids.gold_ore, 0).?.id);
+    try std.testing.expectEqual(@as(u16, ids.diamond), findResult(ids.diamond_ore, 0).?.id);
     // sand glass / cobble stone / clay hardened
-    try std.testing.expectEqual(@as(u16, 20), findResult(12, 0).?.id);
-    try std.testing.expectEqual(@as(u16, 1), findResult(4, 0).?.id);
-    try std.testing.expectEqual(@as(u16, 172), findResult(82, 0).?.id);
+    try std.testing.expectEqual(@as(u16, ids.glass), findResult(ids.sand, 0).?.id);
+    try std.testing.expectEqual(@as(u16, ids.stone), findResult(ids.cobblestone, 0).?.id);
+    try std.testing.expectEqual(@as(u16, ids.hardened_clay), findResult(ids.clay, 0).?.id);
     // charcoal from either log
-    try std.testing.expectEqual(@as(i16, 1), findResult(162, 2).?.dmg);
+    try std.testing.expectEqual(@as(i16, 1), findResult(ids.log2, 2).?.dmg);
     // fish keep damage
-    try std.testing.expectEqual(@as(i16, 1), findResult(349, 1).?.dmg);
+    try std.testing.expectEqual(@as(i16, 1), findResult(ids.fish, 1).?.dmg);
     // lapis ore -> dye/4; redstone dust; quartz
-    try std.testing.expectEqual(@as(i16, 4), findResult(21, 0).?.dmg);
-    try std.testing.expectEqual(@as(u16, 331), findResult(73, 0).?.id);
+    try std.testing.expectEqual(@as(i16, 4), findResult(ids.lapis_ore, 0).?.dmg);
+    try std.testing.expectEqual(@as(u16, ids.redstone), findResult(ids.redstone_ore, 0).?.id);
     // cactus green, clay ball brick, porkchop cooked
-    try std.testing.expectEqual(@as(u16, 336), findResult(337, 0).?.id);
-    try std.testing.expectEqual(@as(u16, 320), findResult(319, 0).?.id);
+    try std.testing.expectEqual(@as(u16, ids.brick), findResult(ids.clay_ball, 0).?.id);
+    try std.testing.expectEqual(@as(u16, ids.cooked_porkchop), findResult(ids.porkchop, 0).?.id);
     // no match
-    try std.testing.expect(findResult(1, 0) == null);
-    try std.testing.expect(findResult(5, 0) == null);
+    try std.testing.expect(findResult(ids.stone, 0) == null);
+    try std.testing.expect(findResult(ids.planks, 0) == null);
 }
 
 test "fuel burn times" {
-    try std.testing.expectEqual(@as(u16, 100), burnTime(280)); // stick
-    try std.testing.expectEqual(@as(u16, 1600), burnTime(263)); // coal
-    try std.testing.expectEqual(@as(u16, 20000), burnTime(327)); // lava bucket
-    try std.testing.expectEqual(@as(u16, 100), burnTime(6)); // sapling
-    try std.testing.expectEqual(@as(u16, 2400), burnTime(369)); // blaze rod
-    try std.testing.expectEqual(@as(u16, 16000), burnTime(173)); // coal block
-    try std.testing.expectEqual(@as(u16, 150), burnTime(126)); // wooden slab (not 300!)
-    try std.testing.expectEqual(@as(u16, 200), burnTime(268)); // wooden sword
-    try std.testing.expectEqual(@as(u16, 300), burnTime(5)); // planks (wood set)
-    try std.testing.expectEqual(@as(u16, 300), burnTime(58)); // crafting table (wood set)
-    try std.testing.expectEqual(@as(u16, 0), burnTime(1)); // stone
-    try std.testing.expectEqual(@as(u16, 0), burnTime(265)); // iron ingot
-    try std.testing.expect(containerItem(327).? == 325);
-    try std.testing.expect(containerItem(263) == null);
+    try std.testing.expectEqual(@as(u16, 100), burnTime(ids.stick)); // stick
+    try std.testing.expectEqual(@as(u16, 1600), burnTime(ids.coal)); // coal
+    try std.testing.expectEqual(@as(u16, 20000), burnTime(ids.lava_bucket)); // lava bucket
+    try std.testing.expectEqual(@as(u16, 100), burnTime(ids.sapling)); // sapling
+    try std.testing.expectEqual(@as(u16, 2400), burnTime(ids.blaze_rod)); // blaze rod
+    try std.testing.expectEqual(@as(u16, 16000), burnTime(ids.coal_block)); // coal block
+    try std.testing.expectEqual(@as(u16, 150), burnTime(ids.wooden_slab)); // wooden slab (not 300!)
+    try std.testing.expectEqual(@as(u16, 200), burnTime(ids.wooden_sword)); // wooden sword
+    try std.testing.expectEqual(@as(u16, 300), burnTime(ids.planks)); // planks (wood set)
+    try std.testing.expectEqual(@as(u16, 300), burnTime(ids.crafting_table)); // crafting table (wood set)
+    try std.testing.expectEqual(@as(u16, 0), burnTime(ids.stone)); // stone
+    try std.testing.expectEqual(@as(u16, 0), burnTime(ids.iron_ingot)); // iron ingot
+    try std.testing.expect(containerItem(ids.lava_bucket).? == ids.bucket);
+    try std.testing.expect(containerItem(ids.coal) == null);
 }

@@ -11,6 +11,7 @@ const codec = @import("../../net/codec.zig");
 const ids = @import("ids.zig");
 const item_mod = @import("../../item.zig");
 const slot_mod = @import("slot.zig");
+const game_ids = @import("../../ids.zig");
 
 // ---------- handshaking ----------
 
@@ -813,14 +814,14 @@ test "click window parse + set slot / window items roundtrip" {
     try std.testing.expectEqual(@as(u8, 0x0D), @intFromEnum(ids.PlayServer.close_window));
     // 0x2F roundtrip incl NBT, then 0x30 full window
     const tag = [_]u8{ 0x0A, 0x00, 0x01, 0x58 };
-    const item: ?item_mod.Stack = .{ .id = 276, .count = 1, .damage = 0, .nbt = &tag };
+    const item: ?item_mod.Stack = .{ .id = game_ids.diamond_sword, .count = 1, .damage = 0, .nbt = &tag };
     const sf = try frameSetSlotAlloc(std.testing.allocator, 0, 36, item);
     defer std.testing.allocator.free(sf);
     var r = codec.PacketReader.init(sf);
     try std.testing.expectEqual(@as(i32, 0x2F), (try codec.decodeFrame(&r)).id);
     try std.testing.expectEqual(@as(i8, 0), @as(i8, @bitCast(try r.readByte())));
     try std.testing.expectEqual(@as(i16, 36), try r.readShort());
-    try std.testing.expectEqual(@as(i16, 276), try r.readShort());
+    try std.testing.expectEqual(@as(i16, game_ids.diamond_sword), try r.readShort());
     try std.testing.expectEqual(@as(i8, 1), @as(i8, @bitCast(try r.readByte())));
     try std.testing.expectEqual(@as(i16, 0), try r.readShort());
     try std.testing.expectEqual(@as(i16, 4), try r.readShort());
@@ -1232,7 +1233,7 @@ test "item entity packets roundtrip (spawn/collect/slot-10)" {
     }
     // item metadata: eid + flags/air baseline + 0xAA head + slot + 0x7F end
     {
-        const stack = item_mod.Stack{ .id = 264, .count = 1, .damage = 0, .nbt = null };
+        const stack = item_mod.Stack{ .id = game_ids.diamond, .count = 1, .damage = 0, .nbt = null };
         const f = try frameItemMetadata(51, stack, &buf);
         var r = codec.PacketReader.init(f);
         try std.testing.expectEqual(@as(i32, 0x1C), (try codec.decodeFrame(&r)).id);

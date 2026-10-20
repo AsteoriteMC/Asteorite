@@ -29,25 +29,8 @@ const std = @import("std");
 const java_random = @import("../rng/java_random.zig");
 const carve_mod = @import("carve.zig");
 const genlayer_mod = @import("genlayer.zig");
+const ids = @import("../../ids.zig");
 
-pub const STONE: u16 = 1;
-pub const GRASS: u16 = 2;
-pub const DIRT: u16 = 3;
-pub const SAPLING: u16 = 6;
-pub const CLAY: u16 = 82;
-pub const SAND: u16 = 12;
-pub const GRAVEL: u16 = 13;
-pub const GOLD_ORE: u16 = 14;
-pub const IRON_ORE: u16 = 15;
-pub const COAL_ORE: u16 = 16;
-pub const LOG: u16 = 17;
-pub const LEAVES: u16 = 18;
-pub const LAPIS_ORE: u16 = 21;
-pub const DIAMOND_ORE: u16 = 56;
-pub const REDSTONE_ORE: u16 = 73;
-pub const VINE: u16 = 106;
-pub const LEAVES2: u16 = 161;
-pub const LOG2: u16 = 162;
 
 // ---------------------------------------------------------------------------
 // View: mutable block+meta window with world-coord access.
@@ -92,7 +75,7 @@ pub const View = struct {
     /// Out-of-bounds reads as solid (fail closed, unlike ores which skip).
     pub fn isAir(self: *const View, wx: i32, y: i32, wz: i32) bool {
         const i = self.idx(wx, y, wz) orelse return false;
-        return self.blocks[i] == 0;
+        return self.blocks[i] == ids.air;
     }
 };
 
@@ -196,13 +179,13 @@ test "minable coal matches JVM (seed 42)" {
     for (0..S) |x| {
         for (0..S) |z| {
             for (0..70) |y| {
-                blocks[(x * S + z) * 256 + y] = STONE;
+                blocks[(x * S + z) * 256 + y] = ids.stone;
             }
         }
     }
     var view = View{ .blocks = blocks, .metas = metas, .ox = -32, .oz = -32, .sx = S, .sz = S };
     var r = java_random.JavaRandom.init(42);
-    try minable(&view, &r, 0, 50, 0, COAL_ORE, 16, STONE);
+    try minable(&view, &r, 0, 50, 0, ids.coal_ore, 16, ids.stone);
     // JVM: changed=20, crc over 64x32x64 window around (0,50,0)
     var crc: i64 = 0;
     var changed: usize = 0;
@@ -215,8 +198,8 @@ test "minable coal matches JVM (seed 42)" {
             while (wz < 32) : (wz += 1) {
                 const id = view.get(wx, wy, wz);
                 crc = crc *% 31 +% @as(i64, id);
-                if (id == COAL_ORE) coal += 1;
-                if (id != STONE and id != 0) changed += 1;
+                if (id == ids.coal_ore) coal += 1;
+                if (id != ids.stone and id != ids.air) changed += 1;
             }
         }
     }
@@ -228,11 +211,11 @@ test "minable coal matches JVM (seed 42)" {
 test "minable iron/gold/redstone/diamond/lapis match JVM (seed 42)" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { ore: u16, size: i32, want_n: usize, want_crc: i64 }{
-        .{ .ore = IRON_ORE, .size = 8, .want_n = 4, .want_crc = -4985998703837180800 },
-        .{ .ore = GOLD_ORE, .size = 8, .want_n = 4, .want_crc = -1848336028041915200 },
-        .{ .ore = REDSTONE_ORE, .size = 7, .want_n = 4, .want_crc = -2502993162867069440 },
-        .{ .ore = DIAMOND_ORE, .size = 7, .want_n = 4, .want_crc = -4502959895476209088 },
-        .{ .ore = LAPIS_ORE, .size = 6, .want_n = 4, .want_crc = -5365230684899222784 },
+        .{ .ore = ids.iron_ore, .size = 8, .want_n = 4, .want_crc = -4985998703837180800 },
+        .{ .ore = ids.gold_ore, .size = 8, .want_n = 4, .want_crc = -1848336028041915200 },
+        .{ .ore = ids.redstone_ore, .size = 7, .want_n = 4, .want_crc = -2502993162867069440 },
+        .{ .ore = ids.diamond_ore, .size = 7, .want_n = 4, .want_crc = -4502959895476209088 },
+        .{ .ore = ids.lapis_ore, .size = 6, .want_n = 4, .want_crc = -5365230684899222784 },
     };
     for (cases) |c| {
         const S: usize = 64;
@@ -245,13 +228,13 @@ test "minable iron/gold/redstone/diamond/lapis match JVM (seed 42)" {
         for (0..S) |x| {
             for (0..S) |z| {
                 for (0..70) |y| {
-                    blocks[(x * S + z) * 256 + y] = STONE;
+                    blocks[(x * S + z) * 256 + y] = ids.stone;
                 }
             }
         }
         var view = View{ .blocks = blocks, .metas = metas, .ox = -32, .oz = -32, .sx = S, .sz = S };
         var r = java_random.JavaRandom.init(42);
-        try minable(&view, &r, 0, 50, 0, c.ore, c.size, STONE);
+        try minable(&view, &r, 0, 50, 0, c.ore, c.size, ids.stone);
         var crc: i64 = 0;
         var n: usize = 0;
         var wx: i32 = -32;
@@ -274,8 +257,8 @@ test "minable iron/gold/redstone/diamond/lapis match JVM (seed 42)" {
 test "minable dirt/gravel match JVM (seed 42)" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { ore: u16, size: i32, want_n: usize, want_crc: i64 }{
-        .{ .ore = DIRT, .size = 32, .want_n = 102, .want_crc = 3423075958434408956 },
-        .{ .ore = GRAVEL, .size = 32, .want_n = 102, .want_crc = -8147241372490269720 },
+        .{ .ore = ids.dirt, .size = 32, .want_n = 102, .want_crc = 3423075958434408956 },
+        .{ .ore = ids.gravel, .size = 32, .want_n = 102, .want_crc = -8147241372490269720 },
     };
     for (cases) |c| {
         const S: usize = 64;
@@ -288,13 +271,13 @@ test "minable dirt/gravel match JVM (seed 42)" {
         for (0..S) |x| {
             for (0..S) |z| {
                 for (0..70) |y| {
-                    blocks[(x * S + z) * 256 + y] = STONE;
+                    blocks[(x * S + z) * 256 + y] = ids.stone;
                 }
             }
         }
         var view = View{ .blocks = blocks, .metas = metas, .ox = -32, .oz = -32, .sx = S, .sz = S };
         var r = java_random.JavaRandom.init(42);
-        try minable(&view, &r, 0, 50, 0, c.ore, c.size, STONE);
+        try minable(&view, &r, 0, 50, 0, c.ore, c.size, ids.stone);
         var crc: i64 = 0;
         var n: usize = 0;
         var wx: i32 = -32;
@@ -321,14 +304,14 @@ test "minable dirt/gravel match JVM (seed 42)" {
 /// Replaceable for tree space checks (`arc.a`): air, leaves, grass, dirt,
 /// logs, saplings, vines. Everything else (stone, ores, sand...) fails.
 fn replaceable(id: u16) bool {
-    return id == 0 or id == GRASS or id == DIRT or id == LOG or id == LEAVES or
-        id == LOG2 or id == LEAVES2 or id == SAPLING or id == VINE;
+    return id == ids.air or id == ids.grass or id == ids.dirt or id == ids.log or id == ids.leaves or
+        id == ids.log2 or id == ids.leaves2 or id == ids.sapling or id == ids.vine;
 }
 
 /// Opaque cube for leaf placement (`aji.j()`): leaves and air are NOT
 /// opaque; everything else is. Pre-tree world has no other transparents.
 fn isOpaque(id: u16) bool {
-    return id != 0 and id != LEAVES and id != LEAVES2;
+    return id != ids.air and id != ids.leaves and id != ids.leaves2;
 }
 
 /// Oak (`asq`): height `h_min` + nextInt(3), log meta `lm`, leaves meta `em`,
@@ -364,9 +347,9 @@ pub fn oakTree(
         }
     }
     const soil = view.get(wx, wy - 1, wz);
-    if (soil != GRASS and soil != DIRT) return false;
+    if (soil != ids.grass and soil != ids.dirt) return false;
     if (wy >= 256 - n10 - 1) return false;
-    view.set(wx, wy - 1, wz, DIRT, 0);
+    view.set(wx, wy - 1, wz, ids.dirt, 0);
     const n8: i32 = 0;
     y = wy - 3 + n10;
     while (y <= wy + n10) : (y += 1) {
@@ -381,15 +364,15 @@ pub fn oakTree(
                 const corner = @abs(n4) == n6 and @abs(n12) == n6;
                 if (corner and ((try rand.nextIntBound(2)) == 0 or n11 == 0)) continue;
                 if (isOpaque(view.get(x, y, z))) continue;
-                view.set(x, y, z, LEAVES, leaf_meta);
+                view.set(x, y, z, ids.leaves, leaf_meta);
             }
         }
     }
     var n7: i32 = 0;
     while (n7 < n10) : (n7 += 1) {
         const b = view.get(wx, wy + n7, wz);
-        if (b != 0 and b != LEAVES and b != LEAVES2) continue;
-        view.set(wx, wy + n7, wz, LOG, log_meta);
+        if (b != ids.air and b != ids.leaves and b != ids.leaves2) continue;
+        view.set(wx, wy + n7, wz, ids.log, log_meta);
     }
     if (do_vines) {
         y = wy - 3 + n10;
@@ -400,21 +383,21 @@ pub fn oakTree(
             while (x <= wx + n6) : (x += 1) {
                 var z: i32 = wz - n6;
                 while (z <= wz + n6) : (z += 1) {
-                    if (view.get(x, y, z) != LEAVES and view.get(x, y, z) != LEAVES2) continue;
-                    if (try rand.nextIntBound(4) == 0 and view.get(x - 1, y, z) == 0) {
-                        view.set(x - 1, y, z, VINE, 8);
+                    if (view.get(x, y, z) != ids.leaves and view.get(x, y, z) != ids.leaves2) continue;
+                    if (try rand.nextIntBound(4) == 0 and view.get(x - 1, y, z) == ids.air) {
+                        view.set(x - 1, y, z, ids.vine, 8);
                         hangVine(view, x - 1, y, z, 8);
                     }
-                    if (try rand.nextIntBound(4) == 0 and view.get(x + 1, y, z) == 0) {
-                        view.set(x + 1, y, z, VINE, 2);
+                    if (try rand.nextIntBound(4) == 0 and view.get(x + 1, y, z) == ids.air) {
+                        view.set(x + 1, y, z, ids.vine, 2);
                         hangVine(view, x + 1, y, z, 2);
                     }
-                    if (try rand.nextIntBound(4) == 0 and view.get(x, y, z - 1) == 0) {
-                        view.set(x, y, z - 1, VINE, 1);
+                    if (try rand.nextIntBound(4) == 0 and view.get(x, y, z - 1) == ids.air) {
+                        view.set(x, y, z - 1, ids.vine, 1);
                         hangVine(view, x, y, z - 1, 1);
                     }
-                    if (try rand.nextIntBound(4) == 0 and view.get(x, y, z + 1) == 0) {
-                        view.set(x, y, z + 1, VINE, 4);
+                    if (try rand.nextIntBound(4) == 0 and view.get(x, y, z + 1) == ids.air) {
+                        view.set(x, y, z + 1, ids.vine, 4);
                         hangVine(view, x, y, z + 1, 4);
                     }
                 }
@@ -437,11 +420,11 @@ pub fn oakTree(
 fn hangVine(view: *View, wx: i32, wy: i32, wz: i32, meta: u8) void {
     var y = wy - 1;
     var left: i32 = 4;
-    while (view.get(wx, y, wz) == 0 and left > 0) : ({
+    while (view.get(wx, y, wz) == ids.air and left > 0) : ({
         y -= 1;
         left -= 1;
     }) {
-        view.set(wx, y, wz, VINE, meta);
+        view.set(wx, y, wz, ids.vine, meta);
     }
 }
 
@@ -482,9 +465,9 @@ pub fn swampTree(view: *View, rand: *java_random.JavaRandom, wx: i32, wy: i32, w
         }
     }
     const soil = view.get(wx, wy - 1, wz);
-    if (soil != GRASS and soil != DIRT) return false;
+    if (soil != ids.grass and soil != ids.dirt) return false;
     if (wy >= 256 - n8 - 1) return false;
-    view.set(wx, wy - 1, wz, DIRT, 0);
+    view.set(wx, wy - 1, wz, ids.dirt, 0);
     y = wy - 3 + n8;
     while (y <= wy + n8) : (y += 1) {
         const n6: i32 = y - (wy + n8);
@@ -497,15 +480,15 @@ pub fn swampTree(view: *View, rand: *java_random.JavaRandom, wx: i32, wy: i32, w
                 const n9: i32 = z - wz;
                 if (@abs(n4) == n5 and @abs(n9) == n5 and ((try rand.nextIntBound(2)) == 0 or n6 == 0)) continue;
                 if (isOpaque(view.get(x, y, z))) continue;
-                view.set(x, y, z, LEAVES, 0);
+                view.set(x, y, z, ids.leaves, 0);
             }
         }
     }
     var n7t: i32 = 0;
     while (n7t < n8) : (n7t += 1) {
         const b = view.get(wx, wy + n7t, wz);
-        if (b != 0 and b != LEAVES and b != LEAVES2) continue;
-        view.set(wx, wy + n7t, wz, LOG, 0);
+        if (b != ids.air and b != ids.leaves and b != ids.leaves2) continue;
+        view.set(wx, wy + n7t, wz, ids.log, 0);
     }
     y = wy - 3 + n8;
     while (y <= wy + n8) : (y += 1) {
@@ -515,21 +498,21 @@ pub fn swampTree(view: *View, rand: *java_random.JavaRandom, wx: i32, wy: i32, w
         while (x <= wx + n5) : (x += 1) {
             var z: i32 = wz - n5;
             while (z <= wz + n5) : (z += 1) {
-                if (view.get(x, y, z) != LEAVES and view.get(x, y, z) != LEAVES2) continue;
-                if (try rand.nextIntBound(4) == 0 and view.get(x - 1, y, z) == 0) {
-                    view.set(x - 1, y, z, VINE, 8);
+                if (view.get(x, y, z) != ids.leaves and view.get(x, y, z) != ids.leaves2) continue;
+                if (try rand.nextIntBound(4) == 0 and view.get(x - 1, y, z) == ids.air) {
+                    view.set(x - 1, y, z, ids.vine, 8);
                     hangVine(view, x - 1, y, z, 8);
                 }
-                if (try rand.nextIntBound(4) == 0 and view.get(x + 1, y, z) == 0) {
-                    view.set(x + 1, y, z, VINE, 2);
+                if (try rand.nextIntBound(4) == 0 and view.get(x + 1, y, z) == ids.air) {
+                    view.set(x + 1, y, z, ids.vine, 2);
                     hangVine(view, x + 1, y, z, 2);
                 }
-                if (try rand.nextIntBound(4) == 0 and view.get(x, y, z - 1) == 0) {
-                    view.set(x, y, z - 1, VINE, 1);
+                if (try rand.nextIntBound(4) == 0 and view.get(x, y, z - 1) == ids.air) {
+                    view.set(x, y, z - 1, ids.vine, 1);
                     hangVine(view, x, y, z - 1, 1);
                 }
-                if (try rand.nextIntBound(4) == 0 and view.get(x, y, z + 1) == 0) {
-                    view.set(x, y, z + 1, VINE, 4);
+                if (try rand.nextIntBound(4) == 0 and view.get(x, y, z + 1) == ids.air) {
+                    view.set(x, y, z + 1, ids.vine, 4);
                     hangVine(view, x, y, z + 1, 4);
                 }
             }
@@ -561,14 +544,14 @@ pub fn spruceTree(view: *View, rand: *java_random.JavaRandom, wx: i32, wy: i32, 
             while (z <= wz + n8) : (z += 1) {
                 if (y < 0 or y >= 256) return false;
                 const b = view.get(x, y, z);
-                if (b != 0 and b != LEAVES and b != LEAVES2) return false;
+                if (b != ids.air and b != ids.leaves and b != ids.leaves2) return false;
             }
         }
     }
     const soil = view.get(wx, wy - 1, wz);
-    if (soil != GRASS and soil != DIRT) return false;
+    if (soil != ids.grass and soil != ids.dirt) return false;
     if (wy >= 256 - n9 - 1) return false;
-    view.set(wx, wy - 1, wz, DIRT, 0);
+    view.set(wx, wy - 1, wz, ids.dirt, 0);
     var n8: i32 = try rand.nextIntBound(2);
     var n7: i32 = 1;
     var n6: i32 = 0;
@@ -583,7 +566,7 @@ pub fn spruceTree(view: *View, rand: *java_random.JavaRandom, wx: i32, wy: i32, 
                 const n14: i32 = z - wz;
                 if (@abs(n13) == n8 and @abs(n14) == n8 and n8 > 0) continue;
                 if (isOpaque(view.get(x, n4, z))) continue;
-                view.set(x, n4, z, LEAVES, 1);
+                view.set(x, n4, z, ids.leaves, 1);
             }
         }
         if (n8 >= n7) {
@@ -599,8 +582,8 @@ pub fn spruceTree(view: *View, rand: *java_random.JavaRandom, wx: i32, wy: i32, 
     var n4: i32 = 0;
     while (n4 < n9 - n5t) : (n4 += 1) {
         const b = view.get(wx, wy + n4, wz);
-        if (b != 0 and b != LEAVES and b != LEAVES2) continue;
-        view.set(wx, wy + n4, wz, LOG, 1);
+        if (b != ids.air and b != ids.leaves and b != ids.leaves2) continue;
+        view.set(wx, wy + n4, wz, ids.log, 1);
     }
     return true;
 }
@@ -617,9 +600,9 @@ test "oak tree matches JVM (seed 42)" {
     for (0..S) |x| {
         for (0..S) |z| {
             for (0..70) |y| {
-                blocks[(x * S + z) * 256 + y] = STONE;
+                blocks[(x * S + z) * 256 + y] = ids.stone;
             }
-            blocks[(x * S + z) * 256 + 70] = GRASS;
+            blocks[(x * S + z) * 256 + 70] = ids.grass;
         }
     }
     var view = View{ .blocks = blocks, .metas = metas, .ox = -16, .oz = -16, .sx = S, .sz = S };
@@ -639,8 +622,8 @@ test "oak tree matches JVM (seed 42)" {
                 const m = view.getMeta(wx, wy, wz);
                 crc = crc *% 31 +% @as(i64, id);
                 mcrc = mcrc *% 31 +% @as(i64, m);
-                if (id == LOG) logs += 1;
-                if (id == LEAVES) leaves += 1;
+                if (id == ids.log) logs += 1;
+                if (id == ids.leaves) leaves += 1;
             }
         }
     }
@@ -667,8 +650,8 @@ test "birch/spruce/swamp trees match JVM (seed 42)" {
         @memset(metas, 0);
         for (0..S) |x| {
             for (0..S) |z| {
-                for (0..70) |y| blocks[(x * S + z) * 256 + y] = STONE;
-                blocks[(x * S + z) * 256 + 70] = GRASS;
+                for (0..70) |y| blocks[(x * S + z) * 256 + y] = ids.stone;
+                blocks[(x * S + z) * 256 + 70] = ids.grass;
             }
         }
         var view = View{ .blocks = blocks, .metas = metas, .ox = -16, .oz = -16, .sx = S, .sz = S };
@@ -695,9 +678,9 @@ test "birch/spruce/swamp trees match JVM (seed 42)" {
                     const m = view.getMeta(wx, wy, wz);
                     crc = crc *% 31 +% @as(i64, id);
                     mcrc = mcrc *% 31 +% @as(i64, m);
-                    if (id == LOG) logs += 1;
-                    if (id == LEAVES) leaves += 1;
-                    if (id == VINE) vines += 1;
+                    if (id == ids.log) logs += 1;
+                    if (id == ids.leaves) leaves += 1;
+                    if (id == ids.vine) vines += 1;
                 }
             }
         }
@@ -741,7 +724,7 @@ pub fn sandDisk(
             var y: i32 = wy - n5;
             while (y <= wy + n5) : (y += 1) {
                 const cur = view.get(x, y, z);
-                if (cur != DIRT and cur != GRASS) continue;
+                if (cur != ids.dirt and cur != ids.grass) continue;
                 view.set(x, y, z, mat, 0);
             }
         }
@@ -766,8 +749,8 @@ pub fn clayDisk(view: *View, rand: *java_random.JavaRandom, wx: i32, wy: i32, wz
             var y: i32 = wy - n5;
             while (y <= wy + n5) : (y += 1) {
                 const cur = view.get(x, y, z);
-                if (cur != DIRT and cur != CLAY) continue;
-                view.set(x, y, z, CLAY, 0);
+                if (cur != ids.dirt and cur != ids.clay) continue;
+                view.set(x, y, z, ids.clay, 0);
             }
         }
     }
@@ -898,13 +881,13 @@ pub fn populateOne(
     biome_id: i32,
 ) !void {
     // Ores (universal, no +8 offset).
-    try oreVein(view, rand, base_x, base_z, 20, DIRT, 32, 0, 256);
-    try oreVein(view, rand, base_x, base_z, 10, GRAVEL, 32, 0, 256);
-    try oreVein(view, rand, base_x, base_z, 20, COAL_ORE, 16, 0, 128);
-    try oreVein(view, rand, base_x, base_z, 20, IRON_ORE, 8, 0, 64);
-    try oreVein(view, rand, base_x, base_z, 2, GOLD_ORE, 8, 0, 32);
-    try oreVein(view, rand, base_x, base_z, 8, REDSTONE_ORE, 7, 0, 16);
-    try oreVein(view, rand, base_x, base_z, 1, DIAMOND_ORE, 7, 0, 16);
+    try oreVein(view, rand, base_x, base_z, 20, ids.dirt, 32, 0, 256);
+    try oreVein(view, rand, base_x, base_z, 10, ids.gravel, 32, 0, 256);
+    try oreVein(view, rand, base_x, base_z, 20, ids.coal_ore, 16, 0, 128);
+    try oreVein(view, rand, base_x, base_z, 20, ids.iron_ore, 8, 0, 64);
+    try oreVein(view, rand, base_x, base_z, 2, ids.gold_ore, 8, 0, 32);
+    try oreVein(view, rand, base_x, base_z, 8, ids.redstone_ore, 7, 0, 16);
+    try oreVein(view, rand, base_x, base_z, 1, ids.diamond_ore, 7, 0, 16);
     // Lapis (triangular via b()).
     {
         var i: i32 = 0;
@@ -913,7 +896,7 @@ pub fn populateOne(
             const ny: i32 = try rand.nextIntBound(16) + try rand.nextIntBound(16);
             const nz: i32 = base_z + try rand.nextIntBound(16);
             // NOTE: no +8 offset (matches `a()` helper,unlike trees/disks).
-            try minable(view, rand, nx, ny, nz, LAPIS_ORE, 6, STONE);
+            try minable(view, rand, nx, ny, nz, ids.lapis_ore, 6, ids.stone);
         }
     }
     // Sand / clay / gravel disks (+8 offset, height-based).
@@ -923,7 +906,7 @@ pub fn populateOne(
         const wx: i32 = base_x + try rand.nextIntBound(16) + 8;
         const wz: i32 = base_z + try rand.nextIntBound(16) + 8;
         const wy = heightAt(view, heights, wx, wz);
-        _ = try sandDisk(view, rand, wx, wy, wz, SAND, 7);
+        _ = try sandDisk(view, rand, wx, wy, wz, ids.sand, 7);
     }
     i = 0;
     while (i < disks.clay) : (i += 1) {
@@ -937,7 +920,7 @@ pub fn populateOne(
         const wx: i32 = base_x + try rand.nextIntBound(16) + 8;
         const wz: i32 = base_z + try rand.nextIntBound(16) + 8;
         const wy = heightAt(view, heights, wx, wz);
-        _ = try sandDisk(view, rand, wx, wy, wz, GRAVEL, 6);
+        _ = try sandDisk(view, rand, wx, wy, wz, ids.gravel, 6);
     }
     // Trees (+8 offset, height-based, per-biome count + selection).
     // NOTE: vanilla uses `ahb.f` (height = top solid + 1, i.e. air above
@@ -972,7 +955,7 @@ fn oreVein(view: *View, rand: *java_random.JavaRandom, base_x: i32, base_z: i32,
         const nx: i32 = base_x + try rand.nextIntBound(16);
         const ny: i32 = try rand.nextIntBound(y_max - y_min) + y_min;
         const nz: i32 = base_z + try rand.nextIntBound(16);
-        try minable(view, rand, nx, ny, nz, ore, size, STONE);
+        try minable(view, rand, nx, ny, nz, ore, size, ids.stone);
     }
 }
 
@@ -1006,7 +989,7 @@ pub fn computeHeights(view: *const View, heights: []i32) void {
             var y: i32 = 255;
             while (y >= 0) : (y -= 1) {
                 const i = (x * view.sz + z) * 256 + @as(usize, @intCast(y));
-                if (view.blocks[i] != 0) {
+                if (view.blocks[i] != ids.air) {
                     top = y;
                     break;
                 }
@@ -1069,9 +1052,9 @@ test "populateOne matches JVM (seed 42 chunk 0,0 forest)" {
     for (0..S) |x| {
         for (0..S) |z| {
             for (0..70) |y| {
-                blocks[(x * S + z) * 256 + y] = STONE;
+                blocks[(x * S + z) * 256 + y] = ids.stone;
             }
-            blocks[(x * S + z) * 256 + 70] = GRASS;
+            blocks[(x * S + z) * 256 + 70] = ids.grass;
         }
     }
     var view = View{ .blocks = blocks, .metas = metas, .ox = -16, .oz = -16, .sx = S, .sz = S };
@@ -1099,7 +1082,7 @@ test "populateOne matches JVM (seed 42 chunk 0,0 forest)" {
     // JVM golden (PopulateOne harness, forest, seed 42): trees place (5 logs,
     // 76 leaves). Our tree count currently differs (RNG/placement mismatch
     // under investigation) — log only, no assert yet.
-    std.debug.print("populate forest crc={d} stone={d} dirt={d} coal={d} logs={d} leaves={d}\n", .{ crc, counts[STONE], counts[DIRT], counts[COAL_ORE], counts[LOG], counts[LEAVES] });
+    std.debug.print("populate forest crc={d} stone={d} dirt={d} coal={d} logs={d} leaves={d}\n", .{ crc, counts[ids.stone], counts[ids.dirt], counts[ids.coal_ore], counts[ids.log], counts[ids.leaves] });
 }
 
 test "populateOne plains matches JVM (seed 42, no trees)" {
@@ -1114,9 +1097,9 @@ test "populateOne plains matches JVM (seed 42, no trees)" {
     for (0..S) |x| {
         for (0..S) |z| {
             for (0..70) |y| {
-                blocks[(x * S + z) * 256 + y] = STONE;
+                blocks[(x * S + z) * 256 + y] = ids.stone;
             }
-            blocks[(x * S + z) * 256 + 70] = GRASS;
+            blocks[(x * S + z) * 256 + 70] = ids.grass;
         }
     }
     var view = View{ .blocks = blocks, .metas = metas, .ox = -16, .oz = -16, .sx = S, .sz = S };
@@ -1142,17 +1125,17 @@ test "populateOne plains matches JVM (seed 42, no trees)" {
         }
     }
     // JVM golden (PopulatePlains harness).
-    std.debug.print("plains got crc={d} 0={d} 1={d} 2={d} 3={d} 13={d} 14={d} 15={d} 16={d} 56={d} 21={d} 73={d}\n", .{ crc, counts[0], counts[STONE], counts[GRASS], counts[DIRT], counts[GRAVEL], counts[GOLD_ORE], counts[IRON_ORE], counts[COAL_ORE], counts[DIAMOND_ORE], counts[LAPIS_ORE], counts[REDSTONE_ORE] });
+    std.debug.print("plains got crc={d} 0={d} 1={d} 2={d} 3={d} 13={d} 14={d} 15={d} 16={d} 56={d} 21={d} 73={d}\n", .{ crc, counts[0], counts[ids.stone], counts[ids.grass], counts[ids.dirt], counts[ids.gravel], counts[ids.gold_ore], counts[ids.iron_ore], counts[ids.coal_ore], counts[ids.diamond_ore], counts[ids.lapis_ore], counts[ids.redstone_ore] });
     try std.testing.expectEqual(@as(i64, 7816887225398614724), crc);
     try std.testing.expectEqual(@as(usize, 47360), counts[0]);
-    try std.testing.expectEqual(@as(usize, 17669), counts[STONE]);
-    try std.testing.expectEqual(@as(usize, 256), counts[GRASS]);
-    try std.testing.expectEqual(@as(usize, 87), counts[DIRT]);
-    try std.testing.expectEqual(@as(usize, 19), counts[GRAVEL]);
-    try std.testing.expectEqual(@as(usize, 1), counts[GOLD_ORE]);
-    try std.testing.expectEqual(@as(usize, 34), counts[IRON_ORE]);
-    try std.testing.expectEqual(@as(usize, 97), counts[COAL_ORE]);
-    try std.testing.expectEqual(@as(usize, 13), counts[REDSTONE_ORE]);
+    try std.testing.expectEqual(@as(usize, 17669), counts[ids.stone]);
+    try std.testing.expectEqual(@as(usize, 256), counts[ids.grass]);
+    try std.testing.expectEqual(@as(usize, 87), counts[ids.dirt]);
+    try std.testing.expectEqual(@as(usize, 19), counts[ids.gravel]);
+    try std.testing.expectEqual(@as(usize, 1), counts[ids.gold_ore]);
+    try std.testing.expectEqual(@as(usize, 34), counts[ids.iron_ore]);
+    try std.testing.expectEqual(@as(usize, 97), counts[ids.coal_ore]);
+    try std.testing.expectEqual(@as(usize, 13), counts[ids.redstone_ore]);
 }
 
 

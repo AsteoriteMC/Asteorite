@@ -13,6 +13,7 @@ const chunk_mod = @import("../world/chunk.zig");
 const store_mod = @import("../world/store.zig");
 const shard_mod = @import("../world/shard.zig");
 const conn_mod = @import("../net/conn.zig");
+const ids = @import("../ids.zig");
 
 /// Returns owned ZC1 bytes for (dim,x,z), or null when the column is missing
 /// (void hole until terrain generation lands). Caller frees.
@@ -250,7 +251,7 @@ pub const PeekBlock = struct { id: u16, meta: u4 };
 /// cubes here — slightly stricter than vanilla, documented.
 pub fn isOpaqueCube(id: u16) bool {
     return switch (id) {
-        0, 6, 8, 9, 10, 11, 18, 20, 26, 27, 28, 30, 31, 32, 37, 38, 39, 40, 44, 50, 51, 53, 55, 59, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 75, 76, 77, 78, 79, 83, 85, 93, 94, 96, 104, 105, 106, 107, 108, 109, 111, 114, 115, 116, 117, 118, 120, 126, 128, 131, 132, 134, 135, 136, 140, 141, 142, 143, 144, 147, 148, 149, 150, 151, 156, 157, 159, 161, 163, 164, 171, 175, 178, 180 => false,
+        ids.air, ids.sapling, ids.flowing_water, ids.water, ids.flowing_lava, ids.lava, ids.leaves, ids.glass, ids.bed_block, ids.golden_rail, ids.detector_rail, ids.web, ids.tallgrass, ids.deadbush, ids.yellow_flower, ids.red_flower, ids.brown_mushroom, ids.red_mushroom, ids.stone_slab, ids.torch, ids.fire, ids.oak_stairs, ids.redstone_wire, ids.wheat_block, ids.standing_sign, ids.wooden_door_block, ids.ladder, ids.rail, ids.stone_stairs, ids.wall_sign, ids.lever, ids.stone_pressure_plate, ids.iron_door_block, ids.wooden_pressure_plate, ids.unlit_redstone_torch, ids.redstone_torch, ids.stone_button, ids.snow_layer, ids.ice, ids.reeds_block, ids.fence, ids.unpowered_repeater, ids.powered_repeater, ids.trapdoor, ids.pumpkin_stem, ids.melon_stem, ids.vine, ids.fence_gate, ids.brick_stairs, ids.stone_brick_stairs, ids.waterlily, ids.nether_brick_stairs, ids.nether_wart_block, ids.enchanting_table, ids.brewing_stand_block, ids.cauldron_block, ids.end_portal_frame, ids.wooden_slab, ids.sandstone_stairs, ids.tripwire_hook, ids.tripwire, ids.spruce_stairs, ids.birch_stairs, ids.jungle_stairs, ids.flower_pot_block, ids.carrots, ids.potatoes, ids.wooden_button, ids.skull_block, ids.light_weighted_pressure_plate, ids.heavy_weighted_pressure_plate, ids.unpowered_comparator, ids.powered_comparator, ids.daylight_detector, ids.quartz_stairs, ids.activator_rail, ids.stained_hardened_clay, ids.leaves2, ids.acacia_stairs, ids.dark_oak_stairs, ids.carpet, ids.double_plant, 178, 180 => false, // 178/180: unassigned in 1.7.10 (dead entries, kept for shape)
         else => true,
     };
 }
@@ -302,7 +303,7 @@ pub fn applyBlock(pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, x: i
     defer ch.destroy(allocator);
     const si: usize = @as(usize, y) >> 4;
     if (ch.sections[si] == null) {
-        if (id == 0) return; // breaking air in an empty section: no-op
+        if (id == ids.air) return; // breaking air in an empty section: no-op
         ch.sections[si] = chunk_mod.Section{};
     }
     const s = &ch.sections[si].?;
@@ -363,7 +364,7 @@ test "completeLogin sends bulk + poslook, skips holes" {
         map.deinit();
     }
     // chunk (0,0): section0 with block 1; chunk (1,0): section0 with block 57
-    for ([_]struct { x: i32, id: u16 }{ .{ .x = 0, .id = 1 }, .{ .x = 1, .id = 57 } }) |e| {
+    for ([_]struct { x: i32, id: u16 }{ .{ .x = 0, .id = ids.stone }, .{ .x = 1, .id = ids.diamond_block } }) |e| {
         var ch = try chunk_mod.Chunk.createEmpty(a, 0, e.x, 0);
         defer ch.destroy(a);
         var s = chunk_mod.Section{};
@@ -502,13 +503,13 @@ test "sync on move: unload + burst, no resends, respawn resets" {
     defer a.free(out);
     // expect: 2 unloads (0,0),(1,0) + 1 bulk with (5,0)
     var r = codec.PacketReader.init(out);
-    var ids: [4]i32 = undefined;
+    var chunk_ids: [4]i32 = undefined;
     var nids: usize = 0;
     var bulk_cols: [2]i32 = .{ -99, -99 };
     var nbulk: usize = 0;
     while (r.remaining() > 0) {
         const h = try codec.decodeFrame(&r);
-        ids[nids] = h.id;
+        chunk_ids[nids] = h.id;
         nids += 1;
         if (h.id == 0x21) {
             _ = try r.readInt();
@@ -535,7 +536,7 @@ test "sync on move: unload + burst, no resends, respawn resets" {
             return error.UnexpectedFrame;
         }
     }
-    try std.testing.expectEqualSlices(i32, &[_]i32{ 0x21, 0x21, 0x26 }, ids[0..nids]);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 0x21, 0x21, 0x26 }, chunk_ids[0..nids]);
     try std.testing.expectEqual(@as(usize, 1), nbulk);
     try std.testing.expectEqual(@as(i32, 5), bulk_cols[0]);
     try std.testing.expect(c.sent.contains(Mem.key(5, 0)));

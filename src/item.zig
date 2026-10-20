@@ -9,6 +9,7 @@
 //! registry maps onto them at the version boundary (Phase I2), not here.
 
 const std = @import("std");
+const ids = @import("ids.zig");
 
 /// One item stack. `nbt` is opaque raw bytes (the i16 length-prefixed gzip
 /// blob, WITHOUT the length prefix) borrowed from the packet body — or owned
@@ -62,16 +63,16 @@ pub fn canMerge(dst: Stack, src: Stack) bool {
 /// 64 (documented; datapack-driven limits are Phase H3/F follow-ups).
 pub fn maxStackSize(id: u16) u8 {
     // Swords.
-    if (id == 267 or id == 268 or id == 272 or id == 276 or id == 283) return 1;
+    if (id == ids.iron_sword or id == ids.wooden_sword or id == ids.stone_sword or id == ids.diamond_sword or id == ids.golden_sword) return 1;
     // Tools: shovels 269/273/256/277/284, pickaxes 270/274/257/278/285,
     // axes 271/275/258/279/286, hoes 290-294, flint&steel 259, shears 359.
-    if ((id >= 256 and id <= 259) or (id >= 269 and id <= 279) or (id >= 283 and id <= 286) or (id >= 290 and id <= 294) or id == 359) return 1;
+    if ((id >= 256 and id <= 259) or (id >= 269 and id <= 279) or (id >= 283 and id <= 286) or (id >= 290 and id <= 294) or id == ids.shears) return 1;
     // Armor 298-317, bow 261, fishing rod 346, filled buckets.
-    if ((id >= 298 and id <= 317) or id == 261 or id == 346 or id == 326 or id == 327 or id == 335) return 1;
-    if (id == 325) return 16; // empty bucket
+    if ((id >= 298 and id <= 317) or id == ids.bow or id == ids.fishing_rod or id == ids.water_bucket or id == ids.lava_bucket or id == ids.milk_bucket) return 1;
+    if (id == ids.bucket) return 16; // empty bucket
     // Small throwables / utility.
-    if (id == 332 or id == 344 or id == 368 or id == 323) return 16; // snowball/egg/ender pearl/sign
-    if (id == 328 or id == 333 or id == 342 or id == 343) return 16; // minecarts/boat/storage carts
+    if (id == ids.snowball or id == ids.egg or id == ids.ender_pearl or id == ids.sign) return 16; // snowball/egg/ender pearl/sign
+    if (id == ids.minecart or id == ids.boat or id == ids.chest_minecart or id == ids.furnace_minecart) return 16; // minecarts/boat/storage carts
     return 64;
 }
 
@@ -81,55 +82,55 @@ pub fn maxStackSize(id: u16) u8 {
 /// Single source of truth: combat (conn.zig) and future versions import this.
 pub fn meleeDamage(id: u16) f32 {
     return switch (id) {
-        268, 283 => 4.0, // wooden/gold sword
-        272 => 5.0, // stone sword
-        267 => 6.0, // iron sword
-        276 => 7.0, // diamond sword
-        271, 286 => 3.0, // wooden/gold axe
-        275 => 4.0, // stone axe
-        258 => 5.0, // iron axe
-        279 => 6.0, // diamond axe
-        270, 285 => 2.0, // wooden/gold pickaxe
-        274 => 3.0, // stone pickaxe
-        257 => 4.0, // iron pickaxe
-        278 => 5.0, // diamond pickaxe
-        269, 284 => 1.0, // wooden/gold shovel (fist-equivalent)
-        273 => 2.0, // stone shovel
-        256 => 3.0, // iron shovel
-        277 => 4.0, // diamond shovel
+        ids.wooden_sword, ids.golden_sword => 4.0, // wooden/gold sword
+        ids.stone_sword => 5.0, // stone sword
+        ids.iron_sword => 6.0, // iron sword
+        ids.diamond_sword => 7.0, // diamond sword
+        ids.wooden_axe, ids.golden_axe => 3.0, // wooden/gold axe
+        ids.stone_axe => 4.0, // stone axe
+        ids.iron_axe => 5.0, // iron axe
+        ids.diamond_axe => 6.0, // diamond axe
+        ids.wooden_pickaxe, ids.golden_pickaxe => 2.0, // wooden/gold pickaxe
+        ids.stone_pickaxe => 3.0, // stone pickaxe
+        ids.iron_pickaxe => 4.0, // iron pickaxe
+        ids.diamond_pickaxe => 5.0, // diamond pickaxe
+        ids.wooden_shovel, ids.golden_shovel => 1.0, // wooden/gold shovel (fist-equivalent)
+        ids.stone_shovel => 2.0, // stone shovel
+        ids.iron_shovel => 3.0, // iron shovel
+        ids.diamond_shovel => 4.0, // diamond shovel
         else => 1.0, // fist and everything else
     };
 }
 
 test "melee damage table" {
-    try std.testing.expectApproxEqAbs(@as(f32, 4.0), meleeDamage(268), 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 7.0), meleeDamage(276), 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 5.0), meleeDamage(258), 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 3.0), meleeDamage(256), 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), meleeDamage(1), 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), meleeDamage(0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), meleeDamage(ids.wooden_sword), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 7.0), meleeDamage(ids.diamond_sword), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), meleeDamage(ids.iron_axe), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), meleeDamage(ids.iron_shovel), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), meleeDamage(ids.stone), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), meleeDamage(ids.air), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), meleeDamage(9999), 1e-6);
 }
 
 test "stack limits" {
-    try std.testing.expectEqual(@as(u8, 64), maxStackSize(3)); // dirt
-    try std.testing.expectEqual(@as(u8, 1), maxStackSize(276)); // diamond sword
-    try std.testing.expectEqual(@as(u8, 1), maxStackSize(310)); // diamond chestplate
-    try std.testing.expectEqual(@as(u8, 16), maxStackSize(332)); // snowball
-    try std.testing.expectEqual(@as(u8, 16), maxStackSize(344)); // egg
-    try std.testing.expectEqual(@as(u8, 16), maxStackSize(325)); // empty bucket
-    try std.testing.expectEqual(@as(u8, 1), maxStackSize(326)); // water bucket
-    try std.testing.expectEqual(@as(u8, 1), maxStackSize(267)); // iron sword
-    try std.testing.expectEqual(@as(u8, 1), maxStackSize(290)); // wooden hoe
-    try std.testing.expectEqual(@as(u8, 64), maxStackSize(5)); // planks
+    try std.testing.expectEqual(@as(u8, 64), maxStackSize(ids.dirt)); // dirt
+    try std.testing.expectEqual(@as(u8, 1), maxStackSize(ids.diamond_sword)); // diamond sword
+    try std.testing.expectEqual(@as(u8, 1), maxStackSize(ids.diamond_helmet)); // diamond chestplate
+    try std.testing.expectEqual(@as(u8, 16), maxStackSize(ids.snowball)); // snowball
+    try std.testing.expectEqual(@as(u8, 16), maxStackSize(ids.egg)); // egg
+    try std.testing.expectEqual(@as(u8, 16), maxStackSize(ids.bucket)); // empty bucket
+    try std.testing.expectEqual(@as(u8, 1), maxStackSize(ids.water_bucket)); // water bucket
+    try std.testing.expectEqual(@as(u8, 1), maxStackSize(ids.iron_sword)); // iron sword
+    try std.testing.expectEqual(@as(u8, 1), maxStackSize(ids.wooden_hoe)); // wooden hoe
+    try std.testing.expectEqual(@as(u8, 64), maxStackSize(ids.planks)); // planks
 }
 
 test "merge rule needs id+damage+nbt equality" {
-    const a = Stack{ .id = 1, .count = 1, .damage = 0, .nbt = null };
-    const b = Stack{ .id = 1, .count = 1, .damage = 0, .nbt = null };
-    const c = Stack{ .id = 1, .count = 1, .damage = 3, .nbt = null };
+    const a = Stack{ .id = ids.stone, .count = 1, .damage = 0, .nbt = null };
+    const b = Stack{ .id = ids.stone, .count = 1, .damage = 0, .nbt = null };
+    const c = Stack{ .id = ids.stone, .count = 1, .damage = 3, .nbt = null };
     const n = [_]u8{ 1, 2, 3 };
-    const d = Stack{ .id = 1, .count = 1, .damage = 0, .nbt = &n };
+    const d = Stack{ .id = ids.stone, .count = 1, .damage = 0, .nbt = &n };
     try std.testing.expect(canMerge(a, b));
     try std.testing.expect(!canMerge(a, c));
     try std.testing.expect(!canMerge(a, d));

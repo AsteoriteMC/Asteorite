@@ -14,6 +14,7 @@
 const std = @import("std");
 const data = @import("recipes_data.zig");
 const item_mod = @import("../item.zig");
+const ids = @import("../ids.zig");
 
 pub const WILD: i16 = 32767;
 
@@ -22,56 +23,56 @@ pub const WILD: i16 = 32767;
 /// diamond 1561/gold 32; armor base x slot {helm 11, chest 16, legs 15, boots 13}).
 fn maxDurability(id: u16) ?u16 {
     return switch (id) {
-        256 => 250,
-        257 => 250,
-        258 => 250,
-        259 => 64,
-        261 => 384,
-        267 => 250,
-        268 => 59,
-        269 => 59,
-        270 => 59,
-        271 => 59,
-        272 => 131,
-        273 => 131,
-        274 => 131,
-        275 => 131,
-        276 => 1561,
-        277 => 1561,
-        278 => 1561,
-        279 => 1561,
-        283 => 32,
-        284 => 32,
-        285 => 32,
-        286 => 32,
-        290 => 59,
-        291 => 131,
-        292 => 250,
-        293 => 1561,
-        294 => 32,
-        298 => 55,
-        299 => 80,
-        300 => 75,
-        301 => 65,
-        302 => 165,
-        303 => 240,
-        304 => 225,
-        305 => 195,
-        306 => 165,
-        307 => 240,
-        308 => 225,
-        309 => 195,
-        310 => 363,
-        311 => 528,
-        312 => 495,
-        313 => 429,
-        314 => 77,
-        315 => 112,
-        316 => 105,
-        317 => 91,
-        346 => 64,
-        359 => 238,
-        398 => 25,
+        ids.iron_shovel => 250,
+        ids.iron_pickaxe => 250,
+        ids.iron_axe => 250,
+        ids.flint_and_steel => 64,
+        ids.bow => 384,
+        ids.iron_sword => 250,
+        ids.wooden_sword => 59,
+        ids.wooden_shovel => 59,
+        ids.wooden_pickaxe => 59,
+        ids.wooden_axe => 59,
+        ids.stone_sword => 131,
+        ids.stone_shovel => 131,
+        ids.stone_pickaxe => 131,
+        ids.stone_axe => 131,
+        ids.diamond_sword => 1561,
+        ids.diamond_shovel => 1561,
+        ids.diamond_pickaxe => 1561,
+        ids.diamond_axe => 1561,
+        ids.golden_sword => 32,
+        ids.golden_shovel => 32,
+        ids.golden_pickaxe => 32,
+        ids.golden_axe => 32,
+        ids.wooden_hoe => 59,
+        ids.stone_hoe => 131,
+        ids.iron_hoe => 250,
+        ids.diamond_hoe => 1561,
+        ids.golden_hoe => 32,
+        ids.leather_helmet => 55,
+        ids.leather_chestplate => 80,
+        ids.leather_leggings => 75,
+        ids.leather_boots => 65,
+        ids.chainmail_helmet => 165,
+        ids.chainmail_chestplate => 240,
+        ids.chainmail_leggings => 225,
+        ids.chainmail_boots => 195,
+        ids.iron_helmet => 165,
+        ids.iron_chestplate => 240,
+        ids.iron_leggings => 225,
+        ids.iron_boots => 195,
+        ids.diamond_helmet => 363,
+        ids.diamond_chestplate => 528,
+        ids.diamond_leggings => 495,
+        ids.diamond_boots => 429,
+        ids.golden_helmet => 77,
+        ids.golden_chestplate => 112,
+        ids.golden_leggings => 105,
+        ids.golden_boots => 91,
+        ids.fishing_rod => 64,
+        ids.shears => 238,
+        ids.carrot_on_a_stick => 25,
         else => null,
     };
 }
@@ -202,45 +203,45 @@ fn firstTaggedNbt(grid: []const ?item_mod.Stack) ?[]const u8 {
 
 test "shaped basics: sticks, torches, planks, mirror" {
     // sticks: 2 planks vertical (2x2 player grid)
-    const sticks: [4]?item_mod.Stack = .{ null, .{ .id = 5, .count = 1, .damage = 0, .nbt = null }, null, .{ .id = 5, .count = 1, .damage = 0, .nbt = null } };
+    const sticks: [4]?item_mod.Stack = .{ null, .{ .id = ids.planks, .count = 1, .damage = 0, .nbt = null }, null, .{ .id = ids.planks, .count = 1, .damage = 0, .nbt = null } };
     // grid is row-major 2-wide: [.,plank, .,plank] = col1 rows 0..1
     const r = findMatch(&sticks, 2, 2);
     try std.testing.expect(r != null);
     try std.testing.expectEqual(@as(u16, 280), r.?.id);
     try std.testing.expectEqual(@as(i8, 4), r.?.count);
     // torches: coal over stick
-    const torch: [4]?item_mod.Stack = .{ null, .{ .id = 263, .count = 1, .damage = 0, .nbt = null }, null, .{ .id = 280, .count = 1, .damage = 0, .nbt = null } };
+    const torch: [4]?item_mod.Stack = .{ null, .{ .id = ids.coal, .count = 1, .damage = 0, .nbt = null }, null, .{ .id = ids.stick, .count = 1, .damage = 0, .nbt = null } };
     const t = findMatch(&torch, 2, 2);
     try std.testing.expect(t != null);
     try std.testing.expectEqual(@as(u16, 50), t.?.id);
     try std.testing.expectEqual(@as(i8, 4), t.?.count);
     // planks from log (any damage wildcard? log recipe damage is explicit per type; oak here)
-    const planks: [4]?item_mod.Stack = .{ .{ .id = 17, .count = 1, .damage = 0, .nbt = null }, null, null, null };
+    const planks: [4]?item_mod.Stack = .{ .{ .id = ids.log, .count = 1, .damage = 0, .nbt = null }, null, null, null };
     const p = findMatch(&planks, 2, 2);
     try std.testing.expect(p != null);
     try std.testing.expectEqual(@as(u16, 5), p.?.id);
     // mirror: arrow " #X / # X /  #X"? use asymmetric pickaxe head on 3x3
     var g3: [9]?item_mod.Stack = [_]?item_mod.Stack{null} ** 9;
     // mirrored iron pickaxe: ingots at cols 2,1,0 row 0 + sticks col 1 rows 1-2
-    g3[2] = .{ .id = 265, .count = 1, .damage = 0, .nbt = null };
-    g3[1] = .{ .id = 265, .count = 1, .damage = 0, .nbt = null };
-    g3[0] = .{ .id = 265, .count = 1, .damage = 0, .nbt = null };
-    g3[4] = .{ .id = 280, .count = 1, .damage = 0, .nbt = null };
-    g3[7] = .{ .id = 280, .count = 1, .damage = 0, .nbt = null };
+    g3[2] = .{ .id = ids.iron_ingot, .count = 1, .damage = 0, .nbt = null };
+    g3[1] = .{ .id = ids.iron_ingot, .count = 1, .damage = 0, .nbt = null };
+    g3[0] = .{ .id = ids.iron_ingot, .count = 1, .damage = 0, .nbt = null };
+    g3[4] = .{ .id = ids.stick, .count = 1, .damage = 0, .nbt = null };
+    g3[7] = .{ .id = ids.stick, .count = 1, .damage = 0, .nbt = null };
     const pk = findMatch(&g3, 3, 3);
     try std.testing.expect(pk != null);
     try std.testing.expectEqual(@as(u16, 257), pk.?.id);
     // wrong material arrangement: no match
     var bad: [9]?item_mod.Stack = [_]?item_mod.Stack{null} ** 9;
-    bad[0] = .{ .id = 265, .count = 1, .damage = 0, .nbt = null };
+    bad[0] = .{ .id = ids.iron_ingot, .count = 1, .damage = 0, .nbt = null };
     try std.testing.expect(findMatch(&bad, 3, 3) == null);
 }
 
 test "repair: two damaged tools combine (vanilla formula)" {
     // iron pick, dur 250: dmg 200 + dmg 200 -> rem 50+50, bonus 12 -> 138
     const rep: [4]?item_mod.Stack = .{
-        .{ .id = 257, .count = 1, .damage = 200, .nbt = null },
-        .{ .id = 257, .count = 1, .damage = 200, .nbt = null },
+        .{ .id = ids.iron_pickaxe, .count = 1, .damage = 200, .nbt = null },
+        .{ .id = ids.iron_pickaxe, .count = 1, .damage = 200, .nbt = null },
         null, null,
     };
     const r = findMatch(&rep, 2, 2);
@@ -253,39 +254,39 @@ test "repair: two damaged tools combine (vanilla formula)" {
     try std.testing.expect(findMatch(&rep2, 2, 2) == null);
     // different items don't repair
     var rep3 = rep;
-    rep3[1].?.id = 258;
+    rep3[1].?.id = ids.iron_axe;
     try std.testing.expect(findMatch(&rep3, 2, 2) == null);
     // three items: not repair (falls through to table -> null here)
     var rep4 = rep;
-    rep4[2] = .{ .id = 257, .count = 1, .damage = 0, .nbt = null };
+    rep4[2] = .{ .id = ids.iron_pickaxe, .count = 1, .damage = 0, .nbt = null };
     try std.testing.expect(findMatch(&rep4, 2, 2) == null);
 }
 
 test "mirror + damage rules (stairs mirrored, wildcard planks, exact stone)" {
     // oak stairs normal: "#  / ##  / ###"
     var norm: [9]?item_mod.Stack = [_]?item_mod.Stack{null} ** 9;
-    norm[0] = .{ .id = 5, .count = 1, .damage = 0, .nbt = null };
-    norm[3] = .{ .id = 5, .count = 1, .damage = 0, .nbt = null };
-    norm[4] = .{ .id = 5, .count = 1, .damage = 0, .nbt = null };
-    norm[6] = .{ .id = 5, .count = 1, .damage = 0, .nbt = null };
-    norm[7] = .{ .id = 5, .count = 1, .damage = 0, .nbt = null };
-    norm[8] = .{ .id = 5, .count = 1, .damage = 0, .nbt = null };
+    norm[0] = .{ .id = ids.planks, .count = 1, .damage = 0, .nbt = null };
+    norm[3] = .{ .id = ids.planks, .count = 1, .damage = 0, .nbt = null };
+    norm[4] = .{ .id = ids.planks, .count = 1, .damage = 0, .nbt = null };
+    norm[6] = .{ .id = ids.planks, .count = 1, .damage = 0, .nbt = null };
+    norm[7] = .{ .id = ids.planks, .count = 1, .damage = 0, .nbt = null };
+    norm[8] = .{ .id = ids.planks, .count = 1, .damage = 0, .nbt = null };
     const n = findMatch(&norm, 3, 3);
     try std.testing.expect(n != null);
     try std.testing.expectEqual(@as(u16, 53), n.?.id);
     // mirrored ("  # / ## / ###"): same output
     var mirr: [9]?item_mod.Stack = [_]?item_mod.Stack{null} ** 9;
-    mirr[2] = .{ .id = 5, .count = 1, .damage = 0, .nbt = null };
-    mirr[4] = .{ .id = 5, .count = 1, .damage = 0, .nbt = null };
-    mirr[5] = .{ .id = 5, .count = 1, .damage = 0, .nbt = null };
-    mirr[6] = .{ .id = 5, .count = 1, .damage = 0, .nbt = null };
-    mirr[7] = .{ .id = 5, .count = 1, .damage = 0, .nbt = null };
-    mirr[8] = .{ .id = 5, .count = 1, .damage = 0, .nbt = null };
+    mirr[2] = .{ .id = ids.planks, .count = 1, .damage = 0, .nbt = null };
+    mirr[4] = .{ .id = ids.planks, .count = 1, .damage = 0, .nbt = null };
+    mirr[5] = .{ .id = ids.planks, .count = 1, .damage = 0, .nbt = null };
+    mirr[6] = .{ .id = ids.planks, .count = 1, .damage = 0, .nbt = null };
+    mirr[7] = .{ .id = ids.planks, .count = 1, .damage = 0, .nbt = null };
+    mirr[8] = .{ .id = ids.planks, .count = 1, .damage = 0, .nbt = null };
     const m = findMatch(&mirr, 3, 3);
     try std.testing.expect(m != null);
     try std.testing.expectEqual(@as(u16, 53), m.?.id);
     // wildcard planks: birch (dmg 2) works for sticks
-    const sticks: [4]?item_mod.Stack = .{ null, .{ .id = 5, .count = 1, .damage = 2, .nbt = null }, null, .{ .id = 5, .count = 1, .damage = 2, .nbt = null } };
+    const sticks: [4]?item_mod.Stack = .{ null, .{ .id = ids.planks, .count = 1, .damage = 2, .nbt = null }, null, .{ .id = ids.planks, .count = 1, .damage = 2, .nbt = null } };
     const st = findMatch(&sticks, 2, 2);
     try std.testing.expect(st != null);
     try std.testing.expectEqual(@as(u16, 280), st.?.id);
@@ -295,9 +296,9 @@ test "shapeless: bread, dye wildcard, paper" {
     // bread: shaped 3x1 wheat row
     const bread: [9]?item_mod.Stack = .{
         null,                         null,                         null,
-        .{ .id = 296, .count = 1, .damage = 0, .nbt = null },
-        .{ .id = 296, .count = 1, .damage = 0, .nbt = null },
-        .{ .id = 296, .count = 1, .damage = 0, .nbt = null },
+        .{ .id = ids.wheat_item, .count = 1, .damage = 0, .nbt = null },
+        .{ .id = ids.wheat_item, .count = 1, .damage = 0, .nbt = null },
+        .{ .id = ids.wheat_item, .count = 1, .damage = 0, .nbt = null },
         null,                         null,                         null,
     };
     const b = findMatch(&bread, 3, 3);
@@ -305,7 +306,7 @@ test "shapeless: bread, dye wildcard, paper" {
     try std.testing.expectEqual(@as(u16, 297), b.?.id);
     // exact-damage shapeless: white wool needs dye 15 + white wool
     const dye: [9]?item_mod.Stack = .{
-        .{ .id = 351, .count = 1, .damage = 15, .nbt = null }, .{ .id = 35, .count = 1, .damage = 0, .nbt = null }, null,
+        .{ .id = ids.dye, .count = 1, .damage = 15, .nbt = null }, .{ .id = ids.wool, .count = 1, .damage = 0, .nbt = null }, null,
         null, null, null,
         null, null, null,
     };
@@ -316,6 +317,6 @@ test "shapeless: bread, dye wildcard, paper" {
     // wrong dye damage: bonemeal(15) + ORANGE wool(1)? needs white wool -> null
     // (use red dye(1) + white wool -> rose red stays? red+white... skip: extra item breaks it)
     var extra = dye;
-    extra[2] = .{ .id = 1, .count = 1, .damage = 0, .nbt = null };
+    extra[2] = .{ .id = ids.stone, .count = 1, .damage = 0, .nbt = null };
     try std.testing.expect(findMatch(&extra, 3, 3) == null);
 }
