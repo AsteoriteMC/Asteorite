@@ -87,6 +87,19 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(genlayer_tool);
 
+    const genbench_tool = b.addExecutable(.{
+        .name = "gen_bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zigcraft", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(genbench_tool);
+
     const run_step = b.step("run", "Run zigcraft server (stub)");
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

@@ -177,9 +177,9 @@ Worldgen version follows the world's version, not the client's (ties to Phase I)
 
 ### H2. 1.7.10 generator (v5 — fills today's void holes)
 
-- [~] `src/worldgen/v5/`: GenLayer zoom chain ✅ DONE (all 21 layers + full 44-node chain, 8 seeds×windows×layers JVM-verified; quirks replicated: uninit river-mix zooms, class-identity similarity, MEDIUM-wildcard edge helper, y-cache staleness, zoom draw order); hill noise ✅ (octave stacks), per-biome surface map, tunnel-walk cave/ravine carvers, ore/tree decorators still TODO
-- [ ] Chunk gen as a background job writing ZC1 into the pool (sync first, never on the 50ms path); spawn pre-gen on boot (`--gen-spawn N` chunks)
-- [ ] Acceptance: fresh DB + no import → login shows terrain, F3 biomes sane, caves/ores/trees present; same-seed parity vs vanilla 1.7.10
+- [~] `src/worldgen/v5/`: GenLayer chain ✅ + hill noise ✅ + density field ✅ + block fill ✅ + surface map ✅ (base path; mesa override pending) — all JVM-verified per-stage; cave/ravine carvers, ore/tree decorators still TODO
+- [x] Chunk gen as background-capable job writing ZC1 into the pool (sync on-demand first, never on the 50ms path by construction of the source seam); spawn pre-gen on boot (`--seed` + `--gen-spawn N`); land-spawn search; live-verified over TCP (dedicated background gen thread is the follow-up)
+- [~] Acceptance: fresh DB → login shows terrain ✅, F3 biomes sane ✅ (voronoi biomes on the wire), same-seed parity ✅ per-stage (biomes, density, fill, surface bit-exact); caves/ores/trees present — pending carvers/decorators
 
 ### H3. Data overlay: custom packs (Terralith / JJThunder-class terrain)
 

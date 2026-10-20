@@ -32,6 +32,14 @@ pub const v5noise = @import("worldgen/v5/noise.zig");
 pub const v5biome = @import("worldgen/v5/biome.zig");
 /// 1.7.10 GenLayer biome chain (CFR-verified ports + JVM goldens).
 pub const v5genlayer = @import("worldgen/v5/genlayer.zig");
+/// 1.7.10 overworld terrain shaper (density field + block fill). JVM-verified.
+pub const v5shaper = @import("worldgen/v5/shaper.zig");
+/// 1.7.10 surface builder (per-biome top/filler). JVM-verified (base path).
+pub const v5surface = @import("worldgen/v5/surface.zig");
+/// 1.7.10 chunk generator (density -> fill -> surface -> ZC1).
+pub const v5gen = @import("worldgen/v5/gen.zig");
+/// v5 generation serving glue (on-demand fill, spawn search, pre-gen).
+pub const v5serve = @import("worldgen/v5/serve.zig");
 /// Lock-free cross-region handoff queue.
 pub const mpsc = @import("sim/mpsc.zig");
 /// Deterministic 20 TPS region tick loop.
@@ -66,6 +74,10 @@ test {
     _ = @import("worldgen/v5/noise.zig");
     _ = @import("worldgen/v5/biome.zig");
     _ = @import("worldgen/v5/genlayer.zig");
+    _ = @import("worldgen/v5/shaper.zig");
+    _ = @import("worldgen/v5/surface.zig");
+    _ = @import("worldgen/v5/gen.zig");
+    _ = @import("worldgen/v5/serve.zig");
     _ = @import("sim/mpsc.zig");
     _ = @import("sim/tick.zig");
     _ = @import("sim/view.zig");

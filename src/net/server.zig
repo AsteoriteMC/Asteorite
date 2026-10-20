@@ -23,6 +23,8 @@ const spin = @import("../sim/spin.zig");
 const packets = @import("../proto/v5/packets.zig");
 const ids = @import("../proto/v5/ids.zig");
 const entity = @import("../sim/entity.zig");
+const v5gen = @import("../worldgen/v5/gen.zig");
+const v5serve = @import("../worldgen/v5/serve.zig");
 
 /// Handshake/login must complete within this window (anti-slowloris).
 pub const login_timeout_ms: i64 = 30000;
@@ -41,6 +43,11 @@ pub const Server = struct {
     /// Optional world store for login chunk bursts (null = no chunks).
     /// Borrowed; must outlive the server (owned by main).
     world: ?*shard_mod.ShardPool = null,
+    /// Optional terrain generator (null = serve stored chunks only, holes stay
+    /// holes). Borrowed; must outlive the server (owned by main).
+    gen: ?*v5gen.Gen = null,
+    /// Gen-aware source state (ctx for view.Source). Set alongside gen.
+    gen_src: ?v5serve.GenSource = null,
     view_distance: u8 = 4,
     /// Allocator for the registry list. Set by serveForever/tests.
     gpa: std.mem.Allocator = undefined,
@@ -63,6 +70,16 @@ pub const Server = struct {
 
     pub fn deinit(self: *Server) void {
         self.net.deinit(self.io);
+    }
+
+    /// Chunk source for view streaming: generating wrapper when gen is set,
+    /// plain pool source otherwise. The wrapper fills LSM holes on demand.
+    pub fn chunkSource(self: *Server, pool: *shard_mod.ShardPool) view.Source {
+        if (self.gen_src) |*gs| {
+            std.debug.assert(gs.pool == pool);
+            return gs.source();
+        }
+        return view.shardPoolSource(pool);
     }
 
     /// Snapshotted refs; caller must `releaseSnap` when done.
@@ -537,12 +554,23 @@ pub fn serveConn(
             entered = false;
             const age = server.world_age.load(.acquire);
             const tod = server.time_of_day.load(.acquire);
+            // Worldgen spawn: ensure land spawn before Join/SpawnPosition go out.
+            if (server.world) |pool| {
+                if (server.gen) |gen| {
+                    const sp = v5serve.findSpawn(pool, gen, &server.world_lock, allocator, 24) catch null;
+                    if (sp) |p| {
+                        conn.config.spawn_x = @intFromFloat(@floor(p.x));
+                        conn.config.spawn_y = @intFromFloat(@floor(p.y));
+                        conn.config.spawn_z = @intFromFloat(@floor(p.z));
+                    }
+                }
+            }
             try conn.queueJoinPackets(age, tod);
             // Login completion: chunks first, PosLook last.
             // (announceJoin runs after unlock — it takes conn.lock itself).
             if (server.world) |pool| {
                 const cc = conn.playerChunk();
-                try view.completeLogin(conn, view.shardPoolSource(pool), 0, cc.cx, cc.cz, server.view_distance, true);
+                try view.completeLogin(conn, server.chunkSource(pool), 0, cc.cx, cc.cz, server.view_distance, true);
             } else {
                 try conn.queuePlayerPosLook();
             }
@@ -552,7 +580,7 @@ pub fn serveConn(
             // Movement / respawn follow-up (no-op without a world).
             if (server.world) |pool| {
                 const radius: u8 = @min(conn.client_view orelse server.view_distance, server.view_distance);
-                try view.syncPlayerChunks(conn, view.shardPoolSource(pool), 0, radius, true);
+                try view.syncPlayerChunks(conn, server.chunkSource(pool), 0, radius, true);
             } else {
                 conn.chunks_dirty = false;
                 conn.force_resync = false;

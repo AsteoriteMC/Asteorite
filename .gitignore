@@ -5,3 +5,4 @@ server_rsa.der
 *.key
 *.der
 tmp_rsa_gen.pem
+.serena
