@@ -11,7 +11,7 @@ Status snapshot (done, tested, live-verified over TCP):
 - [x] Pure-Zig LSM (WAL + SST + `ShardPool`), ZC1 payloads, Anvil→ZC1 import (`tools/anvil_import.zig`)
 - [x] H1 worldgen foundation: `java.util.Random` LCG port (JVM-verified goldens incl. `nextInt(bound)` rejection path), fdlibm `log` port (StrictMath bit-exact — Zig/glibc differ by 1 ulp, proven live), Xoroshiro128++ + Mojang seeding, version-agnostic pipeline driver, `worldgen_dump` tool (`src/worldgen/`, `tools/worldgen_dump.zig`)
 - [x] Region tick stub, MPSC handoff queue, player position tracking (stance quirk handled)
-- [x] 134/134 `zig build test` green (was 53/53 — count the real number when touching this line)
+- [x] 140/140 `zig build test` green (was 53/53 — count the real number when touching this line)
 
 Legend: `[ ]` todo, `[~]` partial. Each phase ends with acceptance criteria.
 
@@ -44,7 +44,8 @@ Without these the client connects but the world is dead. All bodies are
 - [x] ZC1 read-modify-write + LSM persist per edit (`view.applyBlock`; section created on place, no-op break of air, holes ignored)
 - [x] Arm-swing `0x0B` relay to viewers; cross-thread path is conn lock → world lock → per-target locks, never nested (documented in `server.zig`)
 - [x] Acceptance, all live with keepalive-echoing clients: dig+place visible to second client with exact coords/id, swing relayed; restart serves the edited chunk from WAL replay (section mask `10001`, block `3` at the exact cell)
-- [ ] Follow-ups (not blocking): `0x22` multi-block batching, server-driven `0x25` crack stages, survival break-timing validation, NBT preservation, non-overworld dimensions
+- [x] Survival inventory: Click Window `0x0E` (pickup/place/merge/swap, shift-click move, number-key swap, action-number desync → full `0x30` resync) + Close Window `0x0D` no-op on the 45-slot player inventory; NBT-preserving storage, per-change `0x2F` updates, dead-player gates; drop/drag/collect are documented no-ops (no item entities yet); live-verified over TCP
+- [ ] Follow-ups (not blocking): `0x22` multi-block batching, server-driven `0x25` crack stages, survival break-timing validation, NBT in the placement packet's held-item copy (inventory itself preserves NBT end-to-end — see protocol quirks), non-overworld dimensions
 
 ### A4. Entities (minimal) ✅ (done, live-verified)
 - [x] Global atomic eid allocator shared by players + mobs (never reused P1)
@@ -217,7 +218,7 @@ the mapping work grows superlinearly past 1.13, so no skipping ahead.
 
 ### I1. Canonical core + 1.12.2 (tractable — numeric IDs both sides)
 
-- [ ] Canonical internal model first: block state as internal `u16/u32` (not wire id+meta) at the `view.applyBlock`/ZC1 boundary; entity pos/vel/AABB version-free (the Phase D SoA store is the seam). No second protocol until the core stops speaking 1.7
+- [ ] Canonical internal model first: block state as internal `u16/u32` (not wire id+meta) at the `view.applyBlock`/ZC1 boundary; entity pos/vel/AABB version-free (the Phase D SoA store is the seam). Items already follow this shape (`src/item.zig` canonical `Stack` + per-version `proto/vXXX/slot.zig` codecs; no game table duplicated across versions). No second protocol until the core stops speaking 1.7
 - [ ] `src/proto/v340/` (1.12.2) adapter behind the same `Conn` interface: packet IDs, chunk format, `v5 <-> internal <-> v340` mappings; block-entity/NBT mapping proven here before anything newer
 - [ ] Handshake-version routing: bind adapter per conn, reject unlisted versions with a JSON disconnect
 - [ ] Acceptance: same world serves a 1.7.10 and a 1.12.2 client (sequentially first, simultaneously later) with block round-trip tests `v5 -> internal -> v340 -> internal -> v5` for every mapped ID
@@ -296,7 +297,7 @@ and the RAM budget is smaller than a phone's.
 
 ### Protocol correctness (1.7.10 is full of quirks — verify each against a real client before calling done)
 - [ ] Real-client compat harness: scripted 1.7.10 client session (status→login→move→place→break→chat→disconnect) with packet log diffed against vanilla server behavior; check in logs/specs, not binaries
-- [x] Slot/inventory *parsing* (`Slot_Data` id/damage/NBT-skip for creative + placement) — done in A3; full NBT-preserving *encoding* still open (needed for window contents `0x30`/`0x2F`)
+- [x] Slot/inventory *parsing* (`Slot_Data` id/damage/NBT-skip for creative + placement) — done in A3; NBT-preserving *storage + encoding* done via canonical `item.Stack` + `v5/slot.zig` (creative give, click handling, Set Slot `0x2F` / Window Items `0x30` all round-trip NBT verbatim, live-verified; unit + golden coverage in `packets.zig`/`conn.zig`)
 - [x] Living-entity metadata encoder (index 0/1/6 + `0x7F` terminator) used by `0x0C`/`0x0F`/`0x1C` — done in A4
 - [ ] Multi Block Change `0x22` record packing (4-bit meta + 12-bit id + Y + Z + X nibble layout)
 

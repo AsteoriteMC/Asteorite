@@ -11,6 +11,8 @@ const std = @import("std");
 const codec = @import("codec.zig");
 const ids = @import("../proto/v5/ids.zig");
 const packets = @import("../proto/v5/packets.zig");
+const slot_mod = @import("../proto/v5/slot.zig");
+const item_mod = @import("../item.zig");
 const uuid_mod = @import("uuid.zig");
 const cfb8 = @import("cfb8.zig");
 const rsa_mod = @import("rsa.zig");
@@ -110,9 +112,16 @@ pub const Conn = struct {
     last_keepalive: i32 = 0,
     /// Window 0 (player inventory): 45 slots. Only hotbar (36..44) is
     /// interpreted for placement; the rest is stored verbatim.
-    inv: [45]?packets.SlotItem = [_]?packets.SlotItem{null} ** 45,
+    /// Canonical stacks; NBT buffers are OWNED (duped on store, freed on
+    /// replace/deinit) so enchanted/named items survive across frames.
+    inv: [45]?item_mod.Stack = [_]?item_mod.Stack{null} ** 45,
     selected: u8 = 0,
     pending_dig: ?struct { x: i32, y: u8, z: i32 } = null,
+    /// Survival cursor stack (mode-0 clicks) + per-window action counter for
+    /// click validation (desync -> full Window Items refresh, never a kick).
+    cursor: ?item_mod.Stack = null,
+    click_seq: i16 = 0,
+    click_seen: bool = false,
     /// Survival state. Damage resolution lives in the tick thread
     /// (server.zig); the serve thread only records validated attack events.
     /// While is_dead the client shows the death screen: block/entity
@@ -202,6 +211,8 @@ pub const Conn = struct {
         self.frame.deinit(self.allocator);
         self.sent.deinit();
         self.tracked.deinit();
+        for (&self.inv) |*s| item_mod.freeStack(self.allocator, s);
+        item_mod.freeStack(self.allocator, &self.cursor);
     }
 
     /// Pack chunk coords for the sent-set.
@@ -547,7 +558,11 @@ pub const Conn = struct {
         }
         if (frame.id == @as(i32, @intFromEnum(ids.PlayServer.creative_inventory_action))) {
             const c = try packets.parseCreativeSlot(frame.body);
-            if (c.slot >= 0 and c.slot < 45) self.inv[@intCast(c.slot)] = c.item;
+            if (c.slot >= 0 and c.slot < 45) {
+                const idx: usize = @intCast(c.slot);
+                item_mod.freeStack(self.allocator, &self.inv[idx]);
+                self.inv[idx] = try item_mod.cloneStack(self.allocator, c.item);
+            }
             return .none;
         }
         if (frame.id == @as(i32, @intFromEnum(ids.PlayServer.chat_message))) {
@@ -568,33 +583,18 @@ pub const Conn = struct {
             const u = try packets.parseUseEntity(frame.body);
             return self.onUseEntity(u.target, u.mouse);
         }
+        if (frame.id == @as(i32, @intFromEnum(ids.PlayServer.click_window))) {
+            const u = try packets.parseClickWindow(frame.body);
+            try self.onClickWindow(u.window, u.slot, u.button, u.action, u.mode);
+            return .none;
+        }
+        if (frame.id == @as(i32, @intFromEnum(ids.PlayServer.close_window))) {
+            // Only the player inventory (window 0) exists; it cannot close.
+            // Other windows don't exist yet (containers are P-next).
+            return .none;
+        }
         // P-next: actions.
         return .none;
-    }
-
-    /// Vanilla 1.7 melee damage by held item id (no enchantments — NBT is
-    /// skipped on placement, so sharpness can't apply; documented).
-    /// Swords 4-7, axes 3-6, pickaxes 2-5, shovels 1-4, everything else 1.
-    pub fn meleeDamage(item_id: i16) f32 {
-        return switch (item_id) {
-            268, 283 => 4.0, // wooden/gold sword
-            272 => 5.0, // stone sword
-            267 => 6.0, // iron sword
-            276 => 7.0, // diamond sword
-            271, 286 => 3.0, // wooden/gold axe
-            275 => 4.0, // stone axe
-            258 => 5.0, // iron axe
-            279 => 6.0, // diamond axe
-            270, 285 => 2.0, // wooden/gold pickaxe
-            274 => 3.0, // stone pickaxe
-            257 => 4.0, // iron pickaxe
-            278 => 5.0, // diamond pickaxe
-            269, 284 => 1.0, // wooden/gold shovel (fist-equivalent)
-            273 => 2.0, // stone shovel
-            256 => 3.0, // iron shovel
-            277 => 4.0, // diamond shovel
-            else => 1.0, // fist and everything else
-        };
     }
 
     /// Serverbound 0x02: mouse 0 = interact, 1 = attack, 2 = interact-at.
@@ -606,7 +606,7 @@ pub const Conn = struct {
         if (mouse != 1) return .none; // interact / interact-at: P-next
         if (target == self.eid) return .none;
         const held = self.inv[36 + self.selected] orelse null;
-        const dmg = if (held) |h| meleeDamage(h.id) else 1.0;
+        const dmg = if (held) |h| item_mod.meleeDamage(h.id) else 1.0;
         return .{ .attack = .{ .target_eid = target, .dmg = dmg, .ax = self.pos_x, .ay = self.pos_y, .az = self.pos_z } };
     }
 
@@ -616,6 +616,179 @@ pub const Conn = struct {
         const dy = @as(f64, @floatFromInt(y)) + 0.5 - (self.pos_y + 1.62);
         const dz = @as(f64, @floatFromInt(z)) + 0.5 - self.pos_z;
         return dx * dx + dy * dy + dz * dz < 36.0;
+    }
+
+    /// Send one Set Slot (0x2F) update. Heap frame (NBT can be large);
+    /// failures drop the update (client keeps its prediction; the next
+    /// action-number mismatch triggers a full resync).
+    fn sendSlot(self: *Conn, slot: i16) void {
+        const f = packets.frameSetSlotAlloc(self.allocator, 0, slot, if (slot < 0) self.cursor else self.inv[@as(usize, @intCast(slot))]) catch return;
+        defer self.allocator.free(f);
+        self.queueRaw(f) catch {};
+    }
+
+    /// Full window refresh after desync (action-number mismatch).
+    fn sendWindow(self: *Conn) void {
+        const f = packets.frameWindowItemsAlloc(self.allocator, 0, &self.inv) catch return;
+        defer self.allocator.free(f);
+        self.queueRaw(f) catch {};
+    }
+
+    /// Serverbound 0x0E click window. Only the player inventory (window 0)
+    /// exists; other windows are P-next (containers). Modes 3/4/5/6
+    /// (creative pick, drop, drag, collect) are no-ops: drop/drag/collect
+    /// need item entities (0x15 Spawn Object, follow-up), so nothing happens
+    /// rather than deleting or duplicating the player's items.
+    fn onClickWindow(self: *Conn, window: i8, slot: i16, button: i8, action: i16, mode: i8) !void {
+        if (self.is_dead) return;
+        if (window != 0) return;
+        if (slot < -999 or slot > 44) return;
+        // First click seeds the expectation; later clicks must increment.
+        // Mismatch = desynced/replayed client: refresh, ignore the click.
+        if (!self.click_seen) {
+            self.click_seen = true;
+        } else if (action != self.click_seq) {
+            self.sendWindow();
+            return;
+        }
+        self.click_seq = action +% 1;
+        if (slot == -999) return; // outside click: drop path needs entities
+        const s: usize = @intCast(slot);
+        switch (mode) {
+            0 => try self.clickPickup(s, button),
+            1 => self.clickQuickMove(s, button),
+            2 => self.clickNumberKey(s, button),
+            else => {},
+        }
+    }
+
+    /// Mode 0: left (all) / right (one) pickup, place, merge, swap.
+    /// cursor == null means empty-handed. Merge prefers stacking; when the
+    /// stacks can't merge the two sides swap (both buttons).
+    fn clickPickup(self: *Conn, s: usize, button: i8) !void {
+        if (button != 0 and button != 1) return;
+        if (!(try self.clickPickupImpl(s, button))) return;
+        self.sendSlot(@intCast(s));
+        self.sendCursor();
+    }
+
+    /// Returns true when anything moved (caller syncs slot + cursor then).
+    fn clickPickupImpl(self: *Conn, s: usize, button: i8) !bool {
+        const cell = &self.inv[s];
+        if (cell.* == null and self.cursor == null) return false;
+        if (cell.* == null) {
+            // Place from cursor.
+            if (button == 0) {
+                cell.* = self.cursor.?;
+                self.cursor = null;
+            } else {
+                const c = self.cursor.?;
+                cell.* = .{ .id = c.id, .count = 1, .damage = c.damage, .nbt = if (c.nbt) |n| try self.allocator.dupe(u8, n) else null };
+                self.cursor.?.count -= 1;
+                if (self.cursor.?.count <= 0) item_mod.freeStack(self.allocator, &self.cursor);
+            }
+            return true;
+        }
+        if (self.cursor == null) {
+            // Pick up from slot.
+            if (button == 0) {
+                self.cursor = cell.*;
+                cell.* = null;
+            } else {
+                const st = cell.*.?;
+                const take: i8 = @divTrunc(st.count + 1, 2); // ceil half
+                self.cursor = .{ .id = st.id, .count = take, .damage = st.damage, .nbt = if (st.nbt) |n| try self.allocator.dupe(u8, n) else null };
+                cell.*.?.count -= take;
+                if (cell.*.?.count <= 0) item_mod.freeStack(self.allocator, cell);
+            }
+            return true;
+        }
+        // Both sides occupied.
+        const dst = cell.*.?;
+        const src = self.cursor.?;
+        const limit = item_mod.maxStackSize(dst.id);
+        if (item_mod.canMerge(dst, src) and dst.count < limit) {
+            const space: i16 = @as(i16, limit) - dst.count;
+            var n: i16 = if (button == 0) @min(space, src.count) else 1;
+            if (space <= 0 or n <= 0) return false;
+            if (n > src.count) n = src.count;
+            cell.*.?.count += @as(i8, @intCast(n));
+            self.cursor.?.count -= @as(i8, @intCast(n));
+            if (self.cursor.?.count <= 0) item_mod.freeStack(self.allocator, &self.cursor);
+            return true;
+        }
+        if (!item_mod.canMerge(dst, src)) {
+            const t = cell.*;
+            cell.* = self.cursor.?;
+            self.cursor = t;
+            return true;
+        }
+        return false;
+    }
+
+    /// Mode 1: shift-click moves the slot stack into the opposite region
+    /// (main 9..35 <-> hotbar 36..44), merging first then filling the first
+    /// empty. Crafting/armor slots (0..8) are sources only. Cursor untouched.
+    /// Ends with a full refresh (many slots can change at once).
+    fn clickQuickMove(self: *Conn, s: usize, button: i8) void {
+        if (button != 0 and button != 1) return;
+        if (self.inv[s] == null) return;
+        const in_hotbar = s >= 36;
+        const dst_lo: usize = if (in_hotbar) 9 else 36;
+        const dst_hi: usize = if (in_hotbar) 35 else 44;
+        var moved = false;
+        // 1. merge into compatible non-full dest stacks.
+        var i: usize = dst_lo;
+        while (i <= dst_hi) : (i += 1) {
+            if (i == s) continue;
+            const src = self.inv[s] orelse break;
+            const dst = self.inv[i] orelse continue;
+            if (!item_mod.canMerge(dst, src)) continue;
+            const room: i16 = @as(i16, item_mod.maxStackSize(dst.id)) - dst.count;
+            if (room <= 0) continue;
+            const n: i16 = @min(room, @as(i16, src.count));
+            if (n <= 0) continue;
+            self.inv[i].?.count += @as(i8, @intCast(n));
+            self.inv[s].?.count -= @as(i8, @intCast(n));
+            moved = true;
+            if (self.inv[s].?.count <= 0) {
+                item_mod.freeStack(self.allocator, &self.inv[s]);
+                break;
+            }
+        }
+        // 2. remainder goes whole into the first empty dest slot.
+        if (self.inv[s] != null) {
+            i = dst_lo;
+            while (i <= dst_hi) : (i += 1) {
+                if (i == s) continue;
+                if (self.inv[i] != null) continue;
+                self.inv[i] = self.inv[s];
+                self.inv[s] = null;
+                moved = true;
+                break;
+            }
+        }
+        if (moved) self.sendWindow();
+    }
+
+    /// Mode 2: number-key swap with hotbar slot `button` (0..8).
+    /// Ignored while dragging (cursor non-empty), like vanilla.
+    fn clickNumberKey(self: *Conn, s: usize, button: i8) void {
+        if (button < 0 or button > 8) return;
+        if (self.cursor != null) return;
+        const h: usize = 36 + @as(usize, @intCast(button));
+        if (s == h) return;
+        const t = self.inv[s];
+        self.inv[s] = self.inv[h];
+        self.inv[h] = t;
+        self.sendSlot(@intCast(s));
+        self.sendSlot(@intCast(h));
+    }
+
+    fn sendCursor(self: *Conn) void {
+        const f = packets.frameSetSlotAlloc(self.allocator, 0, -1, self.cursor) catch return;
+        defer self.allocator.free(f);
+        self.queueRaw(f) catch {};
     }
 
     fn onDig(self: *Conn, status: i8, x: i32, y: u8, z: i32) Action {
@@ -658,7 +831,7 @@ pub const Conn = struct {
         if (direction < 0 or direction > 5) return .none;
         if (!self.inReach(x, y, z)) return .none;
         const held = self.inv[36 + self.selected] orelse return .none;
-        if (held.id < 0 or held.id > 4095) return .none;
+        if (held.id > 4095) return .none;
         // target cell adjacent on the clicked face
         var tx = x;
         var ty: i32 = y;
@@ -1159,10 +1332,10 @@ test "use entity: attack validation, damage table, dead gates, respawn" {
     // self-hit dropped
     try std.testing.expect((try feed(&c, 0x02, useBody(7, 1, &ub))).? == .none);
     // damage table: diamond sword 7, iron axe 5, stick 1
-    try std.testing.expectApproxEqAbs(@as(f32, 7.0), Conn.meleeDamage(276), 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 5.0), Conn.meleeDamage(258), 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), Conn.meleeDamage(280), 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), Conn.meleeDamage(-1), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 7.0), item_mod.meleeDamage(276), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), item_mod.meleeDamage(258), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), item_mod.meleeDamage(280), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), item_mod.meleeDamage(0), 1e-6);
     // diamond sword in hand -> 7.0 event
     {
         var cb: [32]u8 = undefined;
@@ -1172,7 +1345,7 @@ test "use entity: attack validation, damage table, dead gates, respawn" {
         try w.writeByte(1);
         try w.writeShort(0);
         try w.writeShort(-1);
-        c.inv[36] = .{ .id = 276, .count = 1, .damage = 0 };
+        c.inv[36] = .{ .id = 276, .count = 1, .damage = 0, .nbt = null };
         c.selected = 0;
         const act = try feed(&c, 0x02, useBody(100, 1, &ub));
         try std.testing.expectApproxEqAbs(@as(f32, 7.0), act.?.attack.dmg, 1e-6);
@@ -1211,7 +1384,163 @@ test "use entity: attack validation, damage table, dead gates, respawn" {
     }
 }
 
-test "join packets order + fields" {    const a = std.testing.allocator;
+test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
+    const a = std.testing.allocator;
+    var c = Conn.init(a, std.testing.io, .{ .gamemode = 0, .spawn_x = 8, .spawn_y = 64, .spawn_z = 8 }, 7);
+    defer c.deinit();
+    c.state = .play;
+    @memcpy(c.username[0.."Bo".len], "Bo");
+    c.username_len = "Bo".len;
+    const feed = struct {
+        fn run(conn: *Conn, id: i32, body: []const u8) !?Action {
+            var f: [64]u8 = undefined;
+            try conn.feedData(try codec.framePacket(id, body, &f));
+            const fr = (try conn.poll()).?;
+            return try conn.handleFrame(fr);
+        }
+    }.run;
+    const click = struct {
+        fn run(conn: *Conn, slot: i16, button: i8, action: i16, mode: i8) !?Action {
+            var cb: [32]u8 = undefined;
+            var w = codec.PacketWriter.init(&cb);
+            try w.writeByte(0); // window 0
+            try w.writeShort(slot);
+            try w.writeByte(@as(u8, @bitCast(button)));
+            try w.writeShort(action);
+            try w.writeByte(@as(u8, @bitCast(mode)));
+            try w.writeShort(-1); // empty clicked slot
+            return try feed(conn, 0x0E, w.written());
+        }
+    }.run;
+    // 1. pickup all (left on stack, empty cursor) -> slot empty, cursor full
+    c.inv[10] = .{ .id = 1, .count = 64, .damage = 0, .nbt = null };
+    try std.testing.expect((try click(&c, 10, 0, 1, 0)).? == .none);
+    try std.testing.expect(c.inv[10] == null);
+    try std.testing.expectEqual(@as(i8, 64), c.cursor.?.count);
+    {
+        const out = try c.takeOutput();
+        defer a.free(out);
+        // slot 10 cleared + cursor set
+        var r = codec.PacketReader.init(out);
+        var saw_slot = false;
+        var saw_cursor = false;
+        while (r.remaining() > 0) {
+            const h = try codec.decodeFrame(&r);
+            try std.testing.expectEqual(@as(i32, 0x2F), h.id);
+            _ = try r.readByte(); // window
+            const slot = try r.readShort();
+            if (slot == 10) {
+                try std.testing.expectEqual(@as(i16, -1), try r.readShort());
+                saw_slot = true;
+            } else if (slot == -1) {
+                try std.testing.expectEqual(@as(i16, 1), try r.readShort());
+                try std.testing.expectEqual(@as(i8, 64), @as(i8, @bitCast(try r.readByte())));
+                try std.testing.expectEqual(@as(i16, 0), try r.readShort());
+                try std.testing.expectEqual(@as(i16, -1), try r.readShort());
+                saw_cursor = true;
+            } else return error.TestUnexpectedResult;
+        }
+        try std.testing.expect(saw_slot and saw_cursor);
+    }
+    // 2. place all into empty slot
+    try std.testing.expect((try click(&c, 11, 0, 2, 0)).? == .none);
+    try std.testing.expectEqual(@as(i8, 64), c.inv[11].?.count);
+    try std.testing.expect(c.cursor == null);
+    { const o = try c.takeOutput(); defer a.free(o); }
+    // 3. right-click pickup half (ceil): 10 -> cursor 5, slot 5
+    c.inv[12] = .{ .id = 1, .count = 10, .damage = 0, .nbt = null };
+    try std.testing.expect((try click(&c, 12, 1, 3, 0)).? == .none);
+    try std.testing.expectEqual(@as(i8, 5), c.cursor.?.count);
+    try std.testing.expectEqual(@as(i8, 5), c.inv[12].?.count);
+    { const o = try c.takeOutput(); defer a.free(o); }
+    // 4. right-click place one: slot 13 empty -> 1, cursor 5 -> 4
+    try std.testing.expect((try click(&c, 13, 1, 4, 0)).? == .none);
+    try std.testing.expectEqual(@as(i8, 1), c.inv[13].?.count);
+    try std.testing.expectEqual(@as(i8, 4), c.cursor.?.count);
+    { const o = try c.takeOutput(); defer a.free(o); }
+    // 5. merge: slot has 60, cursor has 10 of same -> slot 64, cursor 6
+    c.inv[14] = .{ .id = 1, .count = 60, .damage = 0, .nbt = null };
+    c.cursor = .{ .id = 1, .count = 10, .damage = 0, .nbt = null };
+    try std.testing.expect((try click(&c, 14, 0, 5, 0)).? == .none);
+    try std.testing.expectEqual(@as(i8, 64), c.inv[14].?.count);
+    try std.testing.expectEqual(@as(i8, 6), c.cursor.?.count);
+    { const o = try c.takeOutput(); defer a.free(o); }
+    // 6. swap: cursor stone vs slot dirt
+    c.inv[16] = .{ .id = 3, .count = 5, .damage = 0, .nbt = null };
+    c.cursor = .{ .id = 1, .count = 6, .damage = 0, .nbt = null };
+    try std.testing.expect((try click(&c, 16, 0, 6, 0)).? == .none);
+    try std.testing.expectEqual(@as(u16, 1), c.inv[16].?.id);
+    try std.testing.expectEqual(@as(i8, 6), c.inv[16].?.count);
+    try std.testing.expectEqual(@as(u16, 3), c.cursor.?.id);
+    { const o = try c.takeOutput(); defer a.free(o); }
+    // 7. shift-click merge: main slot 20 (dirt 32) into hotbar 36 (dirt 32)
+    // exact fill: source empties, no remainder to place
+    c.cursor = null;
+    c.inv[20] = .{ .id = 1, .count = 32, .damage = 0, .nbt = null };
+    c.inv[36] = .{ .id = 1, .count = 32, .damage = 0, .nbt = null };
+    c.inv[37] = .{ .id = 2, .count = 1, .damage = 0, .nbt = null };
+    try std.testing.expect((try click(&c, 20, 0, 7, 1)).? == .none);
+    try std.testing.expect(c.inv[20] == null);
+    try std.testing.expectEqual(@as(i8, 64), c.inv[36].?.count);
+    try std.testing.expect(c.inv[38] == null);
+    // 7b. shift-click fill: no merge target -> first empty dest slot (38)
+    c.inv[24] = .{ .id = 1, .count = 10, .damage = 0, .nbt = null };
+    try std.testing.expect((try click(&c, 24, 0, 8, 1)).? == .none);
+    try std.testing.expect(c.inv[24] == null);
+    try std.testing.expectEqual(@as(i8, 10), c.inv[38].?.count);
+    { const o = try c.takeOutput(); defer a.free(o); }
+    // 8. number key: swap slot 21 with hotbar 0 (button 0); ignored w/ cursor
+    c.inv[21] = .{ .id = 5, .count = 1, .damage = 0, .nbt = null };
+    c.inv[36] = .{ .id = 1, .count = 64, .damage = 0, .nbt = null };
+    try std.testing.expect((try click(&c, 21, 0, 9, 2)).? == .none);
+    try std.testing.expectEqual(@as(u16, 1), c.inv[21].?.id);
+    try std.testing.expectEqual(@as(u16, 5), c.inv[36].?.id);
+    c.cursor = .{ .id = 1, .count = 1, .damage = 0, .nbt = null };
+    try std.testing.expect((try click(&c, 21, 1, 10, 2)).? == .none);
+    try std.testing.expectEqual(@as(u16, 1), c.inv[21].?.id); // unchanged
+    c.cursor = null;
+    { const o = try c.takeOutput(); defer a.free(o); }
+    // 9. desync: reused action number triggers full Window Items + ignore
+    c.inv[22] = .{ .id = 7, .count = 3, .damage = 0, .nbt = null };
+    try std.testing.expect((try click(&c, 22, 0, 10, 0)).? == .none); // stale action
+    try std.testing.expectEqual(@as(u16, 7), c.inv[22].?.id); // untouched
+    try std.testing.expectEqual(@as(i8, 3), c.inv[22].?.count);
+    {
+        const out = try c.takeOutput();
+        defer a.free(out);
+        var r = codec.PacketReader.init(out);
+        try std.testing.expectEqual(@as(i32, 0x30), (try codec.decodeFrame(&r)).id);
+        try std.testing.expectEqual(@as(u8, 0), try r.readByte()); // window
+        try std.testing.expectEqual(@as(i16, 45), try r.readShort()); // full inventory
+    }
+    // 10. NBT survives moves: whole-stack pickup transfers the tag bytes
+    // (same allocation, no copy); split-half copies them (no aliasing).
+    const tag = [_]u8{ 0x0A, 0x00, 0x03, 0x64, 0x75, 0x6D };
+    const owned_tag = try a.dupe(u8, &tag);
+    c.inv[30] = .{ .id = 276, .count = 1, .damage = 0, .nbt = owned_tag };
+    try std.testing.expect((try click(&c, 30, 0, 11, 0)).? == .none); // pickup
+    try std.testing.expect(c.inv[30] == null);
+    try std.testing.expectEqualSlices(u8, &tag, c.cursor.?.nbt.?);
+    try std.testing.expect(c.cursor.?.nbt.?.ptr == owned_tag.ptr); // moved, not copied
+    { const o = try c.takeOutput(); defer a.free(o); }
+    // park it in an empty slot (place path keeps NBT too)
+    try std.testing.expect((try click(&c, 31, 0, 12, 0)).? == .none);
+    try std.testing.expect(c.cursor == null);
+    try std.testing.expectEqualSlices(u8, &tag, c.inv[31].?.nbt.?);
+    { const o = try c.takeOutput(); defer a.free(o); }
+    // two-stack split: fresh enchanted stack of 2, right-click takes half
+    const tag2 = try a.dupe(u8, &tag);
+    c.inv[32] = .{ .id = 276, .count = 2, .damage = 0, .nbt = tag2 };
+    try std.testing.expect((try click(&c, 32, 1, 13, 0)).? == .none);
+    try std.testing.expectEqual(@as(i8, 1), c.cursor.?.count);
+    try std.testing.expectEqual(@as(i8, 1), c.inv[32].?.count);
+    try std.testing.expectEqualSlices(u8, c.cursor.?.nbt.?, c.inv[32].?.nbt.?);
+    try std.testing.expect(c.cursor.?.nbt.?.ptr != c.inv[32].?.nbt.?.ptr); // independent copies
+    { const o = try c.takeOutput(); defer a.free(o); }
+}
+
+test "join packets order + fields" {
+    const a = std.testing.allocator;
     var c = Conn.init(a, std.testing.io, .{ .gamemode = 1 }, 1);
     defer c.deinit();
     @memcpy(c.username[0.."Steve".len], "Steve");
@@ -1452,3 +1781,5 @@ test "online login full handshake (mock Mojang)" {
     try std.testing.expectEqualStrings("069a79f4-44e9-4726-a5be-f2a2fce1b293", try r2.readString());
     try std.testing.expectEqualStrings("Steve", try r2.readString());
 }
+
+

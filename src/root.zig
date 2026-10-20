@@ -42,6 +42,10 @@ pub const v5gen = @import("worldgen/v5/gen.zig");
 pub const v5serve = @import("worldgen/v5/serve.zig");
 /// 1.7.10 cave + ravine carvers (CFR ports, JVM-verified).
 pub const v5carve = @import("worldgen/v5/carve.zig");
+/// Canonical item model (version-agnostic game data; wire codecs per proto).
+pub const item = @import("item.zig");
+/// 1.7 slot wire codec over the canonical model (no game tables here).
+pub const v5slot = @import("proto/v5/slot.zig");
 /// Lock-free cross-region handoff queue.
 pub const mpsc = @import("sim/mpsc.zig");
 /// Deterministic 20 TPS region tick loop.
@@ -81,6 +85,8 @@ test {
     _ = @import("worldgen/v5/gen.zig");
     _ = @import("worldgen/v5/serve.zig");
     _ = @import("worldgen/v5/carve.zig");
+    _ = @import("item.zig");
+    _ = @import("proto/v5/slot.zig");
     _ = @import("sim/mpsc.zig");
     _ = @import("sim/tick.zig");
     _ = @import("sim/view.zig");

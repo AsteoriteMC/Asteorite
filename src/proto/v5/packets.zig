@@ -9,6 +9,8 @@
 const std = @import("std");
 const codec = @import("../../net/codec.zig");
 const ids = @import("ids.zig");
+const item_mod = @import("../../item.zig");
+const slot_mod = @import("slot.zig");
 
 // ---------- handshaking ----------
 
@@ -182,6 +184,53 @@ pub fn frameUpdateHealth(health: f32, food: i16, saturation: f32, out: []u8) cod
     std.mem.writeInt(i16, pb[4..6], food, .big);
     std.mem.writeInt(u32, pb[6..10], @bitCast(saturation), .big);
     return try codec.framePacket(@intFromEnum(ids.PlayClient.update_health), &pb, out);
+}
+
+/// Set Slot 0x2F (slot -1 = cursor). Item encoded by the v5 slot codec
+/// (NBT verbatim), so enchanted/named items survive server round-trips.
+/// Heap-allocated: NBT is attacker-controlled up to the frame limit, so no
+/// fixed stack buffer is safe. Rare UI packet — caller frees.
+pub fn frameSetSlotAlloc(alloc: std.mem.Allocator, window: i8, slot: i16, item: ?item_mod.Stack) ![]u8 {
+    const nbt_len: usize = if (item) |s| (if (s.nbt) |n| n.len else 0) else 0;
+    // payload: window(1) + slot(2) + slot-bytes(2+1+2+2+nbt)
+    const payload = try alloc.alloc(u8, 1 + 2 + 7 + nbt_len);
+    defer alloc.free(payload);
+    var w = codec.PacketWriter.init(payload);
+    try w.writeByte(@bitCast(window));
+    try w.writeShort(slot);
+    try slot_mod.writeSlot(&w, item);
+    const id = @intFromEnum(ids.PlayClient.set_slot);
+    const out = try alloc.alloc(u8, codec.PacketWriter.varIntLen(id) + codec.PacketWriter.varIntLen(@as(i32, @intCast(w.written().len + codec.PacketWriter.varIntLen(id)))) + w.written().len);
+    errdefer alloc.free(out);
+    const f = try codec.framePacket(id, w.written(), out);
+    const owned = try alloc.dupe(u8, f);
+    alloc.free(out);
+    return owned;
+}
+
+/// Window Items 0x30: full window contents (used for desync resyncs).
+/// Same heap discipline as frameSetSlotAlloc.
+pub fn frameWindowItemsAlloc(alloc: std.mem.Allocator, window: u8, items: []const ?item_mod.Stack) ![]u8 {
+    var nbt_total: usize = 0;
+    for (items) |it| {
+        if (it) |s| {
+            if (s.nbt) |n| nbt_total += n.len;
+        }
+    }
+    const payload = try alloc.alloc(u8, 1 + 2 + items.len * 7 + nbt_total);
+    defer alloc.free(payload);
+    var w = codec.PacketWriter.init(payload);
+    try w.writeByte(window);
+    if (items.len > std.math.maxInt(i16)) return error.PacketTooLarge;
+    try w.writeShort(@as(i16, @intCast(items.len)));
+    for (items) |it| try slot_mod.writeSlot(&w, it);
+    const id = @intFromEnum(ids.PlayClient.window_items);
+    const out = try alloc.alloc(u8, codec.PacketWriter.varIntLen(id) + codec.PacketWriter.varIntLen(@as(i32, @intCast(w.written().len + codec.PacketWriter.varIntLen(id)))) + w.written().len);
+    errdefer alloc.free(out);
+    const f = try codec.framePacket(id, w.written(), out);
+    const owned = try alloc.dupe(u8, f);
+    alloc.free(out);
+    return owned;
 }
 
 /// Set Experience 0x1F.
@@ -367,16 +416,12 @@ pub fn formatChatJson(name: []const u8, msg: []const u8, out: []u8) error{ BadNa
 /// damage i16, NBT (i16 length + gzip bytes, -1 = none).
 pub const SlotItem = struct { id: i16, count: i8, damage: i16 };
 
-/// Returns null for empty slot. NBT payload is skipped (not preserved P1).
+/// Legacy parse kept for placement-packet validation. The single canonical
+/// implementation lives in `slot.zig`; this drops NBT for old callers
+/// (placement re-reads the held stack from the inventory instead).
 pub fn parseSlot(r: *codec.PacketReader) codec.CodecError!?SlotItem {
-    const id = try r.readShort();
-    if (id == -1) return null;
-    const count = @as(i8, @bitCast(try r.readByte()));
-    const damage = try r.readShort();
-    const nbt_len = try r.readShort();
-    if (nbt_len > 0) _ = try r.readBytes(@intCast(nbt_len));
-    if (nbt_len < -1) return error.InvalidLength;
-    return .{ .id = id, .count = count, .damage = damage };
+    const st = try slot_mod.readSlot(r) orelse return null;
+    return .{ .id = @as(i16, @intCast(st.id)), .count = st.count, .damage = st.damage };
 }
 
 /// Serverbound 0x07 digging: status, x, y(u8), z, face.
@@ -445,12 +490,45 @@ pub fn parseUseEntity(body: []const u8) codec.CodecError!struct { target: i32, m
     return .{ .target = target, .mouse = mouse, .x = x, .y = y, .z = z };
 }
 
-/// Serverbound 0x10 creative inventory action.
-pub fn parseCreativeSlot(body: []const u8) codec.CodecError!struct { slot: i16, item: ?SlotItem } {
+/// Serverbound 0x10 creative inventory action. NBT preserved (borrowed —
+/// clone via `item.cloneStack` before storing past the current frame).
+/// Backed by the single v5 slot codec (no duplicated format logic).
+pub fn parseCreativeSlot(body: []const u8) codec.CodecError!struct { slot: i16, item: ?item_mod.Stack } {
     var r = codec.PacketReader.init(body);
     const slot = try r.readShort();
-    const item = try parseSlot(&r);
+    const item = try slot_mod.readSlot(&r);
     return .{ .slot = slot, .item = item };
+}
+
+/// Serverbound 0x0E click window. Verified against minecraft-data 1.7:
+/// windowId i8, slot i16, mouseButton i8, action i16, mode i8, clicked item
+/// (full slot incl. NBT). The clicked-item echo is read and validated
+/// against server state in conn.zig (desync -> resync, never trust).
+/// Modes: 0 pickup/place/swap, 1 shift-move, 2 number-key swap, 3 creative
+/// pick (ignored survival-side), 4 drop (no-op: no item entities yet),
+/// 5 drag (no-op), 6 collect (no-op).
+pub fn parseClickWindow(body: []const u8) codec.CodecError!struct {
+    window: i8,
+    slot: i16,
+    button: i8,
+    action: i16,
+    mode: i8,
+    clicked: ?item_mod.Stack,
+} {
+    var r = codec.PacketReader.init(body);
+    const window = @as(i8, @bitCast(try r.readByte()));
+    const slot = try r.readShort();
+    const button = @as(i8, @bitCast(try r.readByte()));
+    const action = try r.readShort();
+    const mode = @as(i8, @bitCast(try r.readByte()));
+    const clicked = try slot_mod.readSlot(&r);
+    return .{ .window = window, .slot = slot, .button = button, .action = action, .mode = mode, .clicked = clicked };
+}
+
+/// Serverbound 0x0D close window (windowId u8).
+pub fn parseCloseWindow(body: []const u8) codec.CodecError!u8 {
+    var r = codec.PacketReader.init(body);
+    return try r.readByte();
 }
 
 /// Block Change 0x23 (1.7 form: separate id VarInt + meta u8, NOT packed).
@@ -644,7 +722,8 @@ test "dig/place/held/arm/creative/serverbound roundtrips" {
         try cw.writeShort(-1); // no nbt
         const cs = try parseCreativeSlot(cw.written());
         try std.testing.expectEqual(@as(i16, 37), cs.slot);
-        try std.testing.expectEqual(@as(i16, 3), cs.item.?.id);
+        try std.testing.expectEqual(@as(u16, 3), cs.item.?.id);
+        try std.testing.expect(cs.item.?.nbt == null);
         // nbt len 0 and -2 are tolerated/rejected
         var zb: [16]u8 = undefined;
         var zw = codec.PacketWriter.init(&zb);
@@ -656,7 +735,71 @@ test "dig/place/held/arm/creative/serverbound roundtrips" {
         try zw.writeShort(0);
         const zs = try parseCreativeSlot(zw.written());
         try std.testing.expect(zs.item != null);
+        try std.testing.expect(zs.item.?.nbt == null);
+        // real NBT bytes are preserved (borrowed)
+        var nb: [32]u8 = undefined;
+        var nw = codec.PacketWriter.init(&nb);
+        try nw.writeShort(36);
+        try nw.writeShort(276);
+        try nw.writeByte(1);
+        try nw.writeShort(0);
+        const tag = [_]u8{ 0x0A, 0x00, 0x04, 0x64, 0x75, 0x6D, 0x6D, 0x79, 0x00 };
+        try nw.writeShort(@as(i16, @intCast(tag.len)));
+        try nw.writeBytes(&tag);
+        const ns = try parseCreativeSlot(nw.written());
+        try std.testing.expectEqualSlices(u8, &tag, ns.item.?.nbt.?);
     }
+}
+
+test "click window parse + set slot / window items roundtrip" {
+    // 0x0E: window i8, slot i16, button i8, action i16, mode i8, item slot
+    var cb: [32]u8 = undefined;
+    var cw = codec.PacketWriter.init(&cb);
+    try cw.writeByte(0); // window 0
+    try cw.writeShort(12); // slot
+    try cw.writeByte(1); // right button
+    try cw.writeShort(7); // action number
+    try cw.writeByte(0); // pickup mode
+    try cw.writeShort(-1); // empty clicked slot
+    const c = try parseClickWindow(cw.written());
+    try std.testing.expectEqual(@as(i8, 0), c.window);
+    try std.testing.expectEqual(@as(i16, 12), c.slot);
+    try std.testing.expectEqual(@as(i8, 1), c.button);
+    try std.testing.expectEqual(@as(i16, 7), c.action);
+    try std.testing.expectEqual(@as(i8, 0), c.mode);
+    try std.testing.expect(c.clicked == null);
+    try std.testing.expectEqual(@as(u8, 0x0D), @intFromEnum(ids.PlayServer.close_window));
+    // 0x2F roundtrip incl NBT, then 0x30 full window
+    const tag = [_]u8{ 0x0A, 0x00, 0x01, 0x58 };
+    const item: ?item_mod.Stack = .{ .id = 276, .count = 1, .damage = 0, .nbt = &tag };
+    const sf = try frameSetSlotAlloc(std.testing.allocator, 0, 36, item);
+    defer std.testing.allocator.free(sf);
+    var r = codec.PacketReader.init(sf);
+    try std.testing.expectEqual(@as(i32, 0x2F), (try codec.decodeFrame(&r)).id);
+    try std.testing.expectEqual(@as(i8, 0), @as(i8, @bitCast(try r.readByte())));
+    try std.testing.expectEqual(@as(i16, 36), try r.readShort());
+    try std.testing.expectEqual(@as(i16, 276), try r.readShort());
+    try std.testing.expectEqual(@as(i8, 1), @as(i8, @bitCast(try r.readByte())));
+    try std.testing.expectEqual(@as(i16, 0), try r.readShort());
+    try std.testing.expectEqual(@as(i16, 4), try r.readShort());
+    try std.testing.expectEqualSlices(u8, &tag, try r.readBytes(4));
+    try std.testing.expectEqual(@as(usize, 0), r.remaining());
+    // cursor slot (-1) + empty slot encode
+    const cur = try frameSetSlotAlloc(std.testing.allocator, 0, -1, null);
+    defer std.testing.allocator.free(cur);
+    var r2 = codec.PacketReader.init(cur);
+    try std.testing.expectEqual(@as(i32, 0x2F), (try codec.decodeFrame(&r2)).id);
+    _ = try r2.readByte();
+    try std.testing.expectEqual(@as(i16, -1), try r2.readShort());
+    try std.testing.expectEqual(@as(i16, -1), try r2.readShort());
+    const items = [_]?item_mod.Stack{ item, null };
+    const wf = try frameWindowItemsAlloc(std.testing.allocator, 0, &items);
+    defer std.testing.allocator.free(wf);
+    var r3 = codec.PacketReader.init(wf);
+    try std.testing.expectEqual(@as(i32, 0x30), (try codec.decodeFrame(&r3)).id);
+    try std.testing.expectEqual(@as(u8, 0), try r3.readByte());
+    try std.testing.expectEqual(@as(i16, 2), try r3.readShort());
+    try std.testing.expectEqual(@as(i16, 276), try r3.readShort());
 }
 
 test "block change + animation frames parse back" {
