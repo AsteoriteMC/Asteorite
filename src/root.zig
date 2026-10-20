@@ -40,6 +40,8 @@ pub const v5surface = @import("worldgen/v5/surface.zig");
 pub const v5gen = @import("worldgen/v5/gen.zig");
 /// v5 generation serving glue (on-demand fill, spawn search, pre-gen).
 pub const v5serve = @import("worldgen/v5/serve.zig");
+/// 1.7.10 decorators: ores + trees (CFR ports, JVM shape goldens).
+pub const v5decor = @import("worldgen/v5/decor.zig");
 /// 1.7.10 cave + ravine carvers (CFR ports, JVM-verified).
 pub const v5carve = @import("worldgen/v5/carve.zig");
 /// Canonical item model (version-agnostic game data; wire codecs per proto).
@@ -84,6 +86,7 @@ test {
     _ = @import("worldgen/v5/surface.zig");
     _ = @import("worldgen/v5/gen.zig");
     _ = @import("worldgen/v5/serve.zig");
+    _ = @import("worldgen/v5/decor.zig");
     _ = @import("worldgen/v5/carve.zig");
     _ = @import("item.zig");
     _ = @import("proto/v5/slot.zig");

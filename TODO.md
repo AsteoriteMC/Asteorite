@@ -11,7 +11,7 @@ Status snapshot (done, tested, live-verified over TCP):
 - [x] Pure-Zig LSM (WAL + SST + `ShardPool`), ZC1 payloads, Anvil→ZC1 import (`tools/anvil_import.zig`)
 - [x] H1 worldgen foundation: `java.util.Random` LCG port (JVM-verified goldens incl. `nextInt(bound)` rejection path), fdlibm `log` port (StrictMath bit-exact — Zig/glibc differ by 1 ulp, proven live), Xoroshiro128++ + Mojang seeding, version-agnostic pipeline driver, `worldgen_dump` tool (`src/worldgen/`, `tools/worldgen_dump.zig`)
 - [x] Region tick stub, MPSC handoff queue, player position tracking (stance quirk handled)
-- [x] 140/140 `zig build test` green (was 53/53 — count the real number when touching this line)
+- [x] 147/147 `zig build test` green (was 53/53 — count the real number when touching this line)
 
 Legend: `[ ]` todo, `[~]` partial. Each phase ends with acceptance criteria.
 
@@ -178,9 +178,9 @@ Worldgen version follows the world's version, not the client's (ties to Phase I)
 
 ### H2. 1.7.10 generator (v5 — fills today's void holes)
 
-- [~] `src/worldgen/v5/`: GenLayer chain ✅ + hill noise ✅ + density ✅ + fill ✅ + surface ✅ (base + mesa plateau w/ Bryce) + cave ✅ + ravine ✅ carvers — all JVM-verified per-stage incl. 10 full-pipeline chunks; ore/tree decorators still TODO
+- [~] `src/worldgen/v5/`: GenLayer chain ✅ + hill noise ✅ + density ✅ + fill ✅ + surface ✅ (base + mesa plateau w/ Bryce) + cave ✅ + ravine ✅ carvers + ores ✅ / trees ✅ decorators — all JVM-verified per-stage incl. 10 full-pipeline chunks (terrain+carve bit-exact); decorator positions differ from vanilla (structures/lakes/dungeons skipped, documented) but shapes/counts/distributions are vanilla-exact via JVM goldens
 - [x] Chunk gen as background-capable job writing ZC1 into the pool (sync on-demand first, never on the 50ms path by construction of the source seam); spawn pre-gen on boot (`--seed` + `--gen-spawn N`); land-spawn search; live-verified over TCP (dedicated background gen thread is the follow-up)
-- [~] Acceptance: fresh DB → login shows terrain ✅, F3 biomes sane ✅ (voronoi biomes on the wire), same-seed parity ✅ per-stage (biomes, density, fill, surface, carve, full-pipeline bit-exact); ores/trees present — pending decorators
+- [~] Acceptance: fresh DB → login shows terrain ✅, F3 biomes sane ✅ (voronoi biomes on the wire), same-seed parity ✅ per-stage (biomes, density, fill, surface, carve, full-pipeline bit-exact); ores ✅ / trees ✅ present (live-verified: 249-353 ore blocks/chunk, logs+leaves in forest chunks); decorator positions differ from vanilla (documented approximation, structures/lakes/dungeons are future work)
 
 ### H3. Data overlay: custom packs (Terralith / JJThunder-class terrain)
 

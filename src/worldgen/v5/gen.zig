@@ -1,13 +1,14 @@
 //! 1.7.10 chunk generator (v5 terrain half).
 //!
 //! Pure function f(worldSeed, cx, cz) -> ZC1 Chunk: density field, block
-//! fill, surface builder, column skylight, heightmap, voronoi biomes.
-//! Carvers (caves/ravines) and decorators (ores/trees) hook into genChunk
-//! (H2 follow-ups); the stage order mirrors ChunkProviderGenerate.d.
+//! fill, surface builder, carvers, decorators (ores/trees via 3x3 neighbor
+//! loop), column skylight, heightmap, voronoi biomes.
+//! The stage order mirrors ChunkProviderGenerate.d.
 
 const std = @import("std");
 const chunk_mod = @import("../../world/chunk.zig");
 const shaper_mod = @import("shaper.zig");
+const decor_mod = @import("decor.zig");
 const surface_mod = @import("surface.zig");
 const carve_mod = @import("carve.zig");
 
@@ -55,10 +56,15 @@ pub const Gen = struct {
 
     /// Generate chunk (cx,cz) into a heap Chunk. Caller destroys.
     /// scratch is a per-call arena; alloc backs the returned Chunk.
+    /// Decorators (ores/trees) run on a 3x3 shaped view (terrain+carve for
+    /// neighbors + center), then the center is extracted. Cost: 9x genFlat
+    /// per chunk (cached in LSM; background pre-gen amortizes).
     pub fn genChunk(self: *Gen, alloc: std.mem.Allocator, scratch: std.mem.Allocator, cx: i32, cz: i32) !*chunk_mod.Chunk {
         const flat = try self.genFlat(alloc, scratch, cx, cz);
         defer alloc.destroy(flat.blocks);
         defer alloc.destroy(flat.meta);
+        // 3x3 decorate: neighbors + center terrain into a 48x48 view.
+        try self.decorateInto(alloc, scratch, cx, cz, flat.blocks, flat.meta);
         const blocks = flat.blocks;
         const meta_fixed: *[shaper_mod.BLOCKS_LEN]u8 = flat.meta;
 
@@ -141,6 +147,90 @@ pub const Gen = struct {
         }
         return SEA_LEVEL + 1;
     }
+    fn decorateInto(self: *Gen, alloc: std.mem.Allocator, scratch: std.mem.Allocator, cx: i32, cz: i32, blocks: *[shaper_mod.BLOCKS_LEN]u16, meta: *[shaper_mod.BLOCKS_LEN]u8) !void {
+        const VS: usize = 48;
+        const vblocks = try scratch.alloc(u16, VS * 256 * VS);
+        defer scratch.free(vblocks);
+        const vmetas = try scratch.alloc(u8, VS * 256 * VS);
+        defer scratch.free(vmetas);
+        @memset(vblocks, 0);
+        @memset(vmetas, 0);
+        // Copy center first (then neighbors overwrite their regions; center
+        // region will be overwritten by our copy below? Actually copy center
+        // into view center, then neighbors into their regions).
+        // Layout: view (x,z) with ox=(cx-1)*16. Local lx in 0..48.
+        // Center chunk occupies lx 16..31, lz 16..31.
+        {
+            var lx: usize = 0;
+            while (lx < 16) : (lx += 1) {
+                var lz: usize = 0;
+                while (lz < 16) : (lz += 1) {
+                    var y: usize = 0;
+                    while (y < 256) : (y += 1) {
+                        const src = (lx * 4096 + lz * 256) + y;
+                        const dst = ((lx + 16) * VS + (lz + 16)) * 256 + y;
+                        vblocks[dst] = blocks[src];
+                        vmetas[dst] = meta[src];
+                    }
+                }
+            }
+        }
+        // Neighbors (8 surrounding chunks).
+        var dz: i32 = -1;
+        while (dz <= 1) : (dz += 1) {
+            var dx: i32 = -1;
+            while (dx <= 1) : (dx += 1) {
+                if (dx == 0 and dz == 0) continue;
+                const nx = cx + dx;
+                const nz = cz + dz;
+                const nflat = try self.genFlat(alloc, scratch, nx, nz);
+                defer alloc.destroy(nflat.blocks);
+                defer alloc.destroy(nflat.meta);
+                const ox: usize = @intCast(dx + 1);
+                const oz: usize = @intCast(dz + 1);
+                var lx: usize = 0;
+                while (lx < 16) : (lx += 1) {
+                    var lz: usize = 0;
+                    while (lz < 16) : (lz += 1) {
+                        var y: usize = 0;
+                        while (y < 256) : (y += 1) {
+                            const src = (lx * 4096 + lz * 256) + y;
+                            const dst = ((lx + ox * 16) * VS + (lz + oz * 16)) * 256 + y;
+                            vblocks[dst] = nflat.blocks[src];
+                            vmetas[dst] = nflat.meta[src];
+                        }
+                    }
+                }
+            }
+        }
+        var view = decor_mod.View{
+            .blocks = vblocks,
+            .metas = vmetas,
+            .ox = (cx - 1) * 16,
+            .oz = (cz - 1) * 16,
+            .sx = VS,
+            .sz = VS,
+        };
+        const vheights = try scratch.alloc(i32, VS * VS);
+        defer scratch.free(vheights);
+        decor_mod.computeHeights(&view, vheights);
+        try decor_mod.decorateCenter(&view, vheights, self.world_seed, cx, cz, &self.shaper.chain, self.shaper.roots[1], scratch);
+        // Extract decorated center back into blocks/meta.
+        var lx: usize = 0;
+        while (lx < 16) : (lx += 1) {
+            var lz: usize = 0;
+            while (lz < 16) : (lz += 1) {
+                var y: usize = 0;
+                while (y < 256) : (y += 1) {
+                    const dst = (lx * 4096 + lz * 256) + y;
+                    const src = ((lx + 16) * VS + (lz + 16)) * 256 + y;
+                    blocks[dst] = vblocks[src];
+                    meta[dst] = vmetas[src];
+                }
+            }
+        }
+    }
+
 };
 
 
@@ -408,3 +498,4 @@ test "full pipeline matches JVM (seed 7 chunk 8,8)" {
         try std.testing.expectEqual(sampm_want[k], flat.meta[idx]);
     }
 }
+
