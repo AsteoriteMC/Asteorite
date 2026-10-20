@@ -35,6 +35,7 @@ pub const Shaper = struct {
     chain: genlayer.Chain,
     roots: [3]u32,
     temp_eval: surface.TempEval,
+    mesa: surface.MesaState,
     amplified: bool,
     alloc: std.mem.Allocator,
 
@@ -54,6 +55,7 @@ pub const Shaper = struct {
             .chain = undefined,
             .roots = undefined,
             .temp_eval = undefined,
+            .mesa = undefined,
             .amplified = amplified,
             .alloc = alloc,
         };
@@ -72,6 +74,7 @@ pub const Shaper = struct {
         s.chain = built.chain;
         s.roots = built.roots;
         s.temp_eval = try surface.TempEval.init(alloc);
+        s.mesa = try surface.MesaState.init(alloc, world_seed);
         return s;
     }
 
@@ -84,6 +87,7 @@ pub const Shaper = struct {
         self.depth_s.deinit();
         self.forest8.deinit();
         self.temp_eval.deinit();
+        self.mesa.deinit();
         self.chain.deinit();
     }
 
@@ -254,18 +258,35 @@ pub const Shaper = struct {
         r.setSeed(@as(i64, cx) *% 341873128712 +% @as(i64, cz) *% 132897987541);
         for (0..16) |i| {
             for (0..16) |j| {
-                surface.buildColumn(
-                    blocks,
-                    meta,
-                    i,
-                    j,
-                    cx * 16 + @as(i32, @intCast(i)),
-                    cz * 16 + @as(i32, @intCast(j)),
-                    s[j + i * 16],
-                    &r,
-                    bio[j + i * 16],
-                    &self.temp_eval,
-                );
+                const bio_id = bio[j + i * 16];
+                if (surface.isMesa(bio_id)) {
+                    surface.mesaBuildColumn(
+                        blocks,
+                        meta,
+                        i,
+                        j,
+                        cx * 16 + @as(i32, @intCast(i)),
+                        cz * 16 + @as(i32, @intCast(j)),
+                        s[j + i * 16],
+                        &r,
+                        &self.mesa,
+                        bio_id == 165,
+                        bio_id == 38 or bio_id == 166,
+                    );
+                } else {
+                    surface.buildColumn(
+                        blocks,
+                        meta,
+                        i,
+                        j,
+                        cx * 16 + @as(i32, @intCast(i)),
+                        cz * 16 + @as(i32, @intCast(j)),
+                        s[j + i * 16],
+                        &r,
+                        bio_id,
+                        &self.temp_eval,
+                    );
+                }
             }
         }
     }
@@ -418,4 +439,52 @@ test "surface matches JVM (seed 12345 chunk -7,11)" {
     const samp_idx = [_]usize{0,1024,2048,3072,4096,5120,6144,7168,8192,9216,10240,11264,12288,13312,14336,15360,16384,17408,18432,19456,20480,21504,22528,23552,24576,25600,26624,27648,28672,29696,30720,31744,32768,33792,34816,35840,36864,37888,38912,39936,40960,41984,43008,44032,45056,46080,47104,48128,49152,50176,51200,52224,53248,54272,55296,56320,57344,58368,59392,60416,61440,62464,63488,64512};
     const samp_want = [_]u16{7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7};
     for (samp_idx, 0..) |idx, k| try std.testing.expectEqual(samp_want[k], blocks[idx]);
+}
+
+test "mesa surface matches JVM (seed 55555 chunk -1,-1)" {
+    const alloc = std.testing.allocator;
+    var sh = try Shaper.init(alloc, 55555, false, false);
+    defer sh.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var q: [Q_LEN]f64 = undefined;
+    try sh.densityField(arena.allocator(), -1, -1, &q);
+    var blocks: [BLOCKS_LEN]u16 = undefined;
+    Shaper.fillChunk(&q, &blocks);
+    var meta: [BLOCKS_LEN]u8 = undefined;
+    try sh.surfaceChunk(arena.allocator(), -1, -1, &blocks, &meta);
+    // JVM: 0:42769 1:14825 2:11 3:69 7:765 159:2836 172:4261
+    try std.testing.expectEqual(@as(i64, 2511227954806405139), blocksCrc(&blocks));
+    try std.testing.expectEqual(@as(i64, 4590157575938082706), metaCrc(&meta));
+    const samp_idx = [_]usize{0,1024,2048,3072,4096,5120,6144,7168,8192,9216,10240,11264,12288,13312,14336,15360,16384,17408,18432,19456,20480,21504,22528,23552,24576,25600,26624,27648,28672,29696,30720,31744,32768,33792,34816,35840,36864,37888,38912,39936,40960,41984,43008,44032,45056,46080,47104,48128,49152,50176,51200,52224,53248,54272,55296,56320,57344,58368,59392,60416,61440,62464,63488,64512};
+    const samp_want = [_]u16{7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7};
+    const sampm_want = [_]u8{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+    for (samp_idx, 0..) |idx, k| {
+        try std.testing.expectEqual(samp_want[k], blocks[idx]);
+        try std.testing.expectEqual(sampm_want[k], meta[idx]);
+    }
+}
+
+test "mesa surface matches JVM (seed 55555 chunk 0,0)" {
+    const alloc = std.testing.allocator;
+    var sh = try Shaper.init(alloc, 55555, false, false);
+    defer sh.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var q: [Q_LEN]f64 = undefined;
+    try sh.densityField(arena.allocator(), 0, 0, &q);
+    var blocks: [BLOCKS_LEN]u16 = undefined;
+    Shaper.fillChunk(&q, &blocks);
+    var meta: [BLOCKS_LEN]u8 = undefined;
+    try sh.surfaceChunk(arena.allocator(), 0, 0, &blocks, &meta);
+    // JVM: 0:44644 1:14613 7:762 12:16 159:1996 172:3505
+    try std.testing.expectEqual(@as(i64, 1655173335233020359), blocksCrc(&blocks));
+    try std.testing.expectEqual(@as(i64, 3474580793047174204), metaCrc(&meta));
+    const samp_idx = [_]usize{0,1024,2048,3072,4096,5120,6144,7168,8192,9216,10240,11264,12288,13312,14336,15360,16384,17408,18432,19456,20480,21504,22528,23552,24576,25600,26624,27648,28672,29696,30720,31744,32768,33792,34816,35840,36864,37888,38912,39936,40960,41984,43008,44032,45056,46080,47104,48128,49152,50176,51200,52224,53248,54272,55296,56320,57344,58368,59392,60416,61440,62464,63488,64512};
+    const samp_want = [_]u16{7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7};
+    const sampm_want = [_]u8{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+    for (samp_idx, 0..) |idx, k| {
+        try std.testing.expectEqual(samp_want[k], blocks[idx]);
+        try std.testing.expectEqual(sampm_want[k], meta[idx]);
+    }
 }

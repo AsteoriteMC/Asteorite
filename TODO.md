@@ -177,9 +177,9 @@ Worldgen version follows the world's version, not the client's (ties to Phase I)
 
 ### H2. 1.7.10 generator (v5 — fills today's void holes)
 
-- [~] `src/worldgen/v5/`: GenLayer chain ✅ + hill noise ✅ + density field ✅ + block fill ✅ + surface map ✅ (base path; mesa override pending) — all JVM-verified per-stage; cave/ravine carvers, ore/tree decorators still TODO
+- [~] `src/worldgen/v5/`: GenLayer chain ✅ + hill noise ✅ + density ✅ + fill ✅ + surface ✅ (base + mesa plateau w/ Bryce) + cave ✅ + ravine ✅ carvers — all JVM-verified per-stage incl. 10 full-pipeline chunks; ore/tree decorators still TODO
 - [x] Chunk gen as background-capable job writing ZC1 into the pool (sync on-demand first, never on the 50ms path by construction of the source seam); spawn pre-gen on boot (`--seed` + `--gen-spawn N`); land-spawn search; live-verified over TCP (dedicated background gen thread is the follow-up)
-- [~] Acceptance: fresh DB → login shows terrain ✅, F3 biomes sane ✅ (voronoi biomes on the wire), same-seed parity ✅ per-stage (biomes, density, fill, surface bit-exact); caves/ores/trees present — pending carvers/decorators
+- [~] Acceptance: fresh DB → login shows terrain ✅, F3 biomes sane ✅ (voronoi biomes on the wire), same-seed parity ✅ per-stage (biomes, density, fill, surface, carve, full-pipeline bit-exact); ores/trees present — pending decorators
 
 ### H3. Data overlay: custom packs (Terralith / JJThunder-class terrain)
 
