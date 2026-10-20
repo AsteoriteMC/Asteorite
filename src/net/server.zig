@@ -447,10 +447,30 @@ pub const Server = struct {
         self.savePerms();
     }
 
-    /// In-game + console command core. `sender` null = server console (reply
-    /// goes to stdout); otherwise the reply is a chat message to the sender
-    /// only. Unknown commands get a usage hint, never a kick.
+    /// "/stop" (bare or with args): persist + exit. Callers deliver the
+    /// reply first — in-game via the normal flush below, console/RCON via
+    /// their own flush before exiting.
+    pub fn isStopCommand(text: []const u8) bool {
+        var t = text;
+        if (t.len > 0 and t[0] == '/') t = t[1..];
+        const sp = std.mem.indexOfScalar(u8, t, ' ') orelse t.len;
+        return std.mem.eql(u8, t[0..sp], "stop");
+    }
+
+    /// In-game + console command entry: runs the command and delivers the
+    /// reply (chat frame to a player, stdout for console). Unknown commands
+    /// get a usage hint, never a kick.
     pub fn handleCommand(self: *Server, sender: ?*Conn, text: []const u8) void {
+        var buf: [8192]u8 = undefined;
+        const r = self.executeCommand(sender, text, &buf);
+        self.reply(sender, r);
+    }
+
+    /// Command core shared by chat, console, and RCON: returns the reply
+    /// text (a slice of `out`, or a static string). Side effects that must
+    /// reach other players (op/deop notices) still send chats directly.
+    /// Callers handle "/stop" themselves via isStopCommand (reply first).
+    pub fn executeCommand(self: *Server, sender: ?*Conn, text: []const u8, out: []u8) []const u8 {
         // Split "/cmd args..." (text[0] == '/' guaranteed by caller).
         var cmd = text[1..];
         var args: []const u8 = "";
@@ -458,30 +478,22 @@ pub const Server = struct {
             args = std.mem.trim(u8, cmd[sp + 1 ..], " ");
             cmd = cmd[0..sp];
         }
-        const desc = perms_mod.findCommand(cmd) orelse {
-            self.reply(sender, "Unknown command. Try /help");
-            return;
-        };
+        const desc = perms_mod.findCommand(cmd) orelse return "Unknown command. Try /help";
         if (!self.commandAllowed(sender, desc)) {
             // Same reply as unknown: failures never oracle command existence
             // or the caller's level.
-            self.reply(sender, "Unknown command. Try /help");
-            return;
+            return "Unknown command. Try /help";
         }
         _ = self.permDb(); // matrix from here on (mutations persist below)
         if (std.mem.eql(u8, desc.name, "help")) {
-            var out: [512]u8 = undefined;
             var ow: usize = 0;
-            ow += (std.fmt.bufPrint(out[ow..], "Commands:", .{}) catch {
-                self.reply(sender, "Commands: /help");
-                return;
-            }).len;
+            ow += (std.fmt.bufPrint(out[ow..], "Commands:", .{}) catch return "Commands: /help").len;
             for (&perms_mod.commands) |*d| {
                 const ok = if (sender == null) true else self.commandAllowed(sender, d);
                 if (!ok) continue;
                 ow += (std.fmt.bufPrint(out[ow..], " {s}", .{d.usage}) catch break).len;
             }
-            self.reply(sender, out[0..ow]);
+            return out[0..ow];
         } else if (std.mem.eql(u8, desc.name, "list")) {
             var batch: [256]RegistryEntry = undefined;
             const snap = self.snapshot(&batch);
@@ -501,66 +513,47 @@ pub const Server = struct {
             }
             // Usernames are charset-validated at login ([A-Za-z0-9_]), so no
             // JSON escaping is needed here.
-            var out: [1024]u8 = undefined;
             var ow: usize = 0;
-            ow += (std.fmt.bufPrint(out[ow..], "Connected ({d}):", .{n}) catch {
-                self.reply(sender, "Connected (?)");
-                return;
-            }).len;
+            ow += (std.fmt.bufPrint(out[ow..], "Connected ({d}):", .{n}) catch return "Connected (?)").len;
             for (names[0..n], 0..) |nm, i| {
                 const pre: []const u8 = if (i == 0) "" else ",";
                 ow += (std.fmt.bufPrint(out[ow..], "{s} {s}", .{ pre, nm }) catch break).len;
             }
-            self.reply(sender, out[0..ow]);
+            return out[0..ow];
         } else if (std.mem.eql(u8, desc.name, "save-all")) {
             const n = self.saveAllPlayers();
             if (self.world) |pool| pool.flushAll() catch {};
-            var msg: [64]u8 = undefined;
-            const s = std.fmt.bufPrint(&msg, "Saved {d} player(s).", .{n}) catch "Saved.";
-            self.reply(sender, s);
+            return std.fmt.bufPrint(out, "Saved {d} player(s).", .{n}) catch "Saved.";
         } else if (std.mem.eql(u8, desc.name, "op")) {
-            const target = firstArg(args) orelse {
-                self.reply(sender, "Usage: /op <player>");
-                return;
-            };
-            if (!Conn.validPlayerName(target)) {
-                self.reply(sender, "Usage: /op <player>");
-                return;
-            }
+            const target = firstArg(args) orelse return "Usage: /op <player>";
+            if (!Conn.validPlayerName(target)) return "Usage: /op <player>";
             self.grantOp(target);
-            var msg: [64]u8 = undefined;
-            const s = std.fmt.bufPrint(&msg, "Opped {s}.", .{target}) catch "Opped.";
-            self.reply(sender, s);
             self.notifyPlayer(target, "You are now op.");
+            return std.fmt.bufPrint(out, "Opped {s}.", .{target}) catch "Opped.";
         } else if (std.mem.eql(u8, desc.name, "deop")) {
-            const target = firstArg(args) orelse {
-                self.reply(sender, "Usage: /deop <player>");
-                return;
-            };
-            if (!Conn.validPlayerName(target)) {
-                self.reply(sender, "Usage: /deop <player>");
-                return;
-            }
+            const target = firstArg(args) orelse return "Usage: /deop <player>";
+            if (!Conn.validPlayerName(target)) return "Usage: /deop <player>";
             self.perm_lock.lock();
             if (self.perms) |*db| db.clearPlayer(target);
             self.perm_lock.unlock();
             self.savePerms();
-            var msg: [64]u8 = undefined;
-            const s = std.fmt.bufPrint(&msg, "Deopped {s}.", .{target}) catch "Deopped.";
-            self.reply(sender, s);
             self.notifyPlayer(target, "You are no longer op.");
+            return std.fmt.bufPrint(out, "Deopped {s}.", .{target}) catch "Deopped.";
         } else if (std.mem.eql(u8, desc.name, "perm")) {
-            self.handlePerm(sender, args);
+            return self.handlePerm(sender, args, out);
+        } else if (std.mem.eql(u8, desc.name, "stop")) {
+            // Reply is delivered by the caller; it exits right after.
+            return "Stopping server.";
         } else if (std.mem.eql(u8, desc.name, "gamemode")) {
-            self.cmdGamemode(sender, args);
+            return self.cmdGamemode(sender, args, out);
         } else if (std.mem.eql(u8, desc.name, "give")) {
-            self.cmdGive(sender, args);
+            return self.cmdGive(sender, args, out);
         } else if (std.mem.eql(u8, desc.name, "tp")) {
-            self.cmdTp(sender, args);
+            return self.cmdTp(sender, args, out);
         } else if (std.mem.eql(u8, desc.name, "time")) {
-            self.cmdTime(sender, args);
+            return self.cmdTime(sender, args, out);
         } else {
-            self.reply(sender, "Unknown command. Try /help");
+            return "Unknown command. Try /help";
         }
     }
 
@@ -598,29 +591,25 @@ pub const Server = struct {
         return out[0..c.username_len];
     }
 
-    fn cmdGamemode(self: *Server, sender: ?*Conn, args: []const u8) void {
+    fn cmdGamemode(self: *Server, sender: ?*Conn, args: []const u8, out: []u8) []const u8 {
         var toks: [3][]const u8 = undefined;
         const n = splitArgs(args, &toks);
         if (n == 0 or n > 2) {
-            self.reply(sender, "Usage: /gamemode <0|1|survival|creative> [player]");
-            return;
+            return "Usage: /gamemode <0|1|survival|creative> [player]";
         }
         const mode: u8 = if (std.mem.eql(u8, toks[0], "0") or std.mem.eql(u8, toks[0], "survival")) 0 else if (std.mem.eql(u8, toks[0], "1") or std.mem.eql(u8, toks[0], "creative")) 1 else {
-            self.reply(sender, "Usage: /gamemode <0|1|survival|creative> [player]");
-            return;
+            return "Usage: /gamemode <0|1|survival|creative> [player]";
         };
         var self_name: [16]u8 = undefined;
         const target: []const u8 = if (n == 2) toks[1] else senderName(sender, &self_name);
         if (!Conn.validPlayerName(target)) {
-            self.reply(sender, "Usage: /gamemode <0|1|survival|creative> [player]");
-            return;
+            return "Usage: /gamemode <0|1|survival|creative> [player]";
         }
         var batch: [256]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         const c = findInSnap(snap, target) orelse {
-            self.reply(sender, "Player not found.");
-            return;
+            return "Player not found.";
         };
         c.lock.lock();
         c.config.gamemode = mode;
@@ -628,59 +617,50 @@ pub const Server = struct {
         var ab: [32]u8 = undefined;
         const f = packets.framePlayerAbilities(if (creative) 0x07 else 0x00, 0.05, 0.1, &ab) catch {
             c.lock.unlock();
-            return;
+            return "";
         };
         c.queueFramed(f) catch {};
         c.lock.unlock();
-        var msg: [64]u8 = undefined;
-        const s = std.fmt.bufPrint(&msg, "Set {s} to {s}.", .{ target, if (mode == 1) "creative" else "survival" }) catch "Gamemode set.";
-        self.reply(sender, s);
+        return std.fmt.bufPrint(out, "Set {s} to {s}.", .{ target, if (mode == 1) "creative" else "survival" }) catch "Gamemode set.";
     }
 
-    fn cmdGive(self: *Server, sender: ?*Conn, args: []const u8) void {
+    fn cmdGive(self: *Server, sender: ?*Conn, args: []const u8, out: []u8) []const u8 {
+        _ = sender;
         var toks: [4][]const u8 = undefined;
         const n = splitArgs(args, &toks);
         if (n < 2 or n > 4) {
-            self.reply(sender, "Usage: /give <player> <id> [count] [damage]");
-            return;
+            return "Usage: /give <player> <id> [count] [damage]";
         }
         const target = toks[0];
         if (!Conn.validPlayerName(target)) {
-            self.reply(sender, "Usage: /give <player> <id> [count] [damage]");
-            return;
+            return "Usage: /give <player> <id> [count] [damage]";
         }
         const id = std.fmt.parseInt(u16, toks[1], 10) catch {
-            self.reply(sender, "Usage: /give <player> <id> [count] [damage]");
-            return;
+            return "Usage: /give <player> <id> [count] [damage]";
         };
         if (id == 0 or id > 4095) {
-            self.reply(sender, "Usage: /give <player> <id> [count] [damage]");
-            return;
+            return "Usage: /give <player> <id> [count] [damage]";
         }
         var count: i32 = 1;
         if (n >= 3) {
             count = std.fmt.parseInt(i32, toks[2], 10) catch {
-                self.reply(sender, "Usage: /give <player> <id> [count] [damage]");
-                return;
+                return "Usage: /give <player> <id> [count] [damage]";
             };
             if (count < 1 or count > 64) {
-                self.reply(sender, "Count must be 1..64.");
-                return;
+                return "Count must be 1..64.";
             }
         }
         var damage: i16 = 0;
         if (n >= 4) {
             damage = std.fmt.parseInt(i16, toks[3], 10) catch {
-                self.reply(sender, "Usage: /give <player> <id> [count] [damage]");
-                return;
+                return "Usage: /give <player> <id> [count] [damage]";
             };
         }
         var batch: [256]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         const c = findInSnap(snap, target) orelse {
-            self.reply(sender, "Player not found.");
-            return;
+            return "Player not found.";
         };
         // Fill like vanilla addItemStackToInventory: merge into main-inventory
         // stacks (slots 9..44) first, then empties; NBT stacks never merge.
@@ -716,22 +696,18 @@ pub const Server = struct {
         }
         c.lock.unlock();
         const placed = count - remaining;
-        var msg: [96]u8 = undefined;
         if (remaining == 0) {
-            const m = std.fmt.bufPrint(&msg, "Gave {d}x{d} to {s}.", .{ placed, id, target }) catch "Gave items.";
-            self.reply(sender, m);
+            return std.fmt.bufPrint(out, "Gave {d}x{d} to {s}.", .{ placed, id, target }) catch "Gave items.";
         } else {
-            const m = std.fmt.bufPrint(&msg, "Gave {d} of {d} (no space for {d}).", .{ placed, count, remaining }) catch "Gave items.";
-            self.reply(sender, m);
+            return std.fmt.bufPrint(out, "Gave {d} of {d} (no space for {d}).", .{ placed, count, remaining }) catch "Gave items.";
         }
     }
 
-    fn cmdTp(self: *Server, sender: ?*Conn, args: []const u8) void {
+    fn cmdTp(self: *Server, sender: ?*Conn, args: []const u8, out: []u8) []const u8 {
         var toks: [3][]const u8 = undefined;
         const n = splitArgs(args, &toks);
         if (n == 0 or n > 3) {
-            self.reply(sender, "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>");
-            return;
+            return "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>";
         }
         // Resolve (mover, destination). Console has no self: it must name
         // players (1-arg and 3-arg forms need a sender).
@@ -743,8 +719,7 @@ pub const Server = struct {
         var by_name: []const u8 = "";
         if (n == 1) {
             if (sender == null) {
-                self.reply(sender, "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>");
-                return;
+                return "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>";
             }
             mover = senderName(sender, &mover_name);
             by_name = toks[0];
@@ -753,46 +728,37 @@ pub const Server = struct {
             by_name = toks[1];
         } else {
             if (sender == null) {
-                self.reply(sender, "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>");
-                return;
+                return "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>";
             }
             mover = senderName(sender, &mover_name);
             dx = std.fmt.parseFloat(f64, toks[0]) catch {
-                self.reply(sender, "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>");
-                return;
+                return "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>";
             };
             dy = std.fmt.parseFloat(f64, toks[1]) catch {
-                self.reply(sender, "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>");
-                return;
+                return "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>";
             };
             dz = std.fmt.parseFloat(f64, toks[2]) catch {
-                self.reply(sender, "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>");
-                return;
+                return "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>";
             };
             if (!std.math.isFinite(dx) or !std.math.isFinite(dy) or !std.math.isFinite(dz) or dy < 0 or dy > 256) {
-                self.reply(sender, "Bad coordinates (y must be 0..256).");
-                return;
+                return "Bad coordinates (y must be 0..256).";
             }
         }
         if (mover.len == 0 or !Conn.validPlayerName(mover)) {
-            self.reply(sender, "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>");
-            return;
+            return "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>";
         }
         if (by_name.len > 0 and !Conn.validPlayerName(by_name)) {
-            self.reply(sender, "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>");
-            return;
+            return "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>";
         }
         var batch: [256]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         const mc = findInSnap(snap, mover) orelse {
-            self.reply(sender, "Player not found.");
-            return;
+            return "Player not found.";
         };
         if (by_name.len > 0) {
             const tc = findInSnap(snap, by_name) orelse {
-                self.reply(sender, "Player not found.");
-                return;
+                return "Player not found.";
             };
             tc.lock.lock();
             const tx = tc.pos_x;
@@ -819,42 +785,34 @@ pub const Server = struct {
             view.syncPlayerChunks(mc, self.chunkSource(pool), 0, radius, true) catch {};
         }
         mc.lock.unlock();
-        var msg: [96]u8 = undefined;
         if (by_name.len > 0) {
-            const m = std.fmt.bufPrint(&msg, "Teleported {s} to {s}.", .{ mover, by_name }) catch "Teleported.";
-            self.reply(sender, m);
+            return std.fmt.bufPrint(out, "Teleported {s} to {s}.", .{ mover, by_name }) catch "Teleported.";
         } else {
-            const m = std.fmt.bufPrint(&msg, "Teleported {s} to {d:.1}, {d:.1}, {d:.1}.", .{ mover, dx, dy, dz }) catch "Teleported.";
-            self.reply(sender, m);
+            return std.fmt.bufPrint(out, "Teleported {s} to {d:.1}, {d:.1}, {d:.1}.", .{ mover, dx, dy, dz }) catch "Teleported.";
         }
     }
 
-    fn cmdTime(self: *Server, sender: ?*Conn, args: []const u8) void {
+    fn cmdTime(self: *Server, sender: ?*Conn, args: []const u8, out: []u8) []const u8 {
+        _ = sender;
         var toks: [2][]const u8 = undefined;
         const n = splitArgs(args, &toks);
         if (n != 2) {
-            self.reply(sender, "Usage: /time <set|add> <value|day|night>");
-            return;
+            return "Usage: /time <set|add> <value|day|night>";
         }
         const delta: ?i64 = if (std.mem.eql(u8, toks[1], "day")) 1000 else if (std.mem.eql(u8, toks[1], "night")) 13000 else std.fmt.parseInt(i64, toks[1], 10) catch null;
         if (delta == null) {
-            self.reply(sender, "Usage: /time <set|add> <value|day|night>");
-            return;
+            return "Usage: /time <set|add> <value|day|night>";
         }
         if (std.mem.eql(u8, toks[0], "set")) {
             self.time_of_day.store(@mod(delta.?, 24000), .release);
-            var msg: [64]u8 = undefined;
-            const s = std.fmt.bufPrint(&msg, "Set time to {d}.", .{@mod(delta.?, 24000)}) catch "Time set.";
-            self.reply(sender, s);
+            return std.fmt.bufPrint(out, "Set time to {d}.", .{@mod(delta.?, 24000)}) catch "Time set.";
         } else if (std.mem.eql(u8, toks[0], "add")) {
             const now = self.time_of_day.load(.acquire);
             const v = @mod(now + delta.?, 24000);
             self.time_of_day.store(v, .release);
-            var msg: [64]u8 = undefined;
-            const s = std.fmt.bufPrint(&msg, "Time is now {d}.", .{v}) catch "Time set.";
-            self.reply(sender, s);
+            return std.fmt.bufPrint(out, "Time is now {d}.", .{v}) catch "Time set.";
         } else {
-            self.reply(sender, "Usage: /time <set|add> <value|day|night>");
+            return "Usage: /time <set|add> <value|day|night>";
         }
     }
 
@@ -885,33 +843,29 @@ pub const Server = struct {
         }
     }
 
-    fn handlePerm(self: *Server, sender: ?*Conn, args: []const u8) void {
+    fn handlePerm(self: *Server, sender: ?*Conn, args: []const u8, out: []u8) []const u8 {
+        _ = sender;
         var parts = std.mem.splitScalar(u8, args, ' ');
         const sub = parts.next() orelse {
-            self.reply(sender, "Usage: /perm <grant|deny|clear|show|reload> [player] [node]");
-            return;
+            return "Usage: /perm <grant|deny|clear|show|reload> [player] [node] /stop";
         };
         if (sub.len == 0) {
-            self.reply(sender, "Usage: /perm <grant|deny|clear|show|reload> [player] [node]");
-            return;
+            return "Usage: /perm <grant|deny|clear|show|reload> [player] [node] /stop";
         }
         if (std.mem.eql(u8, sub, "reload")) {
             self.loadPerms();
-            self.reply(sender, "Permissions reloaded.");
-            return;
+            return "Permissions reloaded.";
         }
         const player = parts.next() orelse {
-            self.reply(sender, "Usage: /perm <grant|deny|clear|show> <player> [node]");
-            return;
+            return "Usage: /perm <grant|deny|clear|show> <player> [node]";
         };
         if (!Conn.validPlayerName(player)) {
-            self.reply(sender, "Usage: /perm <grant|deny|clear|show> <player> [node]");
-            return;
+            return "Usage: /perm <grant|deny|clear|show> <player> [node]";
         }
         if (std.mem.eql(u8, sub, "show")) {
-            // Build the whole reply under perm_lock, release, then send
-            // (reply takes the sender's conn lock — never nest the two).
-            var out: [1024]u8 = undefined;
+            // Build the whole reply under perm_lock, release, then return
+            // (the caller sends it; reply takes the sender's conn lock —
+            // never nest the two).
             const built: ?usize = blk: {
                 self.perm_lock.lock();
                 defer self.perm_lock.unlock();
@@ -937,11 +891,10 @@ pub const Server = struct {
                 break :blk ow;
             };
             if (built) |n| {
-                self.reply(sender, out[0..n]);
+                return out[0..n];
             } else {
-                self.reply(sender, "Show failed.");
+                return "Show failed.";
             }
-            return;
         }
         const node = parts.next() orelse {
             if (std.mem.eql(u8, sub, "clear")) {
@@ -959,36 +912,33 @@ pub const Server = struct {
                 }
                 self.perm_lock.unlock();
                 self.savePerms();
-                self.reply(sender, "Nodes cleared.");
-                return;
+                return "Nodes cleared.";
             }
-            self.reply(sender, "Usage: /perm <grant|deny> <player> <node>");
-            return;
+            return "Usage: /perm <grant|deny> <player> <node>";
         };
         if (!perms_mod.validNode(node)) {
-            self.reply(sender, "Bad node. Use [a-z0-9_.-], optional trailing .*");
-            return;
+            return "Bad node. Use [a-z0-9_.-], optional trailing .*";
         }
         if (std.mem.eql(u8, sub, "grant")) {
             self.perm_lock.lock();
             self.permsDbLocked().grant(player, node) catch {};
             self.perm_lock.unlock();
             self.savePerms();
-            self.reply(sender, "Granted.");
+            return "Granted.";
         } else if (std.mem.eql(u8, sub, "deny")) {
             self.perm_lock.lock();
             self.permsDbLocked().deny(player, node) catch {};
             self.perm_lock.unlock();
             self.savePerms();
-            self.reply(sender, "Denied.");
+            return "Denied.";
         } else if (std.mem.eql(u8, sub, "clear")) {
             self.perm_lock.lock();
             _ = self.permsDbLocked().clearNode(player, node) catch false;
             self.perm_lock.unlock();
             self.savePerms();
-            self.reply(sender, "Cleared.");
+            return "Cleared.";
         } else {
-            self.reply(sender, "Usage: /perm <grant|deny|clear|show|reload> [player] [node]");
+            return "Usage: /perm <grant|deny|clear|show|reload> [player] [node] /stop";
         }
     }
 
@@ -1513,7 +1463,34 @@ pub fn serveConn(
                     .arm_swing => |a| server.broadcastArmSwing(conn, cc_now.cx, cc_now.cz, conn.eid, a) catch {},
                     .chat => |m| server.broadcastChat(conn.chat_buf[0..m.json_len]),
                     .attack => |a| server.resolveAttack(conn, a),
-                    .command => |m| server.handleCommand(conn, conn.chat_buf[0..m.json_len]),
+                    .command => |m| {
+                        const text = conn.chat_buf[0..m.json_len];
+                        server.handleCommand(conn, text);
+                        if (Server.isStopCommand(text)) {
+                            // Flush the "Stopping server." reply first, then
+                            // persist + exit. (Ticker/serve loops die with us;
+                            // the WAL makes the flush a performance plea, not
+                            // a durability requirement.)
+                            conn.lock.lock();
+                            const tail = conn.takeOutput() catch &[_]u8{};
+                            const nm = conn.username[0..conn.username_len];
+                            var nm_copy: [16]u8 = undefined;
+                            @memcpy(nm_copy[0..nm.len], nm);
+                            const nm_len = nm.len;
+                            conn.lock.unlock();
+                            defer conn.allocator.free(tail);
+                            if (tail.len > 0) {
+                                conn.wlock.lock();
+                                defer conn.wlock.unlock();
+                                wout.writeAll(tail) catch {};
+                                wout.flush() catch {};
+                            }
+                            _ = server.saveAllPlayers();
+                            if (server.world) |pool| pool.flushAll() catch {};
+                            std.log.info("in-game stop by {s}: saved players, flushed. bye.", .{nm_copy[0..nm_len]});
+                            std.process.exit(0);
+                        }
+                    },
                     else => {},
                 }
             }
@@ -2386,7 +2363,7 @@ test "permissions gate commands: op/deop/grant/deny/show/clear/reload" {
     srv.handleCommand(alice, "/help");
     const h1 = try readChat(alice);
     defer a.free(h1);
-    try std.testing.expectEqualStrings("{\"text\":\"Commands: /help /list /save-all /op <player> /deop <player> /perm <grant|deny|clear|show|reload> [player] [node] /gamemode <0|1|survival|creative> [player] /give <player> <id> [count] [damage] /tp <target|x> [y] [z] | /tp <victim> <target> /time <set|add> <value|day|night>\"}", h1);
+    try std.testing.expectEqualStrings("{\"text\":\"Commands: /help /list /save-all /op <player> /deop <player> /perm <grant|deny|clear|show|reload> [player] [node] /stop /gamemode <0|1|survival|creative> [player] /give <player> <id> [count] [damage] /tp <target|x> [y] [z] | /tp <victim> <target> /time <set|add> <value|day|night>\"}", h1);
     // /save-all allowed now (pool present; flushes).
     srv.handleCommand(alice, "/save-all");
     const s1 = try readChat(alice);
@@ -2483,7 +2460,7 @@ test "permissions gate commands: op/deop/grant/deny/show/clear/reload" {
     srv.handleCommand(alice, "/perm frobnicate BobP zigcraft.command.list");
     const usage4 = try readChat(alice);
     defer a.free(usage4);
-    try std.testing.expectEqualStrings("{\"text\":\"Usage: /perm <grant|deny|clear|show|reload> [player] [node]\"}", usage4);
+    try std.testing.expectEqualStrings("{\"text\":\"Usage: /perm <grant|deny|clear|show|reload> [player] [node] /stop\"}", usage4);
     _ = srv.registry.pop();
     _ = srv.registry.pop();
 }

@@ -60,6 +60,8 @@ pub const entity = @import("sim/entity.zig");
 pub const players = @import("sim/players.zig");
 /// Permission model: op levels + per-player node grants/denies (LSM-backed).
 pub const permissions = @import("sim/permissions.zig");
+/// RCON remote console (vanilla-style Source framing, password auth).
+pub const rcon = @import("net/rcon.zig");
 /// Test-and-set spinlock for short critical sections.
 pub const spin = @import("sim/spin.zig");
 
@@ -71,6 +73,7 @@ test {
     _ = @import("net/uuid.zig");
     _ = @import("net/conn.zig");
     _ = @import("net/server.zig");
+    _ = @import("net/rcon.zig");
     _ = @import("proto/v5/ids.zig");
     _ = @import("proto/v5/packets.zig");
     _ = @import("proto/v5/chunks.zig");

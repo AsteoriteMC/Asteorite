@@ -11,7 +11,7 @@ Status snapshot (done, tested, live-verified over TCP):
 - [x] Pure-Zig LSM (WAL + SST + `ShardPool`), ZC1 payloads, Anvil→ZC1 import (`tools/anvil_import.zig`)
 - [x] H1 worldgen foundation: `java.util.Random` LCG port (JVM-verified goldens incl. `nextInt(bound)` rejection path), fdlibm `log` port (StrictMath bit-exact — Zig/glibc differ by 1 ulp, proven live), Xoroshiro128++ + Mojang seeding, version-agnostic pipeline driver, `worldgen_dump` tool (`src/worldgen/`, `tools/worldgen_dump.zig`)
 - [x] Region tick stub, MPSC handoff queue, player position tracking (stance quirk handled)
-- [x] 158/158 `zig build test` green (was 53/53 — count the real number when touching this line)
+- [x] 163/163 `zig build test` green (was 53/53 — count the real number when touching this line)
 
 Legend: `[ ]` todo, `[~]` partial. Each phase ends with acceptance criteria.
 
@@ -63,14 +63,15 @@ Without these the client connects but the world is dead. All bodies are
 - [x] Acceptance, all live with echoing clients: broadcast reaches sender + others with byte-exact vanilla-style JSON (unicode preserved, not `\uXXXX`-escaped); spam → `0x40`; invalid UTF-8 → silent drop; idle handshake → clean drop at 30s
 - [ ] Follow-ups: per-IP connection rate limiting, RCON (remote) kick, chat reporting/muting hooks for the mod API (F), tab-complete `0x3A` (local stdin console done — see A6)
 
-### A6. Player persistence + permissions + commands ✅ (done, live-verified)
-- [x] LSM-backed player rows (`src/sim/players.zig`): `ZPLR` v2 binary (pos/yaw/pitch, spawn, health/food/saturation, 45-slot NBT-verbatim inventory + cursor + selected + gamemode; v1 rows decode with gamemode defaulting to creative), key `encodeKey(255, Wyhash(name))` with stored-username mismatch guard; corrupt rows treated as fresh spawn (overwritten on next save)
+### A6. Player persistence + permissions + commands ✅ (done, live-verified)- [x] LSM-backed player rows (`src/sim/players.zig`): `ZPLR` v2 binary (pos/yaw/pitch, spawn, health/food/saturation, 45-slot NBT-verbatim inventory + cursor + selected + gamemode; v1 rows decode with gamemode defaulting to creative), key `encodeKey(255, Wyhash(name))` with stored-username mismatch guard; corrupt rows treated as fresh spawn (overwritten on next save)
 - [x] Save triggers: disconnect (`unregister`), in-game `/save-all`, console `save-all`, ticker autosave every 300 ticks (WAL-durable; save-all/stop flush SSTs). Load on login (conn.lock held): restores pos/health/inv/cursor/selected/gamemode, skips land-spawn search; dead-at-save normalizes to alive-at-spawn on load
 - [x] Login inventory sync: full Window Items `0x30` + cursor Set Slot after chunk burst; PosLook now sends actual player pos (fresh logins land at found spawn via pos sync — burst center + PosLook consistent)
 - [x] Permission model (`src/sim/permissions.zig`): op levels 0-4 + per-player node grants/denies in one LSM row (`ZPRM` v1, dim 254), deny-beats-grant-beats-level, `.*` wildcards, console implicitly 4, secure default (no ops → console only). Denied and unknown commands share one reply (no oracle); `/help` filters to usable commands; validated names/nodes everywhere
 - [x] Commands: `/help`, `/list` (0), `/save-all` (4), `/op|/deop` (4, notify target), `/perm grant|deny|clear|show|reload` (4), `/gamemode <0|1|survival|creative> [player]` (2, live abilities update), `/give <player> <id> [count] [damage]` (2, merges into main inv 9..44, per-slot 0x2F sync, no-space accounting), `/tp` 1-/2-/3-arg forms (2, immediate chunk sync + PosLook), `/time set|add <value|day|night>` (2). Bootstrap via repeatable `--op <name>` (bad names rejected). Operator stdin console: `help|list|save-all|stop` (stop saves + flushes + exits)
 - [x] Acceptance, live over TCP: permission gating (deny==unknown, grant/deny/wildcard, op/deop + notify); full gameplay loop (gamemode flags, give slots/damage, tp PosLook + chunks, time set/add/day, gamemode persist across restart); restart persistence (pos + staged dirt + perms matrix); inventory E2E still green
-- [ ] Follow-ups: RCON, playerdata migration tooling
+- [x] RCON remote console (`src/net/rcon.zig`): vanilla-style Source framing (LE length/id/type + double-NUL), password auth with constant-time compare, fail-closed without `--rcon-password`, 3-strike auth cap, no-auth/oversize/unknown-type → close, single-packet truncated replies. Full console authority (all 14 commands incl. `/stop`, which saves + flushes + exits after the reply flushes). `--rcon-password` (short-password warning) / `--rcon-port` (default 25575); password never logged (localhost/SSH-tunnel posture documented)
+- [x] Acceptance, live: RCON auth/id-echo, no-auth close, 3-strike cap, roster/save-all/op/perm/unknown round-trips, oversize/unknown-type close, game conn undisturbed; in-game `/stop` (reply flushes, exit 0) + console `stop` re-verified after the executeCommand refactor
+- [ ] Follow-ups: playerdata migration tooling
 
 ---
 

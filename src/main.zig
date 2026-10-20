@@ -18,6 +18,8 @@ pub fn main(init: std.process.Init) !void {
         var gen_spawn: ?i32 = null;
         var ops: std.ArrayList([]const u8) = .empty;
         defer ops.deinit(arena);
+        var rcon_password: ?[]const u8 = null;
+        var rcon_port: u16 = 25575;
         var i: usize = 2;
         while (i < args.len) : (i += 1) {
             const a = args[i];
@@ -43,6 +45,14 @@ pub fn main(init: std.process.Init) !void {
                 i += 1;
                 if (i >= args.len) return error.MissingOpName;
                 try ops.append(arena, args[i]);
+            } else if (std.mem.eql(u8, a, "--rcon-password")) {
+                i += 1;
+                if (i >= args.len) return error.MissingRconPassword;
+                rcon_password = args[i];
+            } else if (std.mem.eql(u8, a, "--rcon-port")) {
+                i += 1;
+                if (i >= args.len) return error.MissingRconPort;
+                rcon_port = try std.fmt.parseInt(u16, args[i], 10);
             } else {
                 port = try std.fmt.parseInt(u16, a, 10);
             }
@@ -119,18 +129,19 @@ pub fn main(init: std.process.Init) !void {
                         len = 0;
                         while (cmd.len > 0 and (cmd[cmd.len - 1] == '\r' or cmd[cmd.len - 1] == ' ')) cmd = cmd[0 .. cmd.len - 1];
                         if (cmd.len == 0) continue;
-                        if (std.mem.eql(u8, cmd, "stop")) {
-                            const n = s.saveAllPlayers();
-                            if (s.world) |pl| pl.flushAll() catch {};
-                            std.log.info("stop: saved {d} player(s), flushed. bye.", .{n});
-                            std.process.exit(0);
-                        }
                         // Route through the same core (null sender = console).
                         var tmp: [257]u8 = undefined;
                         tmp[0] = '/';
                         const n = @min(cmd.len, tmp.len - 1);
                         @memcpy(tmp[1..][0..n], cmd[0..n]);
-                        s.handleCommand(null, tmp[0 .. n + 1]);
+                        const full = tmp[0 .. n + 1];
+                        s.handleCommand(null, full);
+                        if (zigcraft.server.Server.isStopCommand(full)) {
+                            const ns = s.saveAllPlayers();
+                            if (s.world) |pl| pl.flushAll() catch {};
+                            std.log.info("stop: saved {d} player(s), flushed. bye.", .{ns});
+                            std.process.exit(0);
+                        }
                     } else {
                         if (len < line.len) {
                             line[len] = b;
@@ -142,10 +153,28 @@ pub fn main(init: std.process.Init) !void {
         };
         const console_th = std.Thread.spawn(.{}, Console.run, .{&srv}) catch null;
         if (console_th) |th| th.detach();
+        // RCON remote console (disabled unless a password is configured).
+        // Same command core as chat/console, full console authority.
+        if (rcon_password) |pw| {
+            if (pw.len == 0) {
+                try w.print("rcon: empty --rcon-password ignored (RCON stays disabled).\n", .{});
+            } else {
+                if (pw.len < 8) try w.print("rcon: WARNING: password is short; use a long random secret.\n", .{});
+                const R = struct {
+                    fn run(s: *zigcraft.server.Server, p: []const u8, rport: u16) void {
+                        zigcraft.rcon.serve(s.io, s, p, rport) catch |err| {
+                            std.log.err("rcon failed to start: {}", .{err});
+                        };
+                    }
+                };
+                const rcon_th = std.Thread.spawn(.{}, R.run, .{ &srv, pw, rcon_port }) catch null;
+                if (rcon_th) |th| th.detach();
+            }
+        }
         // serveForever never returns; per-conn arenas hang off the process arena.
         try srv.serveForever(arena);
         return;
     }
-    try w.print("zigcraft 1.7.10 proto v5. Try `zig build run -- serve [port] [--online] [--db <path>] [--view N] [--seed S] [--gen-spawn N] [--op <name>...]`, `zig build test`, `zig build dump -- <region.mca>`, `zig build import -- <region.mca> <db> [dim] [shards]`\n", .{});
+    try w.print("zigcraft 1.7.10 proto v5. Try `zig build run -- serve [port] [--online] [--db <path>] [--view N] [--seed S] [--gen-spawn N] [--op <name>...] [--rcon-password <pw> [--rcon-port N]]`, `zig build test`, `zig build dump -- <region.mca>`, `zig build import -- <region.mca> <db> [dim] [shards]`\n", .{});
     try w.flush();
 }
