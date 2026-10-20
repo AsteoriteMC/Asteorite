@@ -16,6 +16,7 @@ const std = @import("std");
 const Conn = @import("conn.zig").Conn;
 const Config = @import("conn.zig").Config;
 const Action = @import("conn.zig").Action;
+const AttackEvent = @import("conn.zig").AttackEvent;
 const codec = @import("codec.zig");
 const view = @import("../sim/view.zig");
 const shard_mod = @import("../world/shard.zig");
@@ -60,6 +61,9 @@ pub const Server = struct {
     entities: std.ArrayList(entity.Mob) = .empty,
     ent_lock: spin.SpinLock = .{},
     pig_spawned: bool = false,
+    /// Ticks until the demo pig respawns after death (tickOnce is 1Hz).
+    /// Set on pig death; first spawn is immediate via pig_spawned.
+    pig_cooldown: u32 = 0,
     world_age: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     time_of_day: std.atomic.Value(i64) = std.atomic.Value(i64).init(6000),
 
@@ -283,25 +287,43 @@ pub const Server = struct {
             n_players += 1;
         }
 
-        // Wander mobs + snapshot (spawn the demo pig on first tick with a world).
+        // Wander mobs + snapshot (demo pig auto-spawns when a world is present;
+        // death respawns it after pig_cooldown ticks).
         var mobs: [256]entity.MobSnap = undefined;
         var n_mobs: usize = 0;
         self.ent_lock.lock();
-        if (self.world != null and !self.pig_spawned) {
-            self.pig_spawned = true;
-            const id = self.eid_counter.fetchAdd(1, .acq_rel);
-            self.entities.append(self.gpa, .{
-                .id = id,
-                .kind = entity.MOB_PIG,
-                .x = @as(f64, @floatFromInt(self.config.spawn_x)) + 2.5,
-                .y = @as(f64, @floatFromInt(self.config.spawn_y)),
-                .z = @as(f64, @floatFromInt(self.config.spawn_z)) + 2.5,
-                .yaw = 0,
-                .health = 10.0,
-                .home_x = @as(f64, @floatFromInt(self.config.spawn_x)) + 2.5,
-                .home_z = @as(f64, @floatFromInt(self.config.spawn_z)) + 2.5,
-                .patrol_r = 4.0,
-            }) catch {};
+        if (self.world != null) {
+            var pigs: usize = 0;
+            for (self.entities.items) |m| {
+                if (m.kind == entity.MOB_PIG) pigs += 1;
+            }
+            var want_pig = false;
+            if (pigs == 0) {
+                if (!self.pig_spawned) {
+                    self.pig_spawned = true;
+                    want_pig = true;
+                } else if (self.pig_cooldown == 0) {
+                    self.pig_cooldown = 30;
+                    want_pig = true;
+                } else {
+                    self.pig_cooldown -= 1;
+                }
+            }
+            if (want_pig) {
+                const id = self.eid_counter.fetchAdd(1, .acq_rel);
+                self.entities.append(self.gpa, .{
+                    .id = id,
+                    .kind = entity.MOB_PIG,
+                    .x = @as(f64, @floatFromInt(self.config.spawn_x)) + 2.5,
+                    .y = @as(f64, @floatFromInt(self.config.spawn_y)),
+                    .z = @as(f64, @floatFromInt(self.config.spawn_z)) + 2.5,
+                    .yaw = 0,
+                    .health = 10.0,
+                    .home_x = @as(f64, @floatFromInt(self.config.spawn_x)) + 2.5,
+                    .home_z = @as(f64, @floatFromInt(self.config.spawn_z)) + 2.5,
+                    .patrol_r = 4.0,
+                }) catch {};
+            }
         }
         for (self.entities.items) |*m| m.wanderStep(0.5);
         for (self.entities.items) |m| {
@@ -417,6 +439,110 @@ pub const Server = struct {
             }
             e.conn.lock.unlock();
             flushEntry(e, self.io);
+        }
+    }
+
+    /// Squared attack reach (vanilla 1.7 server checks < 36.0 = 6 blocks).
+    fn attackInReach(ax: f64, ay: f64, az: f64, tx: f64, ty: f64, tz: f64) bool {
+        const dx = tx - ax;
+        const dy = ty - (ay + 1.62);
+        const dz = tz - az;
+        return dx * dx + dy * dy + dz * dz < 36.0;
+    }
+
+    /// Queue one framed packet on every conn tracking `eid` (attacker
+    /// included — the attacker gets no client-side prediction for damage).
+    /// One conn lock at a time; never nested with ent_lock/world_lock.
+    fn broadcastToTrackers(self: *Server, eid: i32, framed: []const u8) void {
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        for (snap) |e| {
+            e.conn.lock.lock();
+            if (e.conn.tracked.contains(eid)) {
+                e.conn.queueFramed(framed) catch {};
+            }
+            e.conn.lock.unlock();
+            flushEntry(e, self.io);
+        }
+    }
+
+    /// Resolve a validated attack event: mobs (ent_lock) then players
+    /// (registry snapshot, one target lock at a time). Never nested.
+    /// Death: mobs are removed + Destroy broadcast (pig respawns on a
+    /// 30s timer); players get Update Health 0 + death screen, and walk
+    /// back via Client Status 0 (conn.zig resets + heals there).
+    fn resolveAttack(self: *Server, attacker: *Conn, ev: AttackEvent) void {
+        // --- mobs (ticker-owned list) ---
+        var mob_hit = false;
+        var mob_dead_id: ?i32 = null;
+        var mob_hp: f32 = 0;
+        self.ent_lock.lock();
+        var mi: usize = 0;
+        while (mi < self.entities.items.len) : (mi += 1) {
+            if (self.entities.items[mi].id != ev.target_eid) continue;
+            const m = &self.entities.items[mi];
+            if (!attackInReach(ev.ax, ev.ay, ev.az, m.x, m.y + 0.5, m.z)) break;
+            mob_hit = true;
+            m.health -= ev.dmg;
+            if (m.health <= 0) {
+                const dead = self.entities.swapRemove(mi);
+                mob_dead_id = dead.id;
+                if (dead.kind == entity.MOB_PIG) self.pig_cooldown = 30;
+            } else {
+                mob_hp = m.health;
+            }
+            break;
+        }
+        self.ent_lock.unlock();
+        if (mob_dead_id) |id| {
+            var db: [8]u8 = undefined;
+            if (packets.frameDestroyEntitiesFramed(&[_]i32{id}, &db)) |f| {
+                self.broadcastToTrackers(id, f);
+            } else |_| {}
+            return;
+        }
+        if (mob_hit) {
+            var mb: [32]u8 = undefined;
+            if (packets.frameEntityMetadata(ev.target_eid, mob_hp, &mb)) |f| {
+                self.broadcastToTrackers(ev.target_eid, f);
+            } else |_| {}
+            return;
+        }
+        // --- players ---
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        for (snap) |e| {
+            if (e.conn == attacker or e.conn.eid != ev.target_eid) continue;
+            e.conn.lock.lock();
+            if (e.conn.state != .play or e.conn.is_dead) {
+                e.conn.lock.unlock();
+                return;
+            }
+            if (!attackInReach(ev.ax, ev.ay, ev.az, e.conn.pos_x, e.conn.pos_y + 1.0, e.conn.pos_z)) {
+                e.conn.lock.unlock();
+                return;
+            }
+            e.conn.health -= ev.dmg;
+            var hp = e.conn.health;
+            if (hp <= 0) {
+                hp = 0;
+                e.conn.is_dead = true;
+            }
+            e.conn.health = hp;
+            var hb: [32]u8 = undefined;
+            if (packets.frameUpdateHealth(hp, e.conn.food, e.conn.saturation, &hb)) |f| {
+                e.conn.queueFramed(f) catch {};
+            } else |_| {}
+            e.conn.lock.unlock();
+            flushEntry(e, self.io);
+            // Show the new health on every tracker (attacker included).
+            var mdb: [32]u8 = undefined;
+            if (packets.frameEntityMetadata(ev.target_eid, hp, &mdb)) |f| {
+                self.broadcastToTrackers(ev.target_eid, f);
+            } else |_| {}
+            return;
         }
     }
 
@@ -546,7 +672,7 @@ pub fn serveConn(
             const action = try conn.handleFrame(f);
             if (action == .entered_play) entered = true;
             switch (action) {
-                .block_set, .arm_swing, .chat => try events.append(allocator, action),
+                .block_set, .arm_swing, .chat, .attack => try events.append(allocator, action),
                 else => {},
             }
         }
@@ -608,6 +734,7 @@ pub fn serveConn(
                     .block_set => |b| server.broadcastBlockChange(conn, b.x, b.y, b.z, b.id, b.meta) catch {},
                     .arm_swing => |a| server.broadcastArmSwing(conn, cc_now.cx, cc_now.cz, conn.eid, a) catch {},
                     .chat => |m| server.broadcastChat(conn.chat_buf[0..m.json_len]),
+                    .attack => |a| server.resolveAttack(conn, a),
                     else => {},
                 }
             }
@@ -891,8 +1018,152 @@ test "broadcastBlockChange/ArmSwing target sent-set viewers only" {
     try std.testing.expectEqual(@as(usize, 0), srv.registry.items.len);
 }
 
-test "tickOnce spawns/tracks/despawns players + mobs" {
+test "resolveAttack: mob damage/death/destroy, PvP, reach, pig respawn timer" {
     const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.registry.deinit(a);
+    defer {
+        srv.ent_lock.lock();
+        srv.entities.deinit(a);
+        srv.ent_lock.unlock();
+    }
+    var port: u16 = 37971;
+    var listener: std.Io.net.Server = while (true) {
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+        break addr.listen(io, .{}) catch |err| switch (err) {
+            error.AddressInUse => {
+                port += 1;
+                if (port > 38000) return err;
+                continue;
+            },
+            else => return err,
+        };
+    };
+    defer listener.deinit(io);
+    const mk = struct {
+        fn run(l: *std.Io.net.Server, p: u16, eid: i32) !struct {
+            conn: *Conn,
+            srv_stream: std.Io.net.Stream,
+            cli_stream: std.Io.net.Stream,
+        } {
+            const addr = try std.Io.net.IpAddress.parse("127.0.0.1", p);
+            var cli = try addr.connect(io, .{ .mode = .stream });
+            errdefer cli.close(io);
+            const sv = try l.accept(io);
+            const c = try a.create(Conn);
+            errdefer a.destroy(c);
+            c.* = Conn.init(a, io, .{}, eid);
+            c.state = .play;
+            return .{ .conn = c, .srv_stream = sv, .cli_stream = cli };
+        }
+    };
+    var alice = try mk.run(&listener, port, 1);
+    defer alice.cli_stream.close(io);
+    defer alice.srv_stream.close(io);
+    var bob = try mk.run(&listener, port, 2);
+    defer bob.cli_stream.close(io);
+    defer bob.srv_stream.close(io);
+    try srv.register(alice.conn, alice.srv_stream);
+    try srv.register(bob.conn, bob.srv_stream);
+    // No announceJoin: streams stay clean for deterministic reads.
+    var arb: [128]u8 = undefined;
+    var afb: [512]u8 = undefined;
+    var arr = alice.cli_stream.reader(io, &arb);
+    var brb: [128]u8 = undefined;
+    var bfb: [512]u8 = undefined;
+    var brr = bob.cli_stream.reader(io, &brb);
+    // Pig id 50 at (10,64,10), hp 10; alice tracks it.
+    srv.ent_lock.lock();
+    try srv.entities.append(a, .{ .id = 50, .kind = entity.MOB_PIG, .x = 10, .y = 64, .z = 10, .yaw = 0, .health = 10.0, .home_x = 10, .home_z = 10, .patrol_r = 4 });
+    srv.ent_lock.unlock();
+    try alice.conn.tracked.put(50, .{ .x = 0, .y = 0, .z = 0, .yaw = 0, .pitch = 0 });
+    // Non-lethal hit: 10 -> 7, metadata to trackers.
+    srv.resolveAttack(alice.conn, .{ .target_eid = 50, .dmg = 3, .ax = 10, .ay = 64, .az = 10 });
+    srv.ent_lock.lock();
+    try std.testing.expectApproxEqAbs(@as(f32, 7.0), srv.entities.items[0].health, 1e-6);
+    srv.ent_lock.unlock();
+    {
+        const f = try readFrame(&arr.interface, &afb);
+        try std.testing.expectEqual(@as(i32, 0x1C), f.id);
+        var pr = codec.PacketReader.init(f.body);
+        try std.testing.expectEqual(@as(i32, 50), try pr.readInt());
+        try std.testing.expectEqual(@as(u8, 0x00), try pr.readByte());
+        _ = try pr.readByte();
+        try std.testing.expectEqual(@as(u8, 0x21), try pr.readByte());
+        _ = try pr.readShort();
+        try std.testing.expectEqual(@as(u8, 0x46), try pr.readByte());
+        try std.testing.expectApproxEqAbs(@as(f32, 7.0), try pr.readFloat(), 1e-6);
+    }
+    // Out of reach: no damage.
+    srv.resolveAttack(alice.conn, .{ .target_eid = 50, .dmg = 3, .ax = 900, .ay = 64, .az = 900 });
+    srv.ent_lock.lock();
+    try std.testing.expectApproxEqAbs(@as(f32, 7.0), srv.entities.items[0].health, 1e-6);
+    srv.ent_lock.unlock();
+    // Lethal hit: destroy broadcast, mob removed, respawn timer armed.
+    srv.resolveAttack(alice.conn, .{ .target_eid = 50, .dmg = 10, .ax = 10, .ay = 64, .az = 10 });
+    srv.ent_lock.lock();
+    try std.testing.expectEqual(@as(usize, 0), srv.entities.items.len);
+    try std.testing.expectEqual(@as(u32, 30), srv.pig_cooldown);
+    srv.ent_lock.unlock();
+    {
+        const f = try readFrame(&arr.interface, &afb);
+        try std.testing.expectEqual(@as(i32, 0x13), f.id);
+        var pr = codec.PacketReader.init(f.body);
+        try std.testing.expectEqual(@as(u8, 1), try pr.readByte());
+        try std.testing.expectEqual(@as(i32, 50), try pr.readInt());
+    }
+    // Unknown eid: silent no-op.
+    srv.resolveAttack(alice.conn, .{ .target_eid = 4242, .dmg = 5, .ax = 10, .ay = 64, .az = 10 });
+    // PvP: bob at (20,64,20), alice tracks him.
+    bob.conn.pos_x = 20;
+    bob.conn.pos_z = 20;
+    try alice.conn.tracked.put(2, .{ .x = 0, .y = 0, .z = 0, .yaw = 0, .pitch = 0 });
+    srv.resolveAttack(alice.conn, .{ .target_eid = 2, .dmg = 3, .ax = 20, .ay = 64, .az = 20 });
+    try std.testing.expectApproxEqAbs(@as(f32, 17.0), bob.conn.health, 1e-6);
+    {
+        const f = try readFrame(&brr.interface, &bfb);
+        try std.testing.expectEqual(@as(i32, 0x06), f.id);
+        var pr = codec.PacketReader.init(f.body);
+        try std.testing.expectApproxEqAbs(@as(f32, 17.0), try pr.readFloat(), 1e-6);
+    }
+    {
+        const f = try readFrame(&arr.interface, &afb);
+        try std.testing.expectEqual(@as(i32, 0x1C), f.id);
+        var pr = codec.PacketReader.init(f.body);
+        try std.testing.expectEqual(@as(i32, 2), try pr.readInt());
+    }
+    // Lethal PvP: death screen + dead flag; further hits ignored.
+    srv.resolveAttack(alice.conn, .{ .target_eid = 2, .dmg = 30, .ax = 20, .ay = 64, .az = 20 });
+    try std.testing.expect(bob.conn.is_dead);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), bob.conn.health, 1e-6);
+    {
+        const f = try readFrame(&brr.interface, &bfb);
+        try std.testing.expectEqual(@as(i32, 0x06), f.id);
+        var pr = codec.PacketReader.init(f.body);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.0), try pr.readFloat(), 1e-6);
+    }
+    srv.resolveAttack(alice.conn, .{ .target_eid = 2, .dmg = 30, .ax = 20, .ay = 64, .az = 20 });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), bob.conn.health, 1e-6);
+    // Respawn timer: 30 ticks with a world present brings the pig back.
+    srv.unregister(alice.conn);
+    srv.unregister(bob.conn);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    srv.world = pool;
+    var t: i64 = 0;
+    while (t < 31) : (t += 1) {
+        srv.tickOnce(t * 1000);
+    }
+    srv.ent_lock.lock();
+    defer srv.ent_lock.unlock();
+    try std.testing.expectEqual(@as(usize, 1), srv.entities.items.len);
+    try std.testing.expectEqual(@as(i32, 90), srv.entities.items[0].kind);
+}
+
+test "tickOnce spawns/tracks/despawns players + mobs" {    const a = std.testing.allocator;
     const io = std.testing.io;
     var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
     defer srv.registry.deinit(a);

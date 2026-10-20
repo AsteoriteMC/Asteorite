@@ -427,6 +427,24 @@ pub fn parseArmAnimation(body: []const u8) codec.CodecError!struct { entity_id: 
     return .{ .entity_id = eid, .animation = anim };
 }
 
+/// Serverbound 0x02 use entity. Verified against minecraft-data 1.7:
+/// target i32, mouse i8 (0 interact, 1 attack, 2 interact-at), x/y/z f32
+/// present only when mouse == 2.
+pub fn parseUseEntity(body: []const u8) codec.CodecError!struct { target: i32, mouse: i8, x: f32, y: f32, z: f32 } {
+    var r = codec.PacketReader.init(body);
+    const target = try r.readInt();
+    const mouse = @as(i8, @bitCast(try r.readByte()));
+    var x: f32 = 0;
+    var y: f32 = 0;
+    var z: f32 = 0;
+    if (mouse == 2) {
+        x = try r.readFloat();
+        y = try r.readFloat();
+        z = try r.readFloat();
+    }
+    return .{ .target = target, .mouse = mouse, .x = x, .y = y, .z = z };
+}
+
 /// Serverbound 0x10 creative inventory action.
 pub fn parseCreativeSlot(body: []const u8) codec.CodecError!struct { slot: i16, item: ?SlotItem } {
     var r = codec.PacketReader.init(body);
@@ -954,4 +972,27 @@ test "chat format + frame roundtrip" {
     var w = codec.PacketWriter.init(&sb);
     try w.writeString("hello there");
     try std.testing.expectEqualStrings("hello there", try parseChat(w.written()));
+}
+
+test "use entity parse (attack vs interact-at)" {
+    var ab: [16]u8 = undefined;
+    var w = codec.PacketWriter.init(&ab);
+    try w.writeInt(99);
+    try w.writeByte(1); // attack: no trailing coords
+    const a = try parseUseEntity(w.written());
+    try std.testing.expectEqual(@as(i32, 99), a.target);
+    try std.testing.expectEqual(@as(i8, 1), a.mouse);
+    var ib: [32]u8 = undefined;
+    var w2 = codec.PacketWriter.init(&ib);
+    try w2.writeInt(7);
+    try w2.writeByte(2); // interact-at: three f32s follow
+    try w2.writeFloat(1.5);
+    try w2.writeFloat(2.5);
+    try w2.writeFloat(3.5);
+    const b = try parseUseEntity(w2.written());
+    try std.testing.expectEqual(@as(i32, 7), b.target);
+    try std.testing.expectEqual(@as(i8, 2), b.mouse);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), b.x, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.5), b.y, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.5), b.z, 1e-6);
 }

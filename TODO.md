@@ -11,7 +11,7 @@ Status snapshot (done, tested, live-verified over TCP):
 - [x] Pure-Zig LSM (WAL + SST + `ShardPool`), ZC1 payloads, Anvil→ZC1 import (`tools/anvil_import.zig`)
 - [x] H1 worldgen foundation: `java.util.Random` LCG port (JVM-verified goldens incl. `nextInt(bound)` rejection path), fdlibm `log` port (StrictMath bit-exact — Zig/glibc differ by 1 ulp, proven live), Xoroshiro128++ + Mojang seeding, version-agnostic pipeline driver, `worldgen_dump` tool (`src/worldgen/`, `tools/worldgen_dump.zig`)
 - [x] Region tick stub, MPSC handoff queue, player position tracking (stance quirk handled)
-- [x] 131/131 `zig build test` green (was 53/53 — count the real number when touching this line)
+- [x] 134/134 `zig build test` green (was 53/53 — count the real number when touching this line)
 
 Legend: `[ ]` todo, `[~]` partial. Each phase ends with acceptance criteria.
 
@@ -53,7 +53,7 @@ Without these the client connects but the world is dead. All bodies are
 - [x] Patrol-wander mob with deterministic square path; demo pig auto-spawns at spawn+2 when a world is present (20tps smoothing is Phase C work)
 - [x] Server tick integrates entities: snapshot players (locked one at a time, no nesting), wander+snapshot mobs under `ent_lock`, reconcile per viewer, broadcast leave doubles as immediate path while tick reap is the safety net
 - [x] Acceptance, all live with echoing clients: mutual player spawns with correct offline UUIDs/names/positions, wandering pig visible to both (relmove stream), despawn on leaving view, re-spawn on return, relmove on small moves, destroy on disconnect
-- [ ] Follow-ups: 20tps movement smoothing, mob AI beyond patrol, health/damage, persistence of entities, riding/velocity/projectiles, equipment slots
+- [ ] Follow-ups: 20tps movement smoothing, mob AI beyond patrol, persistence of entities, riding/velocity/projectiles, equipment slots (health/damage/death/respawn + Use Entity reach validation done, live-verified — see protocol quirks validation below)
 
 ### A5. Chat + disconnect hygiene ✅ (done, live-verified)
 - [x] Serverbound Chat `0x01` (plain string) → broadcast Chat Message `0x02` to all play conns including sender (1.7 has no position byte); JSON escaped (`"`, `\`, control chars → `\u00XX`), UTF-8 validated, 100-codepoint cap; invalid/overlong dropped silently (no kick — can't be weaponized)
@@ -302,7 +302,7 @@ and the RAM budget is smaller than a phone's.
 
 ### Security / robustness
 - [x] RSA key file 0600, gitignored
-- [ ] Attack/use-entity validation (`0x02` Use Entity not yet implemented): reach check first; optional ~200ms hitbox history for high-ping fairness later. Scoped to hit validation only — no full rollback, no client reconciliation (1.7 protocol can't do it). Packet first, history later, both measured
+- [~] Attack/use-entity validation (`0x02` Use Entity implemented with 6-block reach check, melee damage table, mob/player health + death + Destroy broadcast, respawn via Client Status 0 — all live-verified; optional ~200ms hitbox history for high-ping fairness later). Scoped to hit validation only — no full rollback, no client reconciliation (1.7 protocol can't do it). Packet first, history later, both measured
 - [ ] Rate limits: login attempts/IP, chat rate, block-place rate (creative spam = chunk rewrite storm → LSM pressure)
 - [ ] Username/chat validation everywhere (charset + length; chat JSON validated — vanilla disconnects on malformed)
 - [ ] Decompression bomb guards on any client-controlled zlib (chunk packets are server→client today, but future-proof the limit)

@@ -49,6 +49,19 @@ pub const ChatEvent = struct {
     json_len: usize,
 };
 
+/// Validated melee attack (serverbound 0x02, action == attack).
+/// Attacker snapshot is baked in at parse time (under conn.lock) so the
+/// tick thread can resolve damage without taking more locks.
+pub const AttackEvent = struct {
+    target_eid: i32,
+    /// Damage from the attacker's held item (vanilla 1.7 table, no enchants —
+    /// NBT is skipped, documented in onPlace).
+    dmg: f32,
+    ax: f64,
+    ay: f64,
+    az: f64,
+};
+
 pub const Action = union(enum) {
     none,
     /// A status ping completed; caller should flush then close.
@@ -58,6 +71,9 @@ pub const Action = union(enum) {
     disconnect_queued,
     /// Mutate one block then broadcast 0x23 to chunk viewers (not sender).
     block_set: BlockEvent,
+    /// Validated melee attack: resolved by the tick thread against mobs +
+    /// players (carries attacker snapshot so no locks are needed later).
+    attack: AttackEvent,
     /// Relay arm swing 0x0B to chunk viewers (not sender).
     arm_swing: i8,
     /// Broadcast formatted chat line to all play conns.
@@ -97,6 +113,14 @@ pub const Conn = struct {
     inv: [45]?packets.SlotItem = [_]?packets.SlotItem{null} ** 45,
     selected: u8 = 0,
     pending_dig: ?struct { x: i32, y: u8, z: i32 } = null,
+    /// Survival state. Damage resolution lives in the tick thread
+    /// (server.zig); the serve thread only records validated attack events.
+    /// While is_dead the client shows the death screen: block/entity
+    /// actions are dropped until Client Status 0 (respawn) arrives.
+    health: f32 = 20.0,
+    food: i16 = 20,
+    saturation: f32 = 5.0,
+    is_dead: bool = false,
     /// Connection established timestamp (ms, monotonic). Login must complete
     /// within login_timeout_ms or the ticker drops the connection.
     connected_at_ms: i64 = 0,
@@ -482,7 +506,8 @@ pub const Conn = struct {
         if (frame.id == @as(i32, @intFromEnum(ids.PlayServer.client_status))) {
             const st = try packets.parseClientStatus(frame.body);
             if (st == 0) {
-                // respawn: back to spawn, full chunk resync
+                // respawn: back to spawn, full chunk resync; the dead walk
+                // back with full health (food/saturation kept as-is).
                 self.setPos(
                     @as(f64, @floatFromInt(self.config.spawn_x)) + 0.5,
                     @as(f64, @floatFromInt(self.config.spawn_y)),
@@ -493,6 +518,12 @@ pub const Conn = struct {
                 );
                 self.force_resync = true;
                 self.chunks_dirty = true;
+                if (self.is_dead) {
+                    self.is_dead = false;
+                    self.health = 20.0;
+                    var hb: [32]u8 = undefined;
+                    try self.queueRaw(try packets.frameUpdateHealth(self.health, self.food, self.saturation, &hb));
+                }
             }
             return .none;
         }
@@ -533,8 +564,50 @@ pub const Conn = struct {
             self.last_chat_ms = now;
             return .{ .chat = .{ .json_len = json.len } };
         }
+        if (frame.id == @as(i32, @intFromEnum(ids.PlayServer.use_entity))) {
+            const u = try packets.parseUseEntity(frame.body);
+            return self.onUseEntity(u.target, u.mouse);
+        }
         // P-next: actions.
         return .none;
+    }
+
+    /// Vanilla 1.7 melee damage by held item id (no enchantments — NBT is
+    /// skipped on placement, so sharpness can't apply; documented).
+    /// Swords 4-7, axes 3-6, pickaxes 2-5, shovels 1-4, everything else 1.
+    pub fn meleeDamage(item_id: i16) f32 {
+        return switch (item_id) {
+            268, 283 => 4.0, // wooden/gold sword
+            272 => 5.0, // stone sword
+            267 => 6.0, // iron sword
+            276 => 7.0, // diamond sword
+            271, 286 => 3.0, // wooden/gold axe
+            275 => 4.0, // stone axe
+            258 => 5.0, // iron axe
+            279 => 6.0, // diamond axe
+            270, 285 => 2.0, // wooden/gold pickaxe
+            274 => 3.0, // stone pickaxe
+            257 => 4.0, // iron pickaxe
+            278 => 5.0, // diamond pickaxe
+            269, 284 => 1.0, // wooden/gold shovel (fist-equivalent)
+            273 => 2.0, // stone shovel
+            256 => 3.0, // iron shovel
+            277 => 4.0, // diamond shovel
+            else => 1.0, // fist and everything else
+        };
+    }
+
+    /// Serverbound 0x02: mouse 0 = interact, 1 = attack, 2 = interact-at.
+    /// Interact has no target system yet (no riding/leashing) — dropped.
+    /// Attack validates the target isn't self and packs an event; the tick
+    /// thread resolves it against mobs + players (tick-owned entity state).
+    fn onUseEntity(self: *Conn, target: i32, mouse: i8) Action {
+        if (self.is_dead) return .none;
+        if (mouse != 1) return .none; // interact / interact-at: P-next
+        if (target == self.eid) return .none;
+        const held = self.inv[36 + self.selected] orelse null;
+        const dmg = if (held) |h| meleeDamage(h.id) else 1.0;
+        return .{ .attack = .{ .target_eid = target, .dmg = dmg, .ax = self.pos_x, .ay = self.pos_y, .az = self.pos_z } };
     }
 
     /// Reach check from eyes (feet + 1.62) to block center; 6.0 generous.
@@ -546,6 +619,7 @@ pub const Conn = struct {
     }
 
     fn onDig(self: *Conn, status: i8, x: i32, y: u8, z: i32) Action {
+        if (self.is_dead) return .none; // death screen: client sends nothing; drop anything
         const creative = self.config.gamemode == 1;
         switch (status) {
             0 => { // start
@@ -580,6 +654,7 @@ pub const Conn = struct {
 
     /// Face offsets: 0=-Y,1=+Y,2=-Z,3=+Z,4=-X,5=+X. 255/-1 = no placement.
     fn onPlace(self: *Conn, x: i32, y: u8, z: i32, direction: i8) Action {
+        if (self.is_dead) return .none;
         if (direction < 0 or direction > 5) return .none;
         if (!self.inReach(x, y, z)) return .none;
         const held = self.inv[36 + self.selected] orelse return .none;
@@ -619,7 +694,7 @@ pub const Conn = struct {
         var ab: [32]u8 = undefined;
         try self.queueRaw(try packets.framePlayerAbilities(if (creative) 0x07 else 0x00, 0.05, 0.1, &ab));
         var hb: [32]u8 = undefined;
-        try self.queueRaw(try packets.frameUpdateHealth(20.0, 20, 5.0, &hb));
+        try self.queueRaw(try packets.frameUpdateHealth(self.health, self.food, self.saturation, &hb));
         var xb: [32]u8 = undefined;
         try self.queueRaw(try packets.frameSetExperience(0.0, 0, 0, &xb));
         var lb: [64]u8 = undefined;
@@ -1037,8 +1112,106 @@ test "dig/place/held/creative/arm behavior" {
     }
 }
 
-test "join packets order + fields" {
+test "use entity: attack validation, damage table, dead gates, respawn" {
     const a = std.testing.allocator;
+    var c = Conn.init(a, std.testing.io, .{ .gamemode = 0, .spawn_x = 8, .spawn_y = 64, .spawn_z = 8 }, 7);
+    defer c.deinit();
+    c.state = .play;
+    @memcpy(c.username[0.."Al".len], "Al");
+    c.username_len = "Al".len;
+    const feed = struct {
+        fn run(conn: *Conn, id: i32, body: []const u8) !?Action {
+            var f: [64]u8 = undefined;
+            try conn.feedData(try codec.framePacket(id, body, &f));
+            const fr = (try conn.poll()).?;
+            return try conn.handleFrame(fr);
+        }
+    }.run;
+    const useBody = struct {
+        fn run(target: i32, mouse: i8, out: []u8) []const u8 {
+            var w = codec.PacketWriter.init(out);
+            w.writeInt(target) catch unreachable;
+            w.writeByte(@bitCast(mouse)) catch unreachable;
+            return w.written();
+        }
+    }.run;
+    var ub: [16]u8 = undefined;
+    // empty hand attack -> event with fist damage, attacker snapshot
+    {
+        const act = try feed(&c, 0x02, useBody(99, 1, &ub));
+        const ev = act.?.attack;
+        try std.testing.expectEqual(@as(i32, 99), ev.target_eid);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), ev.dmg, 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f64, 8.5), ev.ax, 1e-9);
+    }
+    // interact (0) and interact-at (2): dropped, no target system yet
+    {
+        try std.testing.expect((try feed(&c, 0x02, useBody(99, 0, &ub))).? == .none);
+        var ib: [32]u8 = undefined;
+        var w = codec.PacketWriter.init(&ib);
+        try w.writeInt(99);
+        try w.writeByte(2);
+        try w.writeFloat(1.0);
+        try w.writeFloat(2.0);
+        try w.writeFloat(3.0);
+        try std.testing.expect((try feed(&c, 0x02, w.written())).? == .none);
+    }
+    // self-hit dropped
+    try std.testing.expect((try feed(&c, 0x02, useBody(7, 1, &ub))).? == .none);
+    // damage table: diamond sword 7, iron axe 5, stick 1
+    try std.testing.expectApproxEqAbs(@as(f32, 7.0), Conn.meleeDamage(276), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), Conn.meleeDamage(258), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), Conn.meleeDamage(280), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), Conn.meleeDamage(-1), 1e-6);
+    // diamond sword in hand -> 7.0 event
+    {
+        var cb: [32]u8 = undefined;
+        var w = codec.PacketWriter.init(&cb);
+        try w.writeShort(36);
+        try w.writeShort(276);
+        try w.writeByte(1);
+        try w.writeShort(0);
+        try w.writeShort(-1);
+        c.inv[36] = .{ .id = 276, .count = 1, .damage = 0 };
+        c.selected = 0;
+        const act = try feed(&c, 0x02, useBody(100, 1, &ub));
+        try std.testing.expectApproxEqAbs(@as(f32, 7.0), act.?.attack.dmg, 1e-6);
+        c.inv[36] = null;
+    }
+    // dead: dig/place/attack all dropped
+    {
+        c.is_dead = true;
+        var db: [32]u8 = undefined;
+        var w = codec.PacketWriter.init(&db);
+        try w.writeByte(0);
+        try w.writeInt(8);
+        try w.writeByte(64);
+        try w.writeInt(9);
+        try w.writeByte(1);
+        try std.testing.expect((try feed(&c, 0x07, w.written())).? == .none);
+        try std.testing.expect((try feed(&c, 0x02, useBody(99, 1, &ub))).? == .none);
+        // chat still works while dead
+        var chb: [32]u8 = undefined;
+        var chw = codec.PacketWriter.init(&chb);
+        try chw.writeString("hi");
+        const chact = try feed(&c, 0x01, chw.written());
+        try std.testing.expect(chact.? == .chat);
+        // respawn via client status 0: healed, alive, Update Health queued
+        var sb: [8]u8 = undefined;
+        var sw = codec.PacketWriter.init(&sb);
+        try sw.writeByte(0);
+        try std.testing.expect((try feed(&c, 0x16, sw.written())).? == .none);
+        try std.testing.expect(!c.is_dead);
+        try std.testing.expectApproxEqAbs(@as(f32, 20.0), c.health, 1e-6);
+        const out = try c.takeOutput();
+        defer a.free(out);
+        var r = codec.PacketReader.init(out);
+        try std.testing.expectEqual(@as(i32, 0x06), (try codec.decodeFrame(&r)).id);
+        try std.testing.expectApproxEqAbs(@as(f32, 20.0), try r.readFloat(), 1e-6);
+    }
+}
+
+test "join packets order + fields" {    const a = std.testing.allocator;
     var c = Conn.init(a, std.testing.io, .{ .gamemode = 1 }, 1);
     defer c.deinit();
     @memcpy(c.username[0.."Steve".len], "Steve");
