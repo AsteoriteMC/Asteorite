@@ -11,7 +11,7 @@ Status snapshot (done, tested, live-verified over TCP):
 - [x] Pure-Zig LSM (WAL + SST + `ShardPool`), ZC1 payloads, Anvil→ZC1 import (`tools/anvil_import.zig`)
 - [x] H1 worldgen foundation: `java.util.Random` LCG port (JVM-verified goldens incl. `nextInt(bound)` rejection path), fdlibm `log` port (StrictMath bit-exact — Zig/glibc differ by 1 ulp, proven live), Xoroshiro128++ + Mojang seeding, version-agnostic pipeline driver, `worldgen_dump` tool (`src/worldgen/`, `tools/worldgen_dump.zig`)
 - [x] Region tick stub, MPSC handoff queue, player position tracking (stance quirk handled)
-- [x] 90/90 `zig build test` green (was 53/53 — count the real number when touching this line)
+- [x] 131/131 `zig build test` green (was 53/53 — count the real number when touching this line)
 
 Legend: `[ ]` todo, `[~]` partial. Each phase ends with acceptance criteria.
 
@@ -101,16 +101,16 @@ Current state: `tickOnce` is sequential; `ShardPool` shards storage; MPSC exists
 - [ ] Seqlocks for read-heavy shared state (config, time-of-day, player count for status) so region threads never block on a mutex
 - [ ] Acceptance: `zig build bench` tick micro-benchmarks (entity tick ns/entity, AABB queries/s) with before/after numbers in comments
 
-## Phase E — Storage hardening (LSM is P1-complete, needs P2)
+## Phase E — Storage hardening ✅ (done: compaction + MANIFEST, Bloom/index reads, fsync policy, key-order fix, `check` tool, snapshots; stretch journal deferred)
 
-- [ ] Compaction: merge SSTs within a shard (size-tiered; simplest correct first), delete superseded runs, keep `next_sst_id` monotonic across restarts (exists) + MANIFEST so a crash mid-compact can't lose runs
-- [ ] Read path: per-SST Bloom filter + block index (current linear scan is the known bottleneck — measure first: `get` p99 with 50 SSTs)
-- [ ] fsync policy: WAL `sync()` per N ms or per K bytes (currently sync-on-flush/close only) + `wal.log` truncation atomicity review
-- [ ] Signed-BE key sort fix: offset x/z by 2^31 in `encodeKey` so lexicographic order matches numeric (noted in `store.zig` tests)
-- [ ] Repair/verify tool: `zig build check -- <db>` replays WAL, checks CRCs, lists orphans (`tools/` new binary; reuse `store.zig` open path)
-- [ ] Snapshot/backup: SST file-level snapshot while running (LSM makes this cheap — document procedure)
+- [x] Compaction: merge SSTs within a shard (all-run newest-wins merge, simplest correct first), delete superseded runs, keep `next_sst_id` monotonic across restarts + MANIFEST (tmp+rename swap) so a crash mid-compact can't lose runs; auto-compact at 8 runs (sync; backgrounding is Phase C/H5)
+- [x] Read path: per-SST Bloom filter + sparse block index (ZLS2 footer; ZLS1 reader kept). Measured first: 50-SST `get` p99 1.58ms → 67µs, p50 1.24ms → 33µs (Bloom skips absent files, index narrows present scans)
+- [x] fsync policy: WAL `sync()` per `wal_sync_bytes` (0 = sync on flush/close only, the P1 behavior preserved by default) + truncating WAL only after the SST+MANIFEST it replaces are durable (truncation atomicity reviewed in `flushLocked`)
+- [x] Signed-BE key sort fix: `encodeKey` biases x/z by 2^31 so lexicographic order matches numeric (old P1 DBs not readable — reimport via Anvil)
+- [x] Repair/verify tool: `zig build check -- <db>` replays WAL, checks CRCs, audits SSTs (magic/count/order/footer-CRC/Bloom rebuild), lists orphans (`tools/check.zig`, read-only)
+- [x] Snapshot/backup: SST file-level snapshot while running (`Store.snapshot`/`ShardPool.snapshotAll`: flush, copy MANIFEST + live SSTs; quiesce writes first — documented in code)
 - [ ] (Stretch) Per-tick input journal for forensics/anti-cheat: append compact {tick, player, action} records (separate from the store WAL); used to verify reach/speed claims post-hoc and debug desyncs. NOT instant crash recovery by itself — world durability still comes from LSM WAL/SST; replay needs a deterministic sim we don't have yet. Measure overhead before enabling by default
-- [ ] Acceptance: kill -9 mid-write storm → reopen recovers, zero CRC failures, `check` clean
+- [x] Acceptance: kill -9 mid-write storm (300k+ puts, live compactions) → reopen recovers, zero CRC failures, `check` clean (live-verified: clean before and after server reopen; torn-tail truncation covered by unit test)
 
 ## Phase F — Pure-Zig modding API (per plan §5)
 
@@ -166,14 +166,14 @@ defaults ship as checked-in data (`data/worldgen/`), custom packs (Terralith /
 JJThunder-class) override the data, code only changes for new node *types*.
 Worldgen version follows the world's version, not the client's (ties to Phase I).
 
-### H1. Pipeline driver + RNG (parity foundation — build first) ✅ (done — RNG goldens JVM-verified, chunk parity pending H2)
+### H1. Pipeline driver + RNG (parity foundation — build first) ✅ (done — RNG goldens JVM-verified, chunk parity covered by H2 full-pipeline goldens)
 
 - [x] `src/worldgen/pipeline.zig`: version-agnostic stage driver — biome source → terrain shaper → surface builder → carvers → features → structures. Every chunk is a pure function `f(worldSeed, chunkXZ)` (enables parallel gen + golden tests); features read a 3×3 shaped area, decorate the center
 - [x] `src/worldgen/rng/java_random.zig`: exact `java.util.Random` 48-bit LCG port (≤1.17 parity) with tests against known Java outputs; exact per-chunk seed-mixing formulas. Includes fdlibm `log` port (`strict_math.zig`) — proven necessary: StrictMath.log differs from Zig/glibc by 1 ulp on real inputs, caught by the seed-42 gaussian golden
 - [x] `src/worldgen/rng/xoroshiro.zig`: Xoroshiro128++ port for 1.18+ (needed by H4)
 - [x] Hard rule (code review gate): RNG call order is part of the spec — one stray `nextInt()` shifts all downstream terrain; call sites versioned + counted in tests
 - [x] `tools/worldgen_dump.zig`: gen chunk for seed+X/Z, dump bytes for golden tests (`zig build wgen -- <seed> <x> <z>`; fresh-stream section diffs directly against Goldens.java)
-- [~] Acceptance (partial): RNG-level golden hashes checked in and JVM-verified; same-seed-vs-vanilla **chunk-byte** parity needs H2's real stages
+- [x] Acceptance: RNG-level golden hashes checked in and JVM-verified; same-seed-vs-vanilla **chunk-byte** parity covered by H2's full-pipeline goldens (10 chunks, bit-exact)
 
 ### H2. 1.7.10 generator (v5 — fills today's void holes)
 

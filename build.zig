@@ -100,6 +100,19 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(genbench_tool);
 
+    const check_tool = b.addExecutable(.{
+        .name = "check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/check.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zigcraft", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(check_tool);
+
     const run_step = b.step("run", "Run zigcraft server (stub)");
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -130,6 +143,12 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| genlayer_cmd.addArgs(args);
     genlayer_step.dependOn(&genlayer_cmd.step);
 
+    const check_step = b.step("check", "Verify an LSM db (WAL CRCs, SSTs, MANIFEST, orphans)");
+    const check_cmd = b.addRunArtifact(check_tool);
+    check_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| check_cmd.addArgs(args);
+    check_step.dependOn(&check_cmd.step);
+
     const mod_tests = b.addTest(.{ .root_module = mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
@@ -150,6 +169,9 @@ pub fn build(b: *std.Build) void {
     const genlayer_tests = b.addTest(.{ .root_module = genlayer_tool.root_module });
     const run_genlayer_tests = b.addRunArtifact(genlayer_tests);
 
+    const check_tests = b.addTest(.{ .root_module = check_tool.root_module });
+    const run_check_tests = b.addRunArtifact(check_tests);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
@@ -158,4 +180,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_wgen_tests.step);
     test_step.dependOn(&run_seed_tests.step);
     test_step.dependOn(&run_genlayer_tests.step);
+    test_step.dependOn(&run_check_tests.step);
 }

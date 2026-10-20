@@ -125,6 +125,26 @@ pub const ShardPool = struct {
     pub fn flushAll(self: *ShardPool) !void {
         for (self.shards) |st| try st.flush();
     }
+
+    /// Merge runs within every shard (see `Store.compact`). Bounded SST
+    /// counts keep `get` from degrading to a 50-file linear scan (Phase E).
+    pub fn compactAll(self: *ShardPool) !void {
+        for (self.shards) |st| try st.compact();
+    }
+
+    /// Consistent snapshot of every shard into `backup_root/shard-NN`.
+    /// Flushes first (point-in-time copy). Quiesce writers across all shards
+    /// before calling — there is no cross-shard lock yet (Phase C).
+    /// See `Store.snapshot` for the procedure and guarantees.
+    pub fn snapshotAll(self: *ShardPool, backup_root: std.Io.Dir) !void {
+        for (self.shards, 0..) |st, i| {
+            var name_buf: [32]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buf, "shard-{d:0>2}", .{i});
+            var snap_dir = try backup_root.createDirPathOpen(self.io, name, .{});
+            defer snap_dir.close(self.io);
+            try st.snapshot(snap_dir);
+        }
+    }
 };
 
 test "region mapping floors negatives" {
