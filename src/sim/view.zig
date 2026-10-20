@@ -243,6 +243,18 @@ pub fn fullResync(
 /// (holes) are ignored — generation is P-next. Callers hold the world lock.
 pub const PeekBlock = struct { id: u16, meta: u4 };
 
+/// Vanilla `isOpaqueCube` approximation for suffocation: full solid cubes
+/// suffocate, everything else (air, fluids, glass, leaves, ice, slabs,
+/// stairs, plants, torches, rails, snow, etc.) doesn't. Default is opaque
+/// (stone/dirt/ores/planks/logs/wool/...). Fences/walls/panes are full
+/// cubes here — slightly stricter than vanilla, documented.
+pub fn isOpaqueCube(id: u16) bool {
+    return switch (id) {
+        0, 6, 8, 9, 10, 11, 18, 20, 26, 27, 28, 30, 31, 32, 37, 38, 39, 40, 44, 50, 51, 53, 55, 59, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 75, 76, 77, 78, 79, 83, 85, 93, 94, 96, 104, 105, 106, 107, 108, 109, 111, 114, 115, 116, 117, 118, 120, 126, 128, 131, 132, 134, 135, 136, 140, 141, 142, 143, 144, 147, 148, 149, 150, 151, 156, 157, 159, 161, 163, 164, 171, 175, 178, 180 => false,
+        else => true,
+    };
+}
+
 /// Read one block without mutating. Null when the chunk/section is absent.
 pub fn peekBlock(pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, x: i32, y: u8, z: i32) !?PeekBlock {
     const cx = @divFloor(x, 16);

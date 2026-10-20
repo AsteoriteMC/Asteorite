@@ -11,7 +11,7 @@ Status snapshot (done, tested, live-verified over TCP):
 - [x] Pure-Zig LSM (WAL + SST + `ShardPool`), ZC1 payloads, Anvil→ZC1 import (`tools/anvil_import.zig`)
 - [x] H1 worldgen foundation: `java.util.Random` LCG port (JVM-verified goldens incl. `nextInt(bound)` rejection path), fdlibm `log` port (StrictMath bit-exact — Zig/glibc differ by 1 ulp, proven live), Xoroshiro128++ + Mojang seeding, version-agnostic pipeline driver, `worldgen_dump` tool (`src/worldgen/`, `tools/worldgen_dump.zig`)
 - [x] Region tick stub, MPSC handoff queue, player position tracking (stance quirk handled)
-- [x] 171/171 `zig build test` green (21/21 steps; was 165/165 — count the real number when touching this line)
+- [x] 174/174 `zig build test` green (21/21 steps; was 165/165 — count the real number when touching this line)
 
 Legend: `[ ]` todo, `[~]` partial. Each phase ends with acceptance criteria.
 
@@ -92,8 +92,14 @@ independently live-verifiable):
 - [x] Ground truth: drop formulas/ids are CFR 0.152 ports of the official 1.7.10 jar (`amn`/`amz`/`ali`/`alt`+`aml`+`amh`/`anv`/`aly`/`alg`/`ajy`/`anz` + `aji` harvestBlock/dropBlockAsItemWithChance), not re-derivations; `drops.zig` unit tests sweep seeds for bounds (lapis 4-8, redstone 4-5, glow 2-4, melon 3-7) and rates (flint ~10%, sapling ~5%, seeds ~12.5%). Live JVM sampling was abandoned after the harness fought back — but it paid for itself in protocol facts now baked in: 0x1C eid is i32, living metadata carries a string@10, /tp clears the move-confirm flag (exact-echo 0x06 needed), placement uses the server-side selected stack (mismatch → SetSlot correction), harvestBlock breaks mid-hold (collect during hold, not after)
 - [ ] Follow-ups: our onPlace trusts the packet item (vanilla checks the hand — Phase P cheat-hardening); Q-drop/throw velocity is zeroed (vanilla scatters with world rand); pickup radius is a static approximation (no per-tick physics at 1Hz)
 
-### J2. Hunger + attrition (health regen, fall/drown/lava damage, starvation)
-- [ ] Food drain + saturation, regen-on-full, starvation damage, fall/drown/lava/suffocation damage paths
+### J2. Hunger + attrition (health regen, fall/drown/lava damage, starvation) [~] (implemented + live-verified)
+- [x] FoodStats port (`hungerTick`: exhaustion>4 drain, regen +1/80t at food>=18 (+3 exh), starvation gates easy>10/normal>1/hard-always, peaceful no-drain; saturation default 5.0 kept)
+- [x] Exhaustion sources: attack +0.3 (per landed hit), break +0.025, jump +0.2 / sprint-jump +0.8 (takeoff detect), walk +0.01 / sprint +0.1 per block (0x0B sprint flag); swim 0.015 gap (no water check in packet path)
+- [x] Fall: server-side accumulate + landing stash; serve-thread water check (feet block 8/9 cancels); damage ceil(dist-3), survival-only
+- [x] Drown (eyes water: -20 air/tick, 2 dmg at -20 then 1/s), lava (4 + fire 300; lenient vs 4/tick vanilla), fire (1/s, water extinguishes), suffocate (eyes opaque: 4/tick; lenient vs 1/tick vanilla) — 1Hz-quantized deviations documented
+- [x] Death drops (full inv+cursor as one-entity-per-stack, 10-tick delay), victim row saved on death, respawn full-inv re-sync; combat deaths unified (PvP now respects creative immunity — vanilla-exact, test conns flipped to survival)
+- [x] Acceptance, live E2E: fall 6 → 17.0, regen → 20, lethal fall → 0 + 2 drops, respawn → 20 + Window Items, suffocate 4/tick → death + drops + re-pickup path
+- [ ] Live gaps (unit-covered): drown/lava/fire timing, starvation TTK, fall-into-water cancel, peaceful; swim exhaustion unimplemented
 
 ### J3. Crafting (+ furnace)
 - [ ] 2x2/3x3 grid recipes (vanilla table), furnace smelting; needs J1 inputs

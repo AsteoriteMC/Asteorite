@@ -1120,6 +1120,32 @@ pub const Server = struct {
         }.f;
 
         var claims = entity.ClaimSet{};
+        // Environmental hazards from player snaps (no conn locks here;
+        // world_lock is a leaf). Eyes block decides drown/suffocate, feet
+        // block adds lava.
+        const EnvFlag = struct { water: bool = false, lava: bool = false, suff: bool = false };
+        var envs: [256]EnvFlag = undefined;
+        for (envs[0..@min(envs.len, n_players)]) |*f| f.* = .{};
+        if (self.world) |pool| {
+            self.world_lock.lock();
+            for (players[0..n_players], 0..) |p, i| {
+                if (i >= envs.len) break;
+                const ex: i32 = @intFromFloat(@floor(p.x));
+                const ez: i32 = @intFromFloat(@floor(p.z));
+                const eyes: u8 = @intFromFloat(@max(0, @min(255, p.y + 1.62)));
+                const feet: u8 = @intFromFloat(@max(0, @min(255, p.y)));
+                if (view.peekBlock(pool, self.gpa, ex, eyes, ez) catch null) |b| {
+                    envs[i].water = b.id == 8 or b.id == 9;
+                    envs[i].suff = view.isOpaqueCube(b.id);
+                    if (b.id == 10 or b.id == 11) envs[i].lava = true;
+                }
+                if (view.peekBlock(pool, self.gpa, ex, feet, ez) catch null) |b| {
+                    if (b.id == 10 or b.id == 11) envs[i].lava = true;
+                }
+            }
+            self.world_lock.unlock();
+        }
+        var deaths: std.ArrayList(DeathInfo) = .empty;
         for (snap) |e| {
             e.conn.lock.lock();
             // Connections that never reach play: login timeout (anti-slowloris).
@@ -1159,6 +1185,27 @@ pub const Server = struct {
             };
             const timed_out = action == .timeout;
             if (!timed_out) {
+                // Hunger + hazards before visibility (death gates pickup).
+                var died_now = false;
+                if (hungerTick(e.conn, self.config.difficulty)) died_now = true;
+                if (!died_now) {
+                    for (players[0..n_players], 0..) |p, i| {
+                        if (p.eid != e.conn.eid or i >= envs.len) continue;
+                        if (envTick(e.conn, envs[i].water, envs[i].lava, envs[i].suff)) died_now = true;
+                        break;
+                    }
+                }
+                if (died_now) {
+                    const dd = collectDeathDrops(e.conn);
+                    deaths.append(self.gpa, .{
+                        .conn = e.conn,
+                        .eid = e.conn.eid,
+                        .dd = dd,
+                        .x = e.conn.pos_x,
+                        .y = e.conn.pos_y,
+                        .z = e.conn.pos_z,
+                    }) catch {};
+                }
                 var pctx = PresentCtx{ .viewer = e.conn, .range_blocks = @as(f64, @floatFromInt(self.view_distance)) * 16.0 + 16.0 };
                 entity.reconcileViewer(e.conn, players[0..n_players], mobs[0..n_mobs], item_snaps[0..n_items], &claims, present, &pctx) catch {};
             }
@@ -1199,6 +1246,20 @@ pub const Server = struct {
             }
         }
         for (item_snaps[0..n_items]) |s| if (s.nbt) |n| self.gpa.free(n);
+        // Deaths from hunger/environment this tick: spawn drops (ent_lock),
+        // persist emptied rows (savePlayer locks), broadcast death metadata.
+        for (deaths.items) |*di| {
+            self.spawnDeathDrops(&di.dd, di.x, di.y, di.z);
+        }
+        {
+            var mb: [32]u8 = undefined;
+            for (deaths.items) |di| {
+                const f = packets.frameEntityMetadata(di.eid, 0, &mb) catch continue;
+                self.broadcastToTrackers(di.eid, f);
+            }
+        }
+        for (deaths.items) |di| self.savePlayer(di.conn);
+        deaths.deinit(self.gpa);
         // Periodic autosave (WAL-durable; save-all/stop flush SSTs on top).
         // Counter rolls over naturally; the modulo stays aligned.
         self.tick_counter += 1;
@@ -1252,6 +1313,221 @@ pub const Server = struct {
         const dy = ty - (ay + 1.62);
         const dz = tz - az;
         return dx * dx + dy * dy + dz * dz < 36.0;
+    }
+
+    /// Apply damage to a conn whose lock is ALREADY held: subtract, clamp,
+    /// flag death, queue Update Health. Creative (disableDamage) is immune.
+    /// Caller handles drops/save/broadcast. Returns true on a killing blow.
+    fn applyPlayerDamage(conn: *Conn, amount: f32) bool {
+        if (conn.is_dead) return false;
+        if (conn.config.gamemode == 1) return false;
+        conn.health -= amount;
+        if (conn.health <= 0) {
+            conn.health = 0;
+            conn.is_dead = true;
+        }
+        var hb: [32]u8 = undefined;
+        if (packets.frameUpdateHealth(conn.health, conn.food, conn.saturation, &hb)) |f| {
+            conn.queueFramed(f) catch {};
+        } else |_| {}
+        return conn.is_dead;
+    }
+
+    /// Owned death-drop payload (inv 45 + cursor; NBT moved, not cloned).
+    /// Collected under the victim's lock, spawned + freed post-loop.
+    const DeathDrop = struct {
+        eid: i32,
+        stacks: [46]?item_mod.Stack = [_]?item_mod.Stack{null} ** 46,
+        n: usize = 0,
+    };
+
+    /// Tick-local death record (victim ref held by the tick snapshot).
+    const DeathInfo = struct {
+        conn: *Conn,
+        eid: i32,
+        dd: DeathDrop,
+        x: f64,
+        y: f64,
+        z: f64,
+    };
+
+    /// Vanilla FoodStats.onUpdate quantized to 1Hz (+20 timer per tick).
+    /// Natural-regeneration gamerule assumed on (no gamerules yet).
+    /// Caller holds conn.lock. Returns true on starvation death.
+    fn hungerTick(conn: *Conn, difficulty: u8) bool {
+        if (conn.is_dead or conn.health <= 0) return false;
+        if (conn.config.gamemode == 1) return false; // creative: nothing drains
+        conn.food_timer +|= 20;
+        var dirty = false;
+        if (conn.exhaustion > 4.0) {
+            conn.exhaustion -= 4.0;
+            if (conn.saturation > 0) {
+                conn.saturation = @max(conn.saturation - 1.0, 0.0);
+            } else if (difficulty != 0) {
+                conn.food = @max(conn.food - 1, 0);
+            }
+            dirty = true;
+        }
+        var died = false;
+        if (conn.food >= 18 and conn.health < 20.0) {
+            if (conn.food_timer >= 80) {
+                conn.food_timer = 0;
+                conn.health = @min(conn.health + 1.0, 20.0);
+                conn.addExhaustion(3.0);
+                dirty = true;
+            }
+        } else if (conn.food <= 0) {
+            if (conn.food_timer >= 80) {
+                conn.food_timer = 0;
+                const hp = conn.health;
+                if (hp > 10.0 or difficulty == 3 or (hp > 1.0 and difficulty == 2)) {
+                    died = applyPlayerDamage(conn, 1.0);
+                    dirty = true;
+                }
+            }
+        } else {
+            conn.food_timer = 0;
+        }
+        if (dirty and !died) {
+            var hb: [32]u8 = undefined;
+            if (packets.frameUpdateHealth(conn.health, conn.food, conn.saturation, &hb)) |f| {
+                conn.queueFramed(f) catch {};
+            } else |_| {}
+        }
+        return died;
+    }
+
+    /// Drown/lava/fire/suffocation for one tick (vanilla Entity rules,
+    /// 1Hz-quantized; see deviations). Caller holds conn.lock.
+    /// Returns true on death.
+    fn envTick(conn: *Conn, water: bool, lava: bool, suff: bool) bool {
+        if (conn.is_dead) return false;
+        var died = false;
+        if (water) {
+            conn.fire_ticks = 0; // extinguish on submersion
+            if (conn.config.gamemode != 1) {
+                conn.air -= 20;
+                if (conn.air <= -20) {
+                    conn.air = 0;
+                    died = applyPlayerDamage(conn, 2.0); // then every second
+                }
+            }
+        } else {
+            conn.air = 300;
+            if (!lava and conn.fire_ticks > 0) {
+                conn.fire_ticks -|= 20;
+                if (!died) died = applyPlayerDamage(conn, 1.0); // 1/s burning
+            }
+        }
+        if (!died and lava and conn.config.gamemode != 1) {
+            conn.fire_ticks = 300; // 15s of fire after the bath
+            died = applyPlayerDamage(conn, 4.0); // lenient: vanilla is 4/tick
+        }
+        if (!died and suff) {
+            died = applyPlayerDamage(conn, 4.0); // lenient: vanilla is 1/tick
+        }
+        return died;
+    }
+
+    /// Move every stack out of the victim's inventory + cursor (clears both).
+    /// Caller MUST hold conn.lock. Always call on death (vanilla drops all).
+    fn collectDeathDrops(conn: *Conn) DeathDrop {
+        var dd = DeathDrop{ .eid = conn.eid };
+        for (&conn.inv, 0..) |*slot, i| {
+            if (i < 9 or i > 44) continue; // main 9..44 only (craft/armor vanish)
+            if (slot.*) |_| {
+                dd.stacks[dd.n] = slot.*;
+                slot.* = null;
+                dd.n += 1;
+            }
+        }
+        if (conn.cursor) |_| {
+            dd.stacks[dd.n] = conn.cursor;
+            conn.cursor = null;
+            dd.n += 1;
+        }
+        return dd;
+    }
+
+    /// Spawn death-drop entities at the corpse: ONE entity per stack (vanilla
+    /// `dropAllItems` shape), chance + rand*0.7+0.15 offsets, 10-tick delay.
+    /// Takes rand_lock then ent_lock, in order. Consumes the payload.
+    fn spawnDeathDrops(self: *Server, dd: *DeathDrop, x: f64, y: f64, z: f64) void {
+        self.rand_lock.lock();
+        if (self.drop_rand == null) self.drop_rand = java_random.JavaRandom.init(self.drop_seed);
+        var rng = self.drop_rand.?;
+        var offs: [46][3]f32 = undefined;
+        var n_spawn: usize = 0;
+        for (dd.stacks[0..dd.n]) |maybe| {
+            if (maybe == null or n_spawn >= offs.len) continue;
+            if (rng.nextFloat() > 1.0) continue; // chance, always 1.0
+            offs[n_spawn] = .{
+                rng.nextFloat() * 0.7 + 0.15,
+                rng.nextFloat() * 0.7 + 0.15,
+                rng.nextFloat() * 0.7 + 0.15,
+            };
+            n_spawn += 1;
+        }
+        self.drop_rand = rng;
+        self.rand_lock.unlock();
+        var oi: usize = 0;
+        for (dd.stacks[0..dd.n]) |*maybe| {
+            const st = maybe.* orelse continue;
+            if (oi >= n_spawn) {
+                // Cap-hit: free the undropped remainder.
+                if (st.nbt) |n| self.gpa.free(n);
+                maybe.* = null;
+                continue;
+            }
+            const o = offs[oi];
+            oi += 1;
+            self.ent_lock.lock();
+            // NBT duped into server ownership (victim row keeps none).
+            const owned_nbt: ?[]const u8 = if (st.nbt) |bytes| self.gpa.dupe(u8, bytes) catch null else null;
+            const stored = item_mod.Stack{ .id = st.id, .count = st.count, .damage = st.damage, .nbt = owned_nbt };
+            _ = self.spawnItem(stored, x + o[0], y + 0.1, z + o[2], 10);
+            self.ent_lock.unlock();
+            if (st.nbt) |n| self.gpa.free(n);
+            maybe.* = null;
+        }
+        dd.n = 0;
+    }
+
+    /// Resolve a stashed landing (serve thread; no locks held on entry):
+    /// pool peek for water, then damage + drops + save + broadcast.
+    fn resolvePendingFall(self: *Server, conn: *Conn) void {
+        conn.lock.lock();
+        const pf = conn.pending_fall;
+        conn.pending_fall = null;
+        const creative = conn.config.gamemode == 1;
+        const dead = conn.is_dead;
+        conn.lock.unlock();
+        const fall = pf orelse return;
+        if (creative or dead or fall.dist <= 3.0) return;
+        var water = false;
+        if (self.world) |pool| {
+            self.world_lock.lock();
+            const feet: u8 = @intFromFloat(@max(0, @min(255, fall.y)));
+            const blk = view.peekBlock(pool, self.gpa, @intFromFloat(@floor(fall.x)), feet, @intFromFloat(@floor(fall.z))) catch null;
+            self.world_lock.unlock();
+            if (blk) |b| water = b.id == 8 or b.id == 9;
+        }
+        if (water) return; // splash landing: vanilla resets fallDistance
+        const dmg = @ceil(fall.dist - 3.0);
+        conn.lock.lock();
+        const died = applyPlayerDamage(conn, dmg);
+        const hp = conn.health;
+        var dd: ?DeathDrop = if (died) collectDeathDrops(conn) else null;
+        const eid = conn.eid;
+        conn.lock.unlock();
+        var mb: [32]u8 = undefined;
+        if (packets.frameEntityMetadata(eid, if (died) 0 else hp, &mb)) |f| {
+            self.broadcastToTrackers(eid, f);
+        } else |_| {}
+        if (dd) |*d| {
+            self.spawnDeathDrops(d, fall.x, fall.y + 0.1, fall.z);
+            self.savePlayer(conn);
+        }
     }
 
     /// Remove one item entity by id, freeing its owned stack. Caller MUST hold
@@ -1433,6 +1709,9 @@ pub const Server = struct {
             if (packets.frameDestroyEntitiesFramed(&[_]i32{id}, &db)) |f| {
                 self.broadcastToTrackers(id, f);
             } else |_| {}
+            attacker.lock.lock();
+            attacker.addExhaustion(0.3); // vanilla: charged per landed hit
+            attacker.lock.unlock();
             return;
         }
         if (mob_hit) {
@@ -1440,6 +1719,9 @@ pub const Server = struct {
             if (packets.frameEntityMetadata(ev.target_eid, mob_hp, &mb)) |f| {
                 self.broadcastToTrackers(ev.target_eid, f);
             } else |_| {}
+            attacker.lock.lock();
+            attacker.addExhaustion(0.3); // vanilla: charged per landed hit
+            attacker.lock.unlock();
             return;
         }
         // --- players ---
@@ -1457,24 +1739,26 @@ pub const Server = struct {
                 e.conn.lock.unlock();
                 return;
             }
-            e.conn.health -= ev.dmg;
-            var hp = e.conn.health;
-            if (hp <= 0) {
-                hp = 0;
-                e.conn.is_dead = true;
-            }
-            e.conn.health = hp;
-            var hb: [32]u8 = undefined;
-            if (packets.frameUpdateHealth(hp, e.conn.food, e.conn.saturation, &hb)) |f| {
-                e.conn.queueFramed(f) catch {};
-            } else |_| {}
+            const died = applyPlayerDamage(e.conn, ev.dmg);
+            const hp = e.conn.health;
+            var dd: ?DeathDrop = if (died) collectDeathDrops(e.conn) else null;
+            const px = e.conn.pos_x;
+            const py = e.conn.pos_y;
+            const pz = e.conn.pos_z;
             e.conn.lock.unlock();
+            attacker.lock.lock();
+            attacker.addExhaustion(0.3); // vanilla: charged per landed hit
+            attacker.lock.unlock();
             flushEntry(e, self.io);
             // Show the new health on every tracker (attacker included).
             var mdb: [32]u8 = undefined;
-            if (packets.frameEntityMetadata(ev.target_eid, hp, &mdb)) |f| {
+            if (packets.frameEntityMetadata(ev.target_eid, if (died) 0 else hp, &mdb)) |f| {
                 self.broadcastToTrackers(ev.target_eid, f);
             } else |_| {}
+            if (dd) |*d| {
+                self.spawnDeathDrops(d, px, py, pz);
+                self.savePlayer(e.conn);
+            }
             return;
         }
     }
@@ -1696,7 +1980,15 @@ pub fn serveConn(
             }
             for (events.items) |ev| {
                 switch (ev) {
-                    .block_set => |b| server.broadcastBlockChange(conn, b.x, b.y, b.z, b.id, b.meta) catch {},
+                    .block_set => |b| {
+                        server.broadcastBlockChange(conn, b.x, b.y, b.z, b.id, b.meta) catch {};
+                        // Survival break: vanilla 0.025 exhaustion per block.
+                        if (b.id == 0) {
+                            conn.lock.lock();
+                            if (conn.config.gamemode == 0 and !conn.is_dead) conn.addExhaustion(0.025);
+                            conn.lock.unlock();
+                        }
+                    },
                     .qdrop => |q| server.spawnQDrop(conn, q),
                     .arm_swing => |a| server.broadcastArmSwing(conn, cc_now.cx, cc_now.cz, conn.eid, a) catch {},
                     .chat => |m| server.broadcastChat(conn.chat_buf[0..m.json_len]),
@@ -1734,6 +2026,8 @@ pub fn serveConn(
             }
             events.clearRetainingCapacity();
         }
+        // Landing resolved once per serve pass (water check + fall damage).
+        server.resolvePendingFall(conn);
         if (pending.len > 0) {
             conn.wlock.lock();
             wout.writeAll(pending) catch {
@@ -2012,6 +2306,92 @@ test "broadcastBlockChange/ArmSwing target sent-set viewers only" {
     try std.testing.expectEqual(@as(usize, 0), srv.registry.items.len);
 }
 
+test "hunger: exhaustion drain, regen, starvation gates" {
+    const a = std.testing.allocator;
+    var c = Conn.init(a, std.testing.io, .{ .gamemode = 0 }, 7);
+    defer c.deinit();
+    c.state = .play;
+    // exhaustion > 4 burns saturation first, then food (normal)
+    c.exhaustion = 5.0;
+    c.saturation = 5.0;
+    try std.testing.expect(!Server.hungerTick(&c, 2));
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), c.exhaustion, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), c.saturation, 1e-6);
+    try std.testing.expectEqual(@as(i16, 20), c.food);
+    // saturation 0 -> food drops (peaceful exempts)
+    c.exhaustion = 5.0;
+    c.saturation = 0;
+    try std.testing.expect(!Server.hungerTick(&c, 2));
+    try std.testing.expectEqual(@as(i16, 19), c.food);
+    c.exhaustion = 5.0;
+    try std.testing.expect(!Server.hungerTick(&c, 0));
+    try std.testing.expectEqual(@as(i16, 19), c.food); // peaceful: no drain
+    // regen at food 18+: +1 hp and +3 exhaustion every 80 timer
+    c.health = 10.0;
+    c.food = 18;
+    c.food_timer = 60;
+    c.exhaustion = 0;
+    try std.testing.expect(!Server.hungerTick(&c, 2));
+    try std.testing.expectApproxEqAbs(@as(f32, 11.0), c.health, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), c.exhaustion, 1e-6);
+    // starve: normal hits at hp>1, spares hp==1; hard always hits
+    c.health = 2.0;
+    c.food = 0;
+    c.food_timer = 60;
+    try std.testing.expect(!Server.hungerTick(&c, 2));
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), c.health, 1e-6);
+    c.food_timer = 60;
+    try std.testing.expect(!Server.hungerTick(&c, 2));
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), c.health, 1e-6); // spared
+    c.food_timer = 60;
+    try std.testing.expect(Server.hungerTick(&c, 3));
+    try std.testing.expect(c.is_dead); // hard: killing blow
+    { const o = try c.takeOutput(); defer a.free(o); }
+}
+
+test "env: drown countdown, lava+fire, suffocate; fall resolution" {
+    const a = std.testing.allocator;
+    var c = Conn.init(a, std.testing.io, .{ .gamemode = 0 }, 7);
+    defer c.deinit();
+    c.state = .play;
+    // drown: 15 ticks grace (air 300->0), damage on the 16th
+    var i: usize = 0;
+    while (i < 15) : (i += 1) try std.testing.expect(!Server.envTick(&c, true, false, false));
+    try std.testing.expectEqual(@as(i16, 0), c.air);
+    try std.testing.expectApproxEqAbs(@as(f32, 20.0), c.health, 1e-6);
+    try std.testing.expect(!Server.envTick(&c, true, false, false));
+    try std.testing.expectApproxEqAbs(@as(f32, 18.0), c.health, 1e-6);
+    try std.testing.expectEqual(@as(i16, 0), c.air);
+    // surface resets air
+    try std.testing.expect(!Server.envTick(&c, false, false, false));
+    try std.testing.expectEqual(@as(i16, 300), c.air);
+    // lava: 4 dmg + 300 fire ticks; fire burns 1/tick after leaving
+    try std.testing.expect(!Server.envTick(&c, false, true, false));
+    try std.testing.expectApproxEqAbs(@as(f32, 14.0), c.health, 1e-6);
+    try std.testing.expectEqual(@as(u32, 300), c.fire_ticks);
+    try std.testing.expect(!Server.envTick(&c, false, false, false));
+    try std.testing.expectApproxEqAbs(@as(f32, 13.0), c.health, 1e-6);
+    // water extinguishes instead of burning
+    c.fire_ticks = 100;
+    try std.testing.expect(!Server.envTick(&c, true, false, false));
+    try std.testing.expectEqual(@as(u32, 0), c.fire_ticks);
+    // suffocate: 4 per tick
+    try std.testing.expect(!Server.envTick(&c, false, false, true));
+    try std.testing.expectApproxEqAbs(@as(f32, 9.0), c.health, 1e-6);
+    // fall: ceil(dist-3) without a world (no water to save us)
+    c.pending_fall = .{ .dist = 5.5, .x = 0, .y = 64, .z = 0 };
+    var srv = Server{ .net = undefined, .io = std.testing.io, .config = .{}, .gpa = a };
+    defer srv.registry.deinit(a);
+    srv.resolvePendingFall(&c);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), c.health, 1e-6); // 9-3
+    try std.testing.expect(c.pending_fall == null);
+    // short falls are free
+    c.pending_fall = .{ .dist = 3.0, .x = 0, .y = 64, .z = 0 };
+    srv.resolvePendingFall(&c);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), c.health, 1e-6);
+    { const o = try c.takeOutput(); defer a.free(o); }
+}
+
 test "resolveAttack: mob damage/death/destroy, PvP, reach, pig respawn timer" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -2047,7 +2427,8 @@ test "resolveAttack: mob damage/death/destroy, PvP, reach, pig respawn timer" {
             const sv = try l.accept(io);
             const c = try a.create(Conn);
             errdefer a.destroy(c);
-            c.* = Conn.init(a, io, .{}, eid);
+            // Survival: combat damage applies (creative is immune, like vanilla).
+            c.* = Conn.init(a, io, .{ .gamemode = 0 }, eid);
             c.state = .play;
             return .{ .conn = c, .srv_stream = sv, .cli_stream = cli };
         }

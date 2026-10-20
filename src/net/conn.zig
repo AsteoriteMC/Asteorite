@@ -142,6 +142,19 @@ pub const Conn = struct {
     food: i16 = 20,
     saturation: f32 = 5.0,
     is_dead: bool = false,
+    /// Hunger/attrition state (vanilla FoodStats + env hazards). Ticks are
+    /// 20tps units advanced 20 per 1Hz server tick (same convention as
+    /// world_age); server.zig drives, conn owns. Not persisted (ZPLR keeps
+    /// health/food/saturation; these reset on login — documented J2 gap).
+    exhaustion: f32 = 0,
+    food_timer: u32 = 0,
+    air: i16 = 300,
+    fire_ticks: u32 = 0,
+    sprinting: bool = false,
+    /// Accumulated downward distance while airborne (vanilla fallDistance).
+    fall_acc: f32 = 0,
+    /// Landing awaiting a water check (serve thread owns the pool peek).
+    pending_fall: ?struct { dist: f32, x: f64, y: f64, z: f64 } = null,
     /// Connection established timestamp (ms, monotonic). Login must complete
     /// within login_timeout_ms or the ticker drops the connection.
     connected_at_ms: i64 = 0,
@@ -507,7 +520,9 @@ pub const Conn = struct {
             return .none;
         }
         if (frame.id == @as(i32, @intFromEnum(ids.PlayServer.player))) {
-            self.on_ground = try packets.parseFlying(frame.body);
+            const g = try packets.parseFlying(frame.body);
+            self.groundTransition(0, g);
+            self.on_ground = g;
             return .none;
         }
         if (frame.id == @as(i32, @intFromEnum(ids.PlayServer.player_position))) {
@@ -552,8 +567,22 @@ pub const Conn = struct {
                 if (self.is_dead) {
                     self.is_dead = false;
                     self.health = 20.0;
+                    // Fresh-body reset (vanilla respawn restores food too;
+                    // inventory was dropped on death and re-syncs below).
+                    self.food = 20;
+                    self.saturation = 5.0;
+                    self.exhaustion = 0;
+                    self.food_timer = 0;
+                    self.air = 300;
+                    self.fire_ticks = 0;
+                    self.sprinting = false;
+                    self.fall_acc = 0;
+                    self.pending_fall = null;
                     var hb: [32]u8 = undefined;
                     try self.queueRaw(try packets.frameUpdateHealth(self.health, self.food, self.saturation, &hb));
+                    // Dropped inventory: full re-sync (login does the same).
+                    self.sendWindow();
+                    self.sendSlot(-1);
                 }
             }
             return .none;
@@ -574,6 +603,13 @@ pub const Conn = struct {
         if (frame.id == @as(i32, @intFromEnum(ids.PlayServer.animation))) {
             const a = try packets.parseArmAnimation(frame.body);
             if (a.entity_id == self.eid) return .{ .arm_swing = a.animation };
+            return .none;
+        }
+        if (frame.id == @as(i32, @intFromEnum(ids.PlayServer.entity_action))) {
+            const a = try packets.parseEntityAction(frame.body);
+            if (a.entity_id == self.eid) {
+                if (a.action == 4) self.sprinting = true else if (a.action == 5) self.sprinting = false;
+            }
             return .none;
         }
         if (frame.id == @as(i32, @intFromEnum(ids.PlayServer.creative_inventory_action))) {
@@ -966,12 +1002,48 @@ pub const Conn = struct {
     }
 
     fn setPos(self: *Conn, x: f64, y: f64, z: f64, yaw: f32, pitch: f32, on_ground: bool) void {
+        if (self.state == .play and !self.is_dead and self.baseline_sent) {
+            const dx = x - self.pos_x;
+            const dz = z - self.pos_z;
+            // Movement exhaustion (vanilla `yz.k` rates): horizontal blocks
+            // while grounded, sprint 0.1 / walk 0.01. Airborne moves are free
+            // (swim 0.015 needs a water check — documented J2 gap).
+            if (on_ground and self.on_ground) {
+                const hd = @sqrt(dx * dx + dz * dz);
+                if (hd > 0.01) self.addExhaustion(@as(f32, @floatCast(hd)) * @as(f32, if (self.sprinting) 0.1 else 0.01));
+            }
+        }
+        self.groundTransition(y - self.pos_y, on_ground);
         self.pos_x = x;
         self.pos_y = y;
         self.pos_z = z;
         self.yaw = yaw;
         self.pitch = pitch;
         self.on_ground = on_ground;
+    }
+
+    /// Shared ground-transition logic (landing stashes pending_fall for the
+    /// serve thread's water check; server-grounded + client-airborne + rising
+    /// is a jump). dy is the vertical delta (0 for flying-only frames).
+    fn groundTransition(self: *Conn, dy: f64, on_ground: bool) void {
+        if (self.state != .play or self.is_dead or !self.baseline_sent) return;
+        if (self.on_ground and !on_ground and dy > 0) {
+            // Vanilla `yz.bj()` via the flying handler; step-ups keep the
+            // client grounded, so they don't charge.
+            self.addExhaustion(@as(f32, if (self.sprinting) 0.8 else 0.2));
+        }
+        if (!on_ground and dy < 0) self.fall_acc += @floatCast(-dy);
+        if (!self.on_ground and on_ground) {
+            if (self.fall_acc > 0) self.pending_fall = .{ .dist = self.fall_acc, .x = self.pos_x, .y = self.pos_y, .z = self.pos_z };
+            self.fall_acc = 0;
+        }
+        if (on_ground) self.fall_acc = 0;
+    }
+
+    /// Vanilla `yz.a(float)`: creative (disableDamage) is exempt; cap 40.
+    pub fn addExhaustion(self: *Conn, amount: f32) void {
+        if (self.config.gamemode == 1) return;
+        self.exhaustion = @min(self.exhaustion + amount, 40.0);
     }
 
     /// Chunk coords of the player's current position (for resend-on-move).
@@ -1464,6 +1536,52 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
             return try feed(conn, 0x0E, w.written());
         }
     }.run;
+    // 0. movement accounting: walk/jump/fall/sprint exhaustion + landing
+    {
+        var m = Conn.init(a, std.testing.io, .{ .gamemode = 0, .spawn_x = 8, .spawn_y = 64, .spawn_z = 8 }, 7);
+        defer m.deinit();
+        m.state = .play;
+        m.baseline_sent = true;
+        m.pos_x = 8.5;
+        m.pos_y = 64.0;
+        m.pos_z = 8.5;
+        m.on_ground = true;
+        // walk 1 block: +0.01
+        m.setPos(9.5, 64.0, 8.5, 0, 0, true);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.01), m.exhaustion, 1e-6);
+        // takeoff upward: jump +0.2 (no fall accumulated rising)
+        m.setPos(9.5, 64.6, 8.5, 0, 0, false);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.21), m.exhaustion, 1e-6);
+        try std.testing.expectEqual(@as(f32, 0), m.fall_acc);
+        // fall 5.1 down: accumulates
+        m.setPos(9.5, 59.5, 8.5, 0, 0, false);
+        try std.testing.expectApproxEqAbs(@as(f32, 5.1), m.fall_acc, 1e-4);
+        // land: pending fall stashed, accumulator cleared
+        m.setPos(9.5, 59.5, 8.5, 0, 0, true);
+        try std.testing.expectEqual(@as(f32, 0), m.fall_acc);
+        try std.testing.expect(m.pending_fall != null);
+        try std.testing.expectApproxEqAbs(@as(f32, 5.1), m.pending_fall.?.dist, 1e-4);
+        // sprint flag via 0x0B action 4/5; sprint-jump costs 0.8
+        var eb: [16]u8 = undefined;
+        var ew = codec.PacketWriter.init(&eb);
+        try ew.writeInt(7);
+        try ew.writeByte(4);
+        try ew.writeInt(0);
+        _ = try feed(&m, 0x0B, ew.written());
+        try std.testing.expect(m.sprinting);
+        m.on_ground = true;
+        m.setPos(9.5, 60.0, 8.5, 0, 0, false);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.21 + 0.8), m.exhaustion, 1e-4);
+        // exhaustion caps at 40 (vanilla FoodStats cap)
+        m.exhaustion = 39.9;
+        m.addExhaustion(5.0);
+        try std.testing.expectEqual(@as(f32, 40.0), m.exhaustion);
+        // creative is exempt
+        m.config.gamemode = 1;
+        m.exhaustion = 0;
+        m.addExhaustion(3.0);
+        try std.testing.expectEqual(@as(f32, 0), m.exhaustion);
+    }
     // 0. Q-drop: status 4 drops one (slot decrements, event owns one),
     // status 3 drops the whole stack (slot empties).
     c.inv[36] = .{ .id = 264, .count = 5, .damage = 0, .nbt = null };

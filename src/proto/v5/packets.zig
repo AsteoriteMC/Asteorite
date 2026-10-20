@@ -464,6 +464,16 @@ pub fn parseHeldSlot(body: []const u8) codec.CodecError!i16 {
     return try r.readShort();
 }
 
+/// Serverbound 0x0B entity action: eid + action + jump boost. Vanilla ids:
+/// 1 start sneak, 2 stop sneak, 3 leave bed, 4 start sprint, 5 stop sprint
+/// (CFR `nh.a(jj)`). Only sprint (4/5) matters for hunger so far.
+pub fn parseEntityAction(body: []const u8) codec.CodecError!struct { entity_id: i32, action: i8 } {
+    var r = codec.PacketReader.init(body);
+    const eid = try r.readInt();
+    const action = @as(i8, @bitCast(try r.readByte()));
+    _ = try r.readInt(); // jump boost (used by horses; no riding yet)
+    return .{ .entity_id = eid, .action = action };
+}
 /// Serverbound 0x0A arm animation.
 pub fn parseArmAnimation(body: []const u8) codec.CodecError!struct { entity_id: i32, animation: i8 } {
     var r = codec.PacketReader.init(body);
@@ -1234,6 +1244,17 @@ test "chat format + frame roundtrip" {
     var w = codec.PacketWriter.init(&sb);
     try w.writeString("hello there");
     try std.testing.expectEqualStrings("hello there", try parseChat(w.written()));
+}
+
+test "entity action parse (sprint start/stop)" {
+    var ab: [16]u8 = undefined;
+    var w = codec.PacketWriter.init(&ab);
+    try w.writeInt(7);
+    try w.writeByte(4); // start sprint
+    try w.writeInt(0); // jump boost
+    const a = try parseEntityAction(w.written());
+    try std.testing.expectEqual(@as(i32, 7), a.entity_id);
+    try std.testing.expectEqual(@as(i8, 4), a.action);
 }
 
 test "use entity parse (attack vs interact-at)" {
