@@ -180,8 +180,8 @@ def vanilla_handle_setslot(window: int, slot, container: VanillaContainer):
 
 
 def main() -> int:
-    s = socket.create_connection((HOST, PORT), timeout=10)
-    s.settimeout(10)
+    s = socket.create_connection((HOST, PORT), timeout=60)
+    s.settimeout(60)
     f = s.makefile("rb")
     r = Reader(f)
 
