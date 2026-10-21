@@ -32,7 +32,7 @@ pub fn shardPoolSource(pool: *shard_mod.ShardPool) Source {
     const F = struct {
         fn get(ctx: *anyopaque, dim: u8, x: i32, z: i32, allocator: std.mem.Allocator) ?[]u8 {
             const p: *shard_mod.ShardPool = @ptrCast(@alignCast(ctx));
-            const raw = p.get(store_mod.encodeKey(dim, x, z)) catch null orelse return null;
+            const raw = p.get(allocator, store_mod.encodeKey(dim, x, z)) catch null orelse return null;
             defer p.allocator.free(raw);
             return allocator.dupe(u8, raw) catch null;
         }
@@ -295,7 +295,7 @@ pub fn peekBlock(pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, x: i3
     const cx = @divFloor(x, 16);
     const cz = @divFloor(z, 16);
     const key = store_mod.encodeKey(0, cx, cz);
-    const raw = try pool.get(key) orelse return null;
+    const raw = try pool.get(allocator, key) orelse return null;
     defer allocator.free(raw);
     const ch = chunk_mod.Chunk.decode(allocator, raw) catch return null;
     defer ch.destroy(allocator);
@@ -311,7 +311,7 @@ pub fn groundBlockY(pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, x:
     const cx = @divFloor(x, 16);
     const cz = @divFloor(z, 16);
     const key = store_mod.encodeKey(0, cx, cz);
-    const raw = try pool.get(key) orelse return null;
+    const raw = try pool.get(allocator, key) orelse return null;
     defer allocator.free(raw);
     const ch = chunk_mod.Chunk.decode(allocator, raw) catch return null;
     defer ch.destroy(allocator);
@@ -331,7 +331,7 @@ pub fn applyBlock(pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, x: i
     const cx = @divFloor(x, 16);
     const cz = @divFloor(z, 16);
     const key = store_mod.encodeKey(0, cx, cz);
-    const raw = try pool.get(key) orelse return;
+    const raw = try pool.get(allocator, key) orelse return;
     defer allocator.free(raw);
     const ch = chunk_mod.Chunk.decode(allocator, raw) catch return;
     defer ch.destroy(allocator);
@@ -667,13 +667,13 @@ test "applyBlock roundtrips through the store" {
         var s = chunk_mod.Section{};
         for (&s.blocks) |*b| b.* = ids.stone;
         ch.sections[0] = s;
-        try pool.putChunk(ch);
+        try pool.putChunk(a, ch);
         try pool.flushAll();
     }
     // break one block (section 0, local (3,1,4) -> y=1)
     try applyBlock(pool, a, 3, 1, 4, ids.air, 0);
     {
-        const got = try pool.getChunk(0, 0, 0);
+        const got = try pool.getChunk(a, 0, 0, 0);
         try std.testing.expect(got != null);
         defer got.?.destroy(a);
         const idx = chunk_mod.Section.index(3, 1, 4);
@@ -683,7 +683,7 @@ test "applyBlock roundtrips through the store" {
     // place into an empty section creates it (with air elsewhere)
     try applyBlock(pool, a, 0, 200, 0, ids.planks, 2);
     {
-        const got = try pool.getChunk(0, 0, 0);
+        const got = try pool.getChunk(a, 0, 0, 0);
         defer {
             if (got) |g| g.destroy(a);
         }
@@ -697,7 +697,7 @@ test "applyBlock roundtrips through the store" {
     // breaking air in an empty section is a no-op (no section created)
     try applyBlock(pool, a, 0, 16, 0, ids.air, 0);
     {
-        const got = try pool.getChunk(0, 0, 0);
+        const got = try pool.getChunk(a, 0, 0, 0);
         defer {
             if (got) |g| g.destroy(a);
         }

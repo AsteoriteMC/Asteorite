@@ -797,10 +797,13 @@ pub const Store = struct {
         self.mem_bytes += key.len;
     }
 
-    /// Returns owned copy, or null if missing/deleted. Caller frees.
-    pub fn get(self: *Store, key: ChunkKey) !?[]u8 {
+    /// Returns owned copy, or null if missing/deleted. Caller frees with
+    /// `alloc`. (File reads and value copies use `alloc` too — the store's
+    /// own allocator may be a never-reset arena, which must never back
+    /// per-request bytes.)
+    pub fn get(self: *Store, alloc: std.mem.Allocator, key: ChunkKey) !?[]u8 {
         if (self.mem.get(key)) |v| {
-            if (v) |bytes| return try self.allocator.dupe(u8, bytes);
+            if (v) |bytes| return try alloc.dupe(u8, bytes);
             return null; // tombstone in memtable
         }
         // SSTs newest -> oldest; Bloom skips files that cannot contain key.
@@ -809,7 +812,7 @@ pub const Store = struct {
             i -= 1;
             const meta = &self.ssts.items[i];
             if (!meta.mayContain(key)) continue;
-            if (try self.sstGet(meta, key)) |v| {
+            if (try self.sstGet(alloc, meta, key)) |v| {
                 if (v) |bytes| return bytes; // owned
                 return null; // tombstone in sst
             }
@@ -817,10 +820,10 @@ pub const Store = struct {
         return null;
     }
 
-    fn sstGet(self: *Store, meta: *const SstMeta, key: ChunkKey) !??[]u8 {
+    fn sstGet(self: *Store, alloc: std.mem.Allocator, meta: *const SstMeta, key: ChunkKey) !??[]u8 {
         // Returns null = not in this sst; ?null = tombstone; ??bytes = found owned.
-        const data = try self.sst_dir.readFileAlloc(self.io, meta.name, self.allocator, .limited(256 * 1024 * 1024));
-        defer self.allocator.free(data);
+        const data = try self.sst_dir.readFileAlloc(self.io, meta.name, alloc, .limited(256 * 1024 * 1024));
+        defer alloc.free(data);
         const p = try parseSst(data);
         if (p.count != meta.count) return error.CorruptSst;
         var start: usize = 8;
@@ -851,7 +854,7 @@ pub const Store = struct {
             }
             if (pos + vlen > p.entries_end) return error.CorruptSst;
             if (std.mem.eql(u8, &k, &key)) {
-                const out = try self.allocator.dupe(u8, data[pos .. pos + vlen]);
+                const out = try alloc.dupe(u8, data[pos .. pos + vlen]);
                 return @as(?[]u8, out);
             }
             pos += vlen;
@@ -1293,14 +1296,14 @@ test "put/get/delete memory only" {
     var store = try Store.open(std.testing.allocator, io, tmp.dir, .{ .flush_threshold_bytes = 1 << 30 });
     defer store.deinit();
     const k = encodeKey(0, 3, -7);
-    try std.testing.expect(try store.get(k) == null);
+    try std.testing.expect(try store.get(std.testing.allocator, k) == null);
     try store.put(k, "chunk-bytes-v1");
-    const got = try store.get(k);
+    const got = try store.get(std.testing.allocator, k);
     try std.testing.expect(got != null);
     try std.testing.expectEqualStrings("chunk-bytes-v1", got.?);
     std.testing.allocator.free(got.?);
     try store.delete(k);
-    try std.testing.expect(try store.get(k) == null);
+    try std.testing.expect(try store.get(std.testing.allocator, k) == null);
 }
 
 test "flush + reopen recovers (WAL + SST)" {
@@ -1319,7 +1322,7 @@ test "flush + reopen recovers (WAL + SST)" {
         try store.put(encodeKey(1, 1, 1), "nether-chunk");
         try store.delete(encodeKey(0, 3, -3)); // tombstone
         try store.flush();
-        const g = try store.get(encodeKey(0, 7, -7));
+        const g = try store.get(std.testing.allocator, encodeKey(0, 7, -7));
         try std.testing.expect(g != null);
         try std.testing.expectEqualStrings("payload-7", g.?);
         std.testing.allocator.free(g.?);
@@ -1328,12 +1331,12 @@ test "flush + reopen recovers (WAL + SST)" {
     {
         var store = try Store.open(std.testing.allocator, io, tmp.dir, .{ .flush_threshold_bytes = 1 << 30 });
         defer store.deinit();
-        const g = try store.get(encodeKey(0, 7, -7));
+        const g = try store.get(std.testing.allocator, encodeKey(0, 7, -7));
         try std.testing.expect(g != null);
         try std.testing.expectEqualStrings("payload-7", g.?);
         std.testing.allocator.free(g.?);
-        try std.testing.expect(try store.get(encodeKey(0, 3, -3)) == null);
-        const n = try store.get(encodeKey(1, 1, 1));
+        try std.testing.expect(try store.get(std.testing.allocator, encodeKey(0, 3, -3)) == null);
+        const n = try store.get(std.testing.allocator, encodeKey(1, 1, 1));
         try std.testing.expectEqualStrings("nether-chunk", n.?);
         std.testing.allocator.free(n.?);
     }
@@ -1351,7 +1354,7 @@ test "wal replay without flush" {
     {
         var store = try Store.open(std.testing.allocator, io, tmp.dir, .{ .flush_threshold_bytes = 1 << 30 });
         defer store.deinit();
-        const g = try store.get(encodeKey(0, 9, 9));
+        const g = try store.get(std.testing.allocator, encodeKey(0, 9, 9));
         try std.testing.expect(g != null);
         try std.testing.expectEqualStrings("unflushed", g.?);
         std.testing.allocator.free(g.?);
@@ -1379,17 +1382,17 @@ test "wal torn tail truncated on open" {
         var store = try Store.open(std.testing.allocator, io, tmp.dir, .{ .flush_threshold_bytes = 1 << 30 });
         defer store.deinit();
         // Prefix recovered, torn tail dropped.
-        const g1 = try store.get(encodeKey(0, 1, 1));
+        const g1 = try store.get(std.testing.allocator, encodeKey(0, 1, 1));
         try std.testing.expectEqualStrings("a", g1.?);
         std.testing.allocator.free(g1.?);
-        const g2 = try store.get(encodeKey(0, 2, 2));
+        const g2 = try store.get(std.testing.allocator, encodeKey(0, 2, 2));
         try std.testing.expectEqualStrings("bb", g2.?);
         std.testing.allocator.free(g2.?);
         // 9+4+1+4=18 and 9+4+2+4=19 bytes of valid records.
         try std.testing.expectEqual(@as(u64, 37), store.wal_len);
         // Writes continue at the truncated end.
         try store.put(encodeKey(0, 3, 3), "ccc");
-        const g3 = try store.get(encodeKey(0, 3, 3));
+        const g3 = try store.get(std.testing.allocator, encodeKey(0, 3, 3));
         try std.testing.expectEqualStrings("ccc", g3.?);
         std.testing.allocator.free(g3.?);
     }
@@ -1397,7 +1400,7 @@ test "wal torn tail truncated on open" {
     {
         var store = try Store.open(std.testing.allocator, io, tmp.dir, .{ .flush_threshold_bytes = 1 << 30 });
         defer store.deinit();
-        const g3 = try store.get(encodeKey(0, 3, 3));
+        const g3 = try store.get(std.testing.allocator, encodeKey(0, 3, 3));
         try std.testing.expectEqualStrings("ccc", g3.?);
         std.testing.allocator.free(g3.?);
     }
@@ -1442,11 +1445,11 @@ test "compaction merges newest-wins and drops tombstones" {
     try store.compact();
     try std.testing.expectEqual(@as(usize, 1), store.ssts.items.len);
     try std.testing.expect(std.mem.endsWith(u8, store.ssts.items[0].name, "000003.sst"));
-    const g1 = try store.get(encodeKey(0, 1, 1));
+    const g1 = try store.get(std.testing.allocator, encodeKey(0, 1, 1));
     try std.testing.expectEqualStrings("v2", g1.?);
     std.testing.allocator.free(g1.?);
-    try std.testing.expect(try store.get(encodeKey(0, 2, 2)) == null);
-    const g3 = try store.get(encodeKey(0, 3, 3));
+    try std.testing.expect(try store.get(std.testing.allocator, encodeKey(0, 2, 2)) == null);
+    const g3 = try store.get(std.testing.allocator, encodeKey(0, 3, 3));
     try std.testing.expectEqualStrings("new", g3.?);
     std.testing.allocator.free(g3.?);
     // next id monotonic: further flushes continue the sequence.
@@ -1472,7 +1475,7 @@ test "auto-compact bounds sst count" {
     try std.testing.expect(store.ssts.items.len < 8);
     var j: i32 = 0;
     while (j < 40) : (j += 1) {
-        const g = try store.get(encodeKey(0, j, j));
+        const g = try store.get(std.testing.allocator, encodeKey(0, j, j));
         try std.testing.expect(g != null);
         var ebuf: [32]u8 = undefined;
         const want = try std.fmt.bufPrint(&ebuf, "payload-{d}-padding", .{j});
@@ -1503,7 +1506,7 @@ test "multi-sst get correct with bloom (compaction off)" {
     // Present keys resolve; absent keys miss everywhere.
     var k: i32 = 0;
     while (k < 10) : (k += 1) {
-        const g = try store.get(encodeKey(0, k, 0));
+        const g = try store.get(std.testing.allocator, encodeKey(0, k, 0));
         try std.testing.expect(g != null);
         var ebuf: [32]u8 = undefined;
         const want = try std.fmt.bufPrint(&ebuf, "v-{d}", .{k});
@@ -1512,7 +1515,7 @@ test "multi-sst get correct with bloom (compaction off)" {
     }
     var m: i32 = 100;
     while (m < 110) : (m += 1) {
-        const miss = try store.get(encodeKey(0, m, 0));
+        const miss = try store.get(std.testing.allocator, encodeKey(0, m, 0));
         try std.testing.expect(miss == null);
     }
 }
@@ -1528,7 +1531,7 @@ test "fsync policy option honored" {
     try std.testing.expectEqual(@as(u64, 0), store.bytes_since_sync);
     try store.put(encodeKey(0, 2, 2), "bb");
     try std.testing.expectEqual(@as(u64, 0), store.bytes_since_sync);
-    const g = try store.get(encodeKey(0, 2, 2));
+    const g = try store.get(std.testing.allocator, encodeKey(0, 2, 2));
     try std.testing.expectEqualStrings("bb", g.?);
     std.testing.allocator.free(g.?);
 }
@@ -1551,10 +1554,10 @@ test "snapshot round-trips" {
         defer snap.close(io);
         var store = try Store.open(std.testing.allocator, io, snap, .{ .flush_threshold_bytes = 1 << 30 });
         defer store.deinit();
-        const g = try store.get(encodeKey(0, 1, 1));
+        const g = try store.get(std.testing.allocator, encodeKey(0, 1, 1));
         try std.testing.expectEqualStrings("snap-a", g.?);
         std.testing.allocator.free(g.?);
-        const h = try store.get(encodeKey(0, 2, 2));
+        const h = try store.get(std.testing.allocator, encodeKey(0, 2, 2));
         try std.testing.expectEqualStrings("snap-b", h.?);
         std.testing.allocator.free(h.?);
     }
@@ -1577,7 +1580,7 @@ test "open cleans orphans and tmp files" {
     {
         var store = try Store.open(std.testing.allocator, io, tmp.dir, .{ .flush_threshold_bytes = 1 << 30 });
         defer store.deinit();
-        const g = try store.get(encodeKey(0, 1, 1));
+        const g = try store.get(std.testing.allocator, encodeKey(0, 1, 1));
         try std.testing.expectEqualStrings("live", g.?);
         std.testing.allocator.free(g.?);
         // Leftovers gone.

@@ -3415,7 +3415,7 @@ test "player save/load roundtrip via pool (pos/health/inv/NBT)" {
     // Non-play conns are never persisted (junk row from above untouched).
     c2.state = .login;
     srv.savePlayer(c2);
-    const still = try pool.get(player_db.keyFor("Al"));
+    const still = try pool.get(a, player_db.keyFor("Al"));
     defer if (still) |s| a.free(s);
     try std.testing.expectEqualStrings("junk-bytes", still.?);
     c.deinit();

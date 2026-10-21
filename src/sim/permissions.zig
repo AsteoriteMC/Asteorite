@@ -407,7 +407,7 @@ pub fn save(pool: *shard_mod.ShardPool, db: *const Db) !void {
 }
 
 pub fn load(pool: *shard_mod.ShardPool, alloc: std.mem.Allocator) !?Db {
-    const raw = try pool.get(perm_key);
+    const raw = try pool.get(alloc, perm_key);
     if (raw == null) return null;
     defer alloc.free(raw.?);
     return try decode(alloc, raw.?);

@@ -84,7 +84,7 @@ pub fn main(init: std.process.Init) !void {
             // trust filename region for coords (authoritative); override NBT pos
             ch.x = gx;
             ch.z = gz;
-            try pool.putChunk(ch);
+            try pool.putChunk(arena_alloc, ch);
             imported += 1;
         }
     }

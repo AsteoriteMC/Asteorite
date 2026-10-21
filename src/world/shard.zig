@@ -95,10 +95,10 @@ pub const ShardPool = struct {
         try self.shards[s].put(key, value);
     }
 
-    pub fn get(self: *ShardPool, key: store_mod.ChunkKey) !?[]u8 {
+    pub fn get(self: *ShardPool, alloc: std.mem.Allocator, key: store_mod.ChunkKey) !?[]u8 {
         const d = store_mod.decodeKey(key);
         const s = self.shardFor(d.dim, d.x, d.z);
-        return self.shards[s].get(key);
+        return self.shards[s].get(alloc, key);
     }
 
     pub fn delete(self: *ShardPool, key: store_mod.ChunkKey) !void {
@@ -108,18 +108,19 @@ pub const ShardPool = struct {
     }
 
     /// Encode + store a chunk. Convenience for the tick loop.
-    pub fn putChunk(self: *ShardPool, ch: *const chunk_mod.Chunk) !void {
-        const enc = try ch.encode(self.allocator);
-        defer self.allocator.free(enc);
+    pub fn putChunk(self: *ShardPool, alloc: std.mem.Allocator, ch: *const chunk_mod.Chunk) !void {
+        const enc = try ch.encode(alloc);
+        defer alloc.free(enc);
         try self.put(store_mod.encodeKey(ch.dim, ch.x, ch.z), enc);
     }
 
     /// Load + decode a chunk. Returns null if absent. Caller destroys.
-    pub fn getChunk(self: *ShardPool, dim: u8, x: i32, z: i32) !?*chunk_mod.Chunk {
-        const raw = try self.get(store_mod.encodeKey(dim, x, z));
+    /// `raw` and the chunk use `alloc`; free/destroy with the same.
+    pub fn getChunk(self: *ShardPool, alloc: std.mem.Allocator, dim: u8, x: i32, z: i32) !?*chunk_mod.Chunk {
+        const raw = try self.get(alloc, store_mod.encodeKey(dim, x, z));
         if (raw == null) return null;
-        defer self.allocator.free(raw.?);
-        return try chunk_mod.Chunk.decode(self.allocator, raw.?);
+        defer alloc.free(raw.?);
+        return try chunk_mod.Chunk.decode(alloc, raw.?);
     }
 
     pub fn flushAll(self: *ShardPool) !void {
@@ -173,10 +174,10 @@ test "shard pool routes + recovers" {
             var ch = try chunk_mod.Chunk.createEmpty(std.testing.allocator, 0, i * 32, -i * 32);
             defer ch.destroy(std.testing.allocator);
             ch.biomes[0] = @intCast(i);
-            try pool.putChunk(ch);
+            try pool.putChunk(pool.allocator, ch);
         }
         try pool.flushAll();
-        const got = try pool.getChunk(0, 64, -64);
+        const got = try pool.getChunk(std.testing.allocator, 0, 64, -64);
         try std.testing.expect(got != null);
         defer got.?.destroy(std.testing.allocator);
         try std.testing.expectEqual(@as(u8, 2), got.?.biomes[0]);
@@ -184,7 +185,7 @@ test "shard pool routes + recovers" {
     {
         var pool = try ShardPool.open(std.testing.allocator, io, tmp.dir, 4, .{ .flush_threshold_bytes = 1 << 30 });
         defer pool.deinit();
-        const got = try pool.getChunk(0, 96, -96);
+        const got = try pool.getChunk(std.testing.allocator, 0, 96, -96);
         try std.testing.expect(got != null);
         defer got.?.destroy(std.testing.allocator);
         try std.testing.expectEqual(@as(u8, 3), got.?.biomes[0]);

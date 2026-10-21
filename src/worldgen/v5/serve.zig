@@ -29,17 +29,17 @@ pub fn getOrGen(
     alloc: std.mem.Allocator,
 ) !?[]u8 {
     const key = store_mod.encodeKey(dim, cx, cz);
-    if (try pool.get(key)) |raw| return raw;
+    if (try pool.get(alloc, key)) |raw| return raw;
     lock.lock();
     defer lock.unlock();
     // Recheck under lock (another conn may have filled it).
-    if (try pool.get(key)) |raw| return raw;
+    if (try pool.get(alloc, key)) |raw| return raw;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const ch = try gen.genChunk(alloc, arena.allocator(), cx, cz);
     defer ch.destroy(alloc);
-    try pool.putChunk(ch);
-    return try pool.get(key);
+    try pool.putChunk(alloc, ch);
+    return try pool.get(alloc, key);
 }
 
 /// view.Source over getOrGen. ctx must outlive use (store in Server).
@@ -59,14 +59,11 @@ pub const GenSource = struct {
     fn get(ctx: *anyopaque, dim: u8, x: i32, z: i32, allocator: std.mem.Allocator) ?[]u8 {
         const s: *GenSource = @ptrCast(@alignCast(ctx));
         if (s.gen_pool) |gp| {
-            // Returned bytes are owned by `allocator` (duped); pool-owned
-            // bytes are freed with the pool allocator, never the caller's
-            // (serve threads pass a per-call frame arena).
+            // Miss path: the pool read uses the caller's allocator, so
+            // serve threads pass a per-call frame arena (never the process
+            // arena — whole-SST reads must not be retained).
             const key = store_mod.encodeKey(dim, x, z);
-            if (s.pool.get(key) catch null) |raw| {
-                defer s.pool.allocator.free(raw);
-                return allocator.dupe(u8, raw) catch null;
-            }
+            if (s.pool.get(allocator, key) catch null) |raw| return raw;
             gp.request(dim, x, z);
             return null;
         }
@@ -131,17 +128,20 @@ pub fn findSpawn(
         const cz = off.dz;
         const key = store_mod.encodeKey(0, cx, cz);
         const found: ?Spawn = blk: {
-            const have = try pool.get(key);
+            // Scratch lifetime is this probe only: pool.get reads whole SST
+            // files on hits, which must never land in a long-lived arena.
+            var farena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer farena.deinit();
+            const have = try pool.get(farena.allocator(), key);
             var ch: *chunk_mod.Chunk = undefined;
             if (have) |raw| {
-                defer pool.allocator.free(raw);
                 ch = try chunk_mod.Chunk.decode(alloc, raw);
             } else {
                 lock.lock();
                 defer lock.unlock();
                 const ch2 = gen.genChunk(alloc, arena.allocator(), cx, cz) catch break :blk null;
                 errdefer ch2.destroy(alloc);
-                try pool.putChunk(ch2);
+                try pool.putChunk(farena.allocator(), ch2);
                 ch = ch2;
             }
             defer ch.destroy(alloc);
@@ -186,9 +186,12 @@ pub fn preGen(
     var sp = Spiral{ .radius = radius_chunks };
     if (gp) |p| {
         while (sp.next()) |off| {
+            // Presence probes read whole SST files on hits; keep them out
+            // of the caller's (possibly never-reset) arena.
+            var farena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer farena.deinit();
             const key = store_mod.encodeKey(0, off.dx, off.dz);
-            if (try pool.get(key)) |raw| {
-                pool.allocator.free(raw);
+            if (try pool.get(farena.allocator(), key)) |_| {
                 continue;
             }
             p.request(0, off.dx, off.dz);
@@ -198,9 +201,10 @@ pub fn preGen(
         return n;
     }
     while (sp.next()) |off| {
+        var farena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer farena.deinit();
         const key = store_mod.encodeKey(0, off.dx, off.dz);
-        if (try pool.get(key)) |raw| {
-            pool.allocator.free(raw);
+        if (try pool.get(farena.allocator(), key)) |_| {
             continue;
         }
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -209,7 +213,7 @@ pub fn preGen(
         defer lock.unlock();
         const ch = try gen.genChunk(alloc, arena.allocator(), off.dx, off.dz);
         defer ch.destroy(alloc);
-        try pool.putChunk(ch);
+        try pool.putChunk(farena.allocator(), ch);
         n += 1;
     }
     return n;

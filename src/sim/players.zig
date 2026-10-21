@@ -234,7 +234,7 @@ pub fn save(pool: *shard_mod.ShardPool, username: []const u8, d: *const Data) !v
 /// UsernameMismatch is treated as absent (a hash hit on someone else's row —
 /// vanishingly unlikely, but never trust a key alone).
 pub fn load(pool: *shard_mod.ShardPool, alloc: std.mem.Allocator, username: []const u8) !?Data {
-    const raw = try pool.get(keyFor(username));
+    const raw = try pool.get(alloc, keyFor(username));
     if (raw == null) return null;
     defer alloc.free(raw.?);
     return decode(alloc, raw.?, username) catch |err| switch (err) {

@@ -234,8 +234,8 @@ pub const GenPool = struct {
     fn runJob(self: *GenPool, gen: *gen_mod.Gen, job: Job) void {
         const k = keyOf(job.dim, job.x, job.z);
         // Fast path: another conn (or pre-gen) filled it while queued.
-        if (self.pool.get(k) catch null) |raw| {
-            self.pool.allocator.free(raw);
+        if (self.pool.get(self.alloc, k) catch null) |raw| {
+            self.alloc.free(raw);
             return;
         }
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -252,11 +252,11 @@ pub const GenPool = struct {
         // Narrow critical section: recheck + store only.
         self.lock.lock();
         defer self.lock.unlock();
-        if (self.pool.get(k) catch null) |raw| {
-            self.pool.allocator.free(raw);
+        if (self.pool.get(self.alloc, k) catch null) |raw| {
+            self.alloc.free(raw);
             return;
         }
-        self.pool.putChunk(ch) catch {
+        self.pool.putChunk(self.alloc, ch) catch {
             self.mutex.lockUncancelable(self.io);
             self.stats.failed += 1;
             self.mutex.unlock(self.io);
@@ -289,7 +289,7 @@ test "pool generates missing chunks in parallel, byte-identical to sync gen" {
     try std.testing.expectEqual(@as(usize, 0), gp.pending());
     // Every requested column is now stored...
     for (want[0..4]) |c| {
-        const got = try pool.getChunk(0, c[0], c[1]);
+        const got = try pool.getChunk(a, 0, c[0], c[1]);
         try std.testing.expect(got != null);
         defer got.?.destroy(a);
     }
@@ -301,7 +301,7 @@ test "pool generates missing chunks in parallel, byte-identical to sync gen" {
     for (want[0..4]) |c| {
         const ref_ch = try ref.genChunk(a, arena.allocator(), c[0], c[1]);
         defer ref_ch.destroy(a);
-        const got = try pool.getChunk(0, c[0], c[1]);
+        const got = try pool.getChunk(a, 0, c[0], c[1]);
         defer got.?.destroy(a);
         try std.testing.expectEqual(ref_ch.mask(), got.?.mask());
         try std.testing.expectEqualSlices(u8, &ref_ch.biomes, &got.?.biomes);
@@ -340,7 +340,7 @@ test "pool skips already-stored chunks without generating" {
         defer arena.deinit();
         const ch = try ref.genChunk(a, arena.allocator(), 0, 0);
         defer ch.destroy(a);
-        try pool.putChunk(ch);
+        try pool.putChunk(a, ch);
     }
     var gp = try GenPool.create(a, io, pool, &lock, 1, false, false, 1);
     defer {
