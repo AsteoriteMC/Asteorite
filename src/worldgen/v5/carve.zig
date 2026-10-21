@@ -11,6 +11,7 @@ const genlayer = @import("genlayer.zig");
 const biome = @import("biome.zig");
 const surface_mod = @import("surface.zig");
 const ids = @import("../../ids.zig");
+const wire = @import("../../proto/v5/wire_ids.zig");
 
 pub const RANGE: i32 = 8;
 pub const LAVA_Y: i32 = 10;
@@ -71,7 +72,7 @@ pub const Carver = struct {
 
     /// Base dispatcher (aqx.a): 17x17 neighbor chunks, each reseeded.
     /// scratch arena for voronoi lookups during grass-top replacement.
-    pub fn carveChunk(self: *Carver, scratch: std.mem.Allocator, cx: i32, cz: i32, world_seed: i64, blocks: *[65536]u16) !void {
+    pub fn carveChunk(self: *Carver, scratch: std.mem.Allocator, cx: i32, cz: i32, world_seed: i64, blocks: *[65536]ids.Id) !void {
         self.rand.setSeed(worldSeed(world_seed));
         const l = self.rand.nextLong();
         const l2 = self.rand.nextLong();
@@ -97,7 +98,7 @@ pub const Carver = struct {
     }
 
     // ------------------------------------------------------------ caves
-    fn cavesEntry(self: *Carver, scratch: std.mem.Allocator, n: i32, n2: i32, n3: i32, n4: i32, blocks: *[65536]u16) !void {
+    fn cavesEntry(self: *Carver, scratch: std.mem.Allocator, n: i32, n2: i32, n3: i32, n4: i32, blocks: *[65536]ids.Id) !void {
         var n5 = try self.rand.nextIntBound(try self.rand.nextIntBound(try self.rand.nextIntBound(15) + 1) + 1);
         if (try self.rand.nextIntBound(7) != 0) n5 = 0;
         var i: i32 = 0;
@@ -123,7 +124,7 @@ pub const Carver = struct {
         }
     }
 
-    fn caveWalk(self: *Carver, scratch: std.mem.Allocator, seed: i64, n: i32, n2: i32, blocks: *[65536]u16, d: f64, d2: f64, d3: f64) !void {
+    fn caveWalk(self: *Carver, scratch: std.mem.Allocator, seed: i64, n: i32, n2: i32, blocks: *[65536]ids.Id, d: f64, d2: f64, d3: f64) !void {
         // NOTE: f comes from the dispatcher RNG (this.b), seed passes through
         // unchanged (CFR-verified: 7-arg overload uses this.b.nextFloat and
         // forwards l directly; the 13-arg method creates Random(l)).
@@ -131,7 +132,7 @@ pub const Carver = struct {
         try self.caveWalk13(scratch, seed, n, n2, blocks, d, d2, d3, f, 0.0, 0.0, -1, -1, 0.5);
     }
 
-    fn caveWalk13(self: *Carver, scratch: std.mem.Allocator, seed: i64, tx: i32, tz: i32, blocks: *[65536]u16, d_in: f64, d2_in: f64, d3_in: f64, f_in: f32, f2_in: f32, f3_in: f32, n3_in: i32, n4_in: i32, d4: f64) !void {
+    fn caveWalk13(self: *Carver, scratch: std.mem.Allocator, seed: i64, tx: i32, tz: i32, blocks: *[65536]ids.Id, d_in: f64, d2_in: f64, d3_in: f64, f_in: f32, f2_in: f32, f3_in: f32, n3_in: i32, n4_in: i32, d4: f64) !void {
         var r = java_random.JavaRandom.init(seed);
         var dd = d_in;
         var dd2 = d2_in;
@@ -209,7 +210,7 @@ pub const Carver = struct {
     /// Water check + ellipsoid carve for one segment. Returns true when the
     /// caller must stop after this segment (initial-room single pass that
     /// actually carved). Ravines pass their width table; caves pass null.
-    fn carveCells(self: *Carver, scratch: std.mem.Allocator, tx: i32, tz: i32, blocks: *[65536]u16, d: f64, d2: f64, d3: f64, d7: f64, d8: f64, is_room: i32, kind: CaveKind, width: ?[256]f32) !bool {
+    fn carveCells(self: *Carver, scratch: std.mem.Allocator, tx: i32, tz: i32, blocks: *[65536]ids.Id, d: f64, d2: f64, d3: f64, d7: f64, d8: f64, is_room: i32, kind: CaveKind, width: ?[256]f32) !bool {
         const n9: i32 = @max(0, floorD(d - d7) - tx * 16 - 1);
         const n10: i32 = @min(16, floorD(d + d7) - tx * 16 + 1);
         const n11: i32 = @max(1, floorD(d2 - d8) - 1);
@@ -260,15 +261,15 @@ pub const Carver = struct {
                     if (inside) {
                         const cell: usize = @intCast(n15);
                         const cur = blocks[cell];
-                        if (cur == 2) bl4 = true;
-                        if (cur == 1 or cur == 3 or cur == 2) {
+                        if (cur == ids.grass) bl4 = true;
+                        if (cur == ids.stone or cur == ids.dirt or cur == ids.grass) {
                             if (iy < 10) {
                                 // NOTE: caves place still lava (11), ravines
                                 // place flowing lava (10) — CFR-verified.
-                                blocks[cell] = if (kind == .cave) 11 else 10;
+                                blocks[cell] = if (kind == .cave) ids.lava else ids.flowing_lava;
                             } else {
-                                blocks[cell] = 0;
-                                if (bl4 and blocks[@intCast(n15 - 1)] == 3) {
+                                blocks[cell] = ids.air;
+                                if (bl4 and blocks[@intCast(n15 - 1)] == ids.dirt) {
                                     blocks[@intCast(n15 - 1)] = self.topFor(scratch, nx + tx * 16, nz + tz * 16);
                                 }
                             }
@@ -282,14 +283,14 @@ pub const Carver = struct {
     }
 
     /// Top block for the grass-top replacement (voronoi biome -> TOP256).
-    fn topFor(self: *Carver, scratch: std.mem.Allocator, wx: i32, wz: i32) u16 {
+    fn topFor(self: *Carver, scratch: std.mem.Allocator, wx: i32, wz: i32) ids.Id {
         var one: [1]i32 = undefined;
-        self.chain.getInts(scratch, self.roots_voronoi, wx, wz, 1, 1, &one) catch return 2;
+        self.chain.getInts(scratch, self.roots_voronoi, wx, wz, 1, 1, &one) catch return ids.grass;
         const id: usize = @as(usize, @intCast(@as(u32, @bitCast(one[0])) & 255));
         return biome.TOP256[id];
     }
 
-    fn ravineEntry(self: *Carver, scratch: std.mem.Allocator, n: i32, n2: i32, n3: i32, n4: i32, blocks: *[65536]u16) !void {
+    fn ravineEntry(self: *Carver, scratch: std.mem.Allocator, n: i32, n2: i32, n3: i32, n4: i32, blocks: *[65536]ids.Id) !void {
         if (try self.rand.nextIntBound(50) != 0) return;
         const d: f64 = @as(f64, @floatFromInt(n * 16 + try self.rand.nextIntBound(16)));
         const d2: f64 = @floatFromInt(try self.rand.nextIntBound(try self.rand.nextIntBound(40) + 8) + 20);
@@ -301,7 +302,7 @@ pub const Carver = struct {
         try self.ravineWalk13(scratch, self.rand.nextLong(), n3, n4, blocks, d, d2, d3, f3, f, f2, 0, 0, 3.0);
     }
 
-    fn ravineWalk13(self: *Carver, scratch: std.mem.Allocator, seed: i64, tx: i32, tz: i32, blocks: *[65536]u16, d_in: f64, d2_in: f64, d3_in: f64, f_in: f32, f2_in: f32, f3_in: f32, n3_in: i32, n4_in: i32, d4: f64) !void {
+    fn ravineWalk13(self: *Carver, scratch: std.mem.Allocator, seed: i64, tx: i32, tz: i32, blocks: *[65536]ids.Id, d_in: f64, d2_in: f64, d3_in: f64, f_in: f32, f2_in: f32, f3_in: f32, n3_in: i32, n4_in: i32, d4: f64) !void {
         var r = java_random.JavaRandom.init(seed);
         var dd = d_in;
         var dd2 = d2_in;
@@ -388,24 +389,24 @@ test "grass-top path matches JVM (synthetic dirt+grass, wide walk)" {
     var carver = Carver.init(alloc, &built.chain, built.roots[1]);
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    var blocks: [65536]u16 = undefined;
+    var blocks: [65536]ids.Id = undefined;
     for (0..16) |x| {
         for (0..16) |z| {
             for (0..256) |y| {
-                blocks[x * 4096 + z * 256 + y] = if (y < 60) 1 else if (y < 68) 3 else if (y == 68) 2 else 0;
+                blocks[x * 4096 + z * 256 + y] = if (y < 60) ids.stone else if (y < 68) ids.dirt else if (y == 68) ids.grass else ids.air;
             }
         }
     }
     try carver.caveWalk13(arena.allocator(), 999, 0, 0, &blocks, 8.0, 68.0, 8.0, 10.0, 0.0, 0.0, 0, 100, 1.0);
     // JVM golden: col(8,8) dirt to 66, grass at 67 (was dirt), air above.
-    for (60..67) |y| try std.testing.expectEqual(@as(u16, 3), blocks[8 * 4096 + 8 * 256 + y]);
-    try std.testing.expectEqual(@as(u16, 2), blocks[8 * 4096 + 8 * 256 + 67]);
-    for (68..76) |y| try std.testing.expectEqual(@as(u16, 0), blocks[8 * 4096 + 8 * 256 + y]);
+    for (60..67) |y| try std.testing.expectEqual(ids.dirt, blocks[8 * 4096 + 8 * 256 + y]);
+    try std.testing.expectEqual(ids.grass, blocks[8 * 4096 + 8 * 256 + 67]);
+    for (68..76) |y| try std.testing.expectEqual(ids.air, blocks[8 * 4096 + 8 * 256 + y]);
     // Far corner untouched (walk is localized).
-    for (60..68) |y| try std.testing.expectEqual(@as(u16, 3), blocks[0 * 4096 + 0 * 256 + y]);
-    try std.testing.expectEqual(@as(u16, 2), blocks[0 * 4096 + 0 * 256 + 68]);
+    for (60..68) |y| try std.testing.expectEqual(ids.dirt, blocks[0 * 4096 + 0 * 256 + y]);
+    try std.testing.expectEqual(ids.grass, blocks[0 * 4096 + 0 * 256 + 68]);
     // Full-array crc vs jvm_grass.txt.
     var crc: i64 = 0;
-    for (blocks) |v| crc = crc *% 31 +% @as(i64, v);
+    for (blocks) |v| crc = crc *% 31 +% @as(i64, wire.toWire(v)); // JVM goldens are wire ids
     try std.testing.expectEqual(@as(i64, -3331385501468235747), crc);
 }

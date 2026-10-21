@@ -5,7 +5,7 @@
 
 const ids = @import("../ids.zig");
 
-pub const Smelt = struct { in_id: u16, in_dmg: i16, out_id: u16, out_count: i8, out_dmg: i16 };
+pub const Smelt = struct { in_id: ids.Id, in_dmg: i16, out_id: ids.Id, out_count: i8, out_dmg: i16 };
 
 pub const table: [22]Smelt = .{
     .{ .in_id = ids.iron_ore, .in_dmg = 32767, .out_id = ids.iron_ingot, .out_count = 1, .out_dmg = 0 }, // xp 0.70
@@ -33,7 +33,7 @@ pub const table: [22]Smelt = .{
 };
 
 /// Explicit fuel burn times (ticks). Wood-material blocks handled separately.
-pub const fuels: [12]struct { id: u16, burn: u16 } = .{
+pub const fuels: [12]struct { id: ids.Id, burn: u16 } = .{
     .{ .id = ids.stick, .burn = 100 },
     .{ .id = ids.coal, .burn = 1600 },
     .{ .id = ids.lava_bucket, .burn = 20000 },
@@ -49,4 +49,4 @@ pub const fuels: [12]struct { id: u16, burn: u16 } = .{
 };
 
 /// minecraft-data material=wood block ids (burn 300, except explicit entries above).
-pub const wood_blocks: [25]u16 = .{ids.planks, ids.log, ids.noteblock, ids.bookshelf, ids.oak_stairs, ids.chest, ids.crafting_table, ids.standing_sign, ids.wooden_door_block, ids.wall_sign, ids.wooden_pressure_plate, ids.jukebox, ids.fence, ids.trapdoor, ids.fence_gate, ids.double_wooden_slab, ids.wooden_slab, ids.spruce_stairs, ids.birch_stairs, ids.jungle_stairs, ids.trapped_chest, ids.daylight_detector, ids.log2, ids.acacia_stairs, ids.dark_oak_stairs};
+pub const wood_blocks: [25]ids.Id = .{ids.planks, ids.log, ids.noteblock, ids.bookshelf, ids.oak_stairs, ids.chest, ids.crafting_table, ids.standing_sign, ids.wooden_door_block, ids.wall_sign, ids.wooden_pressure_plate, ids.jukebox, ids.fence, ids.trapdoor, ids.fence_gate, ids.double_wooden_slab, ids.wooden_slab, ids.spruce_stairs, ids.birch_stairs, ids.jungle_stairs, ids.trapped_chest, ids.daylight_detector, ids.log2, ids.acacia_stairs, ids.dark_oak_stairs};

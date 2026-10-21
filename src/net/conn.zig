@@ -50,7 +50,7 @@ pub const BlockEvent = struct {
     x: i32,
     y: u8,
     z: i32,
-    id: u16,
+    id: game_ids.Id,
     meta: u4,
     /// Clicked face (0-5) for right-clicks; tells serve which cell was
     /// clicked (table-vs-place decision). Breaks leave the default.
@@ -1280,7 +1280,8 @@ pub const Conn = struct {
         if (direction < 0 or direction > 5) return .none;
         if (!self.inReach(x, y, z)) return .none;
         const held = self.inv[36 + self.selected] orelse return .none;
-        if (held.id > 4095) return .none;
+        // Canonical ids are always < 4096, so the old wire range check is
+        // vacuous; unknown wires never reach here (slot parse maps them to empty).
         // target cell adjacent on the clicked face
         var tx = x;
         var ty: i32 = y;
@@ -1297,7 +1298,7 @@ pub const Conn = struct {
         if (ty < 0 or ty > 255) return .none;
         // creative damage value doubles as block metadata (low nibble)
         const m: u4 = @truncate(@as(u16, @bitCast(held.damage)) & 0x0F);
-        return .{ .block_set = .{ .x = tx, .y = @intCast(ty), .z = tz, .id = @intCast(held.id), .meta = m, .face = direction } };
+        return .{ .block_set = .{ .x = tx, .y = @intCast(ty), .z = tz, .id = held.id, .meta = m, .face = direction } };
     }
 
     fn markChunkDirty(self: *Conn) void {
@@ -1671,7 +1672,7 @@ test "dig/place/held/creative/arm behavior" {
         const act = try feed(&c, 0x07, digBody(0, 8, 64, 9, &db));
         try std.testing.expect(act != null);
         const ev = act.?.block_set;
-        try std.testing.expectEqual(@as(u16, 0), ev.id);
+        try std.testing.expectEqual(game_ids.air, ev.id);
         try std.testing.expectEqual(@as(i32, 8), ev.x);
         try std.testing.expectEqual(@as(u8, 64), ev.y);
         try std.testing.expectEqual(@as(i32, 9), ev.z);
@@ -1735,7 +1736,7 @@ test "dig/place/held/creative/arm behavior" {
         try pw.writeByte(8);
         const pact = try feed(&c, 0x08, pw.written());
         const be = pact.?.block_set;
-        try std.testing.expectEqual(@as(u16, 1), be.id);
+        try std.testing.expectEqual(game_ids.stone, be.id);
         try std.testing.expectEqual(@as(u4, 3), be.meta);
         try std.testing.expectEqual(@as(i32, 8), be.x);
         try std.testing.expectEqual(@as(u8, 65), be.y);
@@ -1892,7 +1893,7 @@ test "crafting table: 3x3 take, shift-craft, close drops grid" {
     c.table[8] = .{ .id = game_ids.stick, .count = 1, .damage = 0, .nbt = null };
     c.refreshTable();
     try std.testing.expect(c.table[0] != null);
-    try std.testing.expectEqual(@as(u16, 257), c.table[0].?.id);
+    try std.testing.expectEqual(game_ids.iron_pickaxe, c.table[0].?.id);
     // take via mode-0 click on window-1 slot 0 (action 1 seeds)
     {
         var cb: [64]u8 = undefined;
@@ -1906,7 +1907,7 @@ test "crafting table: 3x3 take, shift-craft, close drops grid" {
         try w.writeShort(-1);
         _ = try feed(&c, 0x0E, w.written());
         try std.testing.expect(c.cursor != null);
-        try std.testing.expectEqual(@as(u16, 257), c.cursor.?.id);
+        try std.testing.expectEqual(game_ids.iron_pickaxe, c.cursor.?.id);
         try std.testing.expect(c.table[1] == null); // consumed
         try std.testing.expect(c.table[0] == null); // no longer matches
         var owned: ?item_mod.Stack = c.cursor;
@@ -1946,7 +1947,7 @@ test "crafting table: 3x3 take, shift-craft, close drops grid" {
         var n: usize = 0;
         for (tc.stacks) |st| if (st != null) {
             n += 1;
-            try std.testing.expectEqual(@as(u16, 1), st.?.id);
+            try std.testing.expectEqual(game_ids.stone, st.?.id);
         };
         try std.testing.expectEqual(@as(usize, 1), n);
         try std.testing.expect(c.open_win == null);
@@ -2059,7 +2060,7 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
         c.inv[3] = .{ .id = game_ids.planks, .count = 1, .damage = 0, .nbt = null };
         c.refreshCrafting();
         try std.testing.expect(c.inv[0] != null);
-        try std.testing.expectEqual(@as(u16, 280), c.inv[0].?.id);
+        try std.testing.expectEqual(game_ids.stick, c.inv[0].?.id);
         try std.testing.expectEqual(@as(i8, 4), c.inv[0].?.count);
         // take with left-click on slot 0 (mode 0, empty cursor)
         var cb: [64]u8 = undefined;
@@ -2073,7 +2074,7 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
         try w.writeShort(-1); // clicked item: empty
         _ = try feed(&c, 0x0E, w.written());
         try std.testing.expect(c.cursor != null);
-        try std.testing.expectEqual(@as(u16, 280), c.cursor.?.id);
+        try std.testing.expectEqual(game_ids.stick, c.cursor.?.id);
         try std.testing.expect(c.inv[1] == null and c.inv[3] == null);
         try std.testing.expect(c.inv[0] == null); // grid empty -> no match
         var owned: ?item_mod.Stack = c.cursor;
@@ -2125,7 +2126,7 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
         const fr = (try c.poll()).?;
         _ = try c.handleFrame(fr);
         try std.testing.expect(c.inv[0] != null); // recompute untouched it
-        try std.testing.expectEqual(@as(u16, 280), c.inv[0].?.id);
+        try std.testing.expectEqual(game_ids.stick, c.inv[0].?.id);
         c.inv[0] = null;
         c.inv[1] = null;
         c.inv[3] = null;
@@ -2145,7 +2146,7 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
         const act = try feed(&c, 0x07, qw.written());
         const q = act.?.qdrop;
         try std.testing.expectEqual(@as(i16, 36), q.slot);
-        try std.testing.expectEqual(@as(u16, 264), q.stack.id);
+        try std.testing.expectEqual(game_ids.diamond, q.stack.id);
         try std.testing.expectEqual(@as(i8, 1), q.stack.count);
         try std.testing.expectEqual(@as(i8, 4), c.inv[36].?.count);
         var owned: ?item_mod.Stack = q.stack;
@@ -2223,9 +2224,9 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
     c.inv[16] = .{ .id = game_ids.dirt, .count = 5, .damage = 0, .nbt = null };
     c.cursor = .{ .id = game_ids.stone, .count = 6, .damage = 0, .nbt = null };
     try std.testing.expect((try click(&c, 16, 0, 6, 0)).? == .none);
-    try std.testing.expectEqual(@as(u16, 1), c.inv[16].?.id);
+    try std.testing.expectEqual(game_ids.stone, c.inv[16].?.id);
     try std.testing.expectEqual(@as(i8, 6), c.inv[16].?.count);
-    try std.testing.expectEqual(@as(u16, 3), c.cursor.?.id);
+    try std.testing.expectEqual(game_ids.dirt, c.cursor.?.id);
     { const o = try c.takeOutput(); defer a.free(o); }
     // 7. shift-click merge: main slot 20 (dirt 32) into hotbar 36 (dirt 32)
     // exact fill: source empties, no remainder to place
@@ -2247,17 +2248,17 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
     c.inv[21] = .{ .id = game_ids.planks, .count = 1, .damage = 0, .nbt = null };
     c.inv[36] = .{ .id = game_ids.stone, .count = 64, .damage = 0, .nbt = null };
     try std.testing.expect((try click(&c, 21, 0, 9, 2)).? == .none);
-    try std.testing.expectEqual(@as(u16, 1), c.inv[21].?.id);
-    try std.testing.expectEqual(@as(u16, 5), c.inv[36].?.id);
+    try std.testing.expectEqual(game_ids.stone, c.inv[21].?.id);
+    try std.testing.expectEqual(game_ids.planks, c.inv[36].?.id);
     c.cursor = .{ .id = game_ids.stone, .count = 1, .damage = 0, .nbt = null };
     try std.testing.expect((try click(&c, 21, 1, 10, 2)).? == .none);
-    try std.testing.expectEqual(@as(u16, 1), c.inv[21].?.id); // unchanged
+    try std.testing.expectEqual(game_ids.stone, c.inv[21].?.id); // unchanged
     c.cursor = null;
     { const o = try c.takeOutput(); defer a.free(o); }
     // 9. desync: reused action number triggers full Window Items + ignore
     c.inv[22] = .{ .id = game_ids.bedrock, .count = 3, .damage = 0, .nbt = null };
     try std.testing.expect((try click(&c, 22, 0, 10, 0)).? == .none); // stale action
-    try std.testing.expectEqual(@as(u16, 7), c.inv[22].?.id); // untouched
+    try std.testing.expectEqual(game_ids.bedrock, c.inv[22].?.id); // untouched
     try std.testing.expectEqual(@as(i8, 3), c.inv[22].?.count);
     {
         const out = try c.takeOutput();

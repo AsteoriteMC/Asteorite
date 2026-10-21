@@ -242,16 +242,16 @@ pub fn fullResync(
 
 /// Apply one block edit to the LSM store (ZC1 roundtrip). Missing chunks
 /// (holes) are ignored — generation is P-next. Callers hold the world lock.
-pub const PeekBlock = struct { id: u16, meta: u4 };
+pub const PeekBlock = struct { id: ids.Id, meta: u4 };
 
 /// Vanilla `isOpaqueCube` approximation for suffocation: full solid cubes
 /// suffocate, everything else (air, fluids, glass, leaves, ice, slabs,
 /// stairs, plants, torches, rails, snow, etc.) doesn't. Default is opaque
 /// (stone/dirt/ores/planks/logs/wool/...). Fences/walls/panes are full
 /// cubes here — slightly stricter than vanilla, documented.
-pub fn isOpaqueCube(id: u16) bool {
+pub fn isOpaqueCube(id: ids.Id) bool {
     return switch (id) {
-        ids.air, ids.sapling, ids.flowing_water, ids.water, ids.flowing_lava, ids.lava, ids.leaves, ids.glass, ids.bed_block, ids.golden_rail, ids.detector_rail, ids.web, ids.tallgrass, ids.deadbush, ids.yellow_flower, ids.red_flower, ids.brown_mushroom, ids.red_mushroom, ids.stone_slab, ids.torch, ids.fire, ids.oak_stairs, ids.redstone_wire, ids.wheat_block, ids.standing_sign, ids.wooden_door_block, ids.ladder, ids.rail, ids.stone_stairs, ids.wall_sign, ids.lever, ids.stone_pressure_plate, ids.iron_door_block, ids.wooden_pressure_plate, ids.unlit_redstone_torch, ids.redstone_torch, ids.stone_button, ids.snow_layer, ids.ice, ids.reeds_block, ids.fence, ids.unpowered_repeater, ids.powered_repeater, ids.trapdoor, ids.pumpkin_stem, ids.melon_stem, ids.vine, ids.fence_gate, ids.brick_stairs, ids.stone_brick_stairs, ids.waterlily, ids.nether_brick_stairs, ids.nether_wart_block, ids.enchanting_table, ids.brewing_stand_block, ids.cauldron_block, ids.end_portal_frame, ids.wooden_slab, ids.sandstone_stairs, ids.tripwire_hook, ids.tripwire, ids.spruce_stairs, ids.birch_stairs, ids.jungle_stairs, ids.flower_pot_block, ids.carrots, ids.potatoes, ids.wooden_button, ids.skull_block, ids.light_weighted_pressure_plate, ids.heavy_weighted_pressure_plate, ids.unpowered_comparator, ids.powered_comparator, ids.daylight_detector, ids.quartz_stairs, ids.activator_rail, ids.stained_hardened_clay, ids.leaves2, ids.acacia_stairs, ids.dark_oak_stairs, ids.carpet, ids.double_plant, 178, 180 => false, // 178/180: unassigned in 1.7.10 (dead entries, kept for shape)
+        ids.air, ids.sapling, ids.flowing_water, ids.water, ids.flowing_lava, ids.lava, ids.leaves, ids.glass, ids.bed_block, ids.golden_rail, ids.detector_rail, ids.web, ids.tallgrass, ids.deadbush, ids.yellow_flower, ids.red_flower, ids.brown_mushroom, ids.red_mushroom, ids.stone_slab, ids.torch, ids.fire, ids.oak_stairs, ids.redstone_wire, ids.wheat_block, ids.standing_sign, ids.wooden_door_block, ids.ladder, ids.rail, ids.stone_stairs, ids.wall_sign, ids.lever, ids.stone_pressure_plate, ids.iron_door_block, ids.wooden_pressure_plate, ids.unlit_redstone_torch, ids.redstone_torch, ids.stone_button, ids.snow_layer, ids.ice, ids.reeds_block, ids.fence, ids.unpowered_repeater, ids.powered_repeater, ids.trapdoor, ids.pumpkin_stem, ids.melon_stem, ids.vine, ids.fence_gate, ids.brick_stairs, ids.stone_brick_stairs, ids.waterlily, ids.nether_brick_stairs, ids.nether_wart_block, ids.enchanting_table, ids.brewing_stand_block, ids.cauldron_block, ids.end_portal_frame, ids.wooden_slab, ids.sandstone_stairs, ids.tripwire_hook, ids.tripwire, ids.spruce_stairs, ids.birch_stairs, ids.jungle_stairs, ids.flower_pot_block, ids.carrots, ids.potatoes, ids.wooden_button, ids.skull_block, ids.light_weighted_pressure_plate, ids.heavy_weighted_pressure_plate, ids.unpowered_comparator, ids.powered_comparator, ids.daylight_detector, ids.quartz_stairs, ids.activator_rail, ids.stained_hardened_clay, ids.leaves2, ids.acacia_stairs, ids.dark_oak_stairs, ids.carpet, ids.double_plant => false, // unassigned wire ids never become Ids: fromWire rejects them at the boundary
         else => true,
     };
 }
@@ -287,13 +287,13 @@ pub fn groundBlockY(pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, x:
         const si: usize = @as(usize, yu) >> 4;
         if (ch.sections[si]) |s| {
             const li: usize = chunk_mod.Section.index(@intCast(@as(u4, @truncate(@as(u32, @bitCast(x & 15))))), @truncate(yu & 15), @truncate(@as(u32, @bitCast(z & 15))));
-            if (s.blocks[li] != 0) return yu;
+            if (s.blocks[li] != ids.air) return yu;
         }
     }
     return null;
 }
 
-pub fn applyBlock(pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, x: i32, y: u8, z: i32, id: u16, meta: u4) !void {
+pub fn applyBlock(pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, x: i32, y: u8, z: i32, id: ids.Id, meta: u4) !void {
     const cx = @divFloor(x, 16);
     const cz = @divFloor(z, 16);
     const key = store_mod.encodeKey(0, cx, cz);
@@ -364,11 +364,11 @@ test "completeLogin sends bulk + poslook, skips holes" {
         map.deinit();
     }
     // chunk (0,0): section0 with block 1; chunk (1,0): section0 with block 57
-    for ([_]struct { x: i32, id: u16 }{ .{ .x = 0, .id = ids.stone }, .{ .x = 1, .id = ids.diamond_block } }) |e| {
+    for ([_]struct { x: i32, id: ids.Id }{ .{ .x = 0, .id = ids.stone }, .{ .x = 1, .id = ids.diamond_block } }) |e| {
         var ch = try chunk_mod.Chunk.createEmpty(a, 0, e.x, 0);
         defer ch.destroy(a);
         var s = chunk_mod.Section{};
-        try s.setBlock(0, 0, 0, e.id);
+        s.setBlock(0, 0, 0, e.id);
         ch.sections[0] = s;
         const enc = try ch.encode(a);
         defer a.free(enc);
@@ -443,15 +443,15 @@ test "sync on move: unload + burst, no resends, respawn resets" {
         while (it.next()) |e| a.free(e.value_ptr.*);
         map.deinit();
     }
-    for ([_]i32{ 0, 1, 5 }) |x| {
-        var ch = try chunk_mod.Chunk.createEmpty(a, 0, x, 0);
+    for ([_]struct { x: i32, id: ids.Id }{ .{ .x = 0, .id = ids.flowing_lava }, .{ .x = 1, .id = ids.lava }, .{ .x = 5, .id = ids.coal_ore } }) |e| {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, e.x, 0);
         defer ch.destroy(a);
         var s = chunk_mod.Section{};
-        try s.setBlock(0, 0, 0, @intCast(10 + x));
+        s.setBlock(0, 0, 0, e.id);
         ch.sections[0] = s;
         const enc = try ch.encode(a);
         defer a.free(enc);
-        try map.put(Mem.key(x, 0), try a.dupe(u8, enc));
+        try map.put(Mem.key(e.x, 0), try a.dupe(u8, enc));
     }
     Mem.store = map;
     const src = Source{ .ctx = @ptrCast(&Mem.store), .getFn = Mem.get };
@@ -631,23 +631,23 @@ test "applyBlock roundtrips through the store" {
         var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
         defer ch.destroy(a);
         var s = chunk_mod.Section{};
-        for (&s.blocks) |*b| b.* = 1;
+        for (&s.blocks) |*b| b.* = ids.stone;
         ch.sections[0] = s;
         try pool.putChunk(ch);
         try pool.flushAll();
     }
     // break one block (section 0, local (3,1,4) -> y=1)
-    try applyBlock(pool, a, 3, 1, 4, 0, 0);
+    try applyBlock(pool, a, 3, 1, 4, ids.air, 0);
     {
         const got = try pool.getChunk(0, 0, 0);
         try std.testing.expect(got != null);
         defer got.?.destroy(a);
         const idx = chunk_mod.Section.index(3, 1, 4);
-        try std.testing.expectEqual(@as(u16, 0), got.?.sections[0].?.blocks[idx]);
-        try std.testing.expectEqual(@as(u16, 1), got.?.sections[0].?.blocks[idx + 1]);
+        try std.testing.expectEqual(ids.air, got.?.sections[0].?.blocks[idx]);
+        try std.testing.expectEqual(ids.stone, got.?.sections[0].?.blocks[idx + 1]);
     }
     // place into an empty section creates it (with air elsewhere)
-    try applyBlock(pool, a, 0, 200, 0, 5, 2);
+    try applyBlock(pool, a, 0, 200, 0, ids.planks, 2);
     {
         const got = try pool.getChunk(0, 0, 0);
         defer {
@@ -656,12 +656,12 @@ test "applyBlock roundtrips through the store" {
         try std.testing.expect(got != null);
         try std.testing.expect(got.?.sections[12] != null);
         const s = &got.?.sections[12].?;
-        try std.testing.expectEqual(@as(u16, 5), s.blocks[chunk_mod.Section.index(0, 8, 0)]);
+        try std.testing.expectEqual(ids.planks, s.blocks[chunk_mod.Section.index(0, 8, 0)]);
         try std.testing.expectEqual(@as(u4, 2), chunk_mod.Section.getNibble(&s.meta, chunk_mod.Section.index(0, 8, 0)));
-        try std.testing.expectEqual(@as(u16, 0), s.blocks[1]);
+        try std.testing.expectEqual(ids.air, s.blocks[1]);
     }
     // breaking air in an empty section is a no-op (no section created)
-    try applyBlock(pool, a, 0, 16, 0, 0, 0);
+    try applyBlock(pool, a, 0, 16, 0, ids.air, 0);
     {
         const got = try pool.getChunk(0, 0, 0);
         defer {
@@ -670,5 +670,5 @@ test "applyBlock roundtrips through the store" {
         try std.testing.expect(got.?.sections[1] == null);
     }
     // missing chunk: no crash, no-op
-    try applyBlock(pool, a, 999, 64, 999, 1, 0);
+    try applyBlock(pool, a, 999, 64, 999, ids.stone, 0);
 }

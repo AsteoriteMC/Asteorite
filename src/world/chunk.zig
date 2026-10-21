@@ -2,7 +2,8 @@
 //! Stored as the LSM value under key [dim|x|z] (see store.zig).
 //!
 //! Layout (big-endian):
-//!   magic "ZC1" (3B) + version u8 (=1)
+//!   magic "ZC1" (3B) + version u8 (=2; v1 stored wire ids, v2+ stores
+//!   canonical ids.Id values)
 //!   dim u8, x i32, z i32                      (9B, mirrors key)
 //!   section_mask u16                           (bit i => section i present)
 //!   per present section, ascending:
@@ -14,8 +15,10 @@
 
 const std = @import("std");
 const nbt = @import("nbt.zig");
+const ids = @import("../ids.zig");
+const wire = @import("../proto/v5/wire_ids.zig");
 
-pub const version: u8 = 1;
+pub const version: u8 = 2;
 pub const magic = "ZC1";
 pub const section_size = 4096;
 pub const nibble_size = 2048;
@@ -31,7 +34,7 @@ pub const ChunkError = error{
 } || nbt.NbtError || std.mem.Allocator.Error;
 
 pub const Section = struct {
-    blocks: [section_size]u16 = [_]u16{0} ** section_size,
+    blocks: [section_size]ids.Id = [_]ids.Id{ids.air} ** section_size,
     meta: [nibble_size]u8 = [_]u8{0} ** nibble_size,
     add: [nibble_size]u8 = [_]u8{0} ** nibble_size,
     sky: [nibble_size]u8 = [_]u8{0xFF} ** nibble_size,
@@ -41,12 +44,11 @@ pub const Section = struct {
         return (@as(usize, y) * 16 + @as(usize, z)) * 16 + @as(usize, x);
     }
 
-    pub fn getBlock(self: *const Section, x: u4, y: u4, z: u4) u16 {
-        return self.blocks[index(x, y, z)] & 0x0FFF;
+    pub fn getBlock(self: *const Section, x: u4, y: u4, z: u4) ids.Id {
+        return self.blocks[index(x, y, z)];
     }
 
-    pub fn setBlock(self: *Section, x: u4, y: u4, z: u4, id: u16) !void {
-        if (id > 0x0FFF) return error.BlockIdRange;
+    pub fn setBlock(self: *Section, x: u4, y: u4, z: u4, id: ids.Id) void {
         const i = index(x, y, z);
         self.blocks[i] = id;
     }
@@ -115,7 +117,7 @@ pub const Chunk = struct {
         for (self.sections) |maybe| {
             const s = maybe orelse continue;
             for (s.blocks) |b| {
-                std.mem.writeInt(u16, out[p..][0..2], b & 0x0FFF, .big);
+                std.mem.writeInt(u16, out[p..][0..2], @intFromEnum(b), .big);
                 p += 2;
             }
             @memcpy(out[p..][0..nibble_size], &s.meta);
@@ -156,11 +158,12 @@ pub const Chunk = struct {
             if (section_mask & (@as(u16, 1) << @intCast(i)) == 0) continue;
             var s = Section{};
             for (&s.blocks) |*b| {
-                b.* = std.mem.readInt(u16, data[p..][0..2], .big);
-                if (b.* > 0x0FFF) {
+                const raw = std.mem.readInt(u16, data[p..][0..2], .big);
+                if (raw >= ids.COUNT) {
                     allocator.destroy(c);
                     return error.BlockIdRange;
                 }
+                b.* = @enumFromInt(raw);
                 p += 2;
             }
             @memcpy(&s.meta, data[p..][0..nibble_size]);
@@ -292,7 +295,8 @@ fn parseSections(r: *nbt.Reader, c: *Chunk) ChunkError!void {
         for (0..4096) |idx| {
             const base: u16 = b[idx];
             const an: u16 = if (add) |a| nibbleAt(a, idx) else 0;
-            s.blocks[idx] = (an << 8) | base;
+            const w: u16 = (an << 8) | base;
+            s.blocks[idx] = wire.fromWire(w) orelse return error.BlockIdRange;
             s.meta[idx >> 1] = d[idx >> 1]; // copy whole byte once (loop hits twice, idempotent)
         }
         if (add) |a| @memcpy(&s.add, a[0..2048]);
@@ -313,9 +317,8 @@ test "section index order + nibbles" {
     try std.testing.expectEqual(@as(usize, 0), Section.index(0, 0, 0));
     try std.testing.expectEqual(@as(usize, 4095), Section.index(15, 15, 15));
     var s = Section{};
-    try s.setBlock(1, 2, 3, 0xABC);
-    try std.testing.expectEqual(@as(u16, 0xABC), s.getBlock(1, 2, 3));
-    try std.testing.expectError(error.BlockIdRange, s.setBlock(0, 0, 0, 0x1000));
+    s.setBlock(1, 2, 3, ids.diamond_block);
+    try std.testing.expectEqual(ids.diamond_block, s.getBlock(1, 2, 3));
     var n: [2048]u8 = [_]u8{0} ** 2048;
     Section.setNibble(&n, 0, 0xA);
     Section.setNibble(&n, 1, 0xB);
@@ -330,12 +333,12 @@ test "zc1 sparse roundtrip" {
     ch.biomes[0] = 21;
     ch.heights[0] = 64;
     var s0 = Section{};
-    try s0.setBlock(0, 0, 0, 1);
-    try s0.setBlock(15, 15, 15, 57);
+    s0.setBlock(0, 0, 0, ids.stone);
+    s0.setBlock(15, 15, 15, ids.diamond_block);
     Section.setNibble(&s0.meta, 0, 0x5);
     ch.sections[0] = s0;
     var s5 = Section{};
-    try s5.setBlock(8, 8, 8, 0xFFF);
+    s5.setBlock(8, 8, 8, ids.record_wait);
     ch.sections[5] = s5;
     const enc = try ch.encode(a);
     defer a.free(enc);
@@ -347,10 +350,10 @@ test "zc1 sparse roundtrip" {
     try std.testing.expectEqual(ch.x, dec.x);
     try std.testing.expectEqual(ch.z, dec.z);
     try std.testing.expectEqual(ch.mask(), dec.mask());
-    try std.testing.expectEqual(@as(u16, 1), dec.sections[0].?.getBlock(0, 0, 0));
-    try std.testing.expectEqual(@as(u16, 57), dec.sections[0].?.getBlock(15, 15, 15));
+    try std.testing.expectEqual(ids.stone, dec.sections[0].?.getBlock(0, 0, 0));
+    try std.testing.expectEqual(ids.diamond_block, dec.sections[0].?.getBlock(15, 15, 15));
     try std.testing.expectEqual(@as(u4, 0x5), Section.getNibble(&dec.sections[0].?.meta, 0));
-    try std.testing.expectEqual(@as(u16, 0xFFF), dec.sections[5].?.getBlock(8, 8, 8));
+    try std.testing.expectEqual(ids.record_wait, dec.sections[5].?.getBlock(8, 8, 8));
     try std.testing.expect(dec.sections[1] == null);
     try std.testing.expectEqual(@as(u8, 21), dec.biomes[0]);
     try std.testing.expectEqual(@as(u8, 64), dec.heights[0]);
@@ -451,8 +454,8 @@ test "fromAnvilNbt minimal one-section chunk" {
     try std.testing.expectEqual(@as(i32, -3), ch.z);
     try std.testing.expect(ch.sections[0] != null);
     try std.testing.expect(ch.sections[1] == null);
-    try std.testing.expectEqual(@as(u16, 1), ch.sections[0].?.getBlock(0, 0, 0));
-    try std.testing.expectEqual(@as(u16, 57), ch.sections[0].?.getBlock(15, 15, 15));
+    try std.testing.expectEqual(ids.stone, ch.sections[0].?.getBlock(0, 0, 0));
+    try std.testing.expectEqual(ids.diamond_block, ch.sections[0].?.getBlock(15, 15, 15));
     try std.testing.expectEqual(@as(u8, 7), ch.biomes[100]);
     try std.testing.expectEqual(@as(u8, 64), ch.heights[100]);
     // ZC1 encode of converted chunk decodes back
@@ -460,5 +463,5 @@ test "fromAnvilNbt minimal one-section chunk" {
     defer a.free(enc);
     const dec = try Chunk.decode(a, enc);
     defer dec.destroy(a);
-    try std.testing.expectEqual(@as(u16, 57), dec.sections[0].?.getBlock(15, 15, 15));
+    try std.testing.expectEqual(ids.diamond_block, dec.sections[0].?.getBlock(15, 15, 15));
 }

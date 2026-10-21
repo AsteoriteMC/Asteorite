@@ -132,7 +132,7 @@ pub fn findSpawn(
                     const s: usize = @intCast(@divFloor(top, 16));
                     const sec = ch.sections[s] orelse continue;
                     const lsi = chunk_mod.Section.index(@intCast(lx), @intCast(@mod(top, 16)), @intCast(lz));
-                    const id = sec.blocks[lsi] & 0x0FFF;
+                    const id = sec.blocks[lsi];
                     // NOTE: water/snow-covered tops don't count; need solid ground.
                     // Water surface also exceeds sea level — skip it.
                     if (id == ids.air or id == ids.water) continue;

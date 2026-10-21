@@ -24,7 +24,7 @@ const ids = @import("../ids.zig");
 
 /// One drop roll: spawn `singles` separate single-item entities of this stack.
 pub const DropRoll = struct {
-    item_id: u16,
+    item_id: ids.Id,
     damage: i16,
     singles: u8,
 };
@@ -32,7 +32,7 @@ pub const DropRoll = struct {
 /// Roll drops for a broken block. Writes up to 2 rolls (leaves need two:
 /// sapling + apple) into `out`, returns the count. `meta` is the low nibble
 /// of the broken block.
-pub fn rollDrops(block_id: u16, meta: u4, rand: *JavaRandom, out: *[2]DropRoll) usize {
+pub fn rollDrops(block_id: ids.Id, meta: u4, rand: *JavaRandom, out: *[2]DropRoll) usize {
     var n: usize = 0;
     switch (block_id) {
         // Lapis ore: dye/4, 4 + nextInt(5) (amn, fortune 0).
@@ -139,7 +139,7 @@ pub fn rollDrops(block_id: u16, meta: u4, rand: *JavaRandom, out: *[2]DropRoll) 
 
 /// Blocks whose item form carries the block metadata (vanilla damageDropped
 /// overrides returning meta — same item, meta matters). Spot-checked in CFR.
-fn preservesMeta(id: u16) bool {
+fn preservesMeta(id: ids.Id) bool {
     return switch (id) {
         ids.planks, ids.sapling, ids.log, ids.sandstone, ids.wool, ids.stone_slab, ids.stonebrick, ids.double_wooden_slab, ids.wooden_slab, ids.quartz_block, ids.stained_hardened_clay, ids.log2, ids.carpet, ids.double_plant => true,
         else => false,
@@ -153,7 +153,7 @@ test "fixed drops: stone/cobble/ores/clay/glass" {
     try std.testing.expectEqual(@as(usize, 1), rollDrops(ids.stone, 0, &rng, &out));
     try std.testing.expectEqual(DropRoll{ .item_id = ids.cobblestone, .damage = 0, .singles = 1 }, out[0]);
     // coal/diamond/emerald/gold/iron/quartz
-    for ([_]struct { b: u16, i: u16 }{ .{ .b = ids.coal_ore, .i = ids.coal }, .{ .b = ids.diamond_ore, .i = ids.diamond }, .{ .b = ids.emerald_ore, .i = ids.emerald }, .{ .b = ids.gold_ore, .i = ids.gold_ore }, .{ .b = ids.iron_ore, .i = ids.iron_ore } }) |c| {
+    for ([_]struct { b: ids.Id, i: ids.Id }{ .{ .b = ids.coal_ore, .i = ids.coal }, .{ .b = ids.diamond_ore, .i = ids.diamond }, .{ .b = ids.emerald_ore, .i = ids.emerald }, .{ .b = ids.gold_ore, .i = ids.gold_ore }, .{ .b = ids.iron_ore, .i = ids.iron_ore } }) |c| {
         try std.testing.expectEqual(@as(usize, 1), rollDrops(c.b, 0, &rng, &out));
         try std.testing.expectEqual(c.i, out[0].item_id);
         try std.testing.expectEqual(@as(u8, 1), out[0].singles);
@@ -198,7 +198,7 @@ test "ranged drops stay in vanilla bounds (seed sweep)" {
         _ = rollDrops(ids.lapis_ore, 0, &rng, &out);
         lapis_min = @min(lapis_min, out[0].singles);
         lapis_max = @max(lapis_max, out[0].singles);
-        try std.testing.expectEqual(@as(u16, ids.dye), out[0].item_id);
+        try std.testing.expectEqual(ids.dye, out[0].item_id);
         try std.testing.expectEqual(@as(i16, 4), out[0].damage);
         _ = rollDrops(ids.redstone_ore, 0, &rng, &out);
         red_min = @min(red_min, out[0].singles);
@@ -210,7 +210,7 @@ test "ranged drops stay in vanilla bounds (seed sweep)" {
         melon_min = @min(melon_min, out[0].singles);
         melon_max = @max(melon_max, out[0].singles);
         _ = rollDrops(ids.gravel, 0, &rng, &out);
-        if (out[0].item_id == ids.flint) flint += 1 else try std.testing.expectEqual(@as(u16, ids.gravel), out[0].item_id);
+        if (out[0].item_id == ids.flint) flint += 1 else try std.testing.expectEqual(ids.gravel, out[0].item_id);
         if (rollDrops(ids.leaves, 0, &rng, &out) > 0 and out[0].item_id == ids.sapling) sap += 1;
         if (rollDrops(ids.tallgrass, 1, &rng, &out) > 0) seeds += 1;
     }

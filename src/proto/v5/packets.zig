@@ -12,6 +12,7 @@ const ids = @import("ids.zig");
 const item_mod = @import("../../item.zig");
 const slot_mod = @import("slot.zig");
 const game_ids = @import("../../ids.zig");
+const wire = @import("wire_ids.zig");
 
 // ---------- handshaking ----------
 
@@ -422,7 +423,7 @@ pub const SlotItem = struct { id: i16, count: i8, damage: i16 };
 /// (placement re-reads the held stack from the inventory instead).
 pub fn parseSlot(r: *codec.PacketReader) codec.CodecError!?SlotItem {
     const st = try slot_mod.readSlot(r) orelse return null;
-    return .{ .id = @as(i16, @intCast(st.id)), .count = st.count, .damage = st.damage };
+    return .{ .id = @as(i16, @bitCast(wire.toWire(st.id))), .count = st.count, .damage = st.damage };
 }
 
 /// Serverbound 0x07 digging: status, x, y(u8), z, face.
@@ -575,13 +576,13 @@ pub fn parseCloseWindow(body: []const u8) codec.CodecError!u8 {
 }
 
 /// Block Change 0x23 (1.7 form: separate id VarInt + meta u8, NOT packed).
-pub fn frameBlockChange(x: i32, y: u8, z: i32, id: i32, meta: u8, out: []u8) codec.CodecError![]const u8 {
+pub fn frameBlockChange(x: i32, y: u8, z: i32, id: game_ids.Id, meta: u8, out: []u8) codec.CodecError![]const u8 {
     var payload: [16]u8 = undefined;
     var w = codec.PacketWriter.init(&payload);
     try w.writeInt(x);
     try w.writeByte(y);
     try w.writeInt(z);
-    try w.writeVarInt(id);
+    try w.writeVarInt(@as(i32, wire.toWire(id)));
     try w.writeByte(meta);
     return try codec.framePacket(@intFromEnum(ids.PlayClient.block_change), w.written(), out);
 }
@@ -765,7 +766,7 @@ test "dig/place/held/arm/creative/serverbound roundtrips" {
         try cw.writeShort(-1); // no nbt
         const cs = try parseCreativeSlot(cw.written());
         try std.testing.expectEqual(@as(i16, 37), cs.slot);
-        try std.testing.expectEqual(@as(u16, 3), cs.item.?.id);
+        try std.testing.expectEqual(game_ids.dirt, cs.item.?.id);
         try std.testing.expect(cs.item.?.nbt == null);
         // nbt len 0 and -2 are tolerated/rejected
         var zb: [16]u8 = undefined;
@@ -821,7 +822,7 @@ test "click window parse + set slot / window items roundtrip" {
     try std.testing.expectEqual(@as(i32, 0x2F), (try codec.decodeFrame(&r)).id);
     try std.testing.expectEqual(@as(i8, 0), @as(i8, @bitCast(try r.readByte())));
     try std.testing.expectEqual(@as(i16, 36), try r.readShort());
-    try std.testing.expectEqual(@as(i16, game_ids.diamond_sword), try r.readShort());
+    try std.testing.expectEqual(@as(i16, 276), try r.readShort()); // wire id, not canonical
     try std.testing.expectEqual(@as(i8, 1), @as(i8, @bitCast(try r.readByte())));
     try std.testing.expectEqual(@as(i16, 0), try r.readShort());
     try std.testing.expectEqual(@as(i16, 4), try r.readShort());
@@ -847,7 +848,7 @@ test "click window parse + set slot / window items roundtrip" {
 
 test "block change + animation frames parse back" {
     var out: [64]u8 = undefined;
-    const f = try frameBlockChange(10, 64, -3, 3, 2, &out);
+    const f = try frameBlockChange(10, 64, -3, game_ids.dirt, 2, &out);
     var r = codec.PacketReader.init(f);
     try std.testing.expectEqual(@as(i32, 0x23), (try codec.decodeFrame(&r)).id);
     try std.testing.expectEqual(@as(i32, 10), try r.readInt());

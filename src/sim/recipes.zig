@@ -21,7 +21,7 @@ pub const WILD: i16 = 32767;
 /// Max durability for repairable vanilla items, generated from minecraft-data
 /// names x jar-verified material tables (tool: wood 59/stone 131/iron 250/
 /// diamond 1561/gold 32; armor base x slot {helm 11, chest 16, legs 15, boots 13}).
-fn maxDurability(id: u16) ?u16 {
+fn maxDurability(id: ids.Id) ?u16 {
     return switch (id) {
         ids.iron_shovel => 250,
         ids.iron_pickaxe => 250,
@@ -207,19 +207,19 @@ test "shaped basics: sticks, torches, planks, mirror" {
     // grid is row-major 2-wide: [.,plank, .,plank] = col1 rows 0..1
     const r = findMatch(&sticks, 2, 2);
     try std.testing.expect(r != null);
-    try std.testing.expectEqual(@as(u16, 280), r.?.id);
+    try std.testing.expectEqual(ids.stick, r.?.id);
     try std.testing.expectEqual(@as(i8, 4), r.?.count);
     // torches: coal over stick
     const torch: [4]?item_mod.Stack = .{ null, .{ .id = ids.coal, .count = 1, .damage = 0, .nbt = null }, null, .{ .id = ids.stick, .count = 1, .damage = 0, .nbt = null } };
     const t = findMatch(&torch, 2, 2);
     try std.testing.expect(t != null);
-    try std.testing.expectEqual(@as(u16, 50), t.?.id);
+    try std.testing.expectEqual(ids.torch, t.?.id);
     try std.testing.expectEqual(@as(i8, 4), t.?.count);
     // planks from log (any damage wildcard? log recipe damage is explicit per type; oak here)
     const planks: [4]?item_mod.Stack = .{ .{ .id = ids.log, .count = 1, .damage = 0, .nbt = null }, null, null, null };
     const p = findMatch(&planks, 2, 2);
     try std.testing.expect(p != null);
-    try std.testing.expectEqual(@as(u16, 5), p.?.id);
+    try std.testing.expectEqual(ids.planks, p.?.id);
     // mirror: arrow " #X / # X /  #X"? use asymmetric pickaxe head on 3x3
     var g3: [9]?item_mod.Stack = [_]?item_mod.Stack{null} ** 9;
     // mirrored iron pickaxe: ingots at cols 2,1,0 row 0 + sticks col 1 rows 1-2
@@ -230,7 +230,7 @@ test "shaped basics: sticks, torches, planks, mirror" {
     g3[7] = .{ .id = ids.stick, .count = 1, .damage = 0, .nbt = null };
     const pk = findMatch(&g3, 3, 3);
     try std.testing.expect(pk != null);
-    try std.testing.expectEqual(@as(u16, 257), pk.?.id);
+    try std.testing.expectEqual(ids.iron_pickaxe, pk.?.id);
     // wrong material arrangement: no match
     var bad: [9]?item_mod.Stack = [_]?item_mod.Stack{null} ** 9;
     bad[0] = .{ .id = ids.iron_ingot, .count = 1, .damage = 0, .nbt = null };
@@ -246,7 +246,7 @@ test "repair: two damaged tools combine (vanilla formula)" {
     };
     const r = findMatch(&rep, 2, 2);
     try std.testing.expect(r != null);
-    try std.testing.expectEqual(@as(u16, 257), r.?.id);
+    try std.testing.expectEqual(ids.iron_pickaxe, r.?.id);
     try std.testing.expectEqual(@as(i16, 138), r.?.damage);
     // count 2 stacks don't repair (vanilla requires count 1 each)
     var rep2 = rep;
@@ -273,7 +273,7 @@ test "mirror + damage rules (stairs mirrored, wildcard planks, exact stone)" {
     norm[8] = .{ .id = ids.planks, .count = 1, .damage = 0, .nbt = null };
     const n = findMatch(&norm, 3, 3);
     try std.testing.expect(n != null);
-    try std.testing.expectEqual(@as(u16, 53), n.?.id);
+    try std.testing.expectEqual(ids.oak_stairs, n.?.id);
     // mirrored ("  # / ## / ###"): same output
     var mirr: [9]?item_mod.Stack = [_]?item_mod.Stack{null} ** 9;
     mirr[2] = .{ .id = ids.planks, .count = 1, .damage = 0, .nbt = null };
@@ -284,12 +284,12 @@ test "mirror + damage rules (stairs mirrored, wildcard planks, exact stone)" {
     mirr[8] = .{ .id = ids.planks, .count = 1, .damage = 0, .nbt = null };
     const m = findMatch(&mirr, 3, 3);
     try std.testing.expect(m != null);
-    try std.testing.expectEqual(@as(u16, 53), m.?.id);
+    try std.testing.expectEqual(ids.oak_stairs, m.?.id);
     // wildcard planks: birch (dmg 2) works for sticks
     const sticks: [4]?item_mod.Stack = .{ null, .{ .id = ids.planks, .count = 1, .damage = 2, .nbt = null }, null, .{ .id = ids.planks, .count = 1, .damage = 2, .nbt = null } };
     const st = findMatch(&sticks, 2, 2);
     try std.testing.expect(st != null);
-    try std.testing.expectEqual(@as(u16, 280), st.?.id);
+    try std.testing.expectEqual(ids.stick, st.?.id);
 }
 
 test "shapeless: bread, dye wildcard, paper" {
@@ -303,7 +303,7 @@ test "shapeless: bread, dye wildcard, paper" {
     };
     const b = findMatch(&bread, 3, 3);
     try std.testing.expect(b != null);
-    try std.testing.expectEqual(@as(u16, 297), b.?.id);
+    try std.testing.expectEqual(ids.bread, b.?.id);
     // exact-damage shapeless: white wool needs dye 15 + white wool
     const dye: [9]?item_mod.Stack = .{
         .{ .id = ids.dye, .count = 1, .damage = 15, .nbt = null }, .{ .id = ids.wool, .count = 1, .damage = 0, .nbt = null }, null,
@@ -312,7 +312,7 @@ test "shapeless: bread, dye wildcard, paper" {
     };
     const d = findMatch(&dye, 3, 3);
     try std.testing.expect(d != null);
-    try std.testing.expectEqual(@as(u16, 35), d.?.id);
+    try std.testing.expectEqual(ids.wool, d.?.id);
     try std.testing.expectEqual(@as(i16, 0), d.?.damage); // aka.c(15)=0 white
     // wrong dye damage: bonemeal(15) + ORANGE wool(1)? needs white wool -> null
     // (use red dye(1) + white wool -> rose red stays? red+white... skip: extra item breaks it)

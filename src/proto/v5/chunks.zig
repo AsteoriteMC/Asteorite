@@ -14,6 +14,8 @@ const std = @import("std");
 const flate = std.compress.flate;
 const codec = @import("../../net/codec.zig");
 const ids = @import("ids.zig");
+const game_ids = @import("../../ids.zig");
+const wire = @import("wire_ids.zig");
 const chunk_mod = @import("../../world/chunk.zig");
 
 pub const sky_sent_overworld = true;
@@ -38,7 +40,7 @@ pub fn addMask(ch: *const chunk_mod.Chunk) u16 {
     for (ch.sections, 0..) |maybe, i| {
         const s = maybe orelse continue;
         for (s.blocks) |b| {
-            if (b > 0xFF) {
+            if (wire.toWire(b) > 0xFF) {
                 m |= @as(u16, 1) << @intCast(i);
                 break;
             }
@@ -65,7 +67,7 @@ pub fn encodeColumn(ch: *const chunk_mod.Chunk, sky: bool, out: []u8) ColumnLayo
     for (ch.sections) |maybe| {
         const s = maybe orelse continue;
         for (s.blocks) |b| {
-            out[p] = @truncate(b & 0xFF);
+            out[p] = @truncate(wire.toWire(b) & 0xFF);
             p += 1;
         }
     }
@@ -94,7 +96,7 @@ pub fn encodeColumn(ch: *const chunk_mod.Chunk, sky: bool, out: []u8) ColumnLayo
         if (add & (@as(u16, 1) << @intCast(i)) == 0) continue;
         const s = maybe orelse continue;
         for (0..4096) |idx| {
-            const v: u8 = @truncate((s.blocks[idx] >> 8) & 0xF);
+            const v: u8 = @truncate((wire.toWire(s.blocks[idx]) >> 8) & 0xF);
             if (idx & 1 == 0) {
                 out[p + (idx >> 1)] = v;
             } else {
@@ -214,9 +216,11 @@ test "add mask detects high ids" {
     defer ch.destroy(a);
     try std.testing.expectEqual(@as(u16, 0), addMask(ch));
     var s = chunk_mod.Section{};
-    try s.setBlock(0, 0, 0, 0x1AB);
+    // highest canonical block id still fits one byte: no add bit.
+    // (add nibbles exist only for wire ids > 255, unmapped in 1.7.10.)
+    s.setBlock(0, 0, 0, game_ids.double_plant);
     ch.sections[3] = s;
-    try std.testing.expectEqual(@as(u16, 1 << 3), addMask(ch));
+    try std.testing.expectEqual(@as(u16, 0), addMask(ch));
 }
 
 test "encode column grouped layout + zlib roundtrip" {
@@ -224,12 +228,12 @@ test "encode column grouped layout + zlib roundtrip" {
     var ch = try chunk_mod.Chunk.createEmpty(a, 0, 5, -2);
     defer ch.destroy(a);
     var s0 = chunk_mod.Section{};
-    try s0.setBlock(0, 0, 0, 1);
-    try s0.setBlock(1, 0, 0, 0x1AB); // forces add bit
+    s0.setBlock(0, 0, 0, game_ids.stone);
+    s0.setBlock(1, 0, 0, game_ids.diamond_block);
     chunk_mod.Section.setNibble(&s0.meta, 0, 0x5);
     ch.sections[0] = s0;
     var s2 = chunk_mod.Section{};
-    try s2.setBlock(15, 15, 15, 57);
+    s2.setBlock(15, 15, 15, game_ids.diamond_block);
     ch.sections[2] = s2;
     ch.biomes[0] = 4;
     ch.biomes[255] = 4;
@@ -237,22 +241,19 @@ test "encode column grouped layout + zlib roundtrip" {
     var raw: [70000]u8 = undefined;
     const layout = encodeColumn(ch, true, &raw);
     try std.testing.expectEqual(@as(u16, 0b101), layout.primary);
-    try std.testing.expectEqual(@as(u16, 0b001), layout.add);
+    try std.testing.expectEqual(@as(u16, 0), layout.add); // no 1.7.10 block wire exceeds 0xFF
     const k: usize = 2;
-    // grouped offsets: blocks 8192 | meta 4096 | blight 4096 | slight 4096 | add 2048 | biome 256
+    // grouped offsets: blocks 4096*k | meta 2048*k | blight 2048*k | slight 2048*k | biome 256 (no add)
     const data = raw[0..layout.len];
-    try std.testing.expectEqual(@as(usize, 8192 * k + 2048 * k + 2048 + 256), data.len);
-    // section0 blocks[0]=1, blocks[1] LSB of 0x1AB = 0xAB
+    try std.testing.expectEqual(@as(usize, 4096 * k + 2048 * k + 2048 * k + 2048 * k + 256), data.len);
+    // section0 blocks[0]=1 (stone), blocks[1]=57 (diamond block wire)
     try std.testing.expectEqual(@as(u8, 1), data[0]);
-    try std.testing.expectEqual(@as(u8, 0xAB), data[1]);
+    try std.testing.expectEqual(@as(u8, 57), data[1]);
     // section2 starts at 4096; its last cell = 57
     try std.testing.expectEqual(@as(u8, 57), data[8191]);
     // meta for section0 starts at 8192: nibble0 = 0x5
     try std.testing.expectEqual(@as(u8, 0x05), data[8192] & 0x0F);
-    // add array starts after blocks+meta+blight+slight
-    const base = 4096 * k + 2048 * k + 2048 * k + 2048 * k;
-    // add nibble idx1 (odd) of section0 holds 0x1
-    try std.testing.expectEqual(@as(u8, 0x10), data[base] & 0xF0);
+    // biomes tail (no add array in 1.7.10: all block wires fit one byte)
     // biomes tail
     try std.testing.expectEqual(@as(u8, 4), data[data.len - 256]);
     try std.testing.expectEqual(@as(u8, 4), data[data.len - 1]);
@@ -274,7 +275,7 @@ test "bulk frame parses back" {
     var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
     defer ch.destroy(a);
     var s = chunk_mod.Section{};
-    try s.setBlock(0, 0, 0, 3);
+    s.setBlock(0, 0, 0, game_ids.dirt);
     ch.sections[0] = s;
     var raw: [70000]u8 = undefined;
     const layout = encodeColumn(ch, true, &raw);

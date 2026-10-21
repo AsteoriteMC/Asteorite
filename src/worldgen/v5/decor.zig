@@ -30,6 +30,7 @@ const java_random = @import("../rng/java_random.zig");
 const carve_mod = @import("carve.zig");
 const genlayer_mod = @import("genlayer.zig");
 const ids = @import("../../ids.zig");
+const wire = @import("../../proto/v5/wire_ids.zig");
 
 
 // ---------------------------------------------------------------------------
@@ -37,7 +38,7 @@ const ids = @import("../../ids.zig");
 // ---------------------------------------------------------------------------
 
 pub const View = struct {
-    blocks: []u16,
+    blocks: []ids.Id,
     metas: []u8,
     ox: i32, // world x of local (0,0)
     oz: i32,
@@ -55,8 +56,8 @@ pub const View = struct {
         return (ux * self.sz + uz) * 256 + @as(usize, @intCast(y));
     }
 
-    pub fn get(self: *const View, wx: i32, y: i32, wz: i32) u16 {
-        const i = self.idx(wx, y, wz) orelse return 0;
+    pub fn get(self: *const View, wx: i32, y: i32, wz: i32) ids.Id {
+        const i = self.idx(wx, y, wz) orelse return ids.air;
         return self.blocks[i];
     }
 
@@ -65,7 +66,7 @@ pub const View = struct {
         return self.metas[i];
     }
 
-    pub fn set(self: *View, wx: i32, y: i32, wz: i32, id: u16, meta: u8) void {
+    pub fn set(self: *View, wx: i32, y: i32, wz: i32, id: ids.Id, meta: u8) void {
         const i = self.idx(wx, y, wz) orelse return;
         self.blocks[i] = id;
         self.metas[i] = meta;
@@ -111,7 +112,7 @@ const PI_F: f32 = 3.1415927; // (float)Math.PI, matches `nextFloat()*PI` in ase
 
 /// Single vein at world (wx,wy,wz). Replaces `target` (stone) with `ore`.
 /// Mirrors `ase.a` exactly (float math, RNG order, floor, bounds).
-pub fn minable(view: *View, rand: *java_random.JavaRandom, wx: i32, wy: i32, wz: i32, ore: u16, size: i32, target: u16) !void {
+pub fn minable(view: *View, rand: *java_random.JavaRandom, wx: i32, wy: i32, wz: i32, ore: ids.Id, size: i32, target: ids.Id) !void {
     const f: f32 = rand.nextFloat() * PI_F;
     const sf = qhSin(f);
     const cf = qhCos(f);
@@ -169,11 +170,11 @@ pub fn minable(view: *View, rand: *java_random.JavaRandom, wx: i32, wy: i32, wz:
 test "minable coal matches JVM (seed 42)" {
     const alloc = std.testing.allocator;
     const S: usize = 64;
-    const blocks = try alloc.alloc(u16, S * 256 * S);
+    const blocks = try alloc.alloc(ids.Id, S * 256 * S);
     defer alloc.free(blocks);
     const metas = try alloc.alloc(u8, S * 256 * S);
     defer alloc.free(metas);
-    @memset(blocks, 0);
+    @memset(blocks, ids.air);
     @memset(metas, 0);
     // stone below y=70 (matches harness)
     for (0..S) |x| {
@@ -197,7 +198,7 @@ test "minable coal matches JVM (seed 42)" {
             var wz: i32 = -32;
             while (wz < 32) : (wz += 1) {
                 const id = view.get(wx, wy, wz);
-                crc = crc *% 31 +% @as(i64, id);
+                crc = crc *% 31 +% @as(i64, wire.toWire(id)); // JVM goldens are wire ids
                 if (id == ids.coal_ore) coal += 1;
                 if (id != ids.stone and id != ids.air) changed += 1;
             }
@@ -210,7 +211,7 @@ test "minable coal matches JVM (seed 42)" {
 
 test "minable iron/gold/redstone/diamond/lapis match JVM (seed 42)" {
     const alloc = std.testing.allocator;
-    const cases = [_]struct { ore: u16, size: i32, want_n: usize, want_crc: i64 }{
+    const cases = [_]struct { ore: ids.Id, size: i32, want_n: usize, want_crc: i64 }{
         .{ .ore = ids.iron_ore, .size = 8, .want_n = 4, .want_crc = -4985998703837180800 },
         .{ .ore = ids.gold_ore, .size = 8, .want_n = 4, .want_crc = -1848336028041915200 },
         .{ .ore = ids.redstone_ore, .size = 7, .want_n = 4, .want_crc = -2502993162867069440 },
@@ -219,11 +220,11 @@ test "minable iron/gold/redstone/diamond/lapis match JVM (seed 42)" {
     };
     for (cases) |c| {
         const S: usize = 64;
-        const blocks = try alloc.alloc(u16, S * 256 * S);
+        const blocks = try alloc.alloc(ids.Id, S * 256 * S);
         defer alloc.free(blocks);
         const metas = try alloc.alloc(u8, S * 256 * S);
         defer alloc.free(metas);
-        @memset(blocks, 0);
+        @memset(blocks, ids.air);
         @memset(metas, 0);
         for (0..S) |x| {
             for (0..S) |z| {
@@ -244,7 +245,7 @@ test "minable iron/gold/redstone/diamond/lapis match JVM (seed 42)" {
                 var wz: i32 = -32;
                 while (wz < 32) : (wz += 1) {
                     const id = view.get(wx, wy, wz);
-                    crc = crc *% 31 +% @as(i64, id);
+                    crc = crc *% 31 +% @as(i64, wire.toWire(id)); // JVM goldens are wire ids
                     if (id == c.ore) n += 1;
                 }
             }
@@ -256,17 +257,17 @@ test "minable iron/gold/redstone/diamond/lapis match JVM (seed 42)" {
 
 test "minable dirt/gravel match JVM (seed 42)" {
     const alloc = std.testing.allocator;
-    const cases = [_]struct { ore: u16, size: i32, want_n: usize, want_crc: i64 }{
+    const cases = [_]struct { ore: ids.Id, size: i32, want_n: usize, want_crc: i64 }{
         .{ .ore = ids.dirt, .size = 32, .want_n = 102, .want_crc = 3423075958434408956 },
         .{ .ore = ids.gravel, .size = 32, .want_n = 102, .want_crc = -8147241372490269720 },
     };
     for (cases) |c| {
         const S: usize = 64;
-        const blocks = try alloc.alloc(u16, S * 256 * S);
+        const blocks = try alloc.alloc(ids.Id, S * 256 * S);
         defer alloc.free(blocks);
         const metas = try alloc.alloc(u8, S * 256 * S);
         defer alloc.free(metas);
-        @memset(blocks, 0);
+        @memset(blocks, ids.air);
         @memset(metas, 0);
         for (0..S) |x| {
             for (0..S) |z| {
@@ -287,7 +288,7 @@ test "minable dirt/gravel match JVM (seed 42)" {
                 var wz: i32 = -32;
                 while (wz < 32) : (wz += 1) {
                     const id = view.get(wx, wy, wz);
-                    crc = crc *% 31 +% @as(i64, id);
+                    crc = crc *% 31 +% @as(i64, wire.toWire(id)); // JVM goldens are wire ids
                     if (id == c.ore) n += 1;
                 }
             }
@@ -303,14 +304,14 @@ test "minable dirt/gravel match JVM (seed 42)" {
 
 /// Replaceable for tree space checks (`arc.a`): air, leaves, grass, dirt,
 /// logs, saplings, vines. Everything else (stone, ores, sand...) fails.
-fn replaceable(id: u16) bool {
+fn replaceable(id: ids.Id) bool {
     return id == ids.air or id == ids.grass or id == ids.dirt or id == ids.log or id == ids.leaves or
         id == ids.log2 or id == ids.leaves2 or id == ids.sapling or id == ids.vine;
 }
 
 /// Opaque cube for leaf placement (`aji.j()`): leaves and air are NOT
 /// opaque; everything else is. Pre-tree world has no other transparents.
-fn isOpaque(id: u16) bool {
+fn isOpaque(id: ids.Id) bool {
     return id != ids.air and id != ids.leaves and id != ids.leaves2;
 }
 
@@ -591,11 +592,11 @@ pub fn spruceTree(view: *View, rand: *java_random.JavaRandom, wx: i32, wy: i32, 
 test "oak tree matches JVM (seed 42)" {
     const alloc = std.testing.allocator;
     const S: usize = 32;
-    const blocks = try alloc.alloc(u16, S * 256 * S);
+    const blocks = try alloc.alloc(ids.Id, S * 256 * S);
     defer alloc.free(blocks);
     const metas = try alloc.alloc(u8, S * 256 * S);
     defer alloc.free(metas);
-    @memset(blocks, 0);
+    @memset(blocks, ids.air);
     @memset(metas, 0);
     for (0..S) |x| {
         for (0..S) |z| {
@@ -620,7 +621,7 @@ test "oak tree matches JVM (seed 42)" {
             while (wz < 16) : (wz += 1) {
                 const id = view.get(wx, wy, wz);
                 const m = view.getMeta(wx, wy, wz);
-                crc = crc *% 31 +% @as(i64, id);
+                crc = crc *% 31 +% @as(i64, wire.toWire(id)); // JVM goldens are wire ids
                 mcrc = mcrc *% 31 +% @as(i64, m);
                 if (id == ids.log) logs += 1;
                 if (id == ids.leaves) leaves += 1;
@@ -642,11 +643,11 @@ test "birch/spruce/swamp trees match JVM (seed 42)" {
     };
     for (cases) |c| {
         const S: usize = 32;
-        const blocks = try alloc.alloc(u16, S * 256 * S);
+        const blocks = try alloc.alloc(ids.Id, S * 256 * S);
         defer alloc.free(blocks);
         const metas = try alloc.alloc(u8, S * 256 * S);
         defer alloc.free(metas);
-        @memset(blocks, 0);
+        @memset(blocks, ids.air);
         @memset(metas, 0);
         for (0..S) |x| {
             for (0..S) |z| {
@@ -676,7 +677,7 @@ test "birch/spruce/swamp trees match JVM (seed 42)" {
                 while (wz < 16) : (wz += 1) {
                     const id = view.get(wx, wy, wz);
                     const m = view.getMeta(wx, wy, wz);
-                    crc = crc *% 31 +% @as(i64, id);
+                    crc = crc *% 31 +% @as(i64, wire.toWire(id)); // JVM goldens are wire ids
                     mcrc = mcrc *% 31 +% @as(i64, m);
                     if (id == ids.log) logs += 1;
                     if (id == ids.leaves) leaves += 1;
@@ -705,13 +706,13 @@ pub fn sandDisk(
     wx: i32,
     wy: i32,
     wz: i32,
-    mat: u16,
+    mat: ids.Id,
     b: i32,
 ) !bool {
     // Vanilla requires water material (`awt.h`) at base: disks are
     // underwater patches. Land views correctly place nothing.
     const base = view.get(wx, wy, wz);
-    if (base != 8 and base != 9) return false;
+    if (base != ids.flowing_water and base != ids.water) return false;
     const n4: i32 = try rand.nextIntBound(b - 2) + 2;
     const n5: i32 = 2;
     var x: i32 = wx - n4;
@@ -736,7 +737,7 @@ pub fn sandDisk(
 /// dirt/clay with clay. Base must be grass/dirt (material-h check).
 pub fn clayDisk(view: *View, rand: *java_random.JavaRandom, wx: i32, wy: i32, wz: i32) !bool {
     const base = view.get(wx, wy, wz);
-    if (base != 8 and base != 9) return false;
+    if (base != ids.flowing_water and base != ids.water) return false;
     const n4: i32 = try rand.nextIntBound(2) + 2;
     const n5: i32 = 1;
     var x: i32 = wx - n4;
@@ -949,7 +950,7 @@ pub fn populateOne(
 
 /// Standard ore loop (`aia.a` helper): `count` veins, x/z = base+nextInt16
 /// (no +8), y = nextInt(range)+min.
-fn oreVein(view: *View, rand: *java_random.JavaRandom, base_x: i32, base_z: i32, count: i32, ore: u16, size: i32, y_min: i32, y_max: i32) !void {
+fn oreVein(view: *View, rand: *java_random.JavaRandom, base_x: i32, base_z: i32, count: i32, ore: ids.Id, size: i32, y_min: i32, y_max: i32) !void {
     var i: i32 = 0;
     while (i < count) : (i += 1) {
         const nx: i32 = base_x + try rand.nextIntBound(16);
@@ -1043,11 +1044,11 @@ test "populateOne matches JVM (seed 42 chunk 0,0 forest)" {
     const alloc = std.testing.allocator;
     // 48x48 view, ox=-16 (matches harness). Terrain: stone<70, grass at 70.
     const S: usize = 48;
-    const blocks = try alloc.alloc(u16, S * 256 * S);
+    const blocks = try alloc.alloc(ids.Id, S * 256 * S);
     defer alloc.free(blocks);
     const metas = try alloc.alloc(u8, S * 256 * S);
     defer alloc.free(metas);
-    @memset(blocks, 0);
+    @memset(blocks, ids.air);
     @memset(metas, 0);
     for (0..S) |x| {
         for (0..S) |z| {
@@ -1074,25 +1075,25 @@ test "populateOne matches JVM (seed 42 chunk 0,0 forest)" {
             var wz: i32 = 0;
             while (wz < 16) : (wz += 1) {
                 const id = view.get(wx, wy, wz);
-                crc = crc *% 31 +% @as(i64, id);
-                if (id < 256) counts[id] += 1;
+                crc = crc *% 31 +% @as(i64, wire.toWire(id)); // JVM goldens are wire ids
+                counts[@intFromEnum(id)] += 1; // canonical block ids always < 256
             }
         }
     }
     // JVM golden (PopulateOne harness, forest, seed 42): trees place (5 logs,
     // 76 leaves). Our tree count currently differs (RNG/placement mismatch
     // under investigation) — log only, no assert yet.
-    std.debug.print("populate forest crc={d} stone={d} dirt={d} coal={d} logs={d} leaves={d}\n", .{ crc, counts[ids.stone], counts[ids.dirt], counts[ids.coal_ore], counts[ids.log], counts[ids.leaves] });
+    std.debug.print("populate forest crc={d} stone={d} dirt={d} coal={d} logs={d} leaves={d}\n", .{ crc, counts[@intFromEnum(ids.stone)], counts[@intFromEnum(ids.dirt)], counts[@intFromEnum(ids.coal_ore)], counts[@intFromEnum(ids.log)], counts[@intFromEnum(ids.leaves)] });
 }
 
 test "populateOne plains matches JVM (seed 42, no trees)" {
     const alloc = std.testing.allocator;
     const S: usize = 48;
-    const blocks = try alloc.alloc(u16, S * 256 * S);
+    const blocks = try alloc.alloc(ids.Id, S * 256 * S);
     defer alloc.free(blocks);
     const metas = try alloc.alloc(u8, S * 256 * S);
     defer alloc.free(metas);
-    @memset(blocks, 0);
+    @memset(blocks, ids.air);
     @memset(metas, 0);
     for (0..S) |x| {
         for (0..S) |z| {
@@ -1119,23 +1120,23 @@ test "populateOne plains matches JVM (seed 42, no trees)" {
             var wz: i32 = 0;
             while (wz < 16) : (wz += 1) {
                 const id = view.get(wx, wy, wz);
-                crc = crc *% 31 +% @as(i64, id);
-                if (id < 256) counts[id] += 1;
+                crc = crc *% 31 +% @as(i64, wire.toWire(id)); // JVM goldens are wire ids
+                counts[@intFromEnum(id)] += 1; // canonical block ids always < 256
             }
         }
     }
     // JVM golden (PopulatePlains harness).
-    std.debug.print("plains got crc={d} 0={d} 1={d} 2={d} 3={d} 13={d} 14={d} 15={d} 16={d} 56={d} 21={d} 73={d}\n", .{ crc, counts[0], counts[ids.stone], counts[ids.grass], counts[ids.dirt], counts[ids.gravel], counts[ids.gold_ore], counts[ids.iron_ore], counts[ids.coal_ore], counts[ids.diamond_ore], counts[ids.lapis_ore], counts[ids.redstone_ore] });
+    std.debug.print("plains got crc={d} 0={d} 1={d} 2={d} 3={d} 13={d} 14={d} 15={d} 16={d} 56={d} 21={d} 73={d}\n", .{ crc, counts[@intFromEnum(ids.air)], counts[@intFromEnum(ids.stone)], counts[@intFromEnum(ids.grass)], counts[@intFromEnum(ids.dirt)], counts[@intFromEnum(ids.gravel)], counts[@intFromEnum(ids.gold_ore)], counts[@intFromEnum(ids.iron_ore)], counts[@intFromEnum(ids.coal_ore)], counts[@intFromEnum(ids.diamond_ore)], counts[@intFromEnum(ids.lapis_ore)], counts[@intFromEnum(ids.redstone_ore)] });
     try std.testing.expectEqual(@as(i64, 7816887225398614724), crc);
-    try std.testing.expectEqual(@as(usize, 47360), counts[0]);
-    try std.testing.expectEqual(@as(usize, 17669), counts[ids.stone]);
-    try std.testing.expectEqual(@as(usize, 256), counts[ids.grass]);
-    try std.testing.expectEqual(@as(usize, 87), counts[ids.dirt]);
-    try std.testing.expectEqual(@as(usize, 19), counts[ids.gravel]);
-    try std.testing.expectEqual(@as(usize, 1), counts[ids.gold_ore]);
-    try std.testing.expectEqual(@as(usize, 34), counts[ids.iron_ore]);
-    try std.testing.expectEqual(@as(usize, 97), counts[ids.coal_ore]);
-    try std.testing.expectEqual(@as(usize, 13), counts[ids.redstone_ore]);
+    try std.testing.expectEqual(@as(usize, 47360), counts[@intFromEnum(ids.air)]);
+    try std.testing.expectEqual(@as(usize, 17669), counts[@intFromEnum(ids.stone)]);
+    try std.testing.expectEqual(@as(usize, 256), counts[@intFromEnum(ids.grass)]);
+    try std.testing.expectEqual(@as(usize, 87), counts[@intFromEnum(ids.dirt)]);
+    try std.testing.expectEqual(@as(usize, 19), counts[@intFromEnum(ids.gravel)]);
+    try std.testing.expectEqual(@as(usize, 1), counts[@intFromEnum(ids.gold_ore)]);
+    try std.testing.expectEqual(@as(usize, 34), counts[@intFromEnum(ids.iron_ore)]);
+    try std.testing.expectEqual(@as(usize, 97), counts[@intFromEnum(ids.coal_ore)]);
+    try std.testing.expectEqual(@as(usize, 13), counts[@intFromEnum(ids.redstone_ore)]);
 }
 
 

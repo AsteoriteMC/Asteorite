@@ -54,7 +54,7 @@ pub const ItemSnap = struct {
     x: f64,
     y: f64,
     z: f64,
-    item_id: u16,
+    item_id: ids.Id,
     count: i8,
     damage: i16,
     nbt: ?[]u8 = null,
@@ -466,7 +466,7 @@ test "pickup grants to inventory with collect + destroy" {
     try std.testing.expect(claims.contains(51));
     // main inventory first slot (9) got the diamonds
     try std.testing.expect(c.inv[9] != null);
-    try std.testing.expectEqual(@as(u16, 264), c.inv[9].?.id);
+    try std.testing.expectEqual(ids.diamond, c.inv[9].?.id);
     try std.testing.expectEqual(@as(i8, 3), c.inv[9].?.count);
     // outbox carries 0x2F set slot + 0x0D collect + 0x13 destroy, in order
     const out = try c.takeOutput();

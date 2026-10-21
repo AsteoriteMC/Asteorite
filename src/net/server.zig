@@ -37,6 +37,7 @@ const entity = @import("../sim/entity.zig");
 const v5gen = @import("../worldgen/v5/gen.zig");
 const v5serve = @import("../worldgen/v5/serve.zig");
 const game_ids = @import("../ids.zig");
+const wire = @import("../proto/v5/wire_ids.zig");
 
 /// Handshake/login must complete within this window (anti-slowloris).
 pub const login_timeout_ms: i64 = 30000;
@@ -661,10 +662,15 @@ pub const Server = struct {
         if (!Conn.validPlayerName(target)) {
             return "Usage: /give <player> <id> [count] [damage]";
         }
-        const id = std.fmt.parseInt(u16, toks[1], 10) catch {
+        const wire_id = std.fmt.parseInt(u16, toks[1], 10) catch {
             return "Usage: /give <player> <id> [count] [damage]";
         };
-        if (id == game_ids.air or id > 4095) {
+        // Wire ids map onto canonical ids; unassigned ranges (and air,
+        // which is only legal as an empty slot) are rejected like before.
+        const id = wire.fromWire(wire_id) orelse {
+            return "Usage: /give <player> <id> [count] [damage]";
+        };
+        if (id == game_ids.air) {
             return "Usage: /give <player> <id> [count] [damage]";
         }
         var count: i32 = 1;
@@ -723,7 +729,7 @@ pub const Server = struct {
         c.lock.unlock();
         const placed = count - remaining;
         if (remaining == 0) {
-            return std.fmt.bufPrint(out, "Gave {d}x{d} to {s}.", .{ placed, id, target }) catch "Gave items.";
+            return std.fmt.bufPrint(out, "Gave {d}x{d} to {s}.", .{ placed, wire_id, target }) catch "Gave items.";
         } else {
             return std.fmt.bufPrint(out, "Gave {d} of {d} (no space for {d}).", .{ placed, count, remaining }) catch "Gave items.";
         }
@@ -1395,7 +1401,7 @@ pub const Server = struct {
 
     /// Broadcast a 0x23 block change to viewers tracking the chunk
     /// (sent-set membership), excluding the originator.
-    pub fn broadcastBlockChange(self: *Server, exclude: ?*Conn, x: i32, y: u8, z: i32, id: u16, meta: u4) !void {
+    pub fn broadcastBlockChange(self: *Server, exclude: ?*Conn, x: i32, y: u8, z: i32, id: game_ids.Id, meta: u4) !void {
         var fb: [32]u8 = undefined;
         const f = try packets.frameBlockChange(x, y, z, id, meta, &fb);
         const key = Conn.sentKey(@divFloor(x, 16), @divFloor(z, 16));
@@ -1754,7 +1760,7 @@ pub const Server = struct {
     /// for player breaks, drawn anyway), then 3 position offsets
     /// (rand*0.7+0.15 per axis, CFR `aji`/`alo` drop path). Resting y is the
     /// first solid top + 0.125 (no per-tick physics in the 1Hz model).
-    fn spawnBreakDrops(self: *Server, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, x: i32, y: u8, z: i32, old_id: u16, old_meta: u4) void {
+    fn spawnBreakDrops(self: *Server, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, x: i32, y: u8, z: i32, old_id: game_ids.Id, old_meta: u4) void {
         self.rand_lock.lock();
         if (self.drop_rand == null) self.drop_rand = java_random.JavaRandom.init(self.drop_seed);
         var rng = self.drop_rand.?;
@@ -2830,7 +2836,7 @@ test "broadcastBlockChange/ArmSwing target sent-set viewers only" {
         try std.testing.expectEqual(@as(i32, 0x38), g.id);
     }
     // block change at (3,65,4) -> chunk (0,0): only alice
-    try srv.broadcastBlockChange(null, 3, 65, 4, 7, 0);
+    try srv.broadcastBlockChange(null, 3, 65, 4, game_ids.bedrock, 0);
     {
         const f = try readFrame(&arr.interface, &afb);
         try std.testing.expectEqual(@as(i32, 0x23), f.id);
@@ -3362,10 +3368,10 @@ test "player save/load roundtrip via pool (pos/health/inv/NBT)" {
     try std.testing.expectEqual(@as(i16, 17), c.food);
     try std.testing.expectEqual(@as(u8, 4), c.selected);
     try std.testing.expectEqual(@as(u8, 0), c.config.gamemode);
-    try std.testing.expectEqual(@as(u16, 276), c.inv[36].?.id);
+    try std.testing.expectEqual(game_ids.diamond_sword, c.inv[36].?.id);
     try std.testing.expectEqualSlices(u8, &tag, c.inv[36].?.nbt.?);
-    try std.testing.expectEqual(@as(u16, 1), c.inv[10].?.id);
-    try std.testing.expectEqual(@as(u16, 3), c.cursor.?.id);
+    try std.testing.expectEqual(game_ids.stone, c.inv[10].?.id);
+    try std.testing.expectEqual(game_ids.dirt, c.cursor.?.id);
     try std.testing.expectEqual(@as(i32, 8), c.config.spawn_x);
     // No save -> false. Corrupt row -> false (treated as fresh spawn).
     const c2 = try a.create(Conn);
@@ -3750,7 +3756,7 @@ test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
     // /give: 64 dirt to Bob (first empty main slot = 9).
     srv.handleCommand(alice, "/give BobG 1 64");
     {
-        try std.testing.expectEqual(@as(u16, 1), bob.inv[9].?.id);
+        try std.testing.expectEqual(game_ids.stone, bob.inv[9].?.id);
         try std.testing.expectEqual(@as(i8, 64), bob.inv[9].?.count);
         var fr = try Drain.run(bob);
         defer Drain.free(&fr);
@@ -3793,7 +3799,7 @@ test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
     srv.handleCommand(bob, "/give BobG 3 5");
     {
         // dirt merges into slot 9 (64/64 full) -> first empty slot 10.
-        try std.testing.expectEqual(@as(u16, 3), bob.inv[10].?.id);
+        try std.testing.expectEqual(game_ids.dirt, bob.inv[10].?.id);
         try std.testing.expectEqual(@as(i8, 5), bob.inv[10].?.count);
     }
     const _d3 = try readChat(bob);
@@ -3925,7 +3931,7 @@ test "furnace: take output moves stack to cursor + syncs" {
     f.output = .{ .id = game_ids.iron_ingot, .count = 3, .damage = 0, .nbt = null };
     srv.applyFurnaceClick(&conn, .{ .slot = 2, .button = 0, .action = 601, .mode = 0 });
     try std.testing.expect(conn.cursor != null);
-    try std.testing.expectEqual(@as(u16, 265), conn.cursor.?.id);
+    try std.testing.expectEqual(game_ids.iron_ingot, conn.cursor.?.id);
     try std.testing.expectEqual(@as(i8, 3), conn.cursor.?.count);
     try std.testing.expect(srv.findFurnace(2, 69, 0).?.output == null);
     const out = try conn.takeOutput();

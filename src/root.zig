@@ -46,10 +46,12 @@ pub const v5decor = @import("worldgen/v5/decor.zig");
 pub const v5carve = @import("worldgen/v5/carve.zig");
 /// Canonical item model (version-agnostic game data; wire codecs per proto).
 pub const item = @import("item.zig");
-/// Canonical 1.7.10 block + item numeric IDs (jar-extracted, single flat u16 space).
+/// Canonical block/item identity (interned indices; wire encodings live per proto version).
 pub const ids = @import("ids.zig");
 /// 1.7 slot wire codec over the canonical model (no game tables here).
 pub const v5slot = @import("proto/v5/slot.zig");
+/// 1.7.10 wire encodings for canonical ids (single source of truth for v5 conversion).
+pub const v5wire = @import("proto/v5/wire_ids.zig");
 /// Lock-free cross-region handoff queue.
 pub const mpsc = @import("sim/mpsc.zig");
 /// Deterministic 20 TPS region tick loop.
@@ -99,6 +101,7 @@ test {
     _ = @import("worldgen/v5/carve.zig");
     _ = @import("item.zig");
     _ = @import("ids.zig");
+    _ = @import("proto/v5/wire_ids.zig");
     _ = @import("proto/v5/slot.zig");
     _ = @import("sim/mpsc.zig");
     _ = @import("sim/tick.zig");

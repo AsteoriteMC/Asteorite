@@ -7,8 +7,8 @@
 
 const ids = @import("../ids.zig");
 
-pub const Cell = struct { id: u16, dmg: i16 };
-pub const Output = struct { id: u16, count: i8, dmg: i16 };
+pub const Cell = struct { id: ids.Id, dmg: i16 };
+pub const Output = struct { id: ids.Id, count: i8, dmg: i16 };
 pub const Recipe = union(enum) {
     shaped: struct { w: u8, h: u8, cells: [9]?Cell, out: Output, nbt_copy: bool },
     shapeless: struct { ins: [9]?Cell, n: u8, out: Output },

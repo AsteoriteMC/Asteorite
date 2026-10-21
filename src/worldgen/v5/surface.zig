@@ -44,7 +44,7 @@ pub const TempEval = struct {
 /// One column build (ahu.b body). blocks/meta are full 65536 arrays;
 /// lx,lz in 0..16; wx,wz world coords; bioId < 40 (mesa handled elsewhere).
 pub fn buildColumn(
-    blocks: *[65536]u16,
+    blocks: *[65536]ids.Id,
     meta: *[65536]u8,
     lx: usize,
     lz: usize,
@@ -56,9 +56,9 @@ pub fn buildColumn(
     temp_eval: *const TempEval,
 ) void {
     const stride: usize = 256;
-    var top: u16 = biome.TOP256[@as(usize, @intCast(bio_id))];
+    var top: ids.Id = biome.TOP256[@as(usize, @intCast(bio_id))];
     var top_meta: u8 = biome.TOPMETA256[@as(usize, @intCast(bio_id))];
-    var filler: u16 = biome.FILLER256[@as(usize, @intCast(bio_id))];
+    var filler: ids.Id = biome.FILLER256[@as(usize, @intCast(bio_id))];
     var filler_depth: i32 = -1;
     // NOTE: (int) truncation toward zero, not floor.
     const depth: i32 = @intFromFloat(stone_noise / 3.0 + 3.0 + rand.nextDouble() * 0.25);
@@ -216,7 +216,7 @@ pub const MesaState = struct {
 /// Mesa plateau column builder (ail.a). Bryce variant (id 165, aH) included;
 /// other ids run with aH=false. Top/filler are mesa sand/stained-clay.
 pub fn mesaBuildColumn(
-    blocks: *[65536]u16,
+    blocks: *[65536]ids.Id,
     meta: *[65536]u8,
     lx: usize,
     lz: usize,
@@ -242,9 +242,9 @@ pub fn mesaBuildColumn(
             d2 += 64.0;
         }
     }
-    var top: u16 = ids.sand;
+    var top: ids.Id = ids.sand;
     var top_meta: u8 = 1;
-    var filler: u16 = ids.stained_hardened_clay;
+    var filler: ids.Id = ids.stained_hardened_clay;
     var filler_depth: i32 = -1;
     // NOTE: method-scoped in vanilla (set in the surface block, read by
     // later subsurface rows of the same column).
@@ -284,10 +284,10 @@ pub fn mesaBuildColumn(
             if (y >= 62) {
                 if (has_forest_cap and y > 86 + depth * 2) {
                     if (bl) {
-                        blocks[idx] = 3;
+                        blocks[idx] = ids.dirt;
                         meta[idx] = 1;
                     } else {
-                        blocks[idx] = 2;
+                        blocks[idx] = ids.grass;
                     }
                     continue;
                 }

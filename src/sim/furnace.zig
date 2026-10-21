@@ -110,7 +110,7 @@ test "furnace: coal smelts iron on vanilla timing" {
     _ = tick(&s, &burn, &total, &cook);
     try std.testing.expectEqual(@as(u32, 0), cook);
     try std.testing.expect(s.output != null);
-    try std.testing.expectEqual(@as(u16, 265), s.output.?.id);
+    try std.testing.expectEqual(ids.iron_ingot, s.output.?.id);
     try std.testing.expect(s.input == null);
     // burn keeps ticking down 20/tick (9 decrements over 10 ticks: tick 1
     // consumes fuel with no decrement since burn started at 0)
@@ -149,5 +149,5 @@ test "furnace: no fuel/input/output-full stalls, lava bucket leaves bucket" {
     _ = tick(&s, &burn, &total, &cook);
     try std.testing.expectEqual(@as(u32, 20000), burn);
     try std.testing.expect(s.fuel != null);
-    try std.testing.expectEqual(@as(u16, 325), s.fuel.?.id);
+    try std.testing.expectEqual(ids.bucket, s.fuel.?.id);
 }

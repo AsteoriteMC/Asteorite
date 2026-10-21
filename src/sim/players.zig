@@ -13,7 +13,7 @@
 //! for load (login path is single-threaded per conn). Durability comes
 //! from the WAL (kill -9 safe); `save-all`/stop/periodic flush SSTs.
 //!
-//! Format (versioned binary, "ZPLR"+1): fixed-size scalars big-endian,
+//! Format (versioned binary, "ZPLR"+3): fixed-size scalars big-endian,
 //! NBT stored verbatim (opaque, length-prefixed, -1 = none — same
 //! convention as the 1.7 slot wire format). Decode rejects truncated,
 //! overlong, version-skewed, and username-mismatched payloads.
@@ -24,11 +24,12 @@ const shard_mod = @import("../world/shard.zig");
 const item_mod = @import("../item.zig");
 const nbt_mod = @import("../world/nbt.zig");
 const ids = @import("../ids.zig");
+const wire = @import("../proto/v5/wire_ids.zig");
 
 pub const player_dim: u8 = 255;
 pub const magic = "ZPLR";
 /// v2 adds trailing gamemode (v1 rows decode with gamemode defaulting to 1).
-pub const version: u8 = 2;
+pub const version: u8 = 3;
 pub const inv_size = 45;
 
 pub const Data = struct {
@@ -135,7 +136,7 @@ fn writeSlot(out: []u8, i: usize, s: ?item_mod.Stack) usize {
     };
     out[j] = 1;
     j += 1;
-    std.mem.writeInt(u16, out[j..][0..2], st.id, .big);
+    std.mem.writeInt(u16, out[j..][0..2], wire.toWire(st.id), .big);
     j += 2;
     out[j] = @bitCast(st.count);
     j += 1;
@@ -169,7 +170,9 @@ pub fn decode(alloc: std.mem.Allocator, bytes: []const u8, expect_username: []co
     }.run;
     if (!std.mem.eql(u8, try take(&r, 4), magic)) return error.CorruptPlayer;
     const ver = (try take(&r, 1))[0];
-    if (ver != 1 and ver != version) return error.CorruptPlayer;
+    // v1/v2 stored wire ids; v3+ stores canonical ids. No migration path:
+    // reimport from Anvil/vanilla player.dat instead (same rule as ZC1).
+    if (ver != version) return error.CorruptPlayer;
     const ulen: usize = (try take(&r, 1))[0];
     if (ulen == 0 or ulen > 16) return error.CorruptPlayer;
     const uname = try take(&r, ulen);
@@ -196,10 +199,6 @@ pub fn decode(alloc: std.mem.Allocator, bytes: []const u8, expect_username: []co
     if (!std.math.isFinite(d.saturation) or d.saturation < 0) return error.CorruptPlayer;
     for (&d.inv) |*s| s.* = try readSlot(alloc, &r, take);
     d.cursor = try readSlot(alloc, &r, take);
-    if (ver == 1) {
-        if (r.len != 0) return error.CorruptPlayer;
-        return d; // gamemode stays at the v1 default (creative)
-    }
     d.gamemode = (try take(&r, 1))[0];
     if (d.gamemode > 1) return error.CorruptPlayer;
     if (r.len != 0) return error.CorruptPlayer;
@@ -208,12 +207,14 @@ pub fn decode(alloc: std.mem.Allocator, bytes: []const u8, expect_username: []co
 
 fn readSlot(alloc: std.mem.Allocator, r: *[]const u8, take: fn (*[]const u8, usize) LoadError![]const u8) (LoadError || std.mem.Allocator.Error)!?item_mod.Stack {
     if ((try take(r, 1))[0] == 0) return null;
-    const id = std.mem.readInt(u16, (try take(r, 2))[0..2], .big);
+    const wire_id = std.mem.readInt(u16, (try take(r, 2))[0..2], .big);
     const count: i8 = @bitCast((try take(r, 1))[0]);
     const damage = std.mem.readInt(i16, (try take(r, 2))[0..2], .big);
     const nlen = std.mem.readInt(i32, (try take(r, 4))[0..4], .big);
     if (nlen < -1) return error.CorruptPlayer;
     // id 0 is air: only legal as an empty slot, never as a stack.
+    // Anything else must map to the canonical registry.
+    const id = wire.fromWire(wire_id) orelse return error.CorruptPlayer;
     if (id == ids.air) return error.CorruptPlayer;
     if (nlen == -1) return .{ .id = id, .count = count, .damage = damage, .nbt = null };
     if (nlen > 1024 * 1024) return error.CorruptPlayer;
@@ -284,7 +285,7 @@ test "player roundtrip incl NBT, cursor, selected, spawn" {
     try std.testing.expect(back.inv[0] == null);
 }
 
-test "player v1 rows decode with gamemode default" {
+test "player v1/v2 rows are rejected (wire ids, not canonical)" {
     const a = std.testing.allocator;
     var d = Data{};
     @memcpy(d.username[0.."Al".len], "Al");
@@ -297,10 +298,25 @@ test "player v1 rows decode with gamemode default" {
     defer a.free(v1);
     @memcpy(v1, enc[0 .. enc.len - 1]);
     v1[4] = 1;
-    var back = try decode(a, v1, "Al");
-    defer freeData(a, &back);
-    try std.testing.expectEqual(@as(u8, 1), back.gamemode);
-    // v2 garbage gamemode rejected (2 = neither survival nor creative).
+    var r_v1 = decode(a, v1, "Al");
+    if (r_v1) |*b| {
+        freeData(a, b);
+        try std.testing.expect(false);
+    } else |err| {
+        try std.testing.expect(err == error.CorruptPlayer);
+    }
+    // v2 payloads (also wire ids) are rejected too.
+    const v2 = try a.dupe(u8, enc);
+    defer a.free(v2);
+    v2[4] = 2;
+    var r_v2 = decode(a, v2, "Al");
+    if (r_v2) |*b| {
+        freeData(a, b);
+        try std.testing.expect(false);
+    } else |err| {
+        try std.testing.expect(err == error.CorruptPlayer);
+    }
+    // garbage gamemode rejected (7 = neither survival nor creative).
     const bad = try a.dupe(u8, enc);
     defer a.free(bad);
     bad[bad.len - 1] = 7;
@@ -608,6 +624,11 @@ fn readVanillaInventory(alloc: std.mem.Allocator, r: *nbt_mod.Reader, outer: nbt
             stats.dropped_stacks += 1;
             continue;
         }
+        // Vanilla wire id -> canonical; unmapped ids are dropped, not stored.
+        const canon = wire.fromWire(@intCast(@max(id, 0))) orelse {
+            stats.dropped_stacks += 1;
+            continue;
+        };
         const dst: ?usize = if (s < 9) @as(usize, 36 + s) else if (s < 36) @as(usize, s) else if (s >= 100 and s < 104) @as(usize, 5 + (s - 100)) else null;
         const di = dst orelse {
             stats.unknown_slots += 1;
@@ -615,7 +636,7 @@ fn readVanillaInventory(alloc: std.mem.Allocator, r: *nbt_mod.Reader, outer: nbt
         };
         // Duplicate slots in one file: last wins (vanilla overwrites too).
         item_mod.freeStack(alloc, &d.inv[di]);
-        d.inv[di] = .{ .id = @intCast(id), .count = count, .damage = damage, .nbt = nbt };
+        d.inv[di] = .{ .id = canon, .count = count, .damage = damage, .nbt = nbt };
         nbt = null; // owned by the slot now
     }
 }
@@ -651,13 +672,13 @@ test "vanilla player.dat golden (official 1.7.10 server)" {
     try std.testing.expectEqual(@as(i32, 69), d.spawn_y);
     try std.testing.expectEqual(@as(i32, 250), d.spawn_z);
     // stone in hotbar slot 0 -> window 36
-    try std.testing.expectEqual(@as(u16, 1), d.inv[36].?.id);
+    try std.testing.expectEqual(ids.stone, d.inv[36].?.id);
     try std.testing.expectEqual(@as(i8, 64), d.inv[36].?.count);
     try std.testing.expectEqual(@as(i16, 0), d.inv[36].?.damage);
     try std.testing.expect(d.inv[36].?.nbt == null);
     // renamed sword keeps its tag bytes verbatim (NBT round-trips opaque)
     const sword = d.inv[37].?;
-    try std.testing.expectEqual(@as(u16, 276), sword.id);
+    try std.testing.expectEqual(ids.diamond_sword, sword.id);
     try std.testing.expectEqual(@as(i8, 1), sword.count);
     const want_tag = [_]u8{ 0x0A, 0x00, 0x07, 'd', 'i', 's', 'p', 'l', 'a', 'y', 0x08, 0x00, 0x04, 'N', 'a', 'm', 'e', 0x00, 0x02, 'H', 'i', 0x00, 0x00 };
     try std.testing.expectEqualSlices(u8, &want_tag, sword.nbt.?);

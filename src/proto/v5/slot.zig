@@ -9,10 +9,11 @@ const std = @import("std");
 const codec = @import("../../net/codec.zig");
 const item = @import("../../item.zig");
 const ids = @import("../../ids.zig");
+const wire = @import("wire_ids.zig");
 
 /// Read one slot. NBT bytes are borrowed from the reader buffer (dupe via
 /// `item.cloneStack` before storing past the current frame). Zero-length NBT
-/// normalizes to null (no tag).
+/// normalizes to null (no tag). Unknown wire ids fail closed as empty slots.
 pub fn readSlot(r: *codec.PacketReader) codec.CodecError!?item.Stack {
     const id = try r.readShort();
     if (id == -1) return null;
@@ -21,16 +22,18 @@ pub fn readSlot(r: *codec.PacketReader) codec.CodecError!?item.Stack {
     const nbt_len = try r.readShort();
     if (nbt_len < -1) return error.InvalidLength;
     const nbt: ?[]const u8 = if (nbt_len > 0) try r.readBytes(@intCast(nbt_len)) else null;
-    return .{ .id = @as(u16, @bitCast(id)), .count = count, .damage = damage, .nbt = nbt };
+    const canon = wire.fromWire(@as(u16, @bitCast(id))) orelse return null;
+    return .{ .id = canon, .count = count, .damage = damage, .nbt = nbt };
 }
 
 /// Write one slot (NBT bytes verbatim, including empty; null NBT -> -1).
+/// Converts canonical ids back to v5 wire ids.
 pub fn writeSlot(w: *codec.PacketWriter, s: ?item.Stack) codec.CodecError!void {
     const st = s orelse {
         try w.writeShort(-1);
         return;
     };
-    try w.writeShort(@as(i16, @bitCast(st.id)));
+    try w.writeShort(@as(i16, @bitCast(wire.toWire(st.id))));
     try w.writeByte(@as(u8, @bitCast(st.count)));
     try w.writeShort(st.damage);
     if (st.nbt) |n| {

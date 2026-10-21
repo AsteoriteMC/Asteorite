@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const zigcraft = @import("zigcraft");
+const wire = zigcraft.v5wire;
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -51,15 +52,17 @@ pub fn main(init: std.process.Init) !void {
     );
     for (data.inv, 0..) |slot, i| {
         if (slot) |st| {
+            // Operator-facing: wire ids match /give and vanilla tools; canonical indices are internal.
+            const wid = wire.toWire(st.id);
             if (st.nbt) |n| {
-                try out.print("  slot {d}: id={d} count={d} dmg={d} nbt={d}B\n", .{ i, st.id, st.count, st.damage, n.len });
+                try out.print("  slot {d}: id={d} count={d} dmg={d} nbt={d}B\n", .{ i, wid, st.count, st.damage, n.len });
             } else {
-                try out.print("  slot {d}: id={d} count={d} dmg={d}\n", .{ i, st.id, st.count, st.damage });
+                try out.print("  slot {d}: id={d} count={d} dmg={d}\n", .{ i, wid, st.count, st.damage });
             }
         }
     }
     if (data.cursor) |c| {
-        try out.print("  cursor: id={d} count={d} dmg={d}", .{ c.id, c.count, c.damage });
+        try out.print("  cursor: id={d} count={d} dmg={d}", .{ wire.toWire(c.id), c.count, c.damage });
         if (c.nbt) |n| try out.print(" nbt={d}B", .{n.len});
         try out.print("\n", .{});
     }

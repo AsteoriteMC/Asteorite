@@ -1,12 +1,13 @@
 //! Canonical item model: version-agnostic game data + per-version wire codecs.
 //!
-//! Shape rule (Phase I readiness): game logic speaks `Stack` (numeric id +
+//! Shape rule (Phase I readiness): game logic speaks `Stack` (canonical id +
 //! count + damage + opaque NBT). Wire formats live in exactly one place per
 //! protocol version (`proto/v5/slot.zig`, later `proto/v340/...`) and convert
 //! to/from `Stack`. No gameplay code may touch wire bytes directly, and no
 //! version adapter may duplicate game tables (damage values, stack limits).
-//! Numeric ids are the 1.7-era canonical space; a future `namespace:id`
-//! registry maps onto them at the version boundary (Phase I2), not here.
+//! Canonical ids are dense indices into the `ids` registry (NOT wire values;
+//! see `proto/v5/wire_ids.zig` for the v5 mapping): never persist or compare
+//! them against wire ranges.
 
 const std = @import("std");
 const ids = @import("ids.zig");
@@ -15,7 +16,7 @@ const ids = @import("ids.zig");
 /// blob, WITHOUT the length prefix) borrowed from the packet body — or owned
 /// (see `clone`/`free`) when stored past the current frame.
 pub const Stack = struct {
-    id: u16,
+    id: ids.Id,
     count: i8,
     damage: i16,
     nbt: ?[]const u8,
@@ -61,14 +62,23 @@ pub fn canMerge(dst: Stack, src: Stack) bool {
 /// small throwables/utility to 16; everything else 64.
 /// Approximation boundary: exotic 16-stacks beyond this table fall back to
 /// 64 (documented; datapack-driven limits are Phase H3/F follow-ups).
-pub fn maxStackSize(id: u16) u8 {
+pub fn maxStackSize(id: ids.Id) u8 {
     // Swords.
     if (id == ids.iron_sword or id == ids.wooden_sword or id == ids.stone_sword or id == ids.diamond_sword or id == ids.golden_sword) return 1;
-    // Tools: shovels 269/273/256/277/284, pickaxes 270/274/257/278/285,
-    // axes 271/275/258/279/286, hoes 290-294, flint&steel 259, shears 359.
-    if ((id >= 256 and id <= 259) or (id >= 269 and id <= 279) or (id >= 283 and id <= 286) or (id >= 290 and id <= 294) or id == ids.shears) return 1;
-    // Armor 298-317, bow 261, fishing rod 346, filled buckets.
-    if ((id >= 298 and id <= 317) or id == ids.bow or id == ids.fishing_rod or id == ids.water_bucket or id == ids.lava_bucket or id == ids.milk_bucket) return 1;
+    // Tools: shovels, pickaxes, axes, hoes, flint&steel, shears (explicit:
+    // canonical ids are dense, so the old wire ranges no longer work).
+    if (id == ids.wooden_shovel or id == ids.stone_shovel or id == ids.iron_shovel or id == ids.diamond_shovel or id == ids.golden_shovel) return 1;
+    if (id == ids.wooden_pickaxe or id == ids.stone_pickaxe or id == ids.iron_pickaxe or id == ids.diamond_pickaxe or id == ids.golden_pickaxe) return 1;
+    if (id == ids.wooden_axe or id == ids.stone_axe or id == ids.iron_axe or id == ids.diamond_axe or id == ids.golden_axe) return 1;
+    if (id == ids.wooden_hoe or id == ids.stone_hoe or id == ids.iron_hoe or id == ids.diamond_hoe or id == ids.golden_hoe) return 1;
+    if (id == ids.flint_and_steel or id == ids.shears) return 1;
+    // Armor, bow, fishing rod, filled buckets.
+    if (id == ids.leather_helmet or id == ids.leather_chestplate or id == ids.leather_leggings or id == ids.leather_boots) return 1;
+    if (id == ids.chainmail_helmet or id == ids.chainmail_chestplate or id == ids.chainmail_leggings or id == ids.chainmail_boots) return 1;
+    if (id == ids.iron_helmet or id == ids.iron_chestplate or id == ids.iron_leggings or id == ids.iron_boots) return 1;
+    if (id == ids.diamond_helmet or id == ids.diamond_chestplate or id == ids.diamond_leggings or id == ids.diamond_boots) return 1;
+    if (id == ids.golden_helmet or id == ids.golden_chestplate or id == ids.golden_leggings or id == ids.golden_boots) return 1;
+    if (id == ids.bow or id == ids.fishing_rod or id == ids.water_bucket or id == ids.lava_bucket or id == ids.milk_bucket) return 1;
     if (id == ids.bucket) return 16; // empty bucket
     // Small throwables / utility.
     if (id == ids.snowball or id == ids.egg or id == ids.ender_pearl or id == ids.sign) return 16; // snowball/egg/ender pearl/sign
@@ -80,7 +90,7 @@ pub fn maxStackSize(id: u16) u8 {
 /// skipped on placement, so sharpness can't apply; documented in conn.zig).
 /// Swords 4-7, axes 3-6, pickaxes 2-5, shovels 1-4, everything else 1.
 /// Single source of truth: combat (conn.zig) and future versions import this.
-pub fn meleeDamage(id: u16) f32 {
+pub fn meleeDamage(id: ids.Id) f32 {
     return switch (id) {
         ids.wooden_sword, ids.golden_sword => 4.0, // wooden/gold sword
         ids.stone_sword => 5.0, // stone sword
@@ -109,7 +119,7 @@ test "melee damage table" {
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), meleeDamage(ids.iron_shovel), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), meleeDamage(ids.stone), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), meleeDamage(ids.air), 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), meleeDamage(9999), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), meleeDamage(@as(ids.Id, @enumFromInt(9999))), 1e-6);
 }
 
 test "stack limits" {

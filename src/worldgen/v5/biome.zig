@@ -196,8 +196,8 @@ pub const TEMP_F: [40]f32 = .{
 /// Extended surface tables (BiomeAll2 probe, hex exact).
 /// Covers mutated (+128) ids; unregistered slots fall back to plains.
 /// TOP/FILLER hold 1.7 numeric block ids (0 = air/null top).
-pub const TOP256: [256]u16 = blk: {
-    var t: [256]u16 = .{ids.grass} ** 256;
+pub const TOP256: [256]ids.Id = blk: {
+    var t: [256]ids.Id = .{ids.grass} ** 256;
     t[0] = ids.grass;
     t[1] = ids.grass;
     t[2] = ids.sand;
@@ -271,8 +271,8 @@ pub const TOPMETA256: [256]u8 = blk: {
     t[167] = 1;
     break :blk t;
 };
-pub const FILLER256: [256]u16 = blk: {
-    var t: [256]u16 = .{ids.dirt} ** 256;
+pub const FILLER256: [256]ids.Id = blk: {
+    var t: [256]ids.Id = .{ids.dirt} ** 256;
     t[0] = ids.dirt;
     t[1] = ids.dirt;
     t[2] = ids.sand;

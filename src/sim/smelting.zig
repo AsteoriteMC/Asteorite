@@ -13,7 +13,7 @@ const ids = @import("../ids.zig");
 pub const WILD: i16 = 32767;
 
 /// Smelting result for an input stack (first table match wins, like vanilla).
-pub fn findResult(id: u16, dmg: i16) ?struct { id: u16, count: i8, dmg: i16 } {
+pub fn findResult(id: ids.Id, dmg: i16) ?struct { id: ids.Id, count: i8, dmg: i16 } {
     for (data.table) |r| {
         if (r.in_id != id) continue;
         if (r.in_dmg != WILD and r.in_dmg != dmg) continue;
@@ -23,37 +23,37 @@ pub fn findResult(id: u16, dmg: i16) ?struct { id: u16, count: i8, dmg: i16 } {
 }
 
 /// Burn time in ticks (0 = not fuel). Order: explicit table, then wood blocks.
-pub fn burnTime(id: u16) u16 {
+pub fn burnTime(id: ids.Id) u16 {
     for (data.fuels) |f| if (f.id == id) return f.burn;
     for (data.wood_blocks) |w| if (w == id) return 300;
     return 0;
 }
 
 /// Container left after burning one fuel item (lava bucket -> empty bucket).
-pub fn containerItem(id: u16) ?u16 {
+pub fn containerItem(id: ids.Id) ?ids.Id {
     if (id == ids.lava_bucket) return ids.bucket; // lava_bucket -> bucket
     return null;
 }
 
 test "smelting table spot checks" {
     // iron/gold/diamond ore (wildcard damage)
-    try std.testing.expectEqual(@as(u16, ids.iron_ingot), findResult(ids.iron_ore, 3).?.id);
-    try std.testing.expectEqual(@as(u16, ids.gold_ingot), findResult(ids.gold_ore, 0).?.id);
-    try std.testing.expectEqual(@as(u16, ids.diamond), findResult(ids.diamond_ore, 0).?.id);
+    try std.testing.expectEqual(ids.iron_ingot, findResult(ids.iron_ore, 3).?.id);
+    try std.testing.expectEqual(ids.gold_ingot, findResult(ids.gold_ore, 0).?.id);
+    try std.testing.expectEqual(ids.diamond, findResult(ids.diamond_ore, 0).?.id);
     // sand glass / cobble stone / clay hardened
-    try std.testing.expectEqual(@as(u16, ids.glass), findResult(ids.sand, 0).?.id);
-    try std.testing.expectEqual(@as(u16, ids.stone), findResult(ids.cobblestone, 0).?.id);
-    try std.testing.expectEqual(@as(u16, ids.hardened_clay), findResult(ids.clay, 0).?.id);
+    try std.testing.expectEqual(ids.glass, findResult(ids.sand, 0).?.id);
+    try std.testing.expectEqual(ids.stone, findResult(ids.cobblestone, 0).?.id);
+    try std.testing.expectEqual(ids.hardened_clay, findResult(ids.clay, 0).?.id);
     // charcoal from either log
     try std.testing.expectEqual(@as(i16, 1), findResult(ids.log2, 2).?.dmg);
     // fish keep damage
     try std.testing.expectEqual(@as(i16, 1), findResult(ids.fish, 1).?.dmg);
     // lapis ore -> dye/4; redstone dust; quartz
     try std.testing.expectEqual(@as(i16, 4), findResult(ids.lapis_ore, 0).?.dmg);
-    try std.testing.expectEqual(@as(u16, ids.redstone), findResult(ids.redstone_ore, 0).?.id);
+    try std.testing.expectEqual(ids.redstone, findResult(ids.redstone_ore, 0).?.id);
     // cactus green, clay ball brick, porkchop cooked
-    try std.testing.expectEqual(@as(u16, ids.brick), findResult(ids.clay_ball, 0).?.id);
-    try std.testing.expectEqual(@as(u16, ids.cooked_porkchop), findResult(ids.porkchop, 0).?.id);
+    try std.testing.expectEqual(ids.brick, findResult(ids.clay_ball, 0).?.id);
+    try std.testing.expectEqual(ids.cooked_porkchop, findResult(ids.porkchop, 0).?.id);
     // no match
     try std.testing.expect(findResult(ids.stone, 0) == null);
     try std.testing.expect(findResult(ids.planks, 0) == null);
