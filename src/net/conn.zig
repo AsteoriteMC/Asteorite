@@ -213,6 +213,8 @@ pub const Conn = struct {
     chunks_dirty: bool = false,
     /// Respawn: unload everything first, then full re-burst.
     force_resync: bool = false,
+    /// Last observed background-gen sequence (async gen follow-up below).
+    last_gen_seq: u64 = 0,
     /// From Client Settings 0x15 (unclamped); effective radius = min(this, server max).
     client_view: ?u8 = null,
     /// Per-viewer entity visibility (ticker writes under conn.lock).

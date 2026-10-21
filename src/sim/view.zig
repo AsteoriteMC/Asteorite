@@ -117,9 +117,10 @@ pub fn sendColumns(
     }
 }
 
-/// Send all stored columns around (cx,cz) in spiral order, batched into bulk
-/// packets, then queue PlayerPosLook. Missing columns are skipped.
-pub fn completeLogin(
+/// Send the stored columns of the view disk around (cx,cz) in spiral order
+/// (batched into bulk packets). Holes are skipped (async gen fills them;
+/// serveConn retries when the pool sequence advances).
+pub fn resyncDisk(
     conn: *conn_mod.Conn,
     source: ?Source,
     dim: u8,
@@ -138,6 +139,20 @@ pub fn completeLogin(
         }
         try sendColumns(conn, src, dim, list[0..n], sky);
     }
+}
+
+/// Send all stored columns around (cx,cz) in spiral order, batched into bulk
+/// packets, then queue PlayerPosLook. Missing columns are skipped.
+pub fn completeLogin(
+    conn: *conn_mod.Conn,
+    source: ?Source,
+    dim: u8,
+    cx: i32,
+    cz: i32,
+    radius: u8,
+    sky: bool,
+) !void {
+    try resyncDisk(conn, source, dim, cx, cz, radius, sky);
     try conn.queuePlayerPosLook();
     conn.sent_center = .{ .cx = cx, .cz = cz };
     conn.baseline_sent = true;

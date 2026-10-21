@@ -229,8 +229,9 @@ Worldgen version follows the world's version, not the client's (ties to Phase I)
 ### H2. 1.7.10 generator (v5 — fills today's void holes)
 
 - [~] `src/worldgen/v5/`: GenLayer chain ✅ + hill noise ✅ + density ✅ + fill ✅ + surface ✅ (base + mesa plateau w/ Bryce) + cave ✅ + ravine ✅ carvers + ores ✅ / trees ✅ decorators — all JVM-verified per-stage incl. 10 full-pipeline chunks (terrain+carve bit-exact); decorator positions differ from vanilla (structures/lakes/dungeons skipped, documented) but shapes/counts/distributions are vanilla-exact via JVM goldens
-- [x] Chunk gen as background-capable job writing ZC1 into the pool (sync on-demand first, never on the 50ms path by construction of the source seam); spawn pre-gen on boot (`--seed` + `--gen-spawn N`); land-spawn search; live-verified over TCP (dedicated background gen thread is the follow-up)
-- [~] Acceptance: fresh DB → login shows terrain ✅, F3 biomes sane ✅ (voronoi biomes on the wire), same-seed parity ✅ per-stage (biomes, density, fill, surface, carve, full-pipeline bit-exact); ores ✅ / trees ✅ present (live-verified: 249-353 ore blocks/chunk, logs+leaves in forest chunks); decorator positions differ from vanilla (documented approximation, structures/lakes/dungeons are future work)
+- [x] Chunk gen as background worker pool (`src/worldgen/v5/genpool.zig`): per-worker private `Gen` (chain state isn't shareable), compute lock-free + recheck/store under the world lock; serve threads never generate inline — misses enqueue + serve holes, retry when the pool sequence advances; `--gen-workers N` (default all cores, cap 16); boot `preGen` fans out + drains (81 chunks: 8.9s serial → 2.3s on 4 workers, Debug build). Live-verified over TCP
+- [ ] CPU light propagation (vanilla BFS reference — the current `gen.zig` skylight is a 15/0 column stub and block light is never written, so clients see a binary lightmap and caves are pitch black): skylight flood fill from the surface with vanilla opacity/attenuation (not the 15/0 column hack), block-light BFS from emissives (lava/glowstone/torches/furnace-lit) with vanilla emission tables; incremental relight on the `view.applyBlock` path (never a full re-flood per edit). Must stay scalar — branchy BFS like noise sampling, same H5 rule; GPU (G2 light passes) only after the CPU reference proves out with goldens
+- [~] Acceptance: fresh DB → login shows terrain ✅, F3 biomes sane ✅ (voronoi biomes on the wire), same-seed parity ✅ per-stage (biomes, density, fill, surface, carve, full-pipeline bit-exact); ores ✅ / trees ✅ present (live-verified: 249-353 ore blocks/chunk, logs+leaves in forest chunks); decorator positions differ from vanilla (documented approximation, structures/lakes/dungeons are future work); lighting stubbed (sky 15/0 column, block light zero — see light item above); boot pre-gen parallelized (81 chunks 8.9s → 2.3s on 4 workers, Debug), serve path never blocks on gen (holes + sequence-gated retry); lighting stubbed (sky 15/0 column, block light zero — see light item above)
 
 ### H3. Data overlay: custom packs (Terralith / JJThunder-class terrain)
 
@@ -253,7 +254,7 @@ column-major gen buffers matching ZC1 layout (no transpose), LUTs for fixed tabl
 SIMD only for the safe parts (surface-rule application across column batches,
 density-field thresholding) — never inside noise sampling.
 
-- [ ] Parallel fan-out across Phase C region threads, prioritized by viewer distance; LRU of shaped-but-undecorated columns for neighbor reads
+- [~] Parallel fan-out: dedicated gen worker pool done (`--gen-workers`, per-worker `Gen`, FIFO + dedup, completion-sequence retries); still to do: Phase C region-thread fan-out, true viewer-distance priority (FIFO preserves per-conn spiral order only), LRU of shaped-but-undecorated columns for neighbor reads
 - [ ] Gen once → LSM/ZC1, never regenerate (cache is the primary optimization)
 - [ ] GPU plugs in at exactly one stage: density-field computation as a Phase G noise job (G1/G2/G3)
 - [ ] Acceptance: gen ms/chunk (CPU, per backend where present) checked in; background gen never blocks a tick (tick p99 unchanged with gen storm running)

@@ -36,6 +36,7 @@ const ids = @import("../proto/v5/ids.zig");
 const entity = @import("../sim/entity.zig");
 const v5gen = @import("../worldgen/v5/gen.zig");
 const v5serve = @import("../worldgen/v5/serve.zig");
+const v5genpool = @import("../worldgen/v5/genpool.zig");
 const game_ids = @import("../ids.zig");
 const wire = @import("../proto/v5/wire_ids.zig");
 
@@ -61,6 +62,9 @@ pub const Server = struct {
     gen: ?*v5gen.Gen = null,
     /// Gen-aware source state (ctx for view.Source). Set alongside gen.
     gen_src: ?v5serve.GenSource = null,
+    /// Background generation workers (null = sync legacy path in GenSource).
+    /// Borrowed; must outlive the server (owned by main).
+    gen_pool: ?*v5genpool.GenPool = null,
     view_distance: u8 = 4,
     /// Allocator for the registry list. Set by serveForever/tests.
     gpa: std.mem.Allocator = undefined,
@@ -2468,6 +2472,23 @@ pub fn serveConn(
             } else {
                 conn.chunks_dirty = false;
                 conn.force_resync = false;
+            }
+        }
+        // Async gen follow-up: holes requested earlier may have landed on
+        // worker threads since. Gated on the pool sequence so the idle case
+        // costs one atomic load; sent columns skip before any store read,
+        // and still-missing columns re-request (deduped) for the next bump.
+        if (server.world) |pool| {
+            if (server.gen_pool) |gp| {
+                if (conn.baseline_sent) {
+                    const s = gp.sequence();
+                    if (s != conn.last_gen_seq) {
+                        conn.last_gen_seq = s;
+                        const radius: u8 = @min(conn.client_view orelse server.view_distance, server.view_distance);
+                        const cc = conn.playerChunk();
+                        try view.resyncDisk(conn, server.chunkSource(pool), 0, cc.cx, cc.cz, radius, true);
+                    }
+                }
             }
         }
         const pending = try conn.takeOutput();

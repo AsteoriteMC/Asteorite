@@ -20,6 +20,7 @@ pub fn main(init: std.process.Init) !void {
         defer ops.deinit(arena);
         var rcon_password: ?[]const u8 = null;
         var rcon_port: u16 = 25575;
+        var gen_workers: ?usize = null;
         var i: usize = 2;
         while (i < args.len) : (i += 1) {
             const a = args[i];
@@ -41,6 +42,10 @@ pub fn main(init: std.process.Init) !void {
                 i += 1;
                 if (i >= args.len) return error.MissingGenSpawn;
                 gen_spawn = try std.fmt.parseInt(i32, args[i], 10);
+            } else if (std.mem.eql(u8, a, "--gen-workers")) {
+                i += 1;
+                if (i >= args.len) return error.MissingGenWorkers;
+                gen_workers = try std.fmt.parseInt(usize, args[i], 10);
             } else if (std.mem.eql(u8, a, "--op")) {
                 i += 1;
                 if (i >= args.len) return error.MissingOpName;
@@ -87,12 +92,28 @@ pub fn main(init: std.process.Init) !void {
             gen = try zigcraft.v5gen.Gen.init(arena, s, false, false);
             srv.gen = &gen.?;
             srv.gen_src = .{ .pool = pool.?, .gen = &gen.?, .lock = &srv.world_lock };
+            // Background gen workers: misses enqueue + serve holes instead
+            // of blocking the serve thread (~105ms/chunk sync). Each worker
+            // owns a private Gen (chain state isn't shareable); default to
+            // all cores, capped until contention is measured (H5).
+            const cpus = std.Thread.getCpuCount() catch 4;
+            const n_workers = @min(@max(gen_workers orelse cpus, 1), 16);
+            const gp = try zigcraft.v5genpool.GenPool.create(arena, io, pool.?, &srv.world_lock, s, false, false, n_workers);
+            srv.gen_pool = gp;
+            srv.gen_src.?.gen_pool = gp;
+            try w.print("gen: {d} background workers\n", .{n_workers});
         } else if (gen_spawn != null) {
             return error.GenSpawnNeedsSeed;
         }
+        defer if (srv.gen_pool) |gp| {
+            gp.destroy();
+            arena.destroy(gp);
+        };
         if (gen_spawn) |r| {
-            const n = try zigcraft.v5serve.preGen(pool.?, &gen.?, &srv.world_lock, arena, r);
-            try w.print("gen: pre-generated {d} chunks around spawn\n", .{n});
+            const t0 = std.Io.Timestamp.now(io, .awake);
+            const n = try zigcraft.v5serve.preGen(pool.?, &gen.?, &srv.world_lock, arena, r, srv.gen_pool);
+            const ms = @divFloor(t0.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds, 1000000);
+            try w.print("gen: pre-generated {d} chunks around spawn in {d} ms\n", .{ n, ms });
         }
         // Permissions: load the matrix, then apply --op bootstraps (level 4,
         // persisted immediately so restarts keep them without the flag).
@@ -176,6 +197,6 @@ pub fn main(init: std.process.Init) !void {
         try srv.serveForever(arena);
         return;
     }
-    try w.print("zigcraft 1.7.10 proto v5. Try `zig build run -- serve [port] [--online] [--db <path>] [--view N] [--seed S] [--gen-spawn N] [--op <name>...] [--rcon-password <pw> [--rcon-port N]]`, `zig build test`, `zig build dump -- <region.mca>`, `zig build import -- <region.mca> <db> [dim] [shards]`\n", .{});
+    try w.print("zigcraft 1.7.10 proto v5. Try `zig build run -- serve [port] [--online] [--db <path>] [--view N] [--seed S] [--gen-spawn N] [--gen-workers N] [--op <name>...] [--rcon-password <pw> [--rcon-port N]]`, `zig build test`, `zig build dump -- <region.mca>`, `zig build import -- <region.mca> <db> [dim] [shards]`\n", .{});
     try w.flush();
 }

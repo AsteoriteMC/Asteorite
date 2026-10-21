@@ -13,6 +13,7 @@ const chunk_mod = @import("../../world/chunk.zig");
 const view_mod = @import("../../sim/view.zig");
 const spin_mod = @import("../../sim/spin.zig");
 const gen_mod = @import("gen.zig");
+const genpool_mod = @import("genpool.zig");
 const shaper_mod = @import("shaper.zig");
 const ids = @import("../../ids.zig");
 
@@ -42,10 +43,14 @@ pub fn getOrGen(
 }
 
 /// view.Source over getOrGen. ctx must outlive use (store in Server).
+/// With `gen_pool` set, misses enqueue background jobs and serve holes
+/// (serveConn retries when the pool sequence advances); without it, the
+/// caller blocks in sync `getOrGen` (tests, no-seed fallback).
 pub const GenSource = struct {
     pool: *shard_mod.ShardPool,
     gen: *gen_mod.Gen,
     lock: *spin_mod.SpinLock,
+    gen_pool: ?*genpool_mod.GenPool = null,
 
     pub fn source(self: *GenSource) view_mod.Source {
         return .{ .ctx = self, .getFn = get };
@@ -53,6 +58,11 @@ pub const GenSource = struct {
 
     fn get(ctx: *anyopaque, dim: u8, x: i32, z: i32, allocator: std.mem.Allocator) ?[]u8 {
         const s: *GenSource = @ptrCast(@alignCast(ctx));
+        if (s.gen_pool) |gp| {
+            if (s.pool.get(store_mod.encodeKey(dim, x, z)) catch null) |raw| return raw;
+            gp.request(dim, x, z);
+            return null;
+        }
         return getOrGen(s.pool, s.gen, s.lock, dim, x, z, allocator) catch null;
     }
 };
@@ -151,15 +161,31 @@ pub fn findSpawn(
 }
 
 /// Pre-generate a spiral disk of chunks around (0,0). Reports count.
+/// With a worker pool, missing columns fan out to workers and this drains;
+/// otherwise serial (the old path). Returns newly-present columns.
 pub fn preGen(
     pool: *shard_mod.ShardPool,
     gen: *gen_mod.Gen,
     lock: *spin_mod.SpinLock,
     alloc: std.mem.Allocator,
     radius_chunks: i32,
+    gp: ?*genpool_mod.GenPool,
 ) !usize {
     var n: usize = 0;
     var sp = Spiral{ .radius = radius_chunks };
+    if (gp) |p| {
+        while (sp.next()) |off| {
+            const key = store_mod.encodeKey(0, off.dx, off.dz);
+            if (try pool.get(key)) |raw| {
+                pool.allocator.free(raw);
+                continue;
+            }
+            p.request(0, off.dx, off.dz);
+            n += 1;
+        }
+        p.drain();
+        return n;
+    }
     while (sp.next()) |off| {
         const key = store_mod.encodeKey(0, off.dx, off.dz);
         if (try pool.get(key)) |raw| {
