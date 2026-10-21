@@ -27,12 +27,14 @@ pub const Source = struct {
 };
 
 /// ShardPool-backed source (LSM raw values are ZC1 payloads).
+/// Returned bytes are owned by `allocator`; pool-owned bytes are duped.
 pub fn shardPoolSource(pool: *shard_mod.ShardPool) Source {
     const F = struct {
         fn get(ctx: *anyopaque, dim: u8, x: i32, z: i32, allocator: std.mem.Allocator) ?[]u8 {
             const p: *shard_mod.ShardPool = @ptrCast(@alignCast(ctx));
-            _ = allocator;
-            return p.get(store_mod.encodeKey(dim, x, z)) catch null;
+            const raw = p.get(store_mod.encodeKey(dim, x, z)) catch null orelse return null;
+            defer p.allocator.free(raw);
+            return allocator.dupe(u8, raw) catch null;
         }
     };
     return .{ .ctx = pool, .getFn = F.get };
@@ -100,29 +102,37 @@ pub fn sendColumns(
     const raw_all = conn.bulk_raw;
     const comp_all = conn.bulk_comp;
     const work = conn.bulk_work;
+    // Transient per-column work (ZC1 bytes, decoded chunks, bulk frames)
+    // must NOT use conn.allocator: it is a never-reset arena, so every
+    // `free` on it is a no-op and this function runs per frame during gen
+    // storms (login bursts + async-gen retries re-decode hundreds of
+    // columns/sec — that leaked tens of GB and froze the box). The frame
+    // arena dies at the end of the call; only conn-owned scratch (above)
+    // and the sent-set live on conn.allocator.
+    var frame_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer frame_arena.deinit();
+    const t = frame_arena.allocator();
     var cols: [max_bulk_cols]chunks.BulkColumn = undefined;
     var ncols: usize = 0;
     var raw_len: usize = 0;
     for (positions) |pos| {
         const k = conn_mod.Conn.sentKey(pos.x, pos.z);
         if (conn.sent.contains(k)) continue; // already out (no groundUp re-send)
-        const zc1 = src.get(dim, pos.x, pos.z, a) orelse continue; // hole (terrain gen P-next)
-        defer a.free(zc1);
-        const ch = chunk_mod.Chunk.decode(a, zc1) catch continue;
-        defer ch.destroy(a);
+        const zc1 = src.get(dim, pos.x, pos.z, t) orelse continue; // hole (terrain gen P-next)
+        const ch = chunk_mod.Chunk.decode(t, zc1) catch continue;
         const layout = chunks.encodeColumn(ch, sky, raw_all[raw_len..]);
         cols[ncols] = .{ .x = pos.x, .z = pos.z, .primary = layout.primary, .add = layout.add };
         ncols += 1;
         raw_len += layout.len;
         try conn.sent.put(k, {});
         if (ncols == max_bulk_cols) {
-            try flushBulk(conn, cols[0..ncols], raw_all[0..raw_len], comp_all, work, sky);
+            try flushBulk(conn, t, cols[0..ncols], raw_all[0..raw_len], comp_all, work, sky);
             ncols = 0;
             raw_len = 0;
         }
     }
     if (ncols > 0) {
-        try flushBulk(conn, cols[0..ncols], raw_all[0..raw_len], comp_all, work, sky);
+        try flushBulk(conn, t, cols[0..ncols], raw_all[0..raw_len], comp_all, work, sky);
     }
 }
 
@@ -339,10 +349,10 @@ pub fn applyBlock(pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, x: i
     try pool.put(key, enc);
 }
 
-fn flushBulk(conn: *conn_mod.Conn, cols: []const chunks.BulkColumn, raw: []const u8, comp: []u8, work: []u8, sky: bool) !void {    const a = conn.allocator;
+fn flushBulk(conn: *conn_mod.Conn, alloc: std.mem.Allocator, cols: []const chunks.BulkColumn, raw: []const u8, comp: []u8, work: []u8, sky: bool) !void {
     const cz = try chunks.zlibCompress(raw, comp, work);
-    const out = try a.alloc(u8, 16 + cz.len + 12 * cols.len);
-    defer a.free(out);
+    const out = try alloc.alloc(u8, 16 + cz.len + 12 * cols.len);
+    defer alloc.free(out);
     const f = try chunks.frameMapChunkBulk(cols, cz, sky, out);
     try conn.queueFramed(f);
 }

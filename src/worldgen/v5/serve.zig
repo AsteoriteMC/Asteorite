@@ -59,11 +59,22 @@ pub const GenSource = struct {
     fn get(ctx: *anyopaque, dim: u8, x: i32, z: i32, allocator: std.mem.Allocator) ?[]u8 {
         const s: *GenSource = @ptrCast(@alignCast(ctx));
         if (s.gen_pool) |gp| {
-            if (s.pool.get(store_mod.encodeKey(dim, x, z)) catch null) |raw| return raw;
+            // Returned bytes are owned by `allocator` (duped); pool-owned
+            // bytes are freed with the pool allocator, never the caller's
+            // (serve threads pass a per-call frame arena).
+            const key = store_mod.encodeKey(dim, x, z);
+            if (s.pool.get(key) catch null) |raw| {
+                defer s.pool.allocator.free(raw);
+                return allocator.dupe(u8, raw) catch null;
+            }
             gp.request(dim, x, z);
             return null;
         }
-        return getOrGen(s.pool, s.gen, s.lock, dim, x, z, allocator) catch null;
+        if (getOrGen(s.pool, s.gen, s.lock, dim, x, z, allocator) catch null) |raw| {
+            defer s.pool.allocator.free(raw);
+            return allocator.dupe(u8, raw) catch null;
+        }
+        return null;
     }
 };
 
