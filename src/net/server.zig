@@ -2475,18 +2475,22 @@ pub fn serveConn(
             }
         }
         // Async gen follow-up: holes requested earlier may have landed on
-        // worker threads since. Gated on the pool sequence so the idle case
-        // costs one atomic load; sent columns skip before any store read,
-        // and still-missing columns re-request (deduped) for the next bump.
+        // worker threads since. Gated on the pool sequence (idle = one atomic
+        // load) and rate-limited to 1Hz: the rescan re-reads the view disk,
+        // and a gen storm would otherwise redo 1k+ store reads every frame.
         if (server.world) |pool| {
             if (server.gen_pool) |gp| {
                 if (conn.baseline_sent) {
                     const s = gp.sequence();
                     if (s != conn.last_gen_seq) {
-                        conn.last_gen_seq = s;
-                        const radius: u8 = @min(conn.client_view orelse server.view_distance, server.view_distance);
-                        const cc = conn.playerChunk();
-                        try view.resyncDisk(conn, server.chunkSource(pool), 0, cc.cx, cc.cz, radius, true);
+                        const now_ms = std.Io.Timestamp.now(server.io, .awake).toMilliseconds();
+                        if (now_ms - conn.last_gen_retry_ms >= 1000) {
+                            conn.last_gen_seq = s;
+                            conn.last_gen_retry_ms = now_ms;
+                            const radius: u8 = @min(conn.client_view orelse server.view_distance, server.view_distance);
+                            const cc = conn.playerChunk();
+                            try view.resyncDisk(conn, server.chunkSource(pool), 0, cc.cx, cc.cz, radius, true);
+                        }
                     }
                 }
             }

@@ -30,7 +30,12 @@ pub const Stats = struct {
     deduped: u64 = 0,
     completed: u64 = 0,
     failed: u64 = 0,
+    dropped: u64 = 0,
 };
+
+/// Backpressure: beyond this many queued jobs the pool sheds load (holes
+/// stay holes until the next retry, same as the old sync path under pressure).
+pub const max_pending = 4096;
 
 fn keyOf(dim: u8, x: i32, z: i32) store_mod.ChunkKey {
     return store_mod.encodeKey(dim, x, z);
@@ -148,6 +153,10 @@ pub const GenPool = struct {
         self.stats.requested += 1;
         if (self.inflight.contains(k)) {
             self.stats.deduped += 1;
+            return;
+        }
+        if (self.queue.items.len - self.head >= max_pending) {
+            self.stats.dropped += 1;
             return;
         }
         self.inflight.put(k, {}) catch return;

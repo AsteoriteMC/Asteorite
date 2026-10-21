@@ -95,9 +95,10 @@ pub fn main(init: std.process.Init) !void {
             // Background gen workers: misses enqueue + serve holes instead
             // of blocking the serve thread (~105ms/chunk sync). Each worker
             // owns a private Gen (chain state isn't shareable); default to
-            // all cores, capped until contention is measured (H5).
+            // core count, capped until contention is measured (H5). The pool
+            // sheds load past its queue cap instead of growing memory.
             const cpus = std.Thread.getCpuCount() catch 4;
-            const n_workers = @min(@max(gen_workers orelse cpus, 1), 16);
+            const n_workers = @min(@max(gen_workers orelse cpus, 1), 8);
             const gp = try zigcraft.v5genpool.GenPool.create(arena, io, pool.?, &srv.world_lock, s, false, false, n_workers);
             srv.gen_pool = gp;
             srv.gen_src.?.gen_pool = gp;

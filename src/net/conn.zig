@@ -206,6 +206,13 @@ pub const Conn = struct {
     /// Columns already sent groundUp (groundUp re-send leaks client memory,
     /// so each column goes out at most once until unloaded). Key: x<<32|z.
     sent: std.AutoHashMap(i64, void),
+    /// Reusable bulk-encode scratch (sendColumns writes grouped columns here).
+    /// Allocated once and retained: this allocator is a never-reset arena,
+    /// so per-call 12MB allocs leak until process exit — that OOM-freezes
+    /// the box under gen-storm retries. Freed in deinit.
+    bulk_raw: []u8 = &[_]u8{},
+    bulk_comp: []u8 = &[_]u8{},
+    bulk_work: []u8 = &[_]u8{},
     sent_center: ?struct { cx: i32, cz: i32 } = null,
     /// Set once the login burst went out; movement before that is ignored.
     baseline_sent: bool = false,
@@ -215,6 +222,9 @@ pub const Conn = struct {
     force_resync: bool = false,
     /// Last observed background-gen sequence (async gen follow-up below).
     last_gen_seq: u64 = 0,
+    /// Last async-gen retry (ms). Retries re-scan the view disk; without a
+    /// floor, a gen storm re-runs 1k+ store reads every serve iteration.
+    last_gen_retry_ms: i64 = 0,
     /// From Client Settings 0x15 (unclamped); effective radius = min(this, server max).
     client_view: ?u8 = null,
     /// Per-viewer entity visibility (ticker writes under conn.lock).
@@ -271,6 +281,9 @@ pub const Conn = struct {
         self.frame.deinit(self.allocator);
         self.sent.deinit();
         self.tracked.deinit();
+        if (self.bulk_raw.len > 0) self.allocator.free(self.bulk_raw);
+        if (self.bulk_comp.len > 0) self.allocator.free(self.bulk_comp);
+        if (self.bulk_work.len > 0) self.allocator.free(self.bulk_work);
         for (&self.inv) |*s| item_mod.freeStack(self.allocator, s);
         for (&self.table) |*s| item_mod.freeStack(self.allocator, s);
         item_mod.freeStack(self.allocator, &self.cursor);

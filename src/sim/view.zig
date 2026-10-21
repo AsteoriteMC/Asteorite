@@ -84,13 +84,22 @@ pub fn sendColumns(
     positions: []const ColPos,
     sky: bool,
 ) !void {
+    // Reusable conn-owned scratch (never-reset arena: per-call allocs here
+    // leak until process exit — see Conn.bulk_raw).
     const a = conn.allocator;
-    const raw_all = try a.alloc(u8, max_bulk_cols * 196864);
-    defer a.free(raw_all);
-    const comp_all = try a.alloc(u8, max_bulk_cols * 196864 + 1024);
-    defer a.free(comp_all);
-    const work = try a.alloc(u8, std.compress.flate.max_window_len);
-    defer a.free(work);
+    if (conn.bulk_raw.len == 0) {
+        const raw = try a.alloc(u8, max_bulk_cols * 196864);
+        errdefer a.free(raw);
+        const comp = try a.alloc(u8, max_bulk_cols * 196864 + 1024);
+        errdefer a.free(comp);
+        const work = try a.alloc(u8, std.compress.flate.max_window_len);
+        conn.bulk_raw = raw;
+        conn.bulk_comp = comp;
+        conn.bulk_work = work;
+    }
+    const raw_all = conn.bulk_raw;
+    const comp_all = conn.bulk_comp;
+    const work = conn.bulk_work;
     var cols: [max_bulk_cols]chunks.BulkColumn = undefined;
     var ncols: usize = 0;
     var raw_len: usize = 0;
