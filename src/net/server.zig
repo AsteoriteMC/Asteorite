@@ -1948,7 +1948,7 @@ pub const Server = struct {
                     const sf = packets.frameSetSlotAlloc(conn.allocator, 2, 2, null) catch return;
                     defer conn.allocator.free(sf);
                     conn.queueFramed(sf) catch {};
-                    const cf = packets.frameSetSlotAlloc(conn.allocator, 0, -1, conn.cursor) catch return;
+                    const cf = packets.frameSetSlotAlloc(conn.allocator, -1, -1, conn.cursor) catch return;
                     defer conn.allocator.free(cf);
                     conn.queueFramed(cf) catch {};
                     return;
@@ -1958,7 +1958,7 @@ pub const Server = struct {
                 const sf = packets.frameSetSlotAlloc(conn.allocator, 2, fc.slot, cell.*) catch return;
                 defer conn.allocator.free(sf);
                 conn.queueFramed(sf) catch {};
-                const cf = packets.frameSetSlotAlloc(conn.allocator, 0, -1, conn.cursor) catch return;
+                const cf = packets.frameSetSlotAlloc(conn.allocator, -1, -1, conn.cursor) catch return;
                 defer conn.allocator.free(cf);
                 conn.queueFramed(cf) catch {};
             },
@@ -2450,7 +2450,7 @@ pub fn serveConn(
                 const wf = try packets.frameWindowItemsAlloc(allocator, 0, &conn.inv);
                 defer allocator.free(wf);
                 try conn.queueFramed(wf);
-                const cf = try packets.frameSetSlotAlloc(allocator, 0, -1, conn.cursor);
+                const cf = try packets.frameSetSlotAlloc(allocator, -1, -1, conn.cursor);
                 defer allocator.free(cf);
                 try conn.queueFramed(cf);
                 const cc = conn.playerChunk();

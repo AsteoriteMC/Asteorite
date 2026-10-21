@@ -828,12 +828,13 @@ test "click window parse + set slot / window items roundtrip" {
     try std.testing.expectEqual(@as(i16, 4), try r.readShort());
     try std.testing.expectEqualSlices(u8, &tag, try r.readBytes(4));
     try std.testing.expectEqual(@as(usize, 0), r.remaining());
-    // cursor slot (-1) + empty slot encode
-    const cur = try frameSetSlotAlloc(std.testing.allocator, 0, -1, null);
+    // cursor lives on window -1 per the vanilla rule (window 0/slot -1
+    // crashes 1.7.10: Container.getSlot(-1) -> AIOOBE). Empty slot encodes.
+    const cur = try frameSetSlotAlloc(std.testing.allocator, -1, -1, null);
     defer std.testing.allocator.free(cur);
     var r2 = codec.PacketReader.init(cur);
     try std.testing.expectEqual(@as(i32, 0x2F), (try codec.decodeFrame(&r2)).id);
-    _ = try r2.readByte();
+    try std.testing.expectEqual(@as(i8, -1), @as(i8, @bitCast(try r2.readByte())));
     try std.testing.expectEqual(@as(i16, -1), try r2.readShort());
     try std.testing.expectEqual(@as(i16, -1), try r2.readShort());
     const items = [_]?item_mod.Stack{ item, null };

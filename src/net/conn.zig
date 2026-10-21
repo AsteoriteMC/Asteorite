@@ -735,7 +735,10 @@ pub const Conn = struct {
     /// failures drop the update (client keeps its prediction; the next
     /// action-number mismatch triggers a full resync).
     fn sendSlot(self: *Conn, slot: i16) void {
-        const f = packets.frameSetSlotAlloc(self.allocator, 0, slot, if (slot < 0) self.cursor else self.inv[@as(usize, @intCast(slot))]) catch return;
+        // Vanilla cursor convention: window -1 + slot -1 (window 0/slot -1
+        // hits Container.getSlot(-1) -> AIOOBE and crashes the client).
+        const window: i8 = if (slot < 0) -1 else 0;
+        const f = packets.frameSetSlotAlloc(self.allocator, window, slot, if (slot < 0) self.cursor else self.inv[@as(usize, @intCast(slot))]) catch return;
         defer self.allocator.free(f);
         self.queueRaw(f) catch {};
     }
@@ -1021,7 +1024,7 @@ pub const Conn = struct {
         }
         if (is_table) self.refreshTable() else self.refreshCrafting();
         self.sendSlotWin(window, 0);
-        self.sendSlotWin(0, -1); // cursor is window-agnostic
+        self.sendSlotWin(-1, -1); // cursor lives on window -1 (vanilla rule)
         return true;
     }
 
@@ -1120,7 +1123,7 @@ pub const Conn = struct {
                 if (slot >= 1 and slot <= 9) {
                     if (!(try self.clickPickupImplCell(&self.table[s], button))) return;
                     self.sendSlotWin(1, slot);
-                    self.sendSlotWin(0, -1);
+                    self.sendSlotWin(-1, -1);
                     self.refreshTable();
                     self.sendSlotWin(1, 0);
                     return;
@@ -1129,7 +1132,7 @@ pub const Conn = struct {
                 const islot: usize = s - 1;
                 if (!(try self.clickPickupImplCell(&self.inv[islot], button))) return;
                 self.sendSlotWin(1, slot);
-                self.sendSlotWin(0, -1);
+                self.sendSlotWin(-1, -1);
             },
             1 => {
                 if (s == 0) {
@@ -1212,7 +1215,7 @@ pub const Conn = struct {
     }
 
     fn sendCursor(self: *Conn) void {
-        const f = packets.frameSetSlotAlloc(self.allocator, 0, -1, self.cursor) catch return;
+        const f = packets.frameSetSlotAlloc(self.allocator, -1, -1, self.cursor) catch return;
         defer self.allocator.free(f);
         self.queueRaw(f) catch {};
     }
@@ -2182,12 +2185,14 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
         while (r.remaining() > 0) {
             const h = try codec.decodeFrame(&r);
             try std.testing.expectEqual(@as(i32, 0x2F), h.id);
-            _ = try r.readByte(); // window
+            const win = @as(i8, @bitCast(try r.readByte())); // window
             const slot = try r.readShort();
             if (slot == 10) {
                 try std.testing.expectEqual(@as(i16, -1), try r.readShort());
                 saw_slot = true;
             } else if (slot == -1) {
+                // cursor must ride window -1 (window 0/slot -1 crashes vanilla)
+                try std.testing.expectEqual(@as(i8, -1), win);
                 try std.testing.expectEqual(@as(i16, 1), try r.readShort());
                 try std.testing.expectEqual(@as(i8, 64), @as(i8, @bitCast(try r.readByte())));
                 try std.testing.expectEqual(@as(i16, 0), try r.readShort());
