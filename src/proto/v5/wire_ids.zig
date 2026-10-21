@@ -5,393 +5,74 @@
 //! All packet/world/anvil/player.dat conversion goes through here so the
 //! rest of the codebase only ever speaks canonical ids.
 //!
+//! The mapping is five sequential runs separated by unassigned wire gaps
+//! (which `fromWire` rejects as null):
+//!
+//! | canonical      | wire          | offset | note                    |
+//! |----------------|---------------|--------|-------------------------|
+//! | 0..164         | 0..164        | +0     | blocks incl. beacon     |
+//! | 165..170       | 170..175      | +5     | skips wire 165..169     |
+//! | 171..323       | 256..408      | +85    | items incl. hopper cart |
+//! | 324..329       | 417..422      | +93    | skips wire 409..416     |
+//! | 330..341       | 2256..2267    | +1926  | records; skips 423..2255|
+//!
 //! To add a protocol version: copy this file to the new proto/vNN dir
-//! with that version’s wire values (see tools/ + minecraft-data).
+//! with that version's runs (see tools/ + minecraft-data).
 
 const std = @import("std");
 const ids = @import("../../ids.zig");
 
-/// canonical index -> v5 wire id. Append-only, same order as ids.Id.
-pub const to_wire: [ids.COUNT]u16 = .{
-    0,
-    1,
-    2,
-    3,
-    4,
-    5,
-    6,
-    7,
-    8,
-    9,
-    10,
-    11,
-    12,
-    13,
-    14,
-    15,
-    16,
-    17,
-    18,
-    19,
-    20,
-    21,
-    22,
-    23,
-    24,
-    25,
-    26,
-    27,
-    28,
-    29,
-    30,
-    31,
-    32,
-    33,
-    34,
-    35,
-    36,
-    37,
-    38,
-    39,
-    40,
-    41,
-    42,
-    43,
-    44,
-    45,
-    46,
-    47,
-    48,
-    49,
-    50,
-    51,
-    52,
-    53,
-    54,
-    55,
-    56,
-    57,
-    58,
-    59,
-    60,
-    61,
-    62,
-    63,
-    64,
-    65,
-    66,
-    67,
-    68,
-    69,
-    70,
-    71,
-    72,
-    73,
-    74,
-    75,
-    76,
-    77,
-    78,
-    79,
-    80,
-    81,
-    82,
-    83,
-    84,
-    85,
-    86,
-    87,
-    88,
-    89,
-    90,
-    91,
-    92,
-    93,
-    94,
-    95,
-    96,
-    97,
-    98,
-    99,
-    100,
-    101,
-    102,
-    103,
-    104,
-    105,
-    106,
-    107,
-    108,
-    109,
-    110,
-    111,
-    112,
-    113,
-    114,
-    115,
-    116,
-    117,
-    118,
-    119,
-    120,
-    121,
-    122,
-    123,
-    124,
-    125,
-    126,
-    127,
-    128,
-    129,
-    130,
-    131,
-    132,
-    133,
-    134,
-    135,
-    136,
-    137,
-    138,
-    139,
-    140,
-    141,
-    142,
-    143,
-    144,
-    145,
-    146,
-    147,
-    148,
-    149,
-    150,
-    151,
-    152,
-    153,
-    154,
-    155,
-    156,
-    157,
-    158,
-    159,
-    160,
-    161,
-    162,
-    163,
-    164,
-    170,
-    171,
-    172,
-    173,
-    174,
-    175,
-    256,
-    257,
-    258,
-    259,
-    260,
-    261,
-    262,
-    263,
-    264,
-    265,
-    266,
-    267,
-    268,
-    269,
-    270,
-    271,
-    272,
-    273,
-    274,
-    275,
-    276,
-    277,
-    278,
-    279,
-    280,
-    281,
-    282,
-    283,
-    284,
-    285,
-    286,
-    287,
-    288,
-    289,
-    290,
-    291,
-    292,
-    293,
-    294,
-    295,
-    296,
-    297,
-    298,
-    299,
-    300,
-    301,
-    302,
-    303,
-    304,
-    305,
-    306,
-    307,
-    308,
-    309,
-    310,
-    311,
-    312,
-    313,
-    314,
-    315,
-    316,
-    317,
-    318,
-    319,
-    320,
-    321,
-    322,
-    323,
-    324,
-    325,
-    326,
-    327,
-    328,
-    329,
-    330,
-    331,
-    332,
-    333,
-    334,
-    335,
-    336,
-    337,
-    338,
-    339,
-    340,
-    341,
-    342,
-    343,
-    344,
-    345,
-    346,
-    347,
-    348,
-    349,
-    350,
-    351,
-    352,
-    353,
-    354,
-    355,
-    356,
-    357,
-    358,
-    359,
-    360,
-    361,
-    362,
-    363,
-    364,
-    365,
-    366,
-    367,
-    368,
-    369,
-    370,
-    371,
-    372,
-    373,
-    374,
-    375,
-    376,
-    377,
-    378,
-    379,
-    380,
-    381,
-    382,
-    383,
-    384,
-    385,
-    386,
-    387,
-    388,
-    389,
-    390,
-    391,
-    392,
-    393,
-    394,
-    395,
-    396,
-    397,
-    398,
-    399,
-    400,
-    401,
-    402,
-    403,
-    404,
-    405,
-    406,
-    407,
-    408,
-    417,
-    418,
-    419,
-    420,
-    421,
-    422,
-    2256,
-    2257,
-    2258,
-    2259,
-    2260,
-    2261,
-    2262,
-    2263,
-    2264,
-    2265,
-    2266,
-    2267,
-};
-
-/// Reverse map: v5 wire id -> canonical id (null = unassigned: blocks
-/// 165-169, items 409-416/423-2255/2268+, and anything above 2267).
-const reverse: [4096]?ids.Id = blk: {
-    var t: [4096]?ids.Id = .{null} ** 4096;
-    for (to_wire, 0..) |w, i| t[w] = @enumFromInt(i);
-    break :blk t;
-};
-
-/// v5 wire id -> canonical id, or null for unassigned ranges.
-pub fn fromWire(wire: u16) ?ids.Id {
-    if (wire >= reverse.len) return null;
-    return reverse[wire];
-}
-
-/// Canonical id -> v5 wire id. Total: every canonical id has a wire encoding.
+/// Canonical id -> v5 wire id. Total over `ids.COUNT`: every canonical id
+/// has exactly one wire encoding.
 /// Callers must only pass ids valid in the target context (e.g. a placeable
 /// block for chunk storage); validation happens at parse boundaries.
 pub fn toWire(id: ids.Id) u16 {
-    return to_wire[@intFromEnum(id)];
+    const c: u16 = @intFromEnum(id);
+    if (c <= 164) return c;
+    if (c <= 170) return c + 5; // skip wire 165..169
+    if (c <= 323) return c + 85; // 171 -> 256 ... 323 -> 408
+    if (c <= 329) return c + 93; // skip wire 409..416: 324 -> 417 ... 329 -> 422
+    if (c <= 341) return c + 1926; // skip wire 423..2255: 330 -> 2256 ... 341 -> 2267
+    unreachable; // ids.COUNT is 342; canonical indices stop at 341
+}
+
+/// v5 wire id -> canonical id, or null for unassigned ranges (blocks
+/// 165-169, items 409-416/423-2255/2268+, and anything above 2267).
+pub fn fromWire(wire: u16) ?ids.Id {
+    const c: u16 = if (wire <= 164)
+        wire
+    else if (wire >= 170 and wire <= 175)
+        wire - 5
+    else if (wire >= 256 and wire <= 408)
+        wire - 85
+    else if (wire >= 417 and wire <= 422)
+        wire - 93
+    else if (wire >= 2256 and wire <= 2267)
+        wire - 1926
+    else
+        return null;
+    return @enumFromInt(c);
 }
 
 test "wire mapping round-trips every id" {
     // canonical -> wire -> canonical is the identity
     for (0..ids.COUNT) |i| {
         const id: ids.Id = @enumFromInt(i);
-        const w = to_wire[i];
+        const w = toWire(id);
         try std.testing.expectEqual(id, fromWire(w).?);
     }
     // every wire id in an assigned range maps back to its table entry
-    for (to_wire) |w| {
-        try std.testing.expectEqual(w, to_wire[@intFromEnum(fromWire(w).?)]);
+    for (0..4096) |w| {
+        const back = fromWire(@intCast(w));
+        if (back) |id| {
+            try std.testing.expectEqual(@as(u16, @intCast(w)), toWire(id));
+        }
     }
     // unassigned ranges reject
     try std.testing.expect(fromWire(165) == null);
     try std.testing.expect(fromWire(169) == null);
+    try std.testing.expect(fromWire(176) == null);
+    try std.testing.expect(fromWire(255) == null);
     try std.testing.expect(fromWire(409) == null);
     try std.testing.expect(fromWire(423) == null);
     try std.testing.expect(fromWire(3000) == null);
@@ -400,7 +81,16 @@ test "wire mapping round-trips every id" {
     try std.testing.expectEqual(ids.lit_furnace, fromWire(62).?);
     try std.testing.expectEqual(ids.iron_ingot, fromWire(265).?);
     try std.testing.expectEqual(ids.record_wait, fromWire(2267).?);
-    try std.testing.expectEqual(@as(u16, 265), to_wire[@intFromEnum(ids.iron_ingot)]);
-    try std.testing.expectEqual(@as(u16, 62), to_wire[@intFromEnum(ids.lit_furnace)]);
+    try std.testing.expectEqual(@as(u16, 265), toWire(ids.iron_ingot));
+    try std.testing.expectEqual(@as(u16, 62), toWire(ids.lit_furnace));
+    // run-boundary pins: first/last of each segment
+    try std.testing.expectEqual(@as(u16, 0), toWire(ids.air));
+    try std.testing.expectEqual(@as(u16, 164), toWire(@enumFromInt(164)));
+    try std.testing.expectEqual(@as(u16, 170), toWire(@enumFromInt(165)));
+    try std.testing.expectEqual(@as(u16, 175), toWire(ids.double_plant));
+    try std.testing.expectEqual(@as(u16, 256), toWire(ids.iron_shovel));
+    try std.testing.expectEqual(@as(u16, 408), toWire(ids.hopper_minecart));
+    try std.testing.expectEqual(@as(u16, 417), toWire(ids.iron_horse_armor));
+    try std.testing.expectEqual(@as(u16, 422), toWire(ids.command_block_minecart));
+    try std.testing.expectEqual(@as(u16, 2256), toWire(ids.record_13));
 }
-
