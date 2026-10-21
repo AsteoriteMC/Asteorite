@@ -68,7 +68,7 @@ pub const GenSource = struct {
             return null;
         }
         if (getOrGen(s.pool, s.gen, s.lock, dim, x, z, allocator) catch null) |raw| {
-            defer s.pool.allocator.free(raw);
+            defer allocator.free(raw);
             return allocator.dupe(u8, raw) catch null;
         }
         return null;

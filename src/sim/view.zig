@@ -33,7 +33,7 @@ pub fn shardPoolSource(pool: *shard_mod.ShardPool) Source {
         fn get(ctx: *anyopaque, dim: u8, x: i32, z: i32, allocator: std.mem.Allocator) ?[]u8 {
             const p: *shard_mod.ShardPool = @ptrCast(@alignCast(ctx));
             const raw = p.get(allocator, store_mod.encodeKey(dim, x, z)) catch null orelse return null;
-            defer p.allocator.free(raw);
+            defer allocator.free(raw);
             return allocator.dupe(u8, raw) catch null;
         }
     };
@@ -103,19 +103,19 @@ pub fn sendColumns(
     const comp_all = conn.bulk_comp;
     const work = conn.bulk_work;
     // Transient per-column work (ZC1 bytes, decoded chunks, bulk frames)
-    // must NOT use conn.allocator: it is a never-reset arena, so every
-    // `free` on it is a no-op and this function runs per frame during gen
-    // storms (login bursts + async-gen retries re-decode hundreds of
-    // columns/sec — that leaked tens of GB and froze the box). The frame
-    // arena dies at the end of the call; only conn-owned scratch (above)
-    // and the sent-set live on conn.allocator.
-    var frame_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer frame_arena.deinit();
-    const t = frame_arena.allocator();
+    // uses a per-column scratch arena, NOT conn.allocator (a never-reset
+    // arena leaks every free until process exit) and NOT one shared frame
+    // arena either: pool.get reads whole SST files per lookup, so a single
+    // arena for the whole 289-column login burst pins every file image at
+    // once (~1GB+ transient that only drops at the end of the call).
+    // Only conn-owned scratch (above) and the sent-set outlive one column.
     var cols: [max_bulk_cols]chunks.BulkColumn = undefined;
     var ncols: usize = 0;
     var raw_len: usize = 0;
     for (positions) |pos| {
+        var col_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer col_arena.deinit();
+        const t = col_arena.allocator();
         const k = conn_mod.Conn.sentKey(pos.x, pos.z);
         if (conn.sent.contains(k)) continue; // already out (no groundUp re-send)
         const zc1 = src.get(dim, pos.x, pos.z, t) orelse continue; // hole (terrain gen P-next)
@@ -132,7 +132,11 @@ pub fn sendColumns(
         }
     }
     if (ncols > 0) {
-        try flushBulk(conn, t, cols[0..ncols], raw_all[0..raw_len], comp_all, work, sky);
+        // Tail flush (< max_bulk_cols columns): needs a transient allocator
+        // for the compressed+framed bytes; queueFramed copies into conn.out.
+        var tail_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer tail_arena.deinit();
+        try flushBulk(conn, tail_arena.allocator(), cols[0..ncols], raw_all[0..raw_len], comp_all, work, sky);
     }
 }
 

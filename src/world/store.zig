@@ -66,7 +66,7 @@ pub const StoreError = error{
     CorruptSst,
     OutOfMemory,
 } || std.Io.Dir.OpenError || std.Io.Dir.CreateFileError || std.Io.File.OpenError ||
-    std.Io.File.Writer.Error || std.Io.File.Reader.Error || std.mem.Allocator.Error;
+    std.Io.File.Writer.Error || std.Io.File.Reader.Error || std.Io.File.ReadPositionalError || std.mem.Allocator.Error;
 
 // ---------------------------------------------------------------------------
 // SST format (ZLS2 writer; ZLS1 legacy reader).
@@ -822,26 +822,66 @@ pub const Store = struct {
 
     fn sstGet(self: *Store, alloc: std.mem.Allocator, meta: *const SstMeta, key: ChunkKey) !??[]u8 {
         // Returns null = not in this sst; ?null = tombstone; ??bytes = found owned.
+        if (meta.index.len == 0) return self.sstGetLegacy(alloc, meta, key);
+        // ZLS2: bound the scan to a single index stride using the in-memory
+        // index. Reading the whole file per lookup pinned ~1GB+ transient
+        // across a login burst (and stalled the serve thread for tens of
+        // seconds on cold 89MB databases -> keepalive timeout kicks).
+        // Binary search: last sample with sample.key <= key.
+        var lo: usize = 0;
+        var hi: usize = meta.index.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (std.mem.lessThan(u8, &meta.index[mid].key, &key) or std.mem.eql(u8, &meta.index[mid].key, &key)) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        const start: usize = if (lo > 0) meta.index[lo - 1].offset else 8;
+        const end: usize = if (lo < meta.index.len) meta.index[lo].offset else meta.entries_end;
+        if (end <= start or start < 8 or end > meta.entries_end) return error.CorruptSst;
+        const range_len = end - start;
+        // One stride of entries (writer stride 16, chunk payloads < 300KB):
+        // ~1MB worst case. Refuse absurd ranges (torn file) instead of
+        // trusting a corrupt offset into a huge alloc + read.
+        if (range_len > 8 * 1024 * 1024) return error.CorruptSst;
+        var f = try self.sst_dir.openFile(self.io, meta.name, .{});
+        defer f.close(self.io);
+        const buf = try alloc.alloc(u8, range_len);
+        defer alloc.free(buf);
+        const n = try f.readPositionalAll(self.io, buf, start);
+        if (n != range_len) return error.CorruptSst;
+        var pos: usize = 0;
+        while (pos < range_len) {
+            if (pos + key_len + 4 > range_len) return error.CorruptSst;
+            const k: ChunkKey = buf[pos..][0..key_len].*;
+            pos += key_len;
+            const vlen = std.mem.readInt(u32, buf[pos..][0..4], .big);
+            pos += 4;
+            if (vlen == tombstone_len) {
+                if (std.mem.eql(u8, &k, &key)) return @as(?[]u8, null);
+                continue;
+            }
+            if (pos + vlen > range_len) return error.CorruptSst;
+            if (std.mem.eql(u8, &k, &key)) {
+                const out = try alloc.dupe(u8, buf[pos .. pos + vlen]);
+                return @as(?[]u8, out);
+            }
+            pos += vlen;
+        }
+        return null;
+    }
+
+    fn sstGetLegacy(self: *Store, alloc: std.mem.Allocator, meta: *const SstMeta, key: ChunkKey) !??[]u8 {
+        // Legacy ZLS1 (no footer index): whole-file scan. Correct, slower;
+        // only runs on pre-ZLS2 databases.
+        // Returns null = not in this sst; ?null = tombstone; ??bytes = found owned.
         const data = try self.sst_dir.readFileAlloc(self.io, meta.name, alloc, .limited(256 * 1024 * 1024));
         defer alloc.free(data);
         const p = try parseSst(data);
         if (p.count != meta.count) return error.CorruptSst;
-        var start: usize = 8;
-        if (p.zls2 and meta.index.len > 0) {
-            // Binary search: last sample with sample.key <= key.
-            var lo: usize = 0;
-            var hi: usize = meta.index.len;
-            while (lo < hi) {
-                const mid = lo + (hi - lo) / 2;
-                if (std.mem.lessThan(u8, &meta.index[mid].key, &key) or std.mem.eql(u8, &meta.index[mid].key, &key)) {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-            if (lo > 0) start = meta.index[lo - 1].offset;
-        }
-        var pos = start;
+        var pos: usize = 8;
         while (pos < p.entries_end) {
             if (pos + key_len + 4 > p.entries_end) return error.CorruptSst;
             const k: ChunkKey = data[pos..][0..key_len].*;

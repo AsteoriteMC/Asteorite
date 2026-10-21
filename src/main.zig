@@ -74,12 +74,19 @@ pub fn main(init: std.process.Init) !void {
         defer srv.deinit();
         srv.view_distance = view_distance;
         if (seed) |s| srv.drop_seed = s;
+        // Long-lived mutable state (LSM memtable/SSTs, gen tables, conn
+        // buffers, registry) must NOT sit on the process arena: free is a
+        // no-op there, so every login burst / flush / compaction leaks
+        // until the box OOM-freezes. A thread-safe GPA reclaims it all
+        // (serve + ticker threads share conns; store is cross-thread too).
+        var store_gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
+        const salloc = store_gpa.allocator();
         var db_dir: ?std.Io.Dir = null;
         defer if (db_dir) |*d| d.close(io);
         var pool: ?*zigcraft.shard.ShardPool = null;
         if (db_path) |p| {
             db_dir = try std.Io.Dir.cwd().createDirPathOpen(io, p, .{});
-            pool = try zigcraft.shard.ShardPool.open(arena, io, db_dir.?, 4, .{});
+            pool = try zigcraft.shard.ShardPool.open(salloc, io, db_dir.?, 4, .{});
             srv.world = pool;
         }
         defer if (pool) |pl| pl.deinit();
@@ -89,7 +96,7 @@ pub fn main(init: std.process.Init) !void {
         defer if (gen) |*g| g.deinit();
         if (seed) |s| {
             if (db_path == null) return error.GenNeedsDb;
-            gen = try zigcraft.v5gen.Gen.init(arena, s, false, false);
+            gen = try zigcraft.v5gen.Gen.init(salloc, s, false, false);
             srv.gen = &gen.?;
             srv.gen_src = .{ .pool = pool.?, .gen = &gen.?, .lock = &srv.world_lock };
             // Background gen workers: misses enqueue + serve holes instead
@@ -99,7 +106,7 @@ pub fn main(init: std.process.Init) !void {
             // sheds load past its queue cap instead of growing memory.
             const cpus = std.Thread.getCpuCount() catch 4;
             const n_workers = @min(@max(gen_workers orelse cpus, 1), 8);
-            const gp = try zigcraft.v5genpool.GenPool.create(arena, io, pool.?, &srv.world_lock, s, false, false, n_workers);
+            const gp = try zigcraft.v5genpool.GenPool.create(salloc, io, pool.?, &srv.world_lock, s, false, false, n_workers);
             srv.gen_pool = gp;
             srv.gen_src.?.gen_pool = gp;
             try w.print("gen: {d} background workers\n", .{n_workers});
@@ -108,18 +115,18 @@ pub fn main(init: std.process.Init) !void {
         }
         defer if (srv.gen_pool) |gp| {
             gp.destroy();
-            arena.destroy(gp);
+            salloc.destroy(gp);
         };
         if (gen_spawn) |r| {
             const t0 = std.Io.Timestamp.now(io, .awake);
-            const n = try zigcraft.v5serve.preGen(pool.?, &gen.?, &srv.world_lock, arena, r, srv.gen_pool);
+            const n = try zigcraft.v5serve.preGen(pool.?, &gen.?, &srv.world_lock, salloc, r, srv.gen_pool);
             const ms = @divFloor(t0.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds, 1000000);
             try w.print("gen: pre-generated {d} chunks around spawn in {d} ms\n", .{ n, ms });
         }
         // Permissions: load the matrix, then apply --op bootstraps (level 4,
         // persisted immediately so restarts keep them without the flag).
         // No --op and no stored ops: secure default, console-only admin.
-        srv.gpa = arena;
+        srv.gpa = salloc;
         srv.loadPerms();
         for (ops.items) |name| {
             if (!zigcraft.conn.Conn.validPlayerName(name)) {
@@ -194,8 +201,9 @@ pub fn main(init: std.process.Init) !void {
                 if (rcon_th) |th| th.detach();
             }
         }
-        // serveForever never returns; per-conn arenas hang off the process arena.
-        try srv.serveForever(arena);
+        // serveForever never returns; per-conn + store allocs hang off the
+        // GPA above (the process arena never frees — see above).
+        try srv.serveForever(salloc);
         return;
     }
     try w.print("zigcraft 1.7.10 proto v5. Try `zig build run -- serve [port] [--online] [--db <path>] [--view N] [--seed S] [--gen-spawn N] [--gen-workers N] [--op <name>...] [--rcon-password <pw> [--rcon-port N]]`, `zig build test`, `zig build dump -- <region.mca>`, `zig build import -- <region.mca> <db> [dim] [shards]`\n", .{});
