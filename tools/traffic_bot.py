@@ -126,7 +126,14 @@ def main() -> int:
             pid, body = read_frame(buf, s, time.time() + 60)
             counts[pid] = counts.get(pid, 0) + 1
             nbytes += len(body)
-            if pid == 0x08:
+            if pid == 0x00 and len(body) >= 4:  # echo during burst too;
+                kid = struct.unpack(">i", body[:4])[0]  # slow logins must
+                out = struct.pack(">i", kid)  # still answer keepalive
+                s.sendall(enc_varint(len(enc_varint(0) + out)) + enc_varint(0) + out)
+            elif pid == 0x40:
+                print(f"server disconnected us during login: {body[:200]!r}", flush=True)
+                return 2
+            elif pid == 0x08:
                 break
     except (TimeoutError, EOFError, OSError) as e:
         print(f"login burst failed: {e}", flush=True)
@@ -153,8 +160,9 @@ def main() -> int:
     deadline = time.time() + args.duration
     try:
         while time.time() < deadline:
-            # drain inbound (non-blocking poll; partial frames stay buffered)
-            while True:
+            # drain inbound (non-blocking poll; partial frames stay buffered).
+            # bounded per tick so a bulk flood can't starve our own echoes.
+            for _ in range(200):
                 r, _, _ = select.select([s], [], [], 0)
                 if not r and not buf:
                     break
@@ -202,9 +210,11 @@ def main() -> int:
                 sent += 1
             if now >= next_stat:
                 next_stat = now + 15.0
+                kinds = sorted(counts.items())
                 print(f"  t+{now-t0:.0f}s sent={sent} recvd={recvd} "
                       f"bulk0x26={chunk_bulks} unload0x21={unloads} "
                       f"up={sbytes/1024:.0f}KiB down={rbytes/1024:.0f}KiB", flush=True)
+                print(f"    by-id={kinds}", flush=True)
     except (EOFError, OSError) as e:
         print(f"connection lost: {e}", flush=True)
         return 1
