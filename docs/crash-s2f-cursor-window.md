@@ -96,6 +96,25 @@ Frame cursor updates as window -1, slot -1:
   client and confirm it lands past GuiDownloadTerrain without a crash
   report.
 
+## Detonator PoC (`poc/evil_server.py`)
+
+`poc/setslot_cursor_crash.py` is a client-side regression checker (it logs
+in and asserts the server under test behaves). The actual exploit PoC is
+the other way round: `poc/evil_server.py` **is the malicious server**.
+Minimal 1.7.10 burst (LoginSuccess, JoinGame, SpawnPosition, optional
+PosLook — plus status-ping answers so it lists), then the bad bytes:
+
+- `--exploit cursor`: sends `S2F(window=0, slot=-1, empty)` → vanilla dies
+  in `GuiDownloadTerrain` with `ArrayIndexOutOfBoundsException: -1`.
+- `--exploit metadata`: sends `PosLook` then an `S0F` pig whose baseline
+  tags health `(2<<5)|6` → vanilla dies on the first entity tick with
+  `ClassCastException: Integer cannot be cast to Float`.
+- `--exploit both` chains them; `--selftest` re-parses every served packet
+  with no network (passes).
+
+Run it, point a vanilla 1.7.10 client at the port, watch the crash report
+land. Do not aim it at anyone else's client.
+
 ## Crash 2: living health tagged as int instead of float (fixed)
 
 With crash 1 fixed, the client gets chunks (`MultiplayerChunkCache:
