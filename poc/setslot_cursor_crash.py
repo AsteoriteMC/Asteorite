@@ -89,6 +89,74 @@ def parse_slot(body: bytes, off: int):
     return wid, slot, off
 
 
+def read_varint_buf(body: bytes, off: int):
+    n = 0
+    shift = 0
+    while True:
+        v = body[off]
+        off += 1
+        n |= (v & 0x7F) << shift
+        if not (v & 0x80):
+            return n, off
+        shift += 7
+
+
+def read_string_buf(body: bytes, off: int):
+    slen, off = read_varint_buf(body, off)
+    return off + slen
+
+
+def skip_slot_bytes(body: bytes, off: int) -> int:
+    item_id = struct.unpack_from(">h", body, off)[0]
+    off += 2
+    if item_id != -1:
+        off += 1 + 2
+        nbt_len = struct.unpack_from(">h", body, off)[0]
+        off += 2
+        if nbt_len > 0:
+            off += nbt_len
+    return off
+
+
+def check_metadata(body: bytes, off: int, where: str):
+    """Walk a DataWatcher list; flag health-as-int (type 2, index 6).
+
+    Vanilla 1.7.10 types: 0=byte 1=short 2=int 3=float 4=string 5=slot
+    6=coords. Living health (index 6) must be float(3); int(2) makes the
+    client throw ClassCastException Integer->Float on entity tick.
+    Returns True if the exploit pattern is found."""
+    found = False
+    while True:
+        if off >= len(body):
+            print(f"    [{where}] metadata overruns packet")
+            return True
+        head = body[off]
+        off += 1
+        if head == 0x7F:
+            break
+        typ, idx = head >> 5, head & 0x1F
+        if (typ, idx) == (2, 6):
+            print(f"    [{where}] CRASH TAG: index 6 as int(2), want float(3)")
+            found = True
+        if typ == 0:
+            off += 1
+        elif typ == 1:
+            off += 2
+        elif typ in (2, 3):
+            off += 4
+        elif typ == 4:
+            slen, off = read_varint_buf(body, off)
+            off += slen
+        elif typ == 5:
+            off = skip_slot_bytes(body, off)
+        elif typ == 6:
+            off += 12
+        else:
+            print(f"    [{where}] unknown watcher type {typ}")
+            return True
+    return found
+
+
 # --- vanilla 1.7.10 handler emulation (bjb.a(gq) / zs.getSlot) ---
 class VanillaContainer:
     def __init__(self):
@@ -127,6 +195,9 @@ def main() -> int:
 
     container = VanillaContainer()
     cursor_frames = []
+    meta_bug = False
+    seen_poslook = False
+    seen_mob = False
     try:
         while True:
             pid, body = r.frame()
@@ -142,14 +213,39 @@ def main() -> int:
                         print(f"    vanilla: CRASH ArrayIndexOutOfBoundsException: -1 ({e})")
                         print("EXPLOIT TRIGGERED: window=0/slot=-1 cursor frame")
                         return 1
+            elif pid == 0x0F:
+                # varint eid, byte type, 3x int, 3x byte, 3x short vel, metadata
+                off = 0
+                _, off = read_varint_buf(body, off)
+                off += 1 + 12 + 3 + 6
+                seen_mob = True
+                print("  0x0F SpawnMob metadata:", end=" ")
+                if check_metadata(body, off, "0x0F"):
+                    print("EXPLOIT TRIGGERED: mob health encoded as int")
+                    meta_bug = True
+                else:
+                    print("ok (index 6 is float)")
+                if seen_poslook:
+                    break
+            elif pid == 0x1C:
+                print("  0x1C EntityMetadata:", end=" ")
+                if check_metadata(body, 4, "0x1C"):
+                    print("EXPLOIT TRIGGERED: metadata health encoded as int")
+                    meta_bug = True
+                else:
+                    print("ok")
             elif pid == 0x08:
-                print("  0x08 PlayerPosLook (login burst complete)")
-                break
+                print("  0x08 PlayerPosLook (login burst complete, watching for mob spawn)")
+                if seen_poslook:
+                    break
+                seen_poslook = True
     except (EOFError, socket.timeout) as e:
         print(f"  [!] stream ended early: {e}")
     finally:
         s.close()
 
+    if meta_bug:
+        return 1
     if not cursor_frames:
         print("no 0x2F frames seen (no world? --db/--seed missing?)")
         return 2

@@ -946,7 +946,7 @@ pub fn writeLivingBaseline(w: *codec.PacketWriter, health: f32) codec.CodecError
     try w.writeByte(0); // flags
     try w.writeByte((1 << 5) | 1); // type short(1), index 1
     try w.writeShort(300); // air
-    try w.writeByte((2 << 5) | 6); // type float(2), index 6
+    try w.writeByte((3 << 5) | 6); // type float(3), index 6 (3, not 2: 2 is int)
     const u: u32 = @bitCast(health);
     var fb: [4]u8 = undefined;
     std.mem.writeInt(u32, &fb, u, .big);
@@ -1142,6 +1142,23 @@ test "entity packets roundtrip" {
         // metadata present (terminator 0x7F at end) so notch client won't crash
         try std.testing.expect(r.buffer[r.index..].len > 1);
         try std.testing.expectEqual(@as(u8, 0x7F), r.buffer[r.index..][r.buffer[r.index..].len - 1]);
+    }
+    // living baseline pins vanilla DataWatcher types: (0:byte)(1:short 300)
+    // (6:float) + 0x7F. Tagging health as int(2) crashes 1.7.10 with
+    // ClassCastException Integer->Float on the first living-entity tick.
+    {
+        var wb: [32]u8 = undefined;
+        var w = codec.PacketWriter.init(&wb);
+        try writeLivingBaseline(&w, 20.0);
+        const got = w.written();
+        try std.testing.expectEqual(@as(usize, 11), got.len);
+        try std.testing.expectEqual(@as(u8, 0x00), got[0]); // (0<<5)|0
+        try std.testing.expectEqual(@as(u8, 0x00), got[1]); // flags
+        try std.testing.expectEqual(@as(u8, 0x21), got[2]); // (1<<5)|1
+        try std.testing.expectEqual(@as(i16, 300), std.mem.readInt(i16, got[3..5], .big));
+        try std.testing.expectEqual(@as(u8, 0x66), got[5]); // (3<<5)|6 float
+        try std.testing.expectEqual(@as(f32, 20.0), @as(f32, @bitCast(std.mem.readInt(u32, got[6..10], .big))));
+        try std.testing.expectEqual(@as(u8, 0x7F), got[10]);
     }
     // spawn mob (pig 90)
     {

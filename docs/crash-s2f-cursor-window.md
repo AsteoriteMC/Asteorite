@@ -1,12 +1,14 @@
-# Client crash exploit: S2F cursor framed as window 0 / slot -1
+# Client crash exploits: S2F cursor window + living-health watcher type
 
-- Status: fixed (`sendSlot`/`sendCursor`/`sendSlotWin`/furnace/login cursor
-  syncs now frame window -1). Every login with a world used to crash any
-  vanilla 1.7.10 client deterministically.
+- Status: both fixed. Every login with a world used to crash any vanilla
+  1.7.10 client deterministically (first in `GuiDownloadTerrain`, then on
+  the first living-entity tick once past it).
 - Reported by: local vanilla 1.7.10 client (PrismLauncher) vs zigcraft
   `localhost:25566`, crash on every join right after login.
 
-## Symptoms
+## Crash 1: cursor Set Slot as window 0 / slot -1 (fixed)
+
+### Symptoms
 
 Client dies in "Ticking screen" while `GuiDownloadTerrain` (`bdu`) is up,
 before any chunk renders (`Chunk stats: MultiplayerChunkCache: 0, 0`):
@@ -81,7 +83,7 @@ Frame cursor updates as window -1, slot -1:
   the window byte; `src/net/conn.zig` click test asserts window -1 on
   cursor frames.
 
-## Verification
+## Verification (crash 1)
 
 - `zig build test --summary all`: 21/21 steps, 186/186 tests green.
 - PoC `poc/setslot_cursor_crash.py`: logs in (offline mode), captures the
@@ -93,3 +95,54 @@ Frame cursor updates as window -1, slot -1:
 - Real-client rejoin after the fix is still owed: connect a vanilla 1.7.10
   client and confirm it lands past GuiDownloadTerrain without a crash
   report.
+
+## Crash 2: living health tagged as int instead of float (fixed)
+
+With crash 1 fixed, the client gets chunks (`MultiplayerChunkCache:
+81, 81`) and then dies on "Ticking entity" — our demo pig:
+
+```
+java.lang.ClassCastException: java.lang.Integer cannot be cast to java.lang.Float
+    at te.d(SourceFile:95)     <- DataWatcher.getWatchableObjectFloat
+    at sv.aS(SourceFile:549)   <- EntityLivingBase.getHealth
+    ...
+-- Entity being ticked --
+Entity Type: Pig (wo), Entity ID: 1
+```
+
+### Root cause
+
+Vanilla 1.7.10 `DataWatcher` types (official server jar, class `te`,
+static init — the same ids the client uses):
+
+```
+Byte -> 0, Short -> 1, Integer -> 2, Float -> 3, String -> 4, ...
+```
+
+`writeLivingBaseline` (`src/proto/v5/packets.zig`) tagged index 6
+(health) as `(2 << 5) | 6` — type **int** carrying float bits. The client
+stores an Integer at watcher 6 and throws the moment anything calls
+`getFloat(6)` (first living-entity tick: pig, then the player). The
+metadata *parsed* fine, so there was no parse error — just a poisoned
+watcher. The pig existing at all proves the 0x0F layout (incl. velocity
+tail) is byte-aligned; only the tag was wrong.
+
+### Fix
+
+One byte: `(2 << 5) | 6` -> `(3 << 5) | 6` (`0x46` -> `0x66`), plus a
+regression test pinning the exact baseline bytes
+(`(0:byte)(1:short 300)(6:float) + 0x7F`) and updating the
+`resolveAttack` test that had pinned the buggy `0x46`. Covers Spawn
+Player (0x0C), Spawn Mob (0x0F), and all 0x1C living updates — they share
+`writeLivingBaseline`.
+
+### Verification (crash 2)
+
+- Same suite green (21/21, 186/186; the fixed `resolveAttack` test now
+  asserts `0x66`).
+- PoC extended to walk 0x0F/0x1C watcher lists and flag `(type 2,
+  index 6)`: against the pre-fix server it reports
+  `0x0F SpawnMob metadata: CRASH TAG: index 6 as int(2)` (exit 1);
+  against the fixed server all metadata is float-tagged (exit 0).
+- Real-client rejoin owed again: confirm the client survives the pig tick
+  and can walk around spawn.

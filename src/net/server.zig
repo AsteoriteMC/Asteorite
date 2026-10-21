@@ -3025,7 +3025,7 @@ test "resolveAttack: mob damage/death/destroy, PvP, reach, pig respawn timer" {
         _ = try pr.readByte();
         try std.testing.expectEqual(@as(u8, 0x21), try pr.readByte());
         _ = try pr.readShort();
-        try std.testing.expectEqual(@as(u8, 0x46), try pr.readByte());
+        try std.testing.expectEqual(@as(u8, 0x66), try pr.readByte()); // (3<<5)|6 float health
         try std.testing.expectApproxEqAbs(@as(f32, 7.0), try pr.readFloat(), 1e-6);
     }
     // Out of reach: no damage.
