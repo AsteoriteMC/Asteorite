@@ -2,7 +2,7 @@
 //! Usage: zig build dump -- region/r.0.0.mca
 
 const std = @import("std");
-const zigcraft = @import("zigcraft");
+const asteorite = @import("asteorite");
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -49,7 +49,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const hdr = zigcraft.anvil.parseHeader(data) catch {
+    const hdr = asteorite.anvil.parseHeader(data) catch {
         try out.print("bad header (file too small)\n", .{});
         try out.flush();
         return;
@@ -58,7 +58,7 @@ pub fn main(init: std.process.Init) !void {
     for (0..32) |lz| {
         for (0..32) |lx| {
             const raw = hdr.locations[lx + lz * 32];
-            const loc = zigcraft.anvil.decodeLocation(raw);
+            const loc = asteorite.anvil.decodeLocation(raw);
             if (!loc.present) continue;
             present += 1;
             // chunk coords from filename unknown here; print local + offset
@@ -67,7 +67,7 @@ pub fn main(init: std.process.Init) !void {
             });
             // try decompress first present chunk only (avoid huge dump)
             if (present == 1) {
-                const payload = zigcraft.anvil.getChunkPayload(
+                const payload = asteorite.anvil.getChunkPayload(
                     data,
                     @intCast(lx),
                     @intCast(lz),
@@ -75,14 +75,14 @@ pub fn main(init: std.process.Init) !void {
                     try out.print("  payload slice failed\n", .{});
                     continue;
                 };
-                const plain = zigcraft.anvil.decompressChunk(arena_alloc, payload) catch {
+                const plain = asteorite.anvil.decompressChunk(arena_alloc, payload) catch {
                     try out.print("  decompress failed (comp={})\n", .{payload.compression});
                     continue;
                 };
                 try out.print("  decompressed {d} bytes, first 16: ", .{plain.len});
                 for (plain[0..@min(plain.len, 16)]) |b| try out.print("{x:0>2} ", .{b});
                 try out.print("\n", .{});
-                var nr = zigcraft.nbt.Reader.init(plain);
+                var nr = asteorite.nbt.Reader.init(plain);
                 const root_name = nr.readRoot() catch {
                     try out.print("  NBT root parse failed\n", .{});
                     continue;

@@ -39,6 +39,11 @@ const v5serve = @import("../worldgen/v5/serve.zig");
 const v5genpool = @import("../worldgen/v5/genpool.zig");
 const game_ids = @import("../ids.zig");
 const wire = @import("../proto/v5/wire_ids.zig");
+const tp_mod = @import("../cmd/tp.zig");
+const cmd_spec = @import("../cmd/spec.zig");
+const cmd_data = @import("../proto/v5/cmd_data.zig");
+const bans_mod = @import("../sim/bans.zig");
+const scoreboard_mod = @import("../sim/scoreboard.zig");
 
 /// Handshake/login must complete within this window (anti-slowloris).
 pub const login_timeout_ms: i64 = 30000;
@@ -88,7 +93,7 @@ pub const Server = struct {
     /// Lazy-seeded from drop_seed under rand_lock; never held with other locks.
     drop_rand: ?java_random.JavaRandom = null,
     rand_lock: spin.SpinLock = .{},
-    /// Seed for the gameplay stream (world seed when --seed is given).
+    /// Seed for the gameplay stream (world seed from the config file).
     drop_seed: i64 = 0,
     pig_spawned: bool = false,
     /// Ticks until the demo pig respawns after death (tickOnce is 1Hz).
@@ -96,6 +101,10 @@ pub const Server = struct {
     pig_cooldown: u32 = 0,
     world_age: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     time_of_day: std.atomic.Value(i64) = std.atomic.Value(i64).init(6000),
+    /// Announced play conns, for the server list ping. Bumped in
+    /// announceJoin (once per conn, guarded by announced) and dropped in
+    /// unregister; read lock-free by serveConn when answering status.
+    play_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// Ticks since boot (1Hz ticker). Periodic player save every 300.
     tick_counter: u64 = 0,
     /// Permission matrix (lazy-init on first use; guarded by perm_lock).
@@ -104,6 +113,49 @@ pub const Server = struct {
     /// Guards the permission matrix only (leaf lock; encode happens here,
     /// the LSM put itself goes under world_lock afterwards).
     perm_lock: spin.SpinLock = .{},
+    /// Per-player save epochs (leaf lock): bumped at each login, copied
+    /// onto the conn. A delayed unregister (quit/rejoin races, ghost
+    /// autosaves) drops its save when its epoch is stale, so an older
+    /// session can never overwrite a newer session's row. Keys are
+    /// lowercased login names (same fold as the permission matrix).
+    save_epochs: ?std.StringHashMap(u64) = null,
+    epoch_lock: spin.SpinLock = .{},
+
+    // ---- command-driven world state (guarded by state_lock; leaf lock) ----
+    /// World difficulty 0-3 (peaceful..hard). New logins inherit it.
+    difficulty: u8 = 1,
+    /// Default gamemode for first-time logins (0 survival, 1 creative, 2 adventure).
+    default_gamemode: u8 = 1,
+    /// Weather: raining/thundering flags + remaining ticks (0 = hold state).
+    raining: bool = false,
+    thundering: bool = false,
+    rain_time: u32 = 0,
+    thunder_time: u32 = 0,
+    /// Idle kick threshold in minutes (0 = disabled, vanilla default).
+    idle_timeout_min: u32 = 0,
+    /// Master switch for periodic saves (`/save-on`, `/save-off`).
+    autosave: bool = true,
+    /// Debug profiling window (`/debug start` sets both).
+    debug_start_ms: ?i64 = null,
+    debug_ticks: u64 = 0,
+    /// World spawn for first-time logins (`/setworldspawn`).
+    world_spawn: [3]i32 = .{ 8, 64, 8 },
+    /// Set once /setworldspawn runs: fresh logins keep the world spawn
+    /// instead of re-running the worldgen spawn search.
+    world_spawn_set: bool = false,
+    /// Nine vanilla gamerules (vanilla defaults; see cmd_data.gamerules).
+    gamerules: [9]bool = .{ true, true, false, true, true, true, true, true, true },
+    /// Bans + whitelist (lazy-init alongside perms; own leaf lock).
+    bans: ?bans_mod.BanDb = null,
+    ban_lock: spin.SpinLock = .{},
+    whitelist: ?bans_mod.Whitelist = null,
+    wl_lock: spin.SpinLock = .{},
+    /// Scoreboard (lazy-init; own leaf lock).
+    scoreboard: ?scoreboard_mod.Scoreboard = null,
+    sb_lock: spin.SpinLock = .{},
+    /// Serializes the scalar command state above (leaf lock: never held
+    /// with conn or registry locks — copy out, release, then touch conns).
+    state_lock: spin.SpinLock = .{},
     /// Autosave cadence in ticks (5 min at 1Hz).
     pub const autosave_ticks: u64 = 300;
     /// Anti-DoS cap on live item entities (snapshot arrays are fixed-size).
@@ -111,7 +163,9 @@ pub const Server = struct {
 
     pub fn bind(io: std.Io, port: u16, config: Config) !Server {
         const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
-        return .{ .net = try addr.listen(io, .{}), .io = io, .config = config };
+        var srv = Server{ .net = try addr.listen(io, .{}), .io = io, .config = config };
+        srv.world_spawn = .{ config.spawn_x, config.spawn_y, config.spawn_z };
+        return srv;
     }
 
     pub fn deinit(self: *Server) void {
@@ -142,6 +196,24 @@ pub const Server = struct {
 
     fn releaseSnap(ents: []RegistryEntry) void {
         for (ents) |e| _ = e.conn.refs.fetchSub(1, .acq_rel);
+    }
+
+    /// Find an online (.play) conn by name within a caller-held
+    /// snapshot (refs keep it alive for the caller's critical section).
+    /// Vanilla `getPlayer` is case-insensitive, so this is too (login
+    /// `alice` matches `/op Alice`, `/tp ALICE`, ...).
+    fn findInSnap(snap: []RegistryEntry, name: []const u8) ?*Conn {
+        for (snap) |e| {
+            e.conn.lock.lock();
+            // Skip kicked/dying conns: a freshly kicked ghost can still be
+            // registered while its thread unwinds — routing commands at it
+            // would shadow the live session (same class of bug as the
+            // duplicate-login kick this guards).
+            const match = e.conn.state == .play and !e.conn.dead and !e.conn.close_after_flush and std.ascii.eqlIgnoreCase(e.conn.username[0..e.conn.username_len], name);
+            e.conn.lock.unlock();
+            if (match) return e.conn;
+        }
+        return null;
     }
 
     /// Flush one conn's queued output to its stream. Lock-free except the
@@ -231,7 +303,12 @@ pub const Server = struct {
             writeFramed(e, self.io, pending);
             e.conn.allocator.free(pending);
         }
-        conn.announced = true;
+        // Count once per conn: unregister drops iff announced, so these pair
+        // exactly even if announceJoin is ever re-entered.
+        if (!conn.announced) {
+            conn.announced = true;
+            _ = self.play_count.fetchAdd(1, .release);
+        }
     }
 
     /// Broadcast a chat line to every registered play conn (including sender;
@@ -274,6 +351,8 @@ pub const Server = struct {
         self.reg_lock.unlock();
 
         if (conn.announced) {
+            // Paired with the fetchAdd in announceJoin (guarded by the same flag).
+            _ = self.play_count.fetchSub(1, .release);
             var others: [256]RegistryEntry = undefined;
             const snap = self.snapshot(&others);
             defer releaseSnap(snap);
@@ -339,6 +418,10 @@ pub const Server = struct {
         }
         conn.food = d.food;
         conn.saturation = d.saturation;
+        conn.xp_level = d.xp_level;
+        conn.xp_total = d.xp_total;
+        conn.xp_bar = d.xp_bar;
+        conn.spawn_forced = d.spawn_forced;
         for (&conn.inv, d.inv) |*slot, saved| {
             item_mod.freeStack(conn.allocator, slot);
             slot.* = item_mod.cloneStack(conn.allocator, saved) catch null;
@@ -354,8 +437,10 @@ pub const Server = struct {
     }
 
     /// Snapshot one conn (conn.lock taken here) and persist under world_lock.
-    /// Skips conns that never reached play or have no username. Safe to call
-    /// with no locks held (unregister, console, ticker all qualify).
+    /// Skips conns that never reached play or have no username. A stale
+    /// session (epoch bumped by a newer login) drops its save instead of
+    /// overwriting the newer row. Safe to call with no locks held
+    /// (unregister, console, ticker all qualify).
     pub fn savePlayer(self: *Server, conn: *Conn) void {
         const pool = self.world orelse return;
         conn.lock.lock();
@@ -363,8 +448,9 @@ pub const Server = struct {
             conn.lock.unlock();
             return;
         }
-        var d = player_db.Data{};
         const name = conn.username[0..conn.username_len];
+        const epoch = conn.save_epoch;
+        var d = player_db.Data{};
         @memcpy(d.username[0..name.len], name);
         d.username_len = name.len;
         d.pos_x = conn.pos_x;
@@ -381,6 +467,10 @@ pub const Server = struct {
         d.saturation = conn.saturation;
         d.selected = conn.selected;
         d.gamemode = conn.config.gamemode;
+        d.xp_level = conn.xp_level;
+        d.xp_total = conn.xp_total;
+        d.xp_bar = conn.xp_bar;
+        d.spawn_forced = conn.spawn_forced;
         // Clone NBT into server-owned buffers (conn dies under us in the
         // unregister path; encode only borrows while world_lock is held).
         for (&d.inv, conn.inv) |*dst, src| {
@@ -389,6 +479,10 @@ pub const Server = struct {
         d.cursor = item_mod.cloneStack(self.gpa, conn.cursor) catch null;
         conn.lock.unlock();
         defer player_db.freeData(self.gpa, &d);
+        // Stale-session guard: a newer login for this name owns the row
+        // now — drop this snapshot instead of overwriting it (quit/rejoin
+        // races, ghost autosaves). Leaf-lock read, no nesting.
+        if (!self.saveEpochCurrent(d.username[0..d.username_len], epoch)) return;
         self.world_lock.lock();
         defer self.world_lock.unlock();
         player_db.save(pool, name, &d) catch {};
@@ -478,6 +572,469 @@ pub const Server = struct {
         self.savePerms();
     }
 
+    // ------------------------------------------------------------------
+    // Command backend: the version seam. Commands in src/cmd/ are
+    // version-agnostic and must NEVER touch packets, wire ids, or chunk
+    // streaming directly — everything version-specific funnels through
+    // these methods, so a future protocol version only needs a new set
+    // of them while every command file is reused unchanged.
+    // ------------------------------------------------------------------
+
+    /// /help body: page `page` (1-based, 7 entries) of the usages the
+    /// sender may run (console sees everything). Vanilla header/footer.
+    pub fn helpText(self: *Server, sender: ?*Conn, page: i32, out: []u8) []const u8 {
+        var list: [64]*const perms_mod.Command = undefined;
+        var n: usize = 0;
+        for (&perms_mod.commands) |*d| {
+            const ok = if (sender == null) true else self.commandAllowed(sender, d);
+            if (!ok or n >= list.len) continue;
+            list[n] = d;
+            n += 1;
+        }
+        const pages: i32 = @intCast((n + 6) / 7);
+        const p = @min(@max(page, 1), @max(pages, 1));
+        var ow: usize = 0;
+        ow += (std.fmt.bufPrint(out[ow..], "--- Showing help page {d} of {d} (/help <page>) ---\n", .{ p, @max(pages, 1) }) catch return "Commands: /help").len;
+        const start: usize = @intCast((p - 1) * 7);
+        const end: usize = @min(start + 7, n);
+        for (list[start..end]) |d| {
+            ow += (std.fmt.bufPrint(out[ow..], "{s}\n", .{d.usage()}) catch break).len;
+        }
+        ow += (std.fmt.bufPrint(out[ow..], "Tip: Use the <tab> key while typing a command to auto-complete the command or its arguments", .{}) catch return out[0..ow]).len;
+        return out[0..ow];
+    }
+
+    /// /help <command>: that command's usage, or a not-found error.
+    pub fn helpCommand(self: *Server, sender: ?*Conn, name: []const u8, out: []u8) []const u8 {
+        for (&perms_mod.commands) |*d| {
+            if (!cmdMatches(d, name)) continue;
+            const ok = if (sender == null) true else self.commandAllowed(sender, d);
+            if (!ok) break;
+            return std.fmt.bufPrint(out, "--- {s} ---\n{s}", .{ d.name, d.usage() }) catch d.usage();
+        }
+        return "Unknown command. Try /help for a list of commands";
+    }
+
+    /// Match a typed command word against primary name + aliases.
+    fn cmdMatches(d: *const perms_mod.Command, word: []const u8) bool {
+        if (std.mem.eql(u8, d.name, word)) return true;
+        for (d.aliases) |a| if (std.mem.eql(u8, a, word)) return true;
+        return false;
+    }
+
+    /// Vanilla admin feedback (`chat.type.admin` = gray italic "[Name: msg]")
+    /// to every OTHER online player who could also run this command
+    /// (op + canUse, exactly like `bl.a`), plus the console log. The sender
+    /// gets the raw reply via executeCommand's return — never both.
+    pub fn notifyAdmins(self: *Server, sender: ?*Conn, def: *const perms_mod.Command, inner: []const u8) void {
+        var sname: [16]u8 = undefined;
+        const s = if (sender) |c| blk: {
+            c.lock.lock();
+            defer c.lock.unlock();
+            if (c.username_len == 0) break :blk "Server";
+            @memcpy(sname[0..c.username_len], c.username[0..c.username_len]);
+            break :blk sname[0..c.username_len];
+        } else "Server";
+        // Console runs as the server itself (vanilla skips the admin log
+        // then — the console already gets the raw reply via reply()).
+        if (sender != null) std.log.info("[{s}: {s}]", .{ s, inner });
+        // Command-block senders honor commandBlockOutput (we have no command
+        // blocks; console/player senders always broadcast).
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        var eb: [2048]u8 = undefined;
+        const esc = packets.escapeJsonText(inner, &eb) catch return;
+        var jb: [2208]u8 = undefined;
+        const admin = std.fmt.bufPrint(&jb, "{{\"text\":\"[{s}: {s}]\",\"color\":\"gray\",\"italic\":true}}", .{ s, esc }) catch return;
+        var fb: [2304]u8 = undefined;
+        const f = packets.frameChat(admin, &fb) catch return;
+        for (snap) |e| {
+            if (e.conn == sender) continue;
+            e.conn.lock.lock();
+            const play = e.conn.state == .play and !e.conn.dead and e.conn.username_len > 0;
+            const nm = e.conn.username[0..e.conn.username_len];
+            e.conn.lock.unlock();
+            if (!play) continue;
+            self.perm_lock.lock();
+            const can = if (self.perms) |*db| db.allows(nm, def.node, def.min_level) else perms_mod.DEFAULT_LEVEL >= def.min_level;
+            self.perm_lock.unlock();
+            if (!can) continue;
+            e.conn.lock.lock();
+            e.conn.queueFramed(f) catch {};
+            e.conn.lock.unlock();
+        }
+    }
+
+    /// Immediate one-shot message (chat frame to a player, log for console).
+    /// For warnings that precede the command's own reply (e.g. /give's
+    /// numeric-id deprecation notice) — mirrors reply() exactly.
+    pub fn sendDirect(self: *Server, sender: ?*Conn, text: []const u8) void {
+        self.reply(sender, text);
+    }
+
+    /// Validate raw JSON for /tellraw (vanilla rejects with jsonException).
+    pub fn validateJson(self: *Server, json: []const u8) !void {
+        const v = try std.json.parseFromSlice(std.json.Value, self.gpa, json, .{});
+        defer v.deinit();
+    }
+
+    /// Raw pre-formatted JSON to one online player (/tellraw). False when
+    /// the target isn't online.
+    pub fn sendJsonPlayer(self: *Server, name: []const u8, json: []const u8) bool {
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        const c = findInSnap(snap, name) orelse return false;
+        var fb: [4200]u8 = undefined;
+        const f = packets.frameChat(json, &fb) catch return false;
+        c.lock.lock();
+        defer c.lock.unlock();
+        if (c.state != .play or c.dead) return false;
+        c.queueFramed(f) catch {};
+        return true;
+    }
+
+    pub fn maxPlayers(self: *Server) u8 {
+        return self.config.max_players;
+    }
+
+    pub fn setTimeOfDay(self: *Server, v: i64) void {
+        self.time_of_day.store(v, .release);
+    }
+
+    pub fn getTimeOfDay(self: *Server) i64 {
+        return self.time_of_day.load(.acquire);
+    }
+
+    /// Snapshot-free play roster: copies online names under each conn's
+    /// lock (registry lock held throughout, so unregister can't destroy
+    /// a conn mid-copy). Returns the count.
+    pub fn playNames(self: *Server, names: [][16]u8, lens: []u8) usize {
+        self.reg_lock.lock();
+        defer self.reg_lock.unlock();
+        var n: usize = 0;
+        for (self.registry.items) |e| {
+            if (n >= names.len or n >= lens.len) break;
+            e.conn.lock.lock();
+            const play = e.conn.state == .play;
+            if (play) {
+                @memcpy(names[n][0..e.conn.username_len], e.conn.username[0..e.conn.username_len]);
+                lens[n] = @intCast(e.conn.username_len);
+            }
+            e.conn.lock.unlock();
+            if (!play) continue;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// Flush the world store (no-op without a db).
+    pub fn flushWorld(self: *Server) void {
+        if (self.world) |pool| pool.flushAll() catch {};
+    }
+
+    /// Strip all nodes from a player (keeps level). Used by /deop.
+    pub fn deopPlayer(self: *Server, name: []const u8) void {
+        self.perm_lock.lock();
+        if (self.perms) |*db| db.clearPlayer(name);
+        self.perm_lock.unlock();
+        self.savePerms();
+    }
+
+    /// Login-name charset (single source; mirrors conn.zig validation).
+    pub fn validName(self: *Server, name: []const u8) bool {
+        _ = self;
+        return Conn.validPlayerName(name);
+    }
+
+    /// Permission-node charset (single source; see sim/permissions.zig).
+    pub fn validNode(self: *Server, node: []const u8) bool {
+        _ = self;
+        return perms_mod.validNode(node);
+    }
+
+    /// Wire id -> canonical id for /give. Air maps to null: it is only
+    /// legal as an empty slot, never as a granted stack.
+    pub fn wireToId(self: *Server, wire_id: u16) ?game_ids.Id {
+        _ = self;
+        const id = wire.fromWire(wire_id) orelse return null;
+        if (id == game_ids.air) return null;
+        return id;
+    }
+
+    /// Canonical registry name lookup (`diamond_sword`, `stone`, ...).
+    /// Names are the snake_case enum tags shared with the wire tables.
+    /// Blocks resolve too (vanilla /give hands out ItemBlocks).
+    pub fn itemWireByName(self: *Server, name: []const u8) ?u16 {
+        _ = self;
+        const id = std.meta.stringToEnum(game_ids.Id, name) orelse return null;
+        if (id == game_ids.air) return null;
+        return wire.toWire(id);
+    }
+
+    /// Block names only (wire < 256); null for items/air/unknown.
+    pub fn blockWireByName(self: *Server, name: []const u8) ?u16 {
+        _ = self;
+        const id = std.meta.stringToEnum(game_ids.Id, name) orelse return null;
+        if (id == game_ids.air) return null;
+        const w = wire.toWire(id);
+        if (w > 255) return null;
+        return w;
+    }
+
+    /// Block display name for testforblock feedback (canonical snake_case,
+    /// numeric fallback for unmapped ids).
+    pub fn blockName(self: *Server, wire_id: u16, out: []u8) []const u8 {
+        _ = self;
+        if (wire.fromWire(wire_id)) |id| return @tagName(id);
+        return std.fmt.bufPrint(out, "{d}", .{wire_id}) catch "?";
+    }
+
+    /// True for placeable block wire ids (vanilla `g()` lookup misses items).
+    pub fn isBlockWire(self: *Server, wire_id: u16) bool {
+        _ = self;
+        if (wire_id > 255) return false;
+        const id = wire.fromWire(wire_id) orelse return false;
+        return id != game_ids.air;
+    }
+
+    /// Display name for /give feedback (canonical snake_case).
+    pub fn itemName(self: *Server, id: game_ids.Id) []const u8 {
+        _ = self;
+        return @tagName(id);
+    }
+
+    /// Drop leftover /give stacks at the target's feet (vanilla overflow).
+    pub fn dropLeftover(self: *Server, name: []const u8, id: game_ids.Id, count: i32, damage: i16) void {
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        const c = findInSnap(snap, name) orelse return;
+        c.lock.lock();
+        const px = c.pos_x;
+        const py = c.pos_y;
+        const pz = c.pos_z;
+        const play = c.state == .play;
+        c.lock.unlock();
+        if (!play) return;
+        var left = count;
+        while (left > 0) {
+            const put: i8 = @intCast(@min(left, 64));
+            left -= put;
+            self.ent_lock.lock();
+            _ = self.spawnItem(.{ .id = id, .count = put, .damage = damage, .nbt = null }, px, py + 0.5, pz, 10);
+            self.ent_lock.unlock();
+        }
+    }
+
+    /// Max stack size for /give (vanilla 1.7 table).
+    pub fn maxStack(self: *Server, id: game_ids.Id) u8 {
+        _ = self;
+        return item_mod.maxStackSize(id);
+    }
+
+    /// Set a player's gamemode + push the abilities packet. Returns false
+    /// when the player isn't online.
+    /// Set a player's gamemode. Vanilla `EntityPlayerMP.setGameType` sends
+    /// S2B reason 3 (the client flips its controller + UI/HUD off that),
+    /// plus an S39 refresh with jar-verified flags (0x0D creative / 0x00
+    /// survival+adventure). Returns false when the player isn't online.
+    pub fn applyGamemode(self: *Server, name: []const u8, mode: u8) bool {
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        const c = findInSnap(snap, name) orelse return false;
+        c.lock.lock();
+        defer c.lock.unlock();
+        c.config.gamemode = mode;
+        const creative = mode == 1;
+        var gb: [16]u8 = undefined;
+        if (packets.frameGameState(3, @floatFromInt(mode), &gb)) |f| {
+            c.queueFramed(f) catch {};
+        } else |_| {}
+        var ab: [32]u8 = undefined;
+        const f = packets.framePlayerAbilities(packets.abilityFlags(creative), 0.05, 0.1, &ab) catch return true;
+        c.queueFramed(f) catch {};
+        return true;
+    }
+
+    pub const GiveResult = struct {
+        placed: i32,
+        remaining: i32,
+    };
+
+    /// Fill an online player's inventory (vanilla merge-then-empties rule)
+    /// and sync dirty slots. Null when the player isn't online.
+    pub fn giveItems(self: *Server, target: []const u8, id: game_ids.Id, count: i32, damage: i16) ?GiveResult {
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        const c = findInSnap(snap, target) orelse return null;
+        c.lock.lock();
+        defer c.lock.unlock();
+        var dirty: [45]bool = [_]bool{false} ** 45;
+        const r = item_mod.fillInventory(&c.inv, id, count, damage, &dirty);
+        for (9..45) |ds| {
+            if (!dirty[ds]) continue;
+            const f = packets.frameSetSlotAlloc(self.gpa, 0, @intCast(ds), c.inv[ds]) catch continue;
+            defer self.gpa.free(f);
+            c.queueFramed(f) catch {};
+        }
+        return .{ .placed = r.placed, .remaining = r.remaining };
+    }
+
+    pub fn teleportPlayer(self: *Server, mover: []const u8, dest: []const u8) bool {
+        return self.teleport(mover, .{ .player = dest });
+    }
+
+    pub fn teleportCoords(self: *Server, mover: []const u8, c: [3]f64) bool {
+        return self.teleport(mover, .{ .coords = c });
+    }
+
+    /// Live position of an online player (for `~` relative coords).
+    pub fn playerPos(self: *Server, name: []const u8) ?[3]f64 {
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        const c = findInSnap(snap, name) orelse return null;
+        c.lock.lock();
+        defer c.lock.unlock();
+        if (c.state != .play) return null;
+        return .{ c.pos_x, c.pos_y, c.pos_z };
+    }
+
+    /// Sender position for `~` coords (null for console).
+    pub fn senderPos(self: *Server, sender: ?*Conn) ?[3]f64 {
+        _ = self;
+        const c = sender orelse return null;
+        c.lock.lock();
+        defer c.lock.unlock();
+        if (c.state != .play) return null;
+        return .{ c.pos_x, c.pos_y, c.pos_z };
+    }
+
+    /// Teleport an online player to coordinates or onto another online
+    /// player (with immediate chunk resync, same as the serve loop does
+    /// after a move). False when mover (or target) isn't online.
+    pub fn teleport(self: *Server, mover: []const u8, dest: tp_mod.Dest) bool {
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        const mc = findInSnap(snap, mover) orelse return false;
+        var dx: f64 = 0;
+        var dy: f64 = 0;
+        var dz: f64 = 0;
+        switch (dest) {
+            .player => |name| {
+                const tc = findInSnap(snap, name) orelse return false;
+                tc.lock.lock();
+                dx = tc.pos_x;
+                dy = tc.pos_y;
+                dz = tc.pos_z;
+                tc.lock.unlock();
+            },
+            .coords => |c| {
+                dx = c[0];
+                dy = c[1];
+                dz = c[2];
+            },
+        }
+        mc.lock.lock();
+        defer mc.lock.unlock();
+        mc.pos_x = dx;
+        mc.pos_y = dy;
+        mc.pos_z = dz;
+        mc.chunks_dirty = true;
+        mc.queuePlayerPosLook() catch {};
+        // Stream the destination area immediately: chunk follow-up is
+        // otherwise frame-driven and would stall until the client sends its
+        // next packet (the client has no reason to send one right after /tp).
+        // Same lock order as the serve loop (conn.lock held, world_lock
+        // inside the chunk source) — never the reverse.
+        if (self.world) |pool| {
+            const radius: u8 = @min(mc.client_view orelse self.view_distance, self.view_distance);
+            view.syncPlayerChunks(mc, self.chunkSource(pool), 0, radius, true) catch {};
+        }
+        return true;
+    }
+
+    /// /perm reload.
+    pub fn permReload(self: *Server) void {
+        self.loadPerms();
+    }
+
+    /// /perm show <player>: "name: level N +node -node", or null when the
+    /// line doesn't fit (caller prints "Show failed.").
+    pub fn permShow(self: *Server, player: []const u8, out: []u8) ?[]const u8 {
+        // Build the whole reply under perm_lock, release, then return
+        // (the caller sends it; reply takes the sender's conn lock —
+        // never nest the two).
+        const built: ?usize = blk: {
+            self.perm_lock.lock();
+            defer self.perm_lock.unlock();
+            const db = self.permsDbLocked();
+            const p = db.lookupRow(player);
+            var ow: usize = 0;
+            {
+                const s = std.fmt.bufPrint(out[ow..], "{s}: level {d}", .{ player, if (p) |pp| pp.level else perms_mod.DEFAULT_LEVEL }) catch break :blk null;
+                ow += s.len;
+            }
+            if (p) |pp| {
+                var gi = pp.grants.iterator();
+                while (gi.next()) |e| {
+                    const s = std.fmt.bufPrint(out[ow..], " +{s}", .{e.key_ptr.*}) catch break :blk ow;
+                    ow += s.len;
+                }
+                var di = pp.denies.iterator();
+                while (di.next()) |e| {
+                    const s = std.fmt.bufPrint(out[ow..], " -{s}", .{e.key_ptr.*}) catch break :blk ow;
+                    ow += s.len;
+                }
+            }
+            break :blk ow;
+        };
+        if (built) |n| {
+            return out[0..n];
+        } else {
+            return null;
+        }
+    }
+
+    /// /perm grant|deny <player> <node> (persists immediately).
+    pub fn permGrant(self: *Server, player: []const u8, node: []const u8) void {
+        self.perm_lock.lock();
+        self.permsDbLocked().grant(player, node) catch {};
+        self.perm_lock.unlock();
+        self.savePerms();
+    }
+
+    pub fn permDeny(self: *Server, player: []const u8, node: []const u8) void {
+        self.perm_lock.lock();
+        self.permsDbLocked().deny(player, node) catch {};
+        self.perm_lock.unlock();
+        self.savePerms();
+    }
+
+    /// /perm clear <player> [node] (null node = drop all nodes, keep level).
+    pub fn permClear(self: *Server, player: []const u8, node: ?[]const u8) void {
+        self.perm_lock.lock();
+        if (node) |n| {
+            _ = self.permsDbLocked().clearNode(player, n) catch false;
+        } else if (self.perms) |*db| {
+            if (db.lookupRow(player)) |pp| {
+                var gi = pp.grants.iterator();
+                while (gi.next()) |e| db.alloc.free(e.key_ptr.*);
+                pp.grants.clearRetainingCapacity();
+                var di = pp.denies.iterator();
+                while (di.next()) |e| db.alloc.free(e.key_ptr.*);
+                pp.denies.clearRetainingCapacity();
+            }
+        }
+        self.perm_lock.unlock();
+        self.savePerms();
+    }
+
     /// "/stop" (bare or with args): persist + exit. Callers deliver the
     /// reply first — in-game via the normal flush below, console/RCON via
     /// their own flush before exiting.
@@ -509,354 +1066,21 @@ pub const Server = struct {
             args = std.mem.trim(u8, cmd[sp + 1 ..], " ");
             cmd = cmd[0..sp];
         }
-        const desc = perms_mod.findCommand(cmd) orelse return "Unknown command. Try /help";
-        if (!self.commandAllowed(sender, desc)) {
-            // Same reply as unknown: failures never oracle command existence
-            // or the caller's level.
-            return "Unknown command. Try /help";
-        }
         _ = self.permDb(); // matrix from here on (mutations persist below)
-        if (std.mem.eql(u8, desc.name, "help")) {
-            var ow: usize = 0;
-            ow += (std.fmt.bufPrint(out[ow..], "Commands:", .{}) catch return "Commands: /help").len;
-            for (&perms_mod.commands) |*d| {
-                const ok = if (sender == null) true else self.commandAllowed(sender, d);
-                if (!ok) continue;
-                ow += (std.fmt.bufPrint(out[ow..], " {s}", .{d.usage}) catch break).len;
-            }
-            return out[0..ow];
-        } else if (std.mem.eql(u8, desc.name, "list")) {
-            var batch: [256]RegistryEntry = undefined;
-            const snap = self.snapshot(&batch);
-            defer releaseSnap(snap);
-            // Collect play-state names first (snapshot refs keep conns alive
-            // across the lock-free build below).
-            var names: [256][]const u8 = undefined;
-            var n: usize = 0;
-            for (snap) |e| {
-                if (n >= names.len) break;
-                e.conn.lock.lock();
-                const play = e.conn.state == .play;
-                e.conn.lock.unlock();
-                if (!play) continue;
-                names[n] = e.conn.username[0..e.conn.username_len];
-                n += 1;
-            }
-            // Usernames are charset-validated at login ([A-Za-z0-9_]), so no
-            // JSON escaping is needed here.
-            var ow: usize = 0;
-            ow += (std.fmt.bufPrint(out[ow..], "Connected ({d}):", .{n}) catch return "Connected (?)").len;
-            for (names[0..n], 0..) |nm, i| {
-                const pre: []const u8 = if (i == 0) "" else ",";
-                ow += (std.fmt.bufPrint(out[ow..], "{s} {s}", .{ pre, nm }) catch break).len;
-            }
-            return out[0..ow];
-        } else if (std.mem.eql(u8, desc.name, "save-all")) {
-            const n = self.saveAllPlayers();
-            if (self.world) |pool| pool.flushAll() catch {};
-            return std.fmt.bufPrint(out, "Saved {d} player(s).", .{n}) catch "Saved.";
-        } else if (std.mem.eql(u8, desc.name, "op")) {
-            const target = firstArg(args) orelse return "Usage: /op <player>";
-            if (!Conn.validPlayerName(target)) return "Usage: /op <player>";
-            self.grantOp(target);
-            self.notifyPlayer(target, "You are now op.");
-            return std.fmt.bufPrint(out, "Opped {s}.", .{target}) catch "Opped.";
-        } else if (std.mem.eql(u8, desc.name, "deop")) {
-            const target = firstArg(args) orelse return "Usage: /deop <player>";
-            if (!Conn.validPlayerName(target)) return "Usage: /deop <player>";
-            self.perm_lock.lock();
-            if (self.perms) |*db| db.clearPlayer(target);
-            self.perm_lock.unlock();
-            self.savePerms();
-            self.notifyPlayer(target, "You are no longer op.");
-            return std.fmt.bufPrint(out, "Deopped {s}.", .{target}) catch "Deopped.";
-        } else if (std.mem.eql(u8, desc.name, "perm")) {
-            return self.handlePerm(sender, args, out);
-        } else if (std.mem.eql(u8, desc.name, "stop")) {
-            // Reply is delivered by the caller; it exits right after.
-            return "Stopping server.";
-        } else if (std.mem.eql(u8, desc.name, "gamemode")) {
-            return self.cmdGamemode(sender, args, out);
-        } else if (std.mem.eql(u8, desc.name, "give")) {
-            return self.cmdGive(sender, args, out);
-        } else if (std.mem.eql(u8, desc.name, "tp")) {
-            return self.cmdTp(sender, args, out);
-        } else if (std.mem.eql(u8, desc.name, "time")) {
-            return self.cmdTime(sender, args, out);
-        } else {
-            return "Unknown command. Try /help";
-        }
-    }
-
-    fn splitArgs(args: []const u8, out: [][]const u8) usize {
-        var n: usize = 0;
-        var it = std.mem.splitScalar(u8, args, ' ');
-        while (it.next()) |tok| {
-            if (tok.len == 0) continue;
-            if (n >= out.len) break;
-            out[n] = tok;
-            n += 1;
-        }
-        return n;
-    }
-
-    /// Find an online (.play) conn by exact name within a caller-held
-    /// snapshot (refs keep it alive for the caller's critical section).
-    fn findInSnap(snap: []RegistryEntry, name: []const u8) ?*Conn {
-        for (snap) |e| {
-            e.conn.lock.lock();
-            const match = e.conn.state == .play and std.mem.eql(u8, e.conn.username[0..e.conn.username_len], name);
-            e.conn.lock.unlock();
-            if (match) return e.conn;
-        }
-        return null;
-    }
-
-    /// Sender's own login name (empty when console). Copied under lock.
-    fn senderName(sender: ?*Conn, out: *[16]u8) []const u8 {
-        const c = sender orelse return "";
-        c.lock.lock();
-        defer c.lock.unlock();
-        if (c.username_len == 0) return "";
-        @memcpy(out[0..c.username_len], c.username[0..c.username_len]);
-        return out[0..c.username_len];
-    }
-
-    fn cmdGamemode(self: *Server, sender: ?*Conn, args: []const u8, out: []u8) []const u8 {
-        var toks: [3][]const u8 = undefined;
-        const n = splitArgs(args, &toks);
-        if (n == 0 or n > 2) {
-            return "Usage: /gamemode <0|1|survival|creative> [player]";
-        }
-        const mode: u8 = if (std.mem.eql(u8, toks[0], "0") or std.mem.eql(u8, toks[0], "survival")) 0 else if (std.mem.eql(u8, toks[0], "1") or std.mem.eql(u8, toks[0], "creative")) 1 else {
-            return "Usage: /gamemode <0|1|survival|creative> [player]";
-        };
-        var self_name: [16]u8 = undefined;
-        const target: []const u8 = if (n == 2) toks[1] else senderName(sender, &self_name);
-        if (!Conn.validPlayerName(target)) {
-            return "Usage: /gamemode <0|1|survival|creative> [player]";
-        }
-        var batch: [256]RegistryEntry = undefined;
-        const snap = self.snapshot(&batch);
-        defer releaseSnap(snap);
-        const c = findInSnap(snap, target) orelse {
-            return "Player not found.";
-        };
-        c.lock.lock();
-        c.config.gamemode = mode;
-        const creative = mode == 1;
-        var ab: [32]u8 = undefined;
-        const f = packets.framePlayerAbilities(if (creative) 0x07 else 0x00, 0.05, 0.1, &ab) catch {
-            c.lock.unlock();
-            return "";
-        };
-        c.queueFramed(f) catch {};
-        c.lock.unlock();
-        return std.fmt.bufPrint(out, "Set {s} to {s}.", .{ target, if (mode == 1) "creative" else "survival" }) catch "Gamemode set.";
-    }
-
-    fn cmdGive(self: *Server, sender: ?*Conn, args: []const u8, out: []u8) []const u8 {
-        _ = sender;
-        var toks: [4][]const u8 = undefined;
-        const n = splitArgs(args, &toks);
-        if (n < 2 or n > 4) {
-            return "Usage: /give <player> <id> [count] [damage]";
-        }
-        const target = toks[0];
-        if (!Conn.validPlayerName(target)) {
-            return "Usage: /give <player> <id> [count] [damage]";
-        }
-        const wire_id = std.fmt.parseInt(u16, toks[1], 10) catch {
-            return "Usage: /give <player> <id> [count] [damage]";
-        };
-        // Wire ids map onto canonical ids; unassigned ranges (and air,
-        // which is only legal as an empty slot) are rejected like before.
-        const id = wire.fromWire(wire_id) orelse {
-            return "Usage: /give <player> <id> [count] [damage]";
-        };
-        if (id == game_ids.air) {
-            return "Usage: /give <player> <id> [count] [damage]";
-        }
-        var count: i32 = 1;
-        if (n >= 3) {
-            count = std.fmt.parseInt(i32, toks[2], 10) catch {
-                return "Usage: /give <player> <id> [count] [damage]";
-            };
-            if (count < 1 or count > 64) {
-                return "Count must be 1..64.";
+        // One file per command (src/cmd/); dispatch table and permission
+        // metadata both derive from per-file defs (perms_mod.modules), so
+        // help text, permission checks, and dispatch can never drift apart.
+        inline for (perms_mod.modules) |M| {
+            if (cmdMatches(&M.def, cmd)) {
+                if (!self.commandAllowed(sender, &M.def)) {
+                    // Same reply as unknown: failures never oracle command
+                    // existence or the caller's level.
+                    return "Unknown command. Try /help for a list of commands";
+                }
+                return M.run(self, sender, args, out);
             }
         }
-        var damage: i16 = 0;
-        if (n >= 4) {
-            damage = std.fmt.parseInt(i16, toks[3], 10) catch {
-                return "Usage: /give <player> <id> [count] [damage]";
-            };
-        }
-        var batch: [256]RegistryEntry = undefined;
-        const snap = self.snapshot(&batch);
-        defer releaseSnap(snap);
-        const c = findInSnap(snap, target) orelse {
-            return "Player not found.";
-        };
-        // Fill like vanilla addItemStackToInventory: merge into main-inventory
-        // stacks (slots 9..44) first, then empties; NBT stacks never merge.
-        c.lock.lock();
-        var remaining = count;
-        var dirty: [45]bool = [_]bool{false} ** 45;
-        const limit: i32 = item_mod.maxStackSize(id);
-        for (9..45) |s| {
-            if (remaining <= 0) break;
-            const st = c.inv[s] orelse continue;
-            if (st.id != id or st.damage != damage or st.nbt != null) continue;
-            if (st.count >= limit) continue;
-            const room = limit - @as(i32, st.count);
-            const take = @min(room, remaining);
-            c.inv[s].?.count += @intCast(take);
-            remaining -= take;
-            dirty[s] = true;
-        }
-        var s: usize = 9;
-        while (remaining > 0 and s < 45) : (s += 1) {
-            if (c.inv[s] != null) continue;
-            const put: i8 = @intCast(@min(@as(i32, limit), remaining));
-            c.inv[s] = .{ .id = id, .count = put, .damage = damage, .nbt = null };
-            remaining -= put;
-            dirty[s] = true;
-        }
-        // Sync every touched slot (client has no other way to learn).
-        for (9..45) |ds| {
-            if (!dirty[ds]) continue;
-            const f = packets.frameSetSlotAlloc(self.gpa, 0, @intCast(ds), c.inv[ds]) catch continue;
-            defer self.gpa.free(f);
-            c.queueFramed(f) catch {};
-        }
-        c.lock.unlock();
-        const placed = count - remaining;
-        if (remaining == 0) {
-            return std.fmt.bufPrint(out, "Gave {d}x{d} to {s}.", .{ placed, wire_id, target }) catch "Gave items.";
-        } else {
-            return std.fmt.bufPrint(out, "Gave {d} of {d} (no space for {d}).", .{ placed, count, remaining }) catch "Gave items.";
-        }
-    }
-
-    fn cmdTp(self: *Server, sender: ?*Conn, args: []const u8, out: []u8) []const u8 {
-        var toks: [3][]const u8 = undefined;
-        const n = splitArgs(args, &toks);
-        if (n == 0 or n > 3) {
-            return "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>";
-        }
-        // Resolve (mover, destination). Console has no self: it must name
-        // players (1-arg and 3-arg forms need a sender).
-        var mover_name: [16]u8 = undefined;
-        var mover: []const u8 = "";
-        var dx: f64 = 0;
-        var dy: f64 = 0;
-        var dz: f64 = 0;
-        var by_name: []const u8 = "";
-        if (n == 1) {
-            if (sender == null) {
-                return "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>";
-            }
-            mover = senderName(sender, &mover_name);
-            by_name = toks[0];
-        } else if (n == 2) {
-            mover = toks[0];
-            by_name = toks[1];
-        } else {
-            if (sender == null) {
-                return "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>";
-            }
-            mover = senderName(sender, &mover_name);
-            dx = std.fmt.parseFloat(f64, toks[0]) catch {
-                return "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>";
-            };
-            dy = std.fmt.parseFloat(f64, toks[1]) catch {
-                return "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>";
-            };
-            dz = std.fmt.parseFloat(f64, toks[2]) catch {
-                return "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>";
-            };
-            if (!std.math.isFinite(dx) or !std.math.isFinite(dy) or !std.math.isFinite(dz) or dy < 0 or dy > 256) {
-                return "Bad coordinates (y must be 0..256).";
-            }
-        }
-        if (mover.len == 0 or !Conn.validPlayerName(mover)) {
-            return "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>";
-        }
-        if (by_name.len > 0 and !Conn.validPlayerName(by_name)) {
-            return "Usage: /tp <target|x> [y] [z] | /tp <victim> <target>";
-        }
-        var batch: [256]RegistryEntry = undefined;
-        const snap = self.snapshot(&batch);
-        defer releaseSnap(snap);
-        const mc = findInSnap(snap, mover) orelse {
-            return "Player not found.";
-        };
-        if (by_name.len > 0) {
-            const tc = findInSnap(snap, by_name) orelse {
-                return "Player not found.";
-            };
-            tc.lock.lock();
-            const tx = tc.pos_x;
-            const ty = tc.pos_y;
-            const tz = tc.pos_z;
-            tc.lock.unlock();
-            dx = tx;
-            dy = ty;
-            dz = tz;
-        }
-        mc.lock.lock();
-        mc.pos_x = dx;
-        mc.pos_y = dy;
-        mc.pos_z = dz;
-        mc.chunks_dirty = true;
-        mc.queuePlayerPosLook() catch {};
-        // Stream the destination area immediately: chunk follow-up is
-        // otherwise frame-driven and would stall until the client's next
-        // packet (the client has no reason to send one right after /tp).
-        // Same lock order as the serve loop (conn.lock held, world_lock
-        // inside the chunk source) — never the reverse.
-        if (self.world) |pool| {
-            const radius: u8 = @min(mc.client_view orelse self.view_distance, self.view_distance);
-            view.syncPlayerChunks(mc, self.chunkSource(pool), 0, radius, true) catch {};
-        }
-        mc.lock.unlock();
-        if (by_name.len > 0) {
-            return std.fmt.bufPrint(out, "Teleported {s} to {s}.", .{ mover, by_name }) catch "Teleported.";
-        } else {
-            return std.fmt.bufPrint(out, "Teleported {s} to {d:.1}, {d:.1}, {d:.1}.", .{ mover, dx, dy, dz }) catch "Teleported.";
-        }
-    }
-
-    fn cmdTime(self: *Server, sender: ?*Conn, args: []const u8, out: []u8) []const u8 {
-        _ = sender;
-        var toks: [2][]const u8 = undefined;
-        const n = splitArgs(args, &toks);
-        if (n != 2) {
-            return "Usage: /time <set|add> <value|day|night>";
-        }
-        const delta: ?i64 = if (std.mem.eql(u8, toks[1], "day")) 1000 else if (std.mem.eql(u8, toks[1], "night")) 13000 else std.fmt.parseInt(i64, toks[1], 10) catch null;
-        if (delta == null) {
-            return "Usage: /time <set|add> <value|day|night>";
-        }
-        if (std.mem.eql(u8, toks[0], "set")) {
-            self.time_of_day.store(@mod(delta.?, 24000), .release);
-            return std.fmt.bufPrint(out, "Set time to {d}.", .{@mod(delta.?, 24000)}) catch "Time set.";
-        } else if (std.mem.eql(u8, toks[0], "add")) {
-            const now = self.time_of_day.load(.acquire);
-            const v = @mod(now + delta.?, 24000);
-            self.time_of_day.store(v, .release);
-            return std.fmt.bufPrint(out, "Time is now {d}.", .{v}) catch "Time set.";
-        } else {
-            return "Usage: /time <set|add> <value|day|night>";
-        }
-    }
-
-    fn firstArg(args: []const u8) ?[]const u8 {
-        if (args.len == 0) return null;
-        const end = std.mem.indexOfScalar(u8, args, ' ') orelse args.len;
-        if (end == 0) return null;
-        return args[0..end];
+        return "Unknown command. Try /help for a list of commands";
     }
 
     /// Matrix must already be initialized (permDb called in handleCommand).
@@ -864,134 +1088,2617 @@ pub const Server = struct {
         return &self.perms.?;
     }
 
-    /// Tell an online player something (exact-name match — a direct message,
-    /// not a broadcast).
-    fn notifyPlayer(self: *Server, name: []const u8, text: []const u8) void {
+    /// Tell an online player something (case-insensitive like vanilla
+    /// `getPlayer` — a direct message, not a broadcast). Command backend
+    /// surface (cmd/op.zig, cmd/deop.zig).
+    pub fn notifyPlayer(self: *Server, name: []const u8, text: []const u8) void {
         var batch: [256]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         for (snap) |e| {
             e.conn.lock.lock();
-            const match = e.conn.state == .play and std.mem.eql(u8, e.conn.username[0..e.conn.username_len], name);
+            const match = e.conn.state == .play and !e.conn.dead and !e.conn.close_after_flush and std.ascii.eqlIgnoreCase(e.conn.username[0..e.conn.username_len], name);
             e.conn.lock.unlock();
             if (!match) continue;
             self.reply(e.conn, text);
         }
     }
 
-    fn handlePerm(self: *Server, sender: ?*Conn, args: []const u8, out: []u8) []const u8 {
-        _ = sender;
-        var parts = std.mem.splitScalar(u8, args, ' ');
-        const sub = parts.next() orelse {
-            return "Usage: /perm <grant|deny|clear|show|reload> [player] [node] /stop";
-        };
-        if (sub.len == 0) {
-            return "Usage: /perm <grant|deny|clear|show|reload> [player] [node] /stop";
-        }
-        if (std.mem.eql(u8, sub, "reload")) {
-            self.loadPerms();
-            return "Permissions reloaded.";
-        }
-        const player = parts.next() orelse {
-            return "Usage: /perm <grant|deny|clear|show> <player> [node]";
-        };
-        if (!Conn.validPlayerName(player)) {
-            return "Usage: /perm <grant|deny|clear|show> <player> [node]";
-        }
-        if (std.mem.eql(u8, sub, "show")) {
-            // Build the whole reply under perm_lock, release, then return
-            // (the caller sends it; reply takes the sender's conn lock —
-            // never nest the two).
-            const built: ?usize = blk: {
-                self.perm_lock.lock();
-                defer self.perm_lock.unlock();
-                const db = self.permsDbLocked();
-                const p = db.players.get(player);
-                var ow: usize = 0;
-                {
-                    const s = std.fmt.bufPrint(out[ow..], "{s}: level {d}", .{ player, if (p) |pp| pp.level else perms_mod.DEFAULT_LEVEL }) catch break :blk null;
-                    ow += s.len;
-                }
-                if (p) |pp| {
-                    var gi = pp.grants.iterator();
-                    while (gi.next()) |e| {
-                        const s = std.fmt.bufPrint(out[ow..], " +{s}", .{e.key_ptr.*}) catch break :blk ow;
-                        ow += s.len;
-                    }
-                    var di = pp.denies.iterator();
-                    while (di.next()) |e| {
-                        const s = std.fmt.bufPrint(out[ow..], " -{s}", .{e.key_ptr.*}) catch break :blk ow;
-                        ow += s.len;
-                    }
-                }
-                break :blk ow;
-            };
-            if (built) |n| {
-                return out[0..n];
-            } else {
-                return "Show failed.";
-            }
-        }
-        const node = parts.next() orelse {
-            if (std.mem.eql(u8, sub, "clear")) {
-                // /perm clear <player>: drop all nodes, keep level.
-                self.perm_lock.lock();
-                if (self.perms) |*db| {
-                    if (db.players.get(player)) |pp| {
-                        var gi = pp.grants.iterator();
-                        while (gi.next()) |e| db.alloc.free(e.key_ptr.*);
-                        pp.grants.clearRetainingCapacity();
-                        var di = pp.denies.iterator();
-                        while (di.next()) |e| db.alloc.free(e.key_ptr.*);
-                        pp.denies.clearRetainingCapacity();
-                    }
-                }
-                self.perm_lock.unlock();
-                self.savePerms();
-                return "Nodes cleared.";
-            }
-            return "Usage: /perm <grant|deny> <player> <node>";
-        };
-        if (!perms_mod.validNode(node)) {
-            return "Bad node. Use [a-z0-9_.-], optional trailing .*";
-        }
-        if (std.mem.eql(u8, sub, "grant")) {
-            self.perm_lock.lock();
-            self.permsDbLocked().grant(player, node) catch {};
-            self.perm_lock.unlock();
-            self.savePerms();
-            return "Granted.";
-        } else if (std.mem.eql(u8, sub, "deny")) {
-            self.perm_lock.lock();
-            self.permsDbLocked().deny(player, node) catch {};
-            self.perm_lock.unlock();
-            self.savePerms();
-            return "Denied.";
-        } else if (std.mem.eql(u8, sub, "clear")) {
-            self.perm_lock.lock();
-            _ = self.permsDbLocked().clearNode(player, node) catch false;
-            self.perm_lock.unlock();
-            self.savePerms();
-            return "Cleared.";
-        } else {
-            return "Usage: /perm <grant|deny|clear|show|reload> [player] [node] /stop";
-        }
-    }
-
-
+    /// Command reply: one 0x02 chat frame PER LINE (vanilla never puts
+    /// `\n` inside a chat packet — /help, /list etc. arrive as separate
+    /// messages; some clients render embedded newlines as "[LF]").
+    /// Empty segments are skipped (no blank vanilla lines).
     fn reply(self: *Server, sender: ?*Conn, text: []const u8) void {
         _ = self;
         if (sender) |c| {
-            var jb: [1090]u8 = undefined;
-            var fb: [1152]u8 = undefined;
-            const json = std.fmt.bufPrint(&jb, "{{\"text\":\"{s}\"}}", .{text}) catch return;
-            const f = packets.frameChat(json, &fb) catch return;
-            c.lock.lock();
-            defer c.lock.unlock();
-            if (c.state != .play or c.dead) return;
-            c.queueFramed(f) catch {};
+            var it = std.mem.splitScalar(u8, text, '\n');
+            var any = false;
+            while (it.next()) |line| {
+                if (line.len == 0) continue;
+                any = true;
+                var eb: [2048]u8 = undefined;
+                const esc = packets.escapeJsonText(line, &eb) catch return;
+                var jb: [2112]u8 = undefined;
+                const json = std.fmt.bufPrint(&jb, "{{\"text\":\"{s}\"}}", .{esc}) catch return;
+                var fb: [2176]u8 = undefined;
+                const f = packets.frameChat(json, &fb) catch return;
+                c.lock.lock();
+                const ok = c.state == .play and !c.dead;
+                if (ok) c.queueFramed(f) catch {};
+                c.lock.unlock();
+                if (!ok) return;
+            }
+            // All-empty text (shouldn't happen): send one empty line so the
+            // caller never hangs waiting for a reply that never comes.
+            if (!any) {
+                var fb: [64]u8 = undefined;
+                const f = packets.frameChat("{\"text\":\"\"}", &fb) catch return;
+                c.lock.lock();
+                defer c.lock.unlock();
+                if (c.state != .play or c.dead) return;
+                c.queueFramed(f) catch {};
+            }
         } else {
             std.log.info("(console) {s}", .{text});
+        }
+    }
+
+    // ---- command backends: chat / moderation / world state ----
+    // (All version-agnostic command files go through these; game logic and
+    // message text live in src/cmd/, packet framing stays here.)
+
+    /// Vanilla target selectors for single-player args: @p nearest, @r
+    /// random, @a only when exactly one player is online (vanilla errors
+    /// otherwise). Returns the resolved name, or null for unknown/offline.
+    pub fn resolvePlayerName(self: *Server, sender: ?*Conn, token: []const u8, out: *[16]u8) ?[]const u8 {
+        if (!cmd_spec.isSelector(token)) {
+            var batch: [256]RegistryEntry = undefined;
+            const snap = self.snapshot(&batch);
+            defer releaseSnap(snap);
+            const c = findInSnap(snap, token) orelse return null;
+            c.lock.lock();
+            defer c.lock.unlock();
+            if (c.state != .play or c.username_len == 0) return null;
+            @memcpy(out[0..c.username_len], c.username[0..c.username_len]);
+            return out[0..c.username_len];
+        }
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        var names: [256][16]u8 = undefined;
+        var lens: [256]u8 = undefined;
+        var pos: [256][3]f64 = undefined;
+        var n: usize = 0;
+        for (snap) |e| {
+            if (n >= names.len) break;
+            e.conn.lock.lock();
+            const play = e.conn.state == .play and e.conn.username_len > 0;
+            if (play) {
+                @memcpy(names[n][0..e.conn.username_len], e.conn.username[0..e.conn.username_len]);
+                lens[n] = @intCast(e.conn.username_len);
+                pos[n] = .{ e.conn.pos_x, e.conn.pos_y, e.conn.pos_z };
+                n += 1;
+            }
+            e.conn.lock.unlock();
+        }
+        if (n == 0) return null;
+        if (std.mem.eql(u8, token, "@a")) {
+            if (n != 1) return null;
+            @memcpy(out[0..lens[0]], names[0][0..lens[0]]);
+            return out[0..lens[0]];
+        }
+        if (std.mem.eql(u8, token, "@r")) {
+            self.rand_lock.lock();
+            if (self.drop_rand == null) {
+                const seed: i64 = @bitCast(@as(u64, @bitCast(std.Io.Timestamp.now(self.io, .awake).toMilliseconds())));
+                self.drop_rand = java_random.JavaRandom.init(seed);
+            }
+            const idx: usize = @intCast(@mod(self.drop_rand.?.nextInt(), @as(i32, @intCast(n))));
+            self.rand_lock.unlock();
+            @memcpy(out[0..lens[idx]], names[idx][0..lens[idx]]);
+            return out[0..lens[idx]];
+        }
+        // @p: nearest to the sender (console has no position: first online).
+        var sx: f64 = 0;
+        var sy: f64 = 0;
+        var sz: f64 = 0;
+        var have_pos = false;
+        if (sender) |c| {
+            c.lock.lock();
+            sx = c.pos_x;
+            sy = c.pos_y;
+            sz = c.pos_z;
+            have_pos = c.state == .play;
+            c.lock.unlock();
+        }
+        var best: usize = 0;
+        var best_d: f64 = std.math.inf(f64);
+        if (have_pos) {
+            for (0..n) |i| {
+                const dx = pos[i][0] - sx;
+                const dy = pos[i][1] - sy;
+                const dz = pos[i][2] - sz;
+                const d = dx * dx + dy * dy + dz * dz;
+                if (d < best_d) {
+                    best_d = d;
+                    best = i;
+                }
+            }
+        }
+        @memcpy(out[0..lens[best]], names[best][0..lens[best]]);
+        return out[0..lens[best]];
+    }
+
+    /// Live peer address of an online player (for /ban-ip name form).
+    pub fn playerIp(self: *Server, name: []const u8, out: *[64]u8) ?[]const u8 {
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        const c = findInSnap(snap, name) orelse return null;
+        c.lock.lock();
+        defer c.lock.unlock();
+        if (c.state != .play or c.ip_len == 0) return null;
+        @memcpy(out[0..c.ip_len], c.ip[0..c.ip_len]);
+        return out[0..c.ip_len];
+    }
+
+    /// Multi-target resolution for spreadplayers: @a = all online,
+    /// @p/@r = single, plain = single (null when nobody matches).
+    pub fn resolvePlayerList(self: *Server, sender: ?*Conn, token: []const u8, out: [][16]u8, lens: []u8) usize {
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        var n: usize = 0;
+        if (std.mem.eql(u8, token, "@a")) {
+            for (snap) |e| {
+                if (n >= out.len) break;
+                e.conn.lock.lock();
+                const play = e.conn.state == .play and e.conn.username_len > 0;
+                if (play) {
+                    @memcpy(out[n][0..e.conn.username_len], e.conn.username[0..e.conn.username_len]);
+                    lens[n] = @intCast(e.conn.username_len);
+                    n += 1;
+                }
+                e.conn.lock.unlock();
+            }
+            return n;
+        }
+        var one: [16]u8 = undefined;
+        const t = self.resolvePlayerName(sender, token, &one) orelse return 0;
+        if (out.len == 0) return 0;
+        @memcpy(out[0][0..t.len], t);
+        lens[0] = @intCast(t.len);
+        return 1;
+    }
+
+    /// Online check (play state). Used for "player not found" errors.
+    pub fn isOnline(self: *Server, name: []const u8) bool {
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        const c = findInSnap(snap, name) orelse return false;
+        c.lock.lock();
+        defer c.lock.unlock();
+        return c.state == .play;
+    }
+
+    /// Bump the save epoch for a login name; the caller stores the
+    /// returned value on the conn. Leaf lock only (never nested).
+    fn bumpSaveEpoch(self: *Server, name: []const u8) u64 {
+        self.epoch_lock.lock();
+        defer self.epoch_lock.unlock();
+        if (self.save_epochs == null) self.save_epochs = std.StringHashMap(u64).init(self.gpa);
+        var fold: [perms_mod.max_name_len]u8 = undefined;
+        const key = perms_mod.Db.normKey(name, &fold);
+        const e = self.save_epochs.?.get(key) orelse 0;
+        const next = e + 1;
+        if (self.save_epochs.?.getPtr(key)) |p| {
+            p.* = next;
+        } else {
+            const owned = self.gpa.dupe(u8, key) catch return next;
+            self.save_epochs.?.put(owned, next) catch {
+                self.gpa.free(owned);
+                return next;
+            };
+        }
+        return next;
+    }
+
+    /// True when this conn still owns its player row (no newer login for
+    /// the name has bumped the epoch since). Leaf lock only (never nested).
+    fn saveEpochCurrent(self: *Server, name: []const u8, epoch: u64) bool {
+        self.epoch_lock.lock();
+        defer self.epoch_lock.unlock();
+        const m = self.save_epochs orelse return true;
+        var fold: [perms_mod.max_name_len]u8 = undefined;
+        const cur = m.get(perms_mod.Db.normKey(name, &fold)) orelse return true;
+        return cur == epoch;
+    }
+
+    /// Kick by registry entry: queue the play disconnect, flush it from
+    /// THIS thread, then shut the socket down. Flushing here (instead of
+    /// leaving it to the victim's serve loop) matters: a quiet victim's
+    /// thread can be parked in takeByte indefinitely, in which case a
+    /// queue-only kick never lands and the ghost lingers in the registry
+    /// shadowing the live session. Shutdown wakes the victim's thread so
+    /// it unregisters promptly. Same shape as the idle-kick path.
+    fn kickEntry(self: *Server, e: RegistryEntry, reason: []const u8) void {
+        var eb: [512]u8 = undefined;
+        const esc = packets.escapeJsonText(reason, &eb) catch return;
+        var jb: [560]u8 = undefined;
+        const json = std.fmt.bufPrint(&jb, "{{\"text\":\"{s}\"}}", .{esc}) catch return;
+        e.conn.lock.lock();
+        if (e.conn.state != .play or e.conn.dead) {
+            e.conn.lock.unlock();
+            return;
+        }
+        // Disconnect carries the JSON (client shows it on the screen).
+        var pb: [640]u8 = undefined;
+        var w = codec.PacketWriter.init(&pb);
+        w.writeString(json) catch {
+            e.conn.lock.unlock();
+            return;
+        };
+        var fb: [700]u8 = undefined;
+        const d = codec.framePacket(@intFromEnum(ids.PlayClient.disconnect), w.written(), &fb) catch {
+            e.conn.lock.unlock();
+            return;
+        };
+        e.conn.queueFramed(d) catch {};
+        e.conn.close_after_flush = true;
+        const pending = e.conn.takeOutput() catch {
+            e.conn.lock.unlock();
+            return;
+        };
+        e.conn.lock.unlock();
+        if (pending.len > 0) writeFramed(e, self.io, pending);
+        e.conn.allocator.free(pending);
+        e.stream.shutdown(self.io, .both) catch {};
+    }
+
+    /// Login rejection screen (conn.lock held by the caller). Queues a play
+    /// disconnect with the jar-hardcoded text and closes after flush —
+    /// LoginSuccess already went out, so this is a post-login kick with the
+    /// same screen vanilla shows pre-login.
+    fn rejectLogin(self: *Server, c: *Conn, rej: LoginReject) void {
+        const name = c.username[0..c.username_len];
+        var reason: [1024]u8 = undefined;
+        var rlen: usize = 0;
+        switch (rej) {
+            .banned_name => {
+                self.ban_lock.lock();
+                const r = if (self.bans) |*db| db.bannedName(name) else null;
+                if (r) |rr| {
+                    const s = std.fmt.bufPrint(&reason, "You are banned from this server!\nReason: {s}", .{rr}) catch reason[0..0];
+                    rlen = s.len;
+                } else {
+                    @memcpy(reason[0.."You are banned from this server.".len], "You are banned from this server.");
+                    rlen = "You are banned from this server.".len;
+                }
+                self.ban_lock.unlock();
+            },
+            .banned_ip => {
+                self.ban_lock.lock();
+                const r = if (self.bans) |*db| (if (c.ip_len > 0) db.bannedIp(c.ip[0..c.ip_len]) else null) else null;
+                if (r) |rr| {
+                    const s = std.fmt.bufPrint(&reason, "Your IP address is banned from this server!\nReason: {s}", .{rr}) catch reason[0..0];
+                    rlen = s.len;
+                } else {
+                    @memcpy(reason[0.."Your IP address is banned from this server.".len], "Your IP address is banned from this server.");
+                    rlen = "Your IP address is banned from this server.".len;
+                }
+                self.ban_lock.unlock();
+            },
+            .not_whitelisted => {
+                @memcpy(reason[0.."You are not white-listed on this server!".len], "You are not white-listed on this server!");
+                rlen = "You are not white-listed on this server!".len;
+            },
+        }
+        var eb: [2048]u8 = undefined;
+        const esc = packets.escapeJsonText(reason[0..rlen], &eb) catch return;
+        var jb: [2112]u8 = undefined;
+        const json = std.fmt.bufPrint(&jb, "{{\"text\":\"{s}\"}}", .{esc}) catch return;
+        var pb: [2200]u8 = undefined;
+        var w = codec.PacketWriter.init(&pb);
+        w.writeString(json) catch return;
+        var fb: [2300]u8 = undefined;
+        if (codec.framePacket(@intFromEnum(ids.PlayClient.disconnect), w.written(), &fb)) |f| {
+            c.queueFramed(f) catch {};
+        } else |_| {}
+        c.close_after_flush = true;
+    }
+
+    /// Kick an online player. False when they aren't online.
+    pub fn kickPlayer(self: *Server, name: []const u8, reason: ?[]const u8) bool {
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        for (snap) |e| {
+            e.conn.lock.lock();
+            const match = e.conn.state == .play and std.ascii.eqlIgnoreCase(e.conn.username[0..e.conn.username_len], name);
+            e.conn.lock.unlock();
+            if (!match) continue;
+            self.kickEntry(e, reason orelse "Kicked by an operator.");
+            return true;
+        }
+        return false;
+    }
+
+    fn banDb(self: *Server) *bans_mod.BanDb {
+        self.ban_lock.lock();
+        defer self.ban_lock.unlock();
+        if (self.bans == null) self.bans = bans_mod.BanDb.init(self.gpa);
+        return &self.bans.?;
+    }
+
+    fn banSave(self: *Server) void {
+        const pool = self.world orelse return;
+        self.ban_lock.lock();
+        const enc = if (self.bans) |*db| db.encode(pool.allocator) catch null else null;
+        self.ban_lock.unlock();
+        if (enc) |e| {
+            defer pool.allocator.free(e);
+            self.world_lock.lock();
+            defer self.world_lock.unlock();
+            pool.put(bans_mod.bans_key, e) catch {};
+        }
+    }
+
+    pub fn banLoad(self: *Server) void {
+        const pool = self.world orelse return;
+        const loaded = bans_mod.loadBans(pool, self.gpa) catch |err| blk: {
+            std.log.warn("bans row unreadable ({}) — starting empty", .{err});
+            break :blk null;
+        };
+        if (loaded) |db| {
+            self.ban_lock.lock();
+            defer self.ban_lock.unlock();
+            if (self.bans) |*old| old.deinit();
+            self.bans = db;
+        }
+    }
+
+    fn wlDb(self: *Server) *bans_mod.Whitelist {
+        self.wl_lock.lock();
+        defer self.wl_lock.unlock();
+        if (self.whitelist == null) self.whitelist = bans_mod.Whitelist.init(self.gpa);
+        return &self.whitelist.?;
+    }
+
+    fn wlSave(self: *Server) void {
+        const pool = self.world orelse return;
+        self.wl_lock.lock();
+        const enc = if (self.whitelist) |*wl| wl.encode(pool.allocator) catch null else null;
+        self.wl_lock.unlock();
+        if (enc) |e| {
+            defer pool.allocator.free(e);
+            self.world_lock.lock();
+            defer self.world_lock.unlock();
+            pool.put(bans_mod.whitelist_key, e) catch {};
+        }
+    }
+
+    pub fn whitelistLoad(self: *Server) void {
+        const pool = self.world orelse return;
+        const loaded = bans_mod.loadWhitelist(pool, self.gpa) catch |err| blk: {
+            std.log.warn("whitelist row unreadable ({}) — starting empty", .{err});
+            break :blk null;
+        };
+        if (loaded) |wl| {
+            self.wl_lock.lock();
+            defer self.wl_lock.unlock();
+            if (self.whitelist) |*old| old.deinit();
+            self.whitelist = wl;
+        }
+    }
+
+    pub fn wlSetEnabled(self: *Server, on: bool) void {
+        const wl = self.wlDb();
+        self.wl_lock.lock();
+        wl.enabled = on;
+        self.wl_lock.unlock();
+        self.wlSave();
+    }
+
+    pub fn wlAdd(self: *Server, name: []const u8) bool {
+        if (name.len == 0 or name.len > 16) return false;
+        const wl = self.wlDb();
+        self.wl_lock.lock();
+        wl.add(name) catch {
+            self.wl_lock.unlock();
+            return false;
+        };
+        self.wl_lock.unlock();
+        self.wlSave();
+        return true;
+    }
+
+    pub fn wlRemove(self: *Server, name: []const u8) bool {
+        const wl = self.wlDb();
+        self.wl_lock.lock();
+        const ok = wl.remove(name);
+        self.wl_lock.unlock();
+        if (ok) self.wlSave();
+        return ok;
+    }
+
+    /// "There are %d (out of %d seen) whitelisted players:" + names. Seen =
+    /// union of whitelisted + currently online (player rows need a store
+    /// scan, which the LSM doesn't offer — this is the best available).
+    pub fn wlList(self: *Server, out: []u8) []const u8 {
+        var names: [256][16]u8 = undefined;
+        var lens: [256]u8 = undefined;
+        const online = self.playNames(&names, &lens);
+        self.wl_lock.lock();
+        defer self.wl_lock.unlock();
+        const wl = if (self.whitelist) |*w| w else {
+            return std.fmt.bufPrint(out, "There are 0 (out of {d} seen) whitelisted players:", .{online}) catch out[0..0];
+        };
+        // Union count for "seen".
+        var seen = online;
+        var wit = wl.names.iterator();
+        while (wit.next()) |e| {
+            var known = false;
+            for (names[0..online], lens[0..online]) |nm, ln| {
+                if (std.mem.eql(u8, nm[0..ln], e.key_ptr.*)) {
+                    known = true;
+                    break;
+                }
+            }
+            if (!known) seen += 1;
+        }
+        var ow: usize = 0;
+        ow += (std.fmt.bufPrint(out[ow..], "There are {d} (out of {d} seen) whitelisted players:", .{ wl.names.count(), seen }) catch return out[0..ow]).len;
+        var jit = wl.names.iterator();
+        while (jit.next()) |e| {
+            ow += (std.fmt.bufPrint(out[ow..], "\n{s}", .{e.key_ptr.*}) catch break).len;
+        }
+        return out[0..ow];
+    }
+
+    fn sbDb(self: *Server) *scoreboard_mod.Scoreboard {
+        self.sb_lock.lock();
+        defer self.sb_lock.unlock();
+        if (self.scoreboard == null) self.scoreboard = scoreboard_mod.Scoreboard.init(self.gpa);
+        return &self.scoreboard.?;
+    }
+
+    fn sbSave(self: *Server) void {
+        const pool = self.world orelse return;
+        self.sb_lock.lock();
+        const enc = if (self.scoreboard) |*sb| sb.encode(pool.allocator) catch null else null;
+        self.sb_lock.unlock();
+        if (enc) |e| {
+            defer pool.allocator.free(e);
+            self.world_lock.lock();
+            defer self.world_lock.unlock();
+            pool.put(scoreboard_mod.scoreboard_key, e) catch {};
+        }
+    }
+
+    pub fn scoreboardLoad(self: *Server) void {
+        const pool = self.world orelse return;
+        const loaded = scoreboard_mod.load(pool, self.gpa) catch |err| blk: {
+            std.log.warn("scoreboard row unreadable ({}) — starting empty", .{err});
+            break :blk null;
+        };
+        if (loaded) |sb| {
+            self.sb_lock.lock();
+            defer self.sb_lock.unlock();
+            if (self.scoreboard) |*old| old.deinit();
+            self.scoreboard = sb;
+        }
+    }
+
+    /// Ban a name (any valid name in offline mode) and kick them if online.
+    /// Reason may be empty (login screen then shows the bare ban line).
+    pub fn banName(self: *Server, name: []const u8, reason: []const u8) void {
+        const db = self.banDb();
+        self.ban_lock.lock();
+        db.banName(name, reason) catch {};
+        self.ban_lock.unlock();
+        self.banSave();
+        _ = self.kickPlayer(name, "You are banned from this server.");
+    }
+
+    pub fn pardonName(self: *Server, name: []const u8) bool {
+        const db = self.banDb();
+        self.ban_lock.lock();
+        const ok = db.unbanName(name);
+        self.ban_lock.unlock();
+        if (ok) self.banSave();
+        return ok;
+    }
+
+    pub fn isNameBanned(self: *Server, name: []const u8) ?[]const u8 {
+        // Reason slice borrows the map — copy out under the lock.
+        self.ban_lock.lock();
+        defer self.ban_lock.unlock();
+        if (self.bans) |*db| {
+            if (db.bannedName(name)) |r| return r;
+        }
+        return null;
+    }
+
+    /// Ban an IP and kick every online conn with it.
+    pub fn banIp(self: *Server, ip: []const u8, reason: []const u8) void {
+        const db = self.banDb();
+        self.ban_lock.lock();
+        db.banIp(ip, reason) catch {};
+        self.ban_lock.unlock();
+        self.banSave();
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        for (snap) |e| {
+            e.conn.lock.lock();
+            const match = e.conn.state == .play and e.conn.ip_len == ip.len and std.mem.eql(u8, e.conn.ip[0..e.conn.ip_len], ip);
+            e.conn.lock.unlock();
+            if (match) self.kickEntry(e, "You have been IP banned.");
+        }
+    }
+
+    pub fn pardonIp(self: *Server, ip: []const u8) bool {
+        const db = self.banDb();
+        self.ban_lock.lock();
+        const ok = db.unbanIp(ip);
+        self.ban_lock.unlock();
+        if (ok) self.banSave();
+        return ok;
+    }
+
+    pub fn isIpBanned(self: *Server, ip: []const u8) bool {
+        self.ban_lock.lock();
+        defer self.ban_lock.unlock();
+        if (self.bans) |*db| return db.bannedIp(ip) != null;
+        return false;
+    }
+
+    /// /banlist body: "There are %d total banned players/ips:" + entries.
+    pub fn banList(self: *Server, want_ips: bool, out: []u8) []const u8 {
+        self.ban_lock.lock();
+        defer self.ban_lock.unlock();
+        const db = if (self.bans) |*d| d else {
+            return std.fmt.bufPrint(out, "There are 0 total banned {s}:", .{if (want_ips) "IP addresses" else "players"}) catch out[0..0];
+        };
+        var ow: usize = 0;
+        if (want_ips) {
+            ow += (std.fmt.bufPrint(out[ow..], "There are {d} total banned IP addresses:", .{db.ipCount()}) catch return out[0..ow]).len;
+            var it = db.ips.iterator();
+            while (it.next()) |e| {
+                ow += (std.fmt.bufPrint(out[ow..], "\n{s}", .{e.key_ptr.*}) catch break).len;
+            }
+        } else {
+            ow += (std.fmt.bufPrint(out[ow..], "There are {d} total banned players:", .{db.nameCount()}) catch return out[0..ow]).len;
+            var it = db.names.iterator();
+            while (it.next()) |e| {
+                ow += (std.fmt.bufPrint(out[ow..], "\n{s}", .{e.key_ptr.*}) catch break).len;
+            }
+        }
+        return out[0..ow];
+    }
+
+    /// Login gate: banned names/IPs and non-whitelisted names are rejected
+    /// with the jar-hardcoded screens (`oi` login handler strings).
+    pub const LoginReject = enum { banned_name, banned_ip, not_whitelisted };
+
+    pub fn loginRejected(self: *Server, name: []const u8, ip: []const u8) ?LoginReject {
+        self.ban_lock.lock();
+        const bn = if (self.bans) |*db| db.bannedName(name) != null else false;
+        const bi = if (self.bans) |*db| (if (ip.len > 0) db.bannedIp(ip) != null else false) else false;
+        self.ban_lock.unlock();
+        if (bn) return .banned_name;
+        if (bi) return .banned_ip;
+        self.wl_lock.lock();
+        defer self.wl_lock.unlock();
+        if (self.whitelist) |*wl| {
+            if (wl.enabled and !wl.contains(name)) return .not_whitelisted;
+        }
+        return null;
+    }
+
+    pub fn loginRejectText(reject: LoginReject, out: []u8) []const u8 {
+        _ = out;
+        return switch (reject) {
+            .banned_name => "You are banned from this server.",
+            .banned_ip => "Your IP address is banned from this server.",
+            .not_whitelisted => "You are not white-listed on this server!",
+        };
+    }
+
+    /// Broadcast `[name] message` (vanilla `chat.type.announcement`).
+    /// Multi-line input goes out as one packet per line (never `\n`).
+    pub fn broadcastSay(self: *Server, name: []const u8, msg: []const u8) void {
+        var it = std.mem.splitScalar(u8, msg, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            var eb: [2048]u8 = undefined;
+            const esc = packets.escapeJsonText(line, &eb) catch return;
+            var jb: [2200]u8 = undefined;
+            const json = std.fmt.bufPrint(&jb, "{{\"text\":\"[{s}] {s}\"}}", .{ name, esc }) catch return;
+            self.broadcastChat(json);
+        }
+    }
+
+    /// Broadcast `* name message` (vanilla `chat.type.emote`).
+    /// Multi-line input goes out as one packet per line (never `\n`).
+    pub fn broadcastMe(self: *Server, name: []const u8, msg: []const u8) void {
+        var it = std.mem.splitScalar(u8, msg, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            var eb2: [2048]u8 = undefined;
+            const esc = packets.escapeJsonText(line, &eb2) catch return;
+            var jb: [2200]u8 = undefined;
+            const json = std.fmt.bufPrint(&jb, "{{\"text\":\"* {s} {s}\"}}", .{ name, esc }) catch return;
+            self.broadcastChat(json);
+        }
+    }
+
+    /// Direct message pair for /tell: incoming to the target, outgoing text
+    /// returned for the sender's own reply. False when target is offline.
+    pub fn tellPlayer(self: *Server, target: []const u8, from: []const u8, msg: []const u8, out: []u8) ?[]const u8 {
+        var eb: [2048]u8 = undefined;
+        const esc = packets.escapeJsonText(msg, &eb) catch return null;
+        var ib: [2200]u8 = undefined;
+        const incoming = std.fmt.bufPrint(&ib, "{{\"text\":\"{s} whispers to you: {s}\"}}", .{ from, esc }) catch return null;
+        if (!self.sendJsonPlayer(target, incoming)) return null;
+        return std.fmt.bufPrint(out, "You whisper to {s}: {s}", .{ target, msg }) catch null;
+    }
+
+    /// Kill a player even in creative (vanilla /kill bypasses the damage
+    /// gate). Mirrors the ticker death flow: drops honor keepInventory.
+    pub fn killPlayer(self: *Server, name: []const u8) bool {
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        const c = findInSnap(snap, name) orelse return false;
+        c.lock.lock();
+        if (c.state != .play or c.is_dead) {
+            c.lock.unlock();
+            return true; // already dead: still "Ouch!" like vanilla
+        }
+        c.health = 0;
+        c.is_dead = true;
+        var hb: [32]u8 = undefined;
+        if (packets.frameUpdateHealth(0, c.food, c.saturation, &hb)) |f| {
+            c.queueFramed(f) catch {};
+        } else |_| {}
+        var dd: ?DeathDrop = if (self.keepInv()) null else collectDeathDrops(c);
+        const px = c.pos_x;
+        const py = c.pos_y;
+        const pz = c.pos_z;
+        const eid = c.eid;
+        c.lock.unlock();
+        // Death metadata + drops outside the conn lock.
+        var mdb: [32]u8 = undefined;
+        if (packets.frameEntityMetadata(eid, 0, &mdb)) |f| {
+            self.broadcastToTrackers(eid, f);
+        } else |_| {}
+        if (dd) |*d| {
+            self.spawnDeathDrops(d, px, py, pz);
+            self.savePlayer(c);
+        }
+        return true;
+    }
+
+    /// Uniform double in [0, 1) for spreadplayers (shares the gameplay RNG).
+    pub fn spreadRand(self: *Server) f64 {
+        self.rand_lock.lock();
+        defer self.rand_lock.unlock();
+        if (self.drop_rand == null) {
+            const seed: i64 = @bitCast(@as(u64, @bitCast(std.Io.Timestamp.now(self.io, .awake).toMilliseconds())));
+            self.drop_rand = java_random.JavaRandom.init(seed);
+        }
+        return @as(f64, @floatFromInt(self.drop_rand.?.nextInt() & 0xFFFFFF)) / 16777216.0;
+    }
+
+    /// Gameplay-RNG int (vanilla draw order; e.g. weather durations).
+    pub fn randInt(self: *Server) i64 {
+        self.rand_lock.lock();
+        defer self.rand_lock.unlock();
+        if (self.drop_rand == null) {
+            const seed: i64 = @bitCast(@as(u64, @bitCast(std.Io.Timestamp.now(self.io, .awake).toMilliseconds())));
+            self.drop_rand = java_random.JavaRandom.init(seed);
+        }
+        return self.drop_rand.?.nextInt();
+    }
+
+    const WeatherMode = enum { clear, rain, thunder };
+
+    /// /weather + /toggledownfall core. Durations are ticks (20/sec).
+    pub fn setWeather(self: *Server, mode: WeatherMode, ticks: u32) void {
+        self.state_lock.lock();
+        switch (mode) {
+            .clear => {
+                self.raining = false;
+                self.thundering = false;
+                self.rain_time = ticks;
+                self.thunder_time = ticks;
+            },
+            .rain => {
+                self.raining = true;
+                self.thundering = false;
+                self.rain_time = ticks;
+            },
+            .thunder => {
+                self.raining = true;
+                self.thundering = true;
+                self.rain_time = ticks;
+                self.thunder_time = ticks;
+            },
+        }
+        self.state_lock.unlock();
+        var gb: [16]u8 = undefined;
+        switch (mode) {
+            .clear => {
+                if (packets.frameGameState(2, 0, &gb)) |f| self.broadcastAll(f) else |_| {}
+            },
+            .rain, .thunder => {
+                if (packets.frameGameState(1, 0, &gb)) |f| self.broadcastAll(f) else |_| {}
+            },
+        }
+    }
+
+    pub fn toggleDownfall(self: *Server) void {
+        self.state_lock.lock();
+        self.raining = !self.raining;
+        if (!self.raining) self.thundering = false;
+        const now_raining = self.raining;
+        self.state_lock.unlock();
+        var gb: [16]u8 = undefined;
+        if (packets.frameGameState(if (now_raining) 1 else 2, 0, &gb)) |f| {
+            self.broadcastAll(f);
+        } else |_| {}
+    }
+
+    /// Raw frame to every play conn (weather, game state).
+    fn broadcastAll(self: *Server, framed: []const u8) void {
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        for (snap) |e| {
+            e.conn.lock.lock();
+            const play = e.conn.state == .play and !e.conn.dead;
+            if (play) e.conn.queueFramed(framed) catch {};
+            e.conn.lock.unlock();
+        }
+    }
+
+    /// Countdown in tickOnce: rain/thunder expire to clear + S2B(2).
+    fn tickWeather(self: *Server) void {
+        self.state_lock.lock();
+        var changed = false;
+        if (self.raining and self.rain_time > 0) {
+            self.rain_time -= 20;
+            if (self.rain_time >= 0xFFFFFFF0 or self.rain_time == 0) {
+                // underflow guard: rain_time counts in 20-tick units
+                if (self.rain_time > 1000000) self.rain_time = 0 else changed = false;
+            }
+            if (self.rain_time == 0) {
+                self.raining = false;
+                changed = true;
+            }
+        }
+        if (self.thundering and self.thunder_time > 0) {
+            if (self.thunder_time <= 20) {
+                self.thunder_time = 0;
+                self.thundering = false;
+            } else {
+                self.thunder_time -= 20;
+            }
+        }
+        self.state_lock.unlock();
+        if (changed) {
+            var gb: [16]u8 = undefined;
+            if (packets.frameGameState(2, 0, &gb)) |f| self.broadcastAll(f) else |_| {}
+        }
+    }
+
+    const diff_names = [_][]const u8{ "peaceful", "easy", "normal", "hard" };
+
+    pub fn difficultyName(_: *Server, d: u8) []const u8 {
+        return if (d < 4) diff_names[d] else "normal";
+    }
+
+    pub fn setDifficulty(self: *Server, d: u8) void {
+        self.state_lock.lock();
+        self.difficulty = d;
+        self.state_lock.unlock();
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        for (snap) |e| {
+            e.conn.lock.lock();
+            if (e.conn.state == .play) e.conn.config.difficulty = d;
+            e.conn.lock.unlock();
+        }
+    }
+
+    pub fn getDifficulty(self: *Server) u8 {
+        self.state_lock.lock();
+        defer self.state_lock.unlock();
+        return self.difficulty;
+    }
+
+    const gamemode_names = [_][]const u8{ "survival", "creative", "adventure" };
+
+    pub fn gamemodeName(_: *Server, m: u8) []const u8 {
+        return if (m < 3) gamemode_names[m] else "survival";
+    }
+
+    pub fn setDefaultGamemode(self: *Server, m: u8) void {
+        self.state_lock.lock();
+        self.default_gamemode = m;
+        self.state_lock.unlock();
+    }
+
+    pub fn gameruleGet(self: *Server, name: []const u8) ?bool {
+        self.state_lock.lock();
+        defer self.state_lock.unlock();
+        for (cmd_data.gamerules, 0..) |g, i| {
+            if (std.mem.eql(u8, g.name, name)) return self.gamerules[i];
+        }
+        return null;
+    }
+
+    /// Returns false for unknown rules (caller prints norule).
+    pub fn gameruleSet(self: *Server, name: []const u8, value: bool) bool {
+        self.state_lock.lock();
+        defer self.state_lock.unlock();
+        for (cmd_data.gamerules, 0..) |g, i| {
+            if (std.mem.eql(u8, g.name, name)) {
+                self.gamerules[i] = value;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// keepInventory gamerule (death drops).
+    pub fn keepInv(self: *Server) bool {
+        self.state_lock.lock();
+        defer self.state_lock.unlock();
+        return self.gamerules[2];
+    }
+
+    /// doTileDrops gamerule (block-break drops).
+    pub fn tileDrops(self: *Server) bool {
+        self.state_lock.lock();
+        defer self.state_lock.unlock();
+        return self.gamerules[5];
+    }
+
+    pub fn gameruleList(self: *Server, out: []u8) []const u8 {
+        self.state_lock.lock();
+        defer self.state_lock.unlock();
+        var ow: usize = 0;
+        for (cmd_data.gamerules, 0..) |g, i| {
+            ow += (std.fmt.bufPrint(out[ow..], "{s} = {s}\n", .{ g.name, if (self.gamerules[i]) "true" else "false" }) catch break).len;
+        }
+        if (ow > 0) ow -= 1; // drop trailing newline
+        return out[0..ow];
+    }
+
+    pub fn seedString(self: *Server, out: []u8) []const u8 {
+        return std.fmt.bufPrint(out, "Seed: {d}", .{self.drop_seed}) catch "Seed: 0";
+    }
+
+    // ---- experience ----
+
+    pub fn xpCap(level: i32) i32 {
+        if (level >= 30) return 62 + (level - 30) * 7;
+        if (level >= 15) return 17 + (level - 15) * 3;
+        return 17;
+    }
+
+    /// Queue S1F for one conn (lock must be held by the caller).
+    fn queueExperience(c: *Conn) void {
+        var eb: [16]u8 = undefined;
+        const total: i16 = @truncate(c.xp_total);
+        if (packets.frameSetExperience(c.xp_bar, @intCast(c.xp_level), total, &eb)) |f| {
+            c.queueFramed(f) catch {};
+        } else |_| {}
+    }
+
+    /// Vanilla EntityPlayer.addExperience: capped total, fractional bar,
+    /// level-ups preserve leftover against the new cap.
+    pub fn addXp(self: *Server, name: []const u8, amount: i32) bool {
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        const c = findInSnap(snap, name) orelse return false;
+        c.lock.lock();
+        defer c.lock.unlock();
+        if (c.state != .play) return false;
+        var a = amount;
+        const room: i64 = @as(i64, std.math.maxInt(i32)) - c.xp_total;
+        if (@as(i64, a) > room) a = @intCast(room);
+        c.xp_bar += @as(f32, @floatFromInt(a)) / @as(f32, @floatFromInt(xpCap(c.xp_level)));
+        c.xp_total += a;
+        while (c.xp_bar >= 1.0) {
+            c.xp_bar = (c.xp_bar - 1.0) * @as(f32, @floatFromInt(xpCap(c.xp_level)));
+            c.xp_level += 1;
+            if (c.xp_level < 0) c.xp_level = 0;
+            c.xp_bar /= @as(f32, @floatFromInt(xpCap(c.xp_level)));
+        }
+        queueExperience(c);
+        return true;
+    }
+
+    /// Vanilla addExperienceLevel: negative clamps to 0/0/0; multiples of 5
+    /// play the level-up sound.
+    pub fn addLevels(self: *Server, name: []const u8, amount: i32) bool {
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        const c = findInSnap(snap, name) orelse return false;
+        c.lock.lock();
+        if (c.state != .play) {
+            c.lock.unlock();
+            return false;
+        }
+        c.xp_level += amount;
+        if (c.xp_level < 0) {
+            c.xp_level = 0;
+            c.xp_bar = 0;
+            c.xp_total = 0;
+        }
+        queueExperience(c);
+        const lvl = c.xp_level;
+        const px = c.pos_x;
+        const py = c.pos_y;
+        const pz = c.pos_z;
+        c.lock.unlock();
+        // Vanilla chimes every 5 levels (heard by the leveler).
+        if (amount > 0 and lvl > 0 and @mod(lvl, 5) == 0) {
+            _ = self.playSoundTo(name, "random.levelup", px, py, pz, 1.0, 1.0, 0.0);
+        }
+        return true;
+    }
+
+    // ---- potion effects ----
+
+    /// Give (or refresh) an effect; replaces same-id, 8-slot cap.
+    /// False when the player isn't online.
+    pub fn effectGive(self: *Server, name: []const u8, id: u8, seconds: i32, amp: u8) bool {
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        const c = findInSnap(snap, name) orelse return false;
+        c.lock.lock();
+        defer c.lock.unlock();
+        if (c.state != .play) return false;
+        const ticks: i32 = seconds * 20;
+        var slot: ?usize = null;
+        for (&c.effects, 0..) |*s, i| {
+            if (s.*) |e| {
+                if (e.id == id) {
+                    slot = i;
+                    break;
+                }
+            } else if (slot == null) {
+                slot = i;
+            }
+        }
+        const si = slot orelse return true; // full: still success, vanilla drops extras silently? no — vanilla has no cap; ours holds 8 (documented)
+        c.effects[si] = .{ .id = id, .amplifier = amp, .ticks = ticks };
+        var eb: [16]u8 = undefined;
+        if (packets.frameEntityEffect(c.eid, id, amp, ticks, &eb)) |f| {
+            c.queueFramed(f) catch {};
+        } else |_| {}
+        return true;
+    }
+
+    /// Clear one effect (null id = all). Returns removed count, or null
+    /// when the player isn't online.
+    pub fn effectClear(self: *Server, name: []const u8, id: ?u8) ?usize {
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        const c = findInSnap(snap, name) orelse return null;
+        c.lock.lock();
+        defer c.lock.unlock();
+        if (c.state != .play) return null;
+        var n: usize = 0;
+        for (&c.effects) |*s| {
+            if (s.*) |e| {
+                if (id == null or e.id == id.?) {
+                    var eb: [16]u8 = undefined;
+                    if (packets.frameRemoveEntityEffect(c.eid, e.id, &eb)) |f| {
+                        c.queueFramed(f) catch {};
+                    } else |_| {}
+                    s.* = null;
+                    n += 1;
+                }
+            }
+        }
+        return n;
+    }
+
+    /// Tick down effects (20 units per 1Hz tick); expiry sends S1E.
+    fn tickEffects(self: *Server) void {
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        for (snap) |e| {
+            e.conn.lock.lock();
+            if (e.conn.state != .play) {
+                e.conn.lock.unlock();
+                continue;
+            }
+            var expired: [8]u8 = undefined;
+            var n_exp: usize = 0;
+            for (&e.conn.effects) |*s| {
+                if (s.*) |*fx| {
+                    fx.ticks -= 20;
+                    if (fx.ticks <= 0) {
+                        expired[n_exp] = fx.id;
+                        n_exp += 1;
+                        s.* = null;
+                    }
+                }
+            }
+            for (expired[0..n_exp]) |id| {
+                var eb: [16]u8 = undefined;
+                if (packets.frameRemoveEntityEffect(e.conn.eid, id, &eb)) |f| {
+                    e.conn.queueFramed(f) catch {};
+                } else |_| {}
+            }
+            e.conn.lock.unlock();
+        }
+    }
+
+    // ---- raw-NBT `ench` list helpers (wire format is uncompressed NBT) ----
+
+    /// Skip one NBT payload; false on truncation/unknown tag.
+    fn nbtSkip(tag: u8, buf: []const u8, i: *usize) bool {
+        const need = struct {
+            fn f(buf_: []const u8, i_: *usize, n: usize) bool {
+                if (i_.* + n > buf_.len) return false;
+                i_.* += n;
+                return true;
+            }
+        }.f;
+        switch (tag) {
+            0 => return true,
+            1, 7 => return need(buf, i, 1),
+            2 => return need(buf, i, 2),
+            3, 5 => return need(buf, i, 4),
+            4, 6 => return need(buf, i, 8),
+            8 => {
+                if (i.* + 2 > buf.len) return false;
+                const l = std.mem.readInt(u16, buf[i.*..][0..2], .big);
+                i.* += 2;
+                return need(buf, i, l);
+            },
+            9 => {
+                if (i.* + 5 > buf.len) return false;
+                const et = buf[i.*];
+                i.* += 1;
+                const n = std.mem.readInt(i32, buf[i.*..][0..4], .big);
+                i.* += 4;
+                if (n < 0) return false;
+                var k: i32 = 0;
+                while (k < n) : (k += 1) {
+                    if (et == 10) {
+                        if (!nbtCompound(buf, i, false)) return false;
+                    } else if (!nbtSkip(et, buf, i)) return false;
+                }
+                return true;
+            },
+            10 => return nbtCompound(buf, i, true),
+            11 => {
+                if (i.* + 4 > buf.len) return false;
+                const n = std.mem.readInt(i32, buf[i.*..][0..4], .big);
+                i.* += 4;
+                if (n < 0 or n > 100000) return false;
+                return need(buf, i, @as(usize, @intCast(n)) * 4);
+            },
+            else => return false,
+        }
+    }
+
+    /// Walk a compound's named tags; false on truncation. When `ids_out` is
+    /// given, harvests `ench`-list (id,lvl) pairs instead of stopping early.
+    fn nbtCompound(buf: []const u8, i: *usize, named: bool) bool {
+        _ = named;
+        while (true) {
+            if (i.* + 1 > buf.len) return false;
+            const tag = buf[i.*];
+            i.* += 1;
+            if (tag == 0) return true;
+            if (i.* + 2 > buf.len) return false;
+            const nl = std.mem.readInt(u16, buf[i.*..][0..2], .big);
+            i.* += 2;
+            if (i.* + nl > buf.len) return false;
+            i.* += nl;
+            if (!nbtSkip(tag, buf, i)) return false;
+        }
+    }
+
+    /// Harvest (id, lvl) pairs from a top-level compound's `ench` list.
+    /// Returns pair count; `valid` is false when the bytes aren't a compound.
+    fn parseEnchIds(raw: []const u8, out: *[8]u8) usize {
+        var lvl_out: [8]u8 = undefined;
+        return parseEnchList(raw, out, &lvl_out).n;
+    }
+
+    const EnchParse = struct { n: usize = 0, list_at: usize = 0, list_end: usize = 0, valid: bool = false };
+
+    fn parseEnchList(raw: []const u8, ench_ids: *[8]u8, ench_lvls: *[8]u8) EnchParse {
+        var r = EnchParse{};
+        if (raw.len < 3) return r;
+        if (raw[0] != 10) return r; // root compound
+        var i: usize = 1;
+        // Root name (usually empty u16).
+        if (i + 2 > raw.len) return r;
+        const nl0 = std.mem.readInt(u16, raw[i..][0..2], .big);
+        i += 2;
+        if (i + nl0 > raw.len) return r;
+        i += nl0;
+        while (true) {
+            if (i + 1 > raw.len) return r;
+            const tag = raw[i];
+            i += 1;
+            if (tag == 0) {
+                r.valid = i == raw.len;
+                return r;
+            }
+            if (i + 2 > raw.len) return r;
+            const nl = std.mem.readInt(u16, raw[i..][0..2], .big);
+            i += 2;
+            if (i + nl > raw.len) return r;
+            const name = raw[i .. i + nl];
+            i += nl;
+            if (tag == 9 and std.mem.eql(u8, name, "ench")) {
+                r.list_at = i; // points at element-type byte
+                if (i + 5 > raw.len) return r;
+                if (raw[i] != 10) return r; // must be compound list
+                i += 1;
+                const n = std.mem.readInt(i32, raw[i..][0..4], .big);
+                i += 4;
+                if (n < 0 or n > 64) return r;
+                var k: i32 = 0;
+                while (k < n) : (k += 1) {
+                    var id: ?u8 = null;
+                    var lvl: ?u8 = null;
+                    while (true) {
+                        if (i + 1 > raw.len) return r;
+                        const et = raw[i];
+                        i += 1;
+                        if (et == 0) break;
+                        if (i + 2 > raw.len) return r;
+                        const el = std.mem.readInt(u16, raw[i..][0..2], .big);
+                        i += 2;
+                        if (i + el > raw.len) return r;
+                        const ename = raw[i .. i + el];
+                        i += el;
+                        if (et == 3 and i + 2 <= raw.len) {
+                            const v = std.mem.readInt(i16, raw[i..][0..2], .big);
+                            if (std.mem.eql(u8, ename, "id")) id = @truncate(@max(0, v));
+                            if (std.mem.eql(u8, ename, "lvl")) lvl = @truncate(@max(0, v));
+                            i += 2;
+                        } else {
+                            var j = i;
+                            if (!nbtSkip(et, raw, &j)) return r;
+                            i = j;
+                        }
+                    }
+                    if (r.n < 8) {
+                        ench_ids[r.n] = id orelse 0;
+                        ench_lvls[r.n] = lvl orelse 0;
+                        r.n += 1;
+                    }
+                }
+                r.list_end = i;
+            } else {
+                var j = i;
+                if (!nbtSkip(tag, raw, &j)) return r;
+                i = j;
+            }
+        }
+    }
+
+    /// Build merged NBT: existing `ench` list updated (or appended before the
+    /// root TAG_End), else a fresh compound. Null when `out` is too small.
+    fn buildEnchNbt(existing: ?[]const u8, ench_id: u8, level: u8, out: []u8) ?[]const u8 {
+        var have: [8]u8 = undefined;
+        var have_lvls: [8]u8 = undefined;
+        if (existing) |raw| {
+            const p = parseEnchList(raw, &have, &have_lvls);
+            if (p.valid) {
+                // Update or append the target entry.
+                var n = p.n;
+                var hit = false;
+                for (have[0..n], 0..) |id, k| {
+                    if (id == ench_id) {
+                        have_lvls[k] = level;
+                        hit = true;
+                    }
+                }
+                if (!hit) {
+                    if (n >= 8) return null;
+                    have[n] = ench_id;
+                    have_lvls[n] = level;
+                    n += 1;
+                }
+                if (p.list_end > p.list_at) {
+                    // Splice: raw[0..list_at] + new list + raw[list_end..].
+                    var w: usize = 0;
+                    const pre = raw[0..p.list_at];
+                    if (w + pre.len > out.len) return null;
+                    @memcpy(out[w..][0..pre.len], pre);
+                    w += pre.len;
+                    const list_bytes = 1 + 4 + n * 16; // 0A + count + entries
+                    if (w + list_bytes + (raw.len - p.list_end) > out.len) return null;
+                    out[w] = 10;
+                    w += 1;
+                    std.mem.writeInt(i32, out[w..][0..4], @intCast(n), .big);
+                    w += 4;
+                    for (have[0..n], have_lvls[0..n]) |id, lvl| {
+                        out[w] = 3;
+                        w += 1;
+                        std.mem.writeInt(u16, out[w..][0..2], 2, .big);
+                        w += 2;
+                        out[w] = 'i';
+                        out[w + 1] = 'd';
+                        w += 2;
+                        std.mem.writeInt(i16, out[w..][0..2], id, .big);
+                        w += 2;
+                        out[w] = 3;
+                        w += 1;
+                        std.mem.writeInt(u16, out[w..][0..2], 3, .big);
+                        w += 2;
+                        out[w] = 'l';
+                        out[w + 1] = 'v';
+                        out[w + 2] = 'l';
+                        w += 3;
+                        std.mem.writeInt(i16, out[w..][0..2], lvl, .big);
+                        w += 2;
+                        out[w] = 0;
+                        w += 1;
+                    }
+                    const post = raw[p.list_end..];
+                    @memcpy(out[w..][0..post.len], post);
+                    w += post.len;
+                    return out[0..w];
+                }
+                // No ench list (valid compound without one): append before end.
+                if (raw.len < 1 or raw[raw.len - 1] != 0) return null;
+                const list_bytes = 1 + 2 + 4 + 1 + 4 + 16; // tag+name+count+entry
+                if (raw.len - 1 + list_bytes + 1 > out.len) return null;
+                var w: usize = 0;
+                @memcpy(out[w..][0 .. raw.len - 1], raw[0 .. raw.len - 1]);
+                w += raw.len - 1;
+                out[w] = 9;
+                w += 1;
+                std.mem.writeInt(u16, out[w..][0..2], 4, .big);
+                w += 2;
+                out[w] = 'e';
+                out[w + 1] = 'n';
+                out[w + 2] = 'c';
+                out[w + 3] = 'h';
+                w += 4;
+                out[w] = 10;
+                w += 1;
+                std.mem.writeInt(i32, out[w..][0..4], 1, .big);
+                w += 4;
+                out[w] = 3;
+                w += 1;
+                std.mem.writeInt(u16, out[w..][0..2], 2, .big);
+                w += 2;
+                out[w] = 'i';
+                out[w + 1] = 'd';
+                w += 2;
+                std.mem.writeInt(i16, out[w..][0..2], ench_id, .big);
+                w += 2;
+                out[w] = 3;
+                w += 1;
+                std.mem.writeInt(u16, out[w..][0..2], 3, .big);
+                w += 2;
+                out[w] = 'l';
+                out[w + 1] = 'v';
+                out[w + 2] = 'l';
+                w += 3;
+                std.mem.writeInt(i16, out[w..][0..2], level, .big);
+                w += 2;
+                out[w] = 0;
+                w += 1;
+                out[w] = 0;
+                w += 1;
+                return out[0..w];
+            }
+        }
+        // Fresh compound with a single-entry ench list (23 bytes).
+        if (out.len < 23) return null;
+        var w: usize = 0;
+        out[w] = 10;
+        w += 1; // root compound, empty name
+        out[w] = 0;
+        out[w + 1] = 0;
+        w += 2;
+        out[w] = 9;
+        w += 1; // ench list
+        out[w] = 0;
+        out[w + 1] = 4;
+        w += 2;
+        out[w] = 'e';
+        out[w + 1] = 'n';
+        out[w + 2] = 'c';
+        out[w + 3] = 'h';
+        w += 4;
+        out[w] = 10;
+        w += 1;
+        std.mem.writeInt(i32, out[w..][0..4], 1, .big);
+        w += 4;
+        out[w] = 3;
+        w += 1;
+        std.mem.writeInt(u16, out[w..][0..2], 2, .big);
+        w += 2;
+        out[w] = 'i';
+        out[w + 1] = 'd';
+        w += 2;
+        std.mem.writeInt(i16, out[w..][0..2], ench_id, .big);
+        w += 2;
+        out[w] = 3;
+        w += 1;
+        std.mem.writeInt(u16, out[w..][0..2], 3, .big);
+        w += 2;
+        out[w] = 'l';
+        out[w + 1] = 'v';
+        out[w + 2] = 'l';
+        w += 3;
+        std.mem.writeInt(i16, out[w..][0..2], level, .big);
+        w += 2;
+        out[w] = 0;
+        w += 1; // entry end
+        out[w] = 0;
+        w += 1; // root end
+        return out[0..w];
+    }
+
+    /// Enchant the held item (`ench` NBT list). Use for messages only —
+    /// the NBT bytes are built by `enchNbt`.
+    pub const EnchantResult = enum { ok, no_item, cant_enchant, no_room };
+
+    pub fn enchantById(self: *Server, id: u8) ?cmd_data.Ench {
+        _ = self;
+        return cmd_data.enchantById(id);
+    }
+
+    pub fn enchantMax(self: *Server, id: u8) u8 {
+        _ = self;
+        return cmd_data.enchantById(id).?.max;
+    }
+
+    /// Potion display name for /effect feedback (1..23, else null).
+    pub fn effectName(self: *Server, id: u8) ?[]const u8 {
+        _ = self;
+        return cmd_data.effectName(id);
+    }
+    pub fn enchantHeld(self: *Server, name: []const u8, ench_id: u8, level: u8) ?EnchantResult {
+        const ench = cmd_data.enchantById(ench_id) orelse return .cant_enchant;
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        const c = findInSnap(snap, name) orelse return null;
+        c.lock.lock();
+        defer c.lock.unlock();
+        if (c.state != .play) return null;
+        const held_i: usize = 36 + c.selected;
+        var st = c.inv[held_i] orelse return .no_item;
+        const wire_id = wire.toWire(st.id);
+        if (!cmd_data.enchantApplies(ench.cat, wire_id)) return .cant_enchant;
+        // Existing enchants must all combine (vanilla cantCombine check).
+        if (st.nbt) |raw| {
+            var have: [8]u8 = undefined;
+            const n = parseEnchIds(raw, &have);
+            for (have[0..n]) |other| {
+                if (!cmd_data.enchantsCombine(ench_id, other)) return .cant_enchant;
+            }
+        }
+        var nb: [2048]u8 = undefined;
+        const nbt = buildEnchNbt(st.nbt, ench_id, level, &nb) orelse return .no_room;
+        item_mod.freeStack(c.allocator, &c.inv[held_i]);
+        c.inv[held_i] = .{ .id = st.id, .count = st.count, .damage = st.damage, .nbt = c.allocator.dupe(u8, nbt) catch null };
+        st = c.inv[held_i] orelse return .no_room;
+        const f = packets.frameSetSlotAlloc(self.gpa, 0, @intCast(held_i), st) catch return .ok;
+        defer self.gpa.free(f);
+        c.queueFramed(f) catch {};
+        return .ok;
+    }
+
+    /// Clear matching stacks (item + data(-1 = any), or everything).
+    /// Returns removed item count, or null when offline.
+    pub fn clearInventory(self: *Server, name: []const u8, wire_id: ?u16, data: i16) ?usize {
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        const c = findInSnap(snap, name) orelse return null;
+        c.lock.lock();
+        if (c.state != .play) {
+            c.lock.unlock();
+            return null;
+        }
+        var removed: usize = 0;
+        if (wire_id) |w| {
+            // Unmapped wire ids (air, gaps) match nothing: vanilla reports
+            // clear.failure, not a parse error.
+            const id = wire.fromWire(w) orelse return 0;
+            for (&c.inv) |*s| {
+                if (s.*) |st| {
+                    if (st.id == id and (data < 0 or st.damage == data)) {
+                        removed += @intCast(st.count);
+                        item_mod.freeStack(c.allocator, s);
+                        s.* = null;
+                    }
+                }
+            }
+            if (c.cursor) |st| {
+                if (st.id == id and (data < 0 or st.damage == data)) {
+                    removed += @intCast(st.count);
+                    item_mod.freeStack(c.allocator, &c.cursor);
+                    c.cursor = null;
+                }
+            }
+        } else {
+            for (&c.inv) |*s| {
+                if (s.*) |st| {
+                    removed += @intCast(st.count);
+                    item_mod.freeStack(c.allocator, s);
+                    s.* = null;
+                }
+            }
+            if (c.cursor) |st| {
+                removed += @intCast(st.count);
+                item_mod.freeStack(c.allocator, &c.cursor);
+                c.cursor = null;
+            }
+        }
+        // Full-window resync (vanilla detectAndSendChanges).
+        const wf = packets.frameWindowItemsAlloc(self.gpa, 0, &c.inv) catch null;
+        const cf = if (wf != null) packets.frameSetSlotAlloc(self.gpa, -1, -1, c.cursor) catch null else null;
+        c.lock.unlock();
+        if (wf) |f| {
+            defer self.gpa.free(f);
+            c.lock.lock();
+            c.queueFramed(f) catch {};
+            c.lock.unlock();
+        }
+        if (cf) |f| {
+            defer self.gpa.free(f);
+            c.lock.lock();
+            c.queueFramed(f) catch {};
+            c.lock.unlock();
+        }
+        return removed;
+    }
+
+    /// Summonable living entity by vanilla name (else null).
+    pub fn mobByName(self: *Server, name: []const u8) ?cmd_data.Mob {
+        _ = self;
+        return cmd_data.mobByName(name);
+    }
+
+    /// Read one block (wire id + meta). Null without a world / missing chunk.
+    pub fn getBlockAt(self: *Server, x: i32, y: i32, z: i32) ?struct { wire: u16, meta: u4 } {
+        const pool = self.world orelse return null;
+        if (y < 0 or y > 255) return null;
+        self.world_lock.lock();
+        defer self.world_lock.unlock();
+        const pb = view.peekBlock(pool, self.gpa, x, @intCast(y), z) catch return null;
+        const b = pb orelse return null;
+        return .{ .wire = wire.toWire(b.id), .meta = b.meta };
+    }
+
+    pub const SetBlockResult = enum { ok, no_world, out_of_world, no_change };
+
+    /// Vanilla setblock modes: replace always writes (same block+data =
+    /// noChange); keep writes only into air; destroy drops + breaks first.
+    pub fn setBlockAt(self: *Server, x: i32, y: i32, z: i32, wire_id: u16, meta: u4, mode: enum { replace, keep, destroy }) SetBlockResult {
+        const pool = self.world orelse return .no_world;
+        const id = wire.fromWire(wire_id) orelse return .no_world;
+        if (y < 0 or y > 255) return .out_of_world;
+        self.world_lock.lock();
+        defer self.world_lock.unlock();
+        const cur = (view.peekBlock(pool, self.gpa, x, @intCast(y), z) catch return .no_world) orelse return .out_of_world;
+        switch (mode) {
+            .replace => {
+                if (cur.id == id and cur.meta == meta) return .no_change;
+            },
+            .keep => {
+                if (cur.id != game_ids.air) return .no_change;
+            },
+            .destroy => {
+                if (cur.id == id and cur.meta == meta) return .no_change;
+            },
+        }
+        if (mode == .destroy and cur.id != game_ids.air) {
+            // Break particles + survival-style drop handled by the caller
+            // (drops need gamerule state, checked outside world_lock).
+        }
+        view.applyBlock(pool, self.gpa, x, @intCast(y), z, id, meta) catch return .no_world;
+        self.broadcastBlockChange(null, x, @intCast(y), z, id, meta) catch {};
+        var eb: [24]u8 = undefined;
+        if (mode == .destroy) {
+            if (packets.frameWorldEffect(2001, x, @intCast(y), z, @intCast(wire.toWire(cur.id)), &eb)) |f| {
+                self.broadcastAll(f);
+            } else |_| {}
+        }
+        return .ok;
+    }
+
+    /// Survival dig-drop gate: breaking a real block drops in survival
+    /// and adventure (vanilla drops there too), never in creative, and
+    /// only with doTileDrops on. (Was once inverted (`!tileDrops`),
+    /// which silenced all survival digging drops while /setblock destroy
+    /// still dropped.)
+    fn shouldDropBreak(gamemode: u8, old_id: game_ids.Id, tile_drops: bool) bool {
+        return old_id != game_ids.air and gamemode != 1 and tile_drops;
+    }
+
+    /// Spawn drops for a destroy-mode setblock (gamerule doTileDrops gate).
+    pub fn setblockDrops(self: *Server, x: i32, y: i32, z: i32, old_wire: u16) void {
+        if (!self.tileDrops()) return;
+        const id = wire.fromWire(old_wire) orelse return;
+        if (id == game_ids.air) return;
+        const pool = self.world orelse return;
+        self.spawnBreakDrops(pool, self.gpa, x, @intCast(y), z, id, 0);
+    }
+
+    /// Summon a living entity (ticker broadcasts it like any other mob).
+    /// Caller validates y in [0, 256); returns false without a world.
+    pub fn summonMob(self: *Server, type_id: u8, x: f64, y: f64, z: f64, health: f32) bool {
+        if (self.world == null) return false;
+        const id = self.eid_counter.fetchAdd(1, .acq_rel);
+        self.ent_lock.lock();
+        defer self.ent_lock.unlock();
+        self.entities.append(self.gpa, .{
+            .id = id,
+            .kind = type_id,
+            .x = x,
+            .y = y,
+            .z = z,
+            .yaw = 0,
+            .health = health,
+            .home_x = x,
+            .home_z = z,
+            .patrol_r = 4.0,
+        }) catch return false;
+        return true;
+    }
+
+    /// Surface Y for spreadplayers: stored column top, else gen-less 64.
+    pub fn surfaceY(self: *Server, x: i32, z: i32) i32 {
+        const pool = self.world orelse return 64;
+        self.world_lock.lock();
+        defer self.world_lock.unlock();
+        const top = view.groundBlockY(pool, self.gpa, x, z, 255) catch return 64;
+        return if (top) |t| @as(i32, t) + 1 else 64;
+    }
+
+    /// Playsound to one player with the vanilla 16-block (minVolume-scaled)
+    /// hearing check. Returns heard/unheard/offline.
+    pub const HearResult = enum { heard, too_far, offline };
+
+    pub fn playSoundTo(self: *Server, name: []const u8, sound: []const u8, x: f64, y: f64, z: f64, volume: f32, pitch: f32, min_volume: f32) HearResult {
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        const c = findInSnap(snap, name) orelse return .offline;
+        c.lock.lock();
+        defer c.lock.unlock();
+        if (c.state != .play) return .offline;
+        const range: f64 = if (min_volume > 1.0) @as(f64, min_volume) * 16.0 else 16.0;
+        const dx = x - c.pos_x;
+        const dy = y - c.pos_y;
+        const dz = z - c.pos_z;
+        if (dx * dx + dy * dy + dz * dz > range * range) return .too_far;
+        var sb: [512]u8 = undefined;
+        if (packets.frameSoundEffect(sound, x, y, z, volume, pitch, &sb)) |f| {
+            c.queueFramed(f) catch {};
+        } else |_| {}
+        return .heard;
+    }
+
+    pub fn nowMs(self: *Server) i64 {
+        return std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
+    }
+
+    /// /netstat console body: connection + entity + tick counters (we don't
+    /// track per-packet bytes, so this reports what the server does know).
+    pub fn netstatText(self: *Server, out: []u8) []const u8 {
+        self.ent_lock.lock();
+        const nmobs = self.entities.items.len;
+        const nitems = self.items.items.len;
+        self.ent_lock.unlock();
+        self.reg_lock.lock();
+        const nconns = self.registry.items.len;
+        self.reg_lock.unlock();
+        return std.fmt.bufPrint(out, "connections: {d}, mobs: {d}, item entities: {d}, ticks: {d}, time: {d}", .{ nconns, nmobs, nitems, self.tick_counter, self.time_of_day.load(.acquire) }) catch "netstat";
+    }
+
+    pub fn debugStart(self: *Server, now_ms: i64) void {
+        self.state_lock.lock();
+        defer self.state_lock.unlock();
+        self.debug_start_ms = now_ms;
+        self.debug_ticks = 0;
+    }
+
+    /// Returns elapsed seconds + ticks, or null when not profiling.
+    pub fn debugStop(self: *Server, now_ms: i64) ?struct { secs: f64, ticks: u64 } {
+        self.state_lock.lock();
+        defer self.state_lock.unlock();
+        const start = self.debug_start_ms orelse return null;
+        self.debug_start_ms = null;
+        return .{ .secs = @as(f64, @floatFromInt(now_ms - start)) / 1000.0, .ticks = self.debug_ticks };
+    }
+
+    pub fn setAutosave(self: *Server, on: bool) void {
+        self.state_lock.lock();
+        defer self.state_lock.unlock();
+        self.autosave = on;
+    }
+
+    pub fn getAutosave(self: *Server) bool {
+        self.state_lock.lock();
+        defer self.state_lock.unlock();
+        return self.autosave;
+    }
+
+    pub fn setIdleTimeout(self: *Server, mins: u32) void {
+        self.state_lock.lock();
+        defer self.state_lock.unlock();
+        self.idle_timeout_min = mins;
+    }
+
+    /// Personal spawn (`/spawnpoint`): empty name = sender handled by caller.
+    pub fn setSpawn(self: *Server, name: []const u8, x: i32, y: i32, z: i32) bool {
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        const c = findInSnap(snap, name) orelse return false;
+        c.lock.lock();
+        defer c.lock.unlock();
+        if (c.state != .play) return false;
+        c.config.spawn_x = x;
+        c.config.spawn_y = y;
+        c.config.spawn_z = z;
+        c.spawn_forced = true;
+        return true;
+    }
+
+    /// World spawn (`/setworldspawn`): default for new logins + every
+    /// non-forced online player.
+    pub fn setWorldSpawn(self: *Server, x: i32, y: i32, z: i32) void {
+        self.state_lock.lock();
+        self.world_spawn = .{ x, y, z };
+        self.world_spawn_set = true;
+        self.state_lock.unlock();
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        for (snap) |e| {
+            e.conn.lock.lock();
+            if (e.conn.state == .play and !e.conn.spawn_forced) {
+                e.conn.config.spawn_x = x;
+                e.conn.config.spawn_y = y;
+                e.conn.config.spawn_z = z;
+            }
+            e.conn.lock.unlock();
+        }
+    }
+
+    /// Achievement/stat award. Achievements announce once (vanilla
+    /// `chat.type.achievement`); stats just succeed. Unknown -> null.
+    pub fn awardStat(self: *Server, name: []const u8, stat: []const u8) ?bool {
+        if (!cmd_data.validStatName(stat)) return null;
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        const c = findInSnap(snap, name) orelse return false;
+        var announced = false;
+        var title: ?[]const u8 = null;
+        c.lock.lock();
+        if (c.state == .play and cmd_data.isAchievement(stat)) {
+            var have = false;
+            for (c.achieved[0..c.achieved_len]) |*slot| {
+                if (stat.len < slot.len and std.mem.eql(u8, slot[0..stat.len], stat) and slot[stat.len] == 0) {
+                    have = true;
+                    break;
+                }
+            }
+            if (!have and c.achieved_len < c.achieved.len) {
+                @memcpy(c.achieved[c.achieved_len][0..stat.len], stat);
+                c.achieved[c.achieved_len][stat.len] = 0;
+                c.achieved_len += 1;
+                announced = true;
+                title = cmd_data.achievementTitle(stat);
+            }
+        }
+        c.lock.unlock();
+        if (announced) {
+            var ab: [256]u8 = undefined;
+            const line = std.fmt.bufPrint(&ab, "{s} has just earned the achievement [{s}]", .{ name, title orelse stat }) catch return true;
+            var eb: [512]u8 = undefined;
+            const esc = packets.escapeJsonText(line, &eb) catch return true;
+            var jb: [560]u8 = undefined;
+            const json = std.fmt.bufPrint(&jb, "{{\"text\":\"{s}\",\"color\":\"green\"}}", .{esc}) catch return true;
+            self.broadcastChat(json);
+        }
+        return true;
+    }
+
+    pub fn validStatName(self: *Server, name: []const u8) bool {
+        _ = self;
+        return cmd_data.validStatName(name);
+    }
+
+    pub fn isAchievement(self: *Server, name: []const u8) bool {
+        _ = self;
+        return cmd_data.isAchievement(name);
+    }
+
+    pub fn achievementTitle(self: *Server, name: []const u8) ?[]const u8 {
+        _ = self;
+        return cmd_data.achievementTitle(name);
+    }
+
+    /// Award every achievement to one player (the `*` form).
+    pub fn awardAll(self: *Server, name: []const u8) bool {
+        for (cmd_data.achievements) |a| {
+            const ok = self.awardStat(name, a) orelse return false;
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    // ---- tab completion ----
+
+    /// Vanilla `getPossibleCommands` + per-command `addTabCompletion`.
+    /// Null = suppress (unknown command); otherwise S3A with candidates
+    /// (possibly empty). Caller holds no locks; conn queued under its lock.
+    pub fn handleTabComplete(self: *Server, sender: *Conn, text: []const u8) void {
+        var cands: [128][]const u8 = undefined;
+        var owned: [128][64]u8 = undefined; // player-name / id copies
+        if (text.len == 0 or text[0] != '/') {
+            // Non-slash: complete online player names (vanilla client behavior).
+            const n = self.completePlayers(text, &cands, &owned);
+            self.sendTab(sender, cands[0..n]);
+            return;
+        }
+        // Split keeping the trailing empty token (vanilla split(" ", -1)).
+        var toks: [32][]const u8 = undefined;
+        var nt: usize = 0;
+        var start: usize = 1; // skip '/'
+        var i: usize = 1;
+        while (i <= text.len and nt < toks.len) : (i += 1) {
+            if (i == text.len or text[i] == ' ') {
+                toks[nt] = text[start..i];
+                nt += 1;
+                start = i + 1;
+            }
+        }
+        if (nt == 0) return;
+        if (nt == 1) {
+            // Command-name completion, perm-filtered (aliases included).
+            const n = self.completeCommandsFor(sender, toks[0], &cands, &owned);
+            self.sendTab(sender, cands[0..n]);
+            return;
+        }
+        // Multi-word: find the command (exact, names + aliases).
+        var found: ?*const perms_mod.Command = null;
+        for (&perms_mod.commands) |*d| {
+            if (cmdMatches(d, toks[0])) {
+                found = d;
+                break;
+            }
+        }
+        const def = found orelse return; // vanilla returns null -> suppress
+        // Vanilla only completes args for commands the sender can use? No —
+        // getPossibleCommands delegates without a perm re-check (the
+        // single-token path already filtered). Match that: no re-check here.
+        const n = self.completeArgs(def, toks[1..nt], &cands, &owned);
+        self.sendTab(sender, cands[0..n]);
+    }
+
+    fn sendTab(self: *Server, sender: *Conn, cands: []const []const u8) void {
+        _ = self;
+        var fb: [4096]u8 = undefined;
+        const f = packets.frameTabComplete(cands, &fb) catch return;
+        sender.lock.lock();
+        defer sender.lock.unlock();
+        if (sender.state != .play or sender.dead) return;
+        sender.queueFramed(f) catch {};
+    }
+
+    fn completePlayers(self: *Server, prefix: []const u8, out: [][]const u8, owned: [][64]u8) usize {
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        var n: usize = 0;
+        for (snap) |e| {
+            if (n >= out.len or n >= owned.len) break;
+            e.conn.lock.lock();
+            const play = e.conn.state == .play and e.conn.username_len > 0;
+            var len: u8 = 0;
+            if (play) {
+                len = @intCast(e.conn.username_len);
+                @memcpy(owned[n][0..len], e.conn.username[0..len]);
+            }
+            e.conn.lock.unlock();
+            if (!play) continue;
+            if (cmd_spec.startsWithIgnoreCase(owned[n][0..len], prefix)) {
+                out[n] = owned[n][0..len];
+                n += 1;
+            }
+        }
+        return n;
+    }
+
+    /// Command-name completion for the single-token path. Vanilla S3A
+    /// carries the slash (`/gamemode` for input `/game`) — the 1.7.10
+    /// client replaces the whole current word with the match, so bare
+    /// names made it eat the `/`. (Was bare names; `/game<TAB>` became
+    /// `game`.)
+    fn completeCommandsFor(self: *Server, sender: ?*Conn, prefix: []const u8, out: [][]const u8, owned: [][64]u8) usize {
+        var n: usize = 0;
+        var on: usize = 0;
+        inline for (perms_mod.modules) |M| {
+            const ok = if (sender == null) true else self.commandAllowed(sender, &M.def);
+            if (ok) {
+                if (cmd_spec.startsWithIgnoreCase(M.def.name, prefix)) {
+                    if (n < out.len and on < owned.len) {
+                        const s = std.fmt.bufPrint(&owned[on], "/{s}", .{M.def.name}) catch null;
+                        if (s) |cand| {
+                            if (!containsName(out[0..n], cand)) {
+                                out[n] = cand;
+                                n += 1;
+                            }
+                            on += 1;
+                        }
+                    }
+                }
+                for (M.def.aliases) |a| {
+                    if (cmd_spec.startsWithIgnoreCase(a, prefix)) {
+                        if (n < out.len and on < owned.len) {
+                            const s = std.fmt.bufPrint(&owned[on], "/{s}", .{a}) catch null;
+                            if (s) |cand| {
+                                if (!containsName(out[0..n], cand)) {
+                                    out[n] = cand;
+                                    n += 1;
+                                }
+                                on += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return n;
+    }
+
+    fn containsName(hay: [][]const u8, needle: []const u8) bool {
+        for (hay) |e| if (std.mem.eql(u8, e, needle)) return true;
+        return false;
+    }
+
+    fn completeArgs(self: *Server, def: *const perms_mod.Command, toks: [][]const u8, out: [][]const u8, owned: [][64]u8) usize {
+        // Find the command module to get its spec.
+        inline for (perms_mod.modules) |M| {
+            if (std.mem.eql(u8, M.def.name, def.name)) {
+                return completeArgsFor(self, &M.def, toks, out, owned);
+            }
+        }
+        return 0;
+    }
+
+    fn completeArgsFor(self: *Server, def: *const perms_mod.Command, toks: [][]const u8, out: [][]const u8, owned: [][64]u8) usize {
+        const arg_index = toks.len - 1;
+        const prefix = toks[arg_index];
+        // Overloads where all COMPLETE tokens (before the prefix) match.
+        var n: usize = 0;
+        for (def.spec) |over| {
+            if (arg_index >= over.len) continue;
+            if (!prefixMatches(over, toks[0..arg_index])) continue;
+            var tmp: [32][]const u8 = undefined;
+            var m: usize = 0;
+            const slot = over[arg_index];
+            switch (slot.arg) {
+                .literal => |lit| {
+                    if (cmd_spec.startsWithIgnoreCase(lit, prefix) and m < tmp.len) {
+                        tmp[m] = lit;
+                        m += 1;
+                    }
+                },
+                .choice => |opts| {
+                    for (opts) |o| {
+                        if (m >= tmp.len) break;
+                        if (cmd_spec.startsWithIgnoreCase(o, prefix)) {
+                            tmp[m] = o;
+                            m += 1;
+                        }
+                    }
+                },
+                .player => {
+                    m += self.completePlayers(prefix, tmp[m..], owned[m..]);
+                },
+                else => {},
+            }
+            for (tmp[0..m]) |c| {
+                if (n >= out.len) break;
+                var dup = false;
+                for (out[0..n]) |e| if (std.mem.eql(u8, e, c)) {
+                    dup = true;
+                    break;
+                };
+                if (!dup) {
+                    out[n] = c;
+                    n += 1;
+                }
+            }
+        }
+        // Command-specific dynamic sets (items, gamerules, mobs...).
+        n += self.completeExtra(def, toks, prefix, out[n..], owned);
+        return n;
+    }
+
+    /// Command-specific dynamic candidates beyond the static spec
+    /// (item/block/mob names, gamerule names, enchant ids, ...).
+    fn completeExtra(self: *Server, def: *const perms_mod.Command, toks: [][]const u8, prefix: []const u8, out: [][]const u8, owned: [][64]u8) usize {
+        var n: usize = 0;
+        const arg_index = toks.len - 1;
+        // Item/block name completion for /give /clear /setblock /testforblock.
+        if (std.mem.eql(u8, def.name, "give") or std.mem.eql(u8, def.name, "clear")) {
+            if (arg_index == 1) n = completeWireNames(prefix, out);
+        } else if (std.mem.eql(u8, def.name, "setblock") or std.mem.eql(u8, def.name, "testforblock")) {
+            if (arg_index == 3) n = completeWireNames(prefix, out);
+        } else if (std.mem.eql(u8, def.name, "gamerule")) {
+            if (arg_index == 0) {
+                for (cmd_data.gamerules) |g| {
+                    if (n >= out.len) break;
+                    if (cmd_spec.startsWithIgnoreCase(g.name, prefix)) {
+                        out[n] = g.name;
+                        n += 1;
+                    }
+                }
+            } else if (arg_index == 1) {
+                for ([_][]const u8{ "true", "false" }) |b| {
+                    if (n >= out.len) break;
+                    if (cmd_spec.startsWithIgnoreCase(b, prefix)) {
+                        out[n] = b;
+                        n += 1;
+                    }
+                }
+            }
+        } else if (std.mem.eql(u8, def.name, "effect")) {
+            if (arg_index == 2 and n < out.len) {
+                // effect names are numeric; offer 1..23 by prefix
+                var id: u8 = 1;
+                while (id <= 23) : (id += 1) {
+                    if (n >= out.len or n >= owned.len) break;
+                    const s = std.fmt.bufPrint(&owned[n], "{d}", .{id}) catch break;
+                    if (cmd_spec.startsWithIgnoreCase(s, prefix)) {
+                        out[n] = s;
+                        n += 1;
+                    }
+                }
+            } else if (arg_index == 1 and (std.mem.eql(u8, toks[0], "clear") or toks.len > 0)) {
+                if (cmd_spec.startsWithIgnoreCase("clear", prefix) and n < out.len) {
+                    out[n] = "clear";
+                    n += 1;
+                }
+            }
+        } else if (std.mem.eql(u8, def.name, "enchant")) {
+            if (arg_index == 1) {
+                for (cmd_data.enchants) |e| {
+                    if (n >= out.len or n >= owned.len) break;
+                    const s = std.fmt.bufPrint(&owned[n], "{d}", .{e.id}) catch break;
+                    if (cmd_spec.startsWithIgnoreCase(s, prefix)) {
+                        out[n] = s;
+                        n += 1;
+                    }
+                }
+            }
+        } else if (std.mem.eql(u8, def.name, "summon")) {
+            if (arg_index == 0) {
+                for (cmd_data.mobs) |m| {
+                    if (n >= out.len) break;
+                    if (cmd_spec.startsWithIgnoreCase(m.name, prefix)) {
+                        out[n] = m.name;
+                        n += 1;
+                    }
+                }
+            }
+        } else if (std.mem.eql(u8, def.name, "difficulty")) {
+            if (arg_index == 0) {
+                for (diff_names ++ [_][]const u8{ "p", "e", "n", "h", "0", "1", "2", "3" }) |v| {
+                    if (n >= out.len) break;
+                    if (cmd_spec.startsWithIgnoreCase(v, prefix)) {
+                        out[n] = v;
+                        n += 1;
+                    }
+                }
+            }
+        } else if (std.mem.eql(u8, def.name, "gamemode") or std.mem.eql(u8, def.name, "defaultgamemode")) {
+            if (arg_index == 0) {
+                for ([_][]const u8{ "survival", "creative", "adventure", "s", "c", "a", "0", "1", "2" }) |v| {
+                    if (n >= out.len) break;
+                    if (cmd_spec.startsWithIgnoreCase(v, prefix)) {
+                        out[n] = v;
+                        n += 1;
+                    }
+                }
+            }
+        } else if (std.mem.eql(u8, def.name, "scoreboard")) {
+            n = self.completeScoreboard(toks, prefix, out, owned);
+        } else if (std.mem.eql(u8, def.name, "tellraw")) {
+            // JSON payload: no candidates.
+        }
+        return n;
+    }
+
+    fn completeScoreboard(self: *Server, toks: [][]const u8, prefix: []const u8, out: [][]const u8, owned: [][64]u8) usize {
+        _ = self;
+        _ = owned;
+        var n: usize = 0;
+        const put = struct {
+            fn f(list: []const []const u8, prefix_: []const u8, o: [][]const u8, nn: *usize) void {
+                for (list) |v| {
+                    if (nn.* >= o.len) break;
+                    if (cmd_spec.startsWithIgnoreCase(v, prefix_)) {
+                        o[nn.*] = v;
+                        nn.* += 1;
+                    }
+                }
+            }
+        }.f;
+        if (toks.len == 1) {
+            put(&.{ "objectives", "players", "teams" }, prefix, out, &n);
+            return n;
+        }
+        if (std.mem.eql(u8, toks[0], "objectives")) {
+            if (toks.len == 2) {
+                put(&.{ "list", "add", "remove", "setdisplay" }, prefix, out, &n);
+            } else if (toks.len == 3 and std.mem.eql(u8, toks[1], "add")) {
+                put(&cmd_data.criteria, prefix, out, &n);
+            } else if (toks.len == 3 and std.mem.eql(u8, toks[1], "setdisplay")) {
+                put(&.{ "list", "sidebar", "belowName" }, prefix, out, &n);
+            }
+        } else if (std.mem.eql(u8, toks[0], "players")) {
+            if (toks.len == 2) put(&.{ "set", "add", "remove", "reset", "list" }, prefix, out, &n);
+        } else if (std.mem.eql(u8, toks[0], "teams")) {
+            if (toks.len == 2) {
+                put(&.{ "list", "add", "remove", "empty", "join", "leave", "option" }, prefix, out, &n);
+            } else if (toks.len == 4 and std.mem.eql(u8, toks[1], "option")) {
+                put(&.{ "friendlyfire", "color", "seeFriendlyInvisibles" }, prefix, out, &n);
+            } else if (toks.len == 5 and std.mem.eql(u8, toks[1], "option") and std.mem.eql(u8, toks[3], "color")) {
+                put(&cmd_data.team_colors, prefix, out, &n);
+            }
+        }
+        return n;
+    }
+
+    /// All registered item/block names (canonical snake_case) for /give etc.
+    fn completeWireNames(prefix: []const u8, out: [][]const u8) usize {
+        var n: usize = 0;
+        inline for (@typeInfo(game_ids.Id).@"enum".fields) |f| {
+            if (n >= out.len) break;
+            if (cmd_spec.startsWithIgnoreCase(f.name, prefix)) {
+                out[n] = f.name;
+                n += 1;
+            }
+        }
+        return n;
+    }
+
+    /// Overload-prefix check: every complete token matches its slot shape
+    /// (literals/choices exactly; typed slots accept anything shapely).
+    fn prefixMatches(over: cmd_spec.Overload, toks: [][]const u8) bool {
+        for (over[0..toks.len], toks) |slot, tok| {
+            switch (slot.arg) {
+                .literal => |lit| if (!std.mem.eql(u8, lit, tok)) return false,
+                .choice => |opts| {
+                    var hit = false;
+                    for (opts) |o| if (std.mem.eql(u8, o, tok)) {
+                        hit = true;
+                        break;
+                    };
+                    if (!hit) return false;
+                },
+                .player => if (!cmd_spec.isSelector(tok) and !cmd_spec.validPlayerNameChars(tok)) return false,
+                .int_range => |r| {
+                    const v = std.fmt.parseInt(i64, tok, 0) catch return false;
+                    if (r.min) |lo| if (v < lo) return false;
+                    if (r.max) |hi| if (v > hi) return false;
+                },
+                .float_range => |r| {
+                    const v = std.fmt.parseFloat(f64, tok) catch return false;
+                    if (!std.math.isFinite(v)) return false;
+                    if (r.min) |lo| if (v < lo) return false;
+                    if (r.max) |hi| if (v > hi) return false;
+                },
+                .coord => {
+                    if (!cmd_spec.isCoord(tok)) return false;
+                },
+                .boolean => if (cmd_spec.parseBool(tok) == null) return false,
+                .word => {},
+                .rest => return false, // rest swallows; completion past it is moot
+            }
+        }
+        return true;
+    }
+
+    // ---- scoreboard backends (store + broadcast) ----
+
+    fn sbBroadcastObjective(self: *Server, name: []const u8, display: []const u8, action: u8) void {
+        var b: [512]u8 = undefined;
+        if (packets.frameObjective(name, display, action, &b)) |f| self.broadcastAll(f) else |_| {}
+    }
+
+    fn sbBroadcastDisplay(self: *Server, slot: u8, objective: []const u8) void {
+        var b: [256]u8 = undefined;
+        if (packets.frameDisplayScoreboard(slot, objective, &b)) |f| self.broadcastAll(f) else |_| {}
+    }
+
+    fn sbBroadcastTeamsCreate(self: *Server, name: []const u8) void {
+        const sb = self.sbDb();
+        self.sb_lock.lock();
+        const t = sb.teams.get(name);
+        var info: packets.TeamInfo = undefined;
+        var disp: [64]u8 = undefined;
+        var pre: [64]u8 = undefined;
+        var suf: [64]u8 = undefined;
+        if (t) |team| {
+            @memcpy(disp[0..@min(team.display.len, disp.len)], team.display[0..@min(team.display.len, disp.len)]);
+            @memcpy(pre[0..@min(team.prefix.len, pre.len)], team.prefix[0..@min(team.prefix.len, pre.len)]);
+            @memcpy(suf[0..@min(team.suffix.len, suf.len)], team.suffix[0..@min(team.suffix.len, suf.len)]);
+            info = .{
+                .display = disp[0..@min(team.display.len, disp.len)],
+                .prefix = pre[0..@min(team.prefix.len, pre.len)],
+                .suffix = suf[0..@min(team.suffix.len, suf.len)],
+                .friendly_fire = if (team.friendly_fire) 0 else 1,
+            };
+        }
+        self.sb_lock.unlock();
+        if (t == null) return;
+        var b: [4096]u8 = undefined;
+        if (packets.frameTeams(name, 0, info, &.{}, &b)) |f| self.broadcastAll(f) else |_| {}
+    }
+
+    pub const SbResult = enum { ok, too_long, display_too_long, exists, not_found, bad_criteria, bad_slot };
+
+    pub fn sbAddObjective(self: *Server, name: []const u8, criteria: []const u8, display: []const u8) SbResult {
+        const sb = self.sbDb();
+        self.sb_lock.lock();
+        const r = sb.addObjective(name, criteria, display) catch |err| {
+            self.sb_lock.unlock();
+            return switch (err) {
+                error.NameTooLong => .too_long,
+                error.DisplayTooLong => .display_too_long,
+                error.AlreadyExists => .exists,
+                error.BadCriteria => .bad_criteria,
+                else => .not_found,
+            };
+        };
+        _ = r;
+        self.sb_lock.unlock();
+        self.sbSave();
+        self.sbBroadcastObjective(name, if (display.len == 0) name else display, 0);
+        return .ok;
+    }
+
+    pub fn sbRemoveObjective(self: *Server, name: []const u8) SbResult {
+        const sb = self.sbDb();
+        self.sb_lock.lock();
+        sb.removeObjective(name) catch {
+            self.sb_lock.unlock();
+            return .not_found;
+        };
+        // removeObjective already purges the objective's scores and clears
+        // slots pointing at it; broadcast only the objective removal + slot
+        // clears happen implicitly client-side on objective remove.
+        self.sb_lock.unlock();
+        self.sbSave();
+        self.sbBroadcastObjective(name, "", 1);
+        return .ok;
+    }
+
+    pub fn sbListObjectives(self: *Server, out: []u8) []const u8 {
+        const sb = self.sbDb();
+        self.sb_lock.lock();
+        defer self.sb_lock.unlock();
+        var ow: usize = 0;
+        var oit = sb.objectives.iterator();
+        var n: usize = 0;
+        while (oit.next()) |_| n += 1;
+        ow += (std.fmt.bufPrint(out[ow..], "Showing {d} objective(s) on scoreboard:", .{n}) catch return out[0..ow]).len;
+        var ojt = sb.objectives.iterator();
+        while (ojt.next()) |e| {
+            ow += (std.fmt.bufPrint(out[ow..], "\n- {s}: displays as '{s}' and is type '{s}'", .{ e.key_ptr.*, e.value_ptr.*.display, e.value_ptr.*.criteria }) catch break).len;
+        }
+        if (n == 0) ow += (std.fmt.bufPrint(out[ow..], "\nThere are no objectives on the scoreboard", .{}) catch return out[0..ow]).len;
+        return out[0..ow];
+    }
+
+    pub fn sbSetDisplay(self: *Server, slot_name: []const u8, objective: ?[]const u8) SbResult {
+        var slot: u8 = 255;
+        for (cmd_data.display_slots) |s| {
+            if (std.mem.eql(u8, s.name, slot_name)) slot = s.value;
+        }
+        if (slot == 255) {
+            const v = std.fmt.parseInt(u8, slot_name, 10) catch return .bad_slot;
+            if (v > 2) return .bad_slot;
+            slot = v;
+        }
+        if (slot > 2) return .bad_slot;
+        const sb = self.sbDb();
+        self.sb_lock.lock();
+        sb.setSlot(slot, objective) catch {
+            self.sb_lock.unlock();
+            return .not_found;
+        };
+        self.sb_lock.unlock();
+        self.sbSave();
+        if (objective) |o| {
+            self.sbBroadcastDisplay(slot, o);
+        } else {
+            var b: [256]u8 = undefined;
+            if (packets.frameDisplayScoreboard(slot, "", &b)) |f| self.broadcastAll(f) else |_| {}
+        }
+        return .ok;
+    }
+
+    /// Add/subtract a score (creates at 0 when missing). NotFound = bad objective.
+    pub fn sbAddScore(self: *Server, player: []const u8, objective: []const u8, delta: i32) SbResult {
+        const sb = self.sbDb();
+        self.sb_lock.lock();
+        const cur: i32 = sb.getScore(player, objective) orelse 0;
+        if (!sb.objectives.contains(objective)) {
+            self.sb_lock.unlock();
+            return .not_found;
+        }
+        sb.setScore(player, objective, cur + delta) catch {
+            self.sb_lock.unlock();
+            return .not_found;
+        };
+        const v = cur + delta;
+        self.sb_lock.unlock();
+        self.sbSave();
+        var b: [512]u8 = undefined;
+        if (packets.frameUpdateScore(player, 0, objective, v, &b)) |f| self.broadcastAll(f) else |_| {}
+        return .ok;
+    }
+
+    pub fn sbSetScore(self: *Server, player: []const u8, objective: []const u8, value: i32) SbResult {
+        const sb = self.sbDb();
+        self.sb_lock.lock();
+        sb.setScore(player, objective, value) catch {
+            self.sb_lock.unlock();
+            return .not_found;
+        };
+        self.sb_lock.unlock();
+        self.sbSave();
+        var b: [512]u8 = undefined;
+        if (packets.frameUpdateScore(player, 0, objective, value, &b)) |f| self.broadcastAll(f) else |_| {}
+        return .ok;
+    }
+
+    /// Current value for add/remove feedback (null when untracked).
+    pub fn sbGetScore(self: *Server, player: []const u8, objective: []const u8) ?i32 {
+        const sb = self.sbDb();
+        self.sb_lock.lock();
+        defer self.sb_lock.unlock();
+        return sb.getScore(player, objective);
+    }
+
+    pub fn sbResetScores(self: *Server, player: []const u8) void {
+        const sb = self.sbDb();
+        self.sb_lock.lock();
+        // Collect first (broadcast removes outside the lock).
+        var doomed: [128][80]u8 = undefined;
+        var n_doomed: usize = 0;
+        var sit = sb.scores.iterator();
+        while (sit.next()) |e| {
+            const key = e.key_ptr.*;
+            const sep = std.mem.indexOfScalar(u8, key, 0) orelse continue;
+            if (std.mem.eql(u8, key[0..sep], player)) {
+                if (n_doomed < doomed.len and key.len < doomed[0].len) {
+                    @memcpy(doomed[n_doomed][0..key.len], key);
+                    doomed[n_doomed][key.len] = 0;
+                    n_doomed += 1;
+                }
+            }
+        }
+        sb.resetScores(player);
+        self.sb_lock.unlock();
+        self.sbSave();
+        for (doomed[0..n_doomed]) |k| {
+            const zl = std.mem.indexOfScalar(u8, &k, 0) orelse k.len;
+            const key = k[0..zl];
+            const sep = std.mem.indexOfScalar(u8, key, 0) orelse continue;
+            const obj = key[sep + 1 ..];
+            var b: [512]u8 = undefined;
+            if (packets.frameUpdateScore(player, 1, obj, 0, &b)) |f| self.broadcastAll(f) else |_| {}
+        }
+    }
+
+    pub const SbScore = scoreboard_mod.SbScore;
+
+    pub fn sbPlayerScores(self: *Server, player: []const u8, out: []SbScore, bufs: [][80]u8) usize {
+        const sb = self.sbDb();
+        self.sb_lock.lock();
+        defer self.sb_lock.unlock();
+        var n: usize = 0;
+        var sit = sb.scores.iterator();
+        while (sit.next()) |e| {
+            if (n >= out.len or n >= bufs.len) break;
+            const key = e.key_ptr.*;
+            const sep = std.mem.indexOfScalar(u8, key, 0) orelse continue;
+            if (!std.mem.eql(u8, key[0..sep], player)) continue;
+            const obj = key[sep + 1 ..];
+            if (obj.len + 1 > bufs[n].len) continue;
+            @memcpy(bufs[n][0..obj.len], obj);
+            bufs[n][obj.len] = 0;
+            out[n] = .{ .player = player, .objective = bufs[n][0..obj.len], .value = e.value_ptr.* };
+            n += 1;
+        }
+        return n;
+    }
+
+    pub fn sbTrackedPlayers(self: *Server, out: [][16]u8) usize {
+        const sb = self.sbDb();
+        self.sb_lock.lock();
+        defer self.sb_lock.unlock();
+        var n: usize = 0;
+        var sit = sb.scores.iterator();
+        while (sit.next()) |e| {
+            if (n >= out.len) break;
+            const key = e.key_ptr.*;
+            const sep = std.mem.indexOfScalar(u8, key, 0) orelse continue;
+            const pname = key[0..sep];
+            var dup = false;
+            for (out[0..n]) |*slot| {
+                if (std.mem.eql(u8, slot[0..@min(pname.len, 16)], pname[0..@min(pname.len, 16)])) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup and pname.len <= 16) {
+                @memcpy(out[n][0..pname.len], pname);
+                n += 1;
+            }
+        }
+        return n;
+    }
+
+    pub fn sbAddTeam(self: *Server, name: []const u8, display: []const u8) SbResult {
+        const sb = self.sbDb();
+        self.sb_lock.lock();
+        const r = sb.addTeam(name, display) catch |err| {
+            self.sb_lock.unlock();
+            return switch (err) {
+                error.NameTooLong => .too_long,
+                error.DisplayTooLong => .display_too_long,
+                error.AlreadyExists => .exists,
+                else => .not_found,
+            };
+        };
+        _ = r;
+        self.sb_lock.unlock();
+        self.sbSave();
+        self.sbBroadcastTeamsCreate(name);
+        return .ok;
+    }
+
+    pub fn sbRemoveTeam(self: *Server, name: []const u8) SbResult {
+        const sb = self.sbDb();
+        self.sb_lock.lock();
+        sb.removeTeam(name) catch {
+            self.sb_lock.unlock();
+            return .not_found;
+        };
+        self.sb_lock.unlock();
+        self.sbSave();
+        var b: [256]u8 = undefined;
+        if (packets.frameTeams(name, 1, null, &.{}, &b)) |f| self.broadcastAll(f) else |_| {}
+        return .ok;
+    }
+
+    /// Join one player to a team (moves them out of any current team).
+    /// Returns joined count (0 = unknown team).
+    pub fn sbJoinTeam(self: *Server, team: []const u8, player: []const u8, out_names: []u8) usize {
+        const sb = self.sbDb();
+        self.sb_lock.lock();
+        sb.joinTeam(team, player) catch {
+            self.sb_lock.unlock();
+            return 0;
+        };
+        self.sb_lock.unlock();
+        self.sbSave();
+        var b: [512]u8 = undefined;
+        const one = [_][]const u8{player};
+        if (packets.frameTeams(team, 3, null, &one, &b)) |f| self.broadcastAll(f) else |_| {}
+        @memcpy(out_names[0..player.len], player);
+        return 1;
+    }
+
+    /// Remove players from their teams. Null player = caller resolves.
+    /// Remove one player from their team with the S3E mode-4 broadcast.
+    /// Returns the team name (borrowed) or null when teamless.
+    pub fn sbLeavePlayer(self: *Server, player: []const u8) ?[]const u8 {
+        const sb = self.sbDb();
+        self.sb_lock.lock();
+        const team = sb.teamOf(player) orelse {
+            self.sb_lock.unlock();
+            return null;
+        };
+        _ = sb.leaveTeams(player);
+        self.sb_lock.unlock();
+        self.sbSave();
+        // Mode 4 (remove players) broadcast:
+        var b: [512]u8 = undefined;
+        const one = [_][]const u8{player};
+        if (packets.frameTeams(team, 4, null, &one, &b)) |f| self.broadcastAll(f) else |_| {}
+        return team;
+    }
+
+    pub fn sbTeamOf(self: *Server, player: []const u8) ?[]const u8 {
+        const sb = self.sbDb();
+        self.sb_lock.lock();
+        defer self.sb_lock.unlock();
+        if (sb.teamOf(player)) |t| return t;
+        return null;
+    }
+
+    pub fn sbEmptyTeam(self: *Server, team: []const u8) ?usize {
+        const sb = self.sbDb();
+        self.sb_lock.lock();
+        const t = sb.teams.get(team) orelse {
+            self.sb_lock.unlock();
+            return null;
+        };
+        var members: [128][]u8 = undefined;
+        var mbufs: [128][24]u8 = undefined;
+        var n: usize = 0;
+        var mit = t.members.iterator();
+        while (mit.next()) |m| {
+            if (n >= members.len) break;
+            @memcpy(mbufs[n][0..m.key_ptr.len], m.key_ptr.*);
+            members[n] = mbufs[n][0..m.key_ptr.len];
+            n += 1;
+        }
+        // Drop membership (keep the team itself).
+        for (members[0..n]) |m| {
+            if (t.members.fetchRemove(m)) |old| sb.alloc.free(old.key);
+        }
+        self.sb_lock.unlock();
+        self.sbSave();
+        if (n > 0) {
+            var b: [4096]u8 = undefined;
+            if (packets.frameTeams(team, 4, null, members[0..n], &b)) |f| self.broadcastAll(f) else |_| {}
+        }
+        return n;
+    }
+
+    pub const SbOption = enum { friendlyfire, color, see_friendly_invisibles };
+
+    pub fn sbSetOption(self: *Server, team: []const u8, opt: SbOption, value: []const u8) enum { ok, not_found, bad_value } {
+        const sb = self.sbDb();
+        self.sb_lock.lock();
+        const t = sb.teams.get(team) orelse {
+            self.sb_lock.unlock();
+            return .not_found;
+        };
+        switch (opt) {
+            .friendlyfire => {
+                if (std.mem.eql(u8, value, "true")) t.friendly_fire = true else if (std.mem.eql(u8, value, "false")) t.friendly_fire = false else {
+                    self.sb_lock.unlock();
+                    return .bad_value;
+                }
+            },
+            .see_friendly_invisibles => {
+                if (std.mem.eql(u8, value, "true")) t.see_friendly_invisibles = true else if (std.mem.eql(u8, value, "false")) t.see_friendly_invisibles = false else {
+                    self.sb_lock.unlock();
+                    return .bad_value;
+                }
+            },
+            .color => {
+                var okc = std.mem.eql(u8, value, "reset");
+                for (cmd_data.team_colors) |c| {
+                    if (std.mem.eql(u8, c, value)) okc = true;
+                }
+                if (!okc) {
+                    self.sb_lock.unlock();
+                    return .bad_value;
+                }
+                sb.alloc.free(t.color);
+                t.color = sb.alloc.dupe(u8, value) catch {
+                    self.sb_lock.unlock();
+                    return .bad_value;
+                };
+            },
+        }
+        self.sb_lock.unlock();
+        self.sbSave();
+        // Mode-2 info update broadcast.
+        self.sb_lock.lock();
+        const tt = sb.teams.get(team);
+        var disp: [64]u8 = undefined;
+        var pre: [64]u8 = undefined;
+        var suf: [64]u8 = undefined;
+        var info: ?packets.TeamInfo = null;
+        if (tt) |team2| {
+            @memcpy(disp[0..@min(team2.display.len, disp.len)], team2.display[0..@min(team2.display.len, disp.len)]);
+            @memcpy(pre[0..@min(team2.prefix.len, pre.len)], team2.prefix[0..@min(team2.prefix.len, pre.len)]);
+            @memcpy(suf[0..@min(team2.suffix.len, suf.len)], team2.suffix[0..@min(team2.suffix.len, suf.len)]);
+            info = .{
+                .display = disp[0..@min(team2.display.len, disp.len)],
+                .prefix = pre[0..@min(team2.prefix.len, pre.len)],
+                .suffix = suf[0..@min(team2.suffix.len, suf.len)],
+                .friendly_fire = if (team2.friendly_fire) 0 else 1,
+            };
+        }
+        self.sb_lock.unlock();
+        var b: [4096]u8 = undefined;
+        if (packets.frameTeams(team, 2, info, &.{}, &b)) |f| self.broadcastAll(f) else |_| {}
+        return .ok;
+    }
+
+    pub fn sbListTeams(self: *Server, out: []u8) []const u8 {
+        const sb = self.sbDb();
+        self.sb_lock.lock();
+        defer self.sb_lock.unlock();
+        var ow: usize = 0;
+        ow += (std.fmt.bufPrint(out[ow..], "Showing {d} teams on the scoreboard:", .{sb.teams.count()}) catch return out[0..ow]).len;
+        var tit = sb.teams.iterator();
+        while (tit.next()) |e| {
+            ow += (std.fmt.bufPrint(out[ow..], "\n- {s}: '{s}' has {d} players", .{ e.key_ptr.*, e.value_ptr.*.display, e.value_ptr.*.members.count() }) catch break).len;
+        }
+        if (sb.teams.count() == 0) ow += (std.fmt.bufPrint(out[ow..], "\nThere are no teams registered on the scoreboard", .{}) catch return out[0..ow]).len;
+        return out[0..ow];
+    }
+
+    pub fn sbListTeamPlayers(self: *Server, team: []const u8, out: []u8) ?[]const u8 {
+        const sb = self.sbDb();
+        self.sb_lock.lock();
+        defer self.sb_lock.unlock();
+        const t = sb.teams.get(team) orelse return null;
+        var ow: usize = 0;
+        ow += (std.fmt.bufPrint(out[ow..], "Showing {d} player(s) in team {s}:", .{ t.members.count(), team }) catch return out[0..ow]).len;
+        var mit = t.members.iterator();
+        while (mit.next()) |m| {
+            ow += (std.fmt.bufPrint(out[ow..], "\n- {s}", .{m.key_ptr.*}) catch break).len;
+        }
+        if (t.members.count() == 0) ow += (std.fmt.bufPrint(out[ow..], "\nTeam {s} has no players", .{team}) catch return out[0..ow]).len;
+        return out[0..ow];
+    }
+
+    // ---- connection helpers for the login path ----
+
+    /// Peer IP capture from the accepted socket (called once per conn).
+    pub fn captureIp(conn: *Conn, stream: std.Io.net.Stream) void {
+        switch (stream.socket.address) {
+            .ip4 => |a| {
+                const s = std.fmt.bufPrint(&conn.ip, "{d}.{d}.{d}.{d}", .{ a.bytes[0], a.bytes[1], a.bytes[2], a.bytes[3] }) catch return;
+                conn.ip_len = s.len;
+            },
+            .ip6 => |a| {
+                var w: usize = 0;
+                for (a.bytes, 0..) |b, i| {
+                    if (i % 2 == 0) {
+                        if (i > 0) {
+                            if (w + 1 > conn.ip.len) return;
+                            conn.ip[w] = ':';
+                            w += 1;
+                        }
+                        const v: u16 = @as(u16, b) << 8 | a.bytes[i + 1];
+                        const s = std.fmt.bufPrint(conn.ip[w..], "{x}", .{v}) catch return;
+                        w += s.len;
+                    }
+                }
+                conn.ip_len = w;
+            },
         }
     }
 
@@ -999,8 +3706,17 @@ pub const Server = struct {
     /// shut down timed-out sockets. Lock-free clock via atomics.
     pub fn tickOnce(self: *Server, now_ms: i64) void {
         const age = self.world_age.fetchAdd(20, .acq_rel) + 20;
-        const tod = @mod(self.time_of_day.load(.acquire) + 20, @as(i64, 24000));
-        self.time_of_day.store(tod, .release);
+        // doDaylightCycle gates the clock (world age always advances).
+        self.state_lock.lock();
+        const cycle = self.gamerules[8];
+        if (self.debug_start_ms != null) self.debug_ticks += 1;
+        self.state_lock.unlock();
+        if (cycle) {
+            const tod = @mod(self.time_of_day.load(.acquire) + 20, @as(i64, 24000));
+            self.time_of_day.store(tod, .release);
+        }
+        self.tickWeather();
+        self.tickEffects();
 
         var batch: [256]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
@@ -1202,7 +3918,7 @@ pub const Server = struct {
         // Environmental hazards from player snaps (no conn locks here;
         // world_lock is a leaf). Eyes block decides drown/suffocate, feet
         // block adds lava.
-        const EnvFlag = struct { water: bool = false, lava: bool = false, suff: bool = false };
+        const EnvFlag = struct { water: bool = false, lava: bool = false, suff: bool = false, cactus: bool = false };
         var envs: [256]EnvFlag = undefined;
         for (envs[0..@min(envs.len, n_players)]) |*f| f.* = .{};
         if (self.world) |pool| {
@@ -1217,9 +3933,11 @@ pub const Server = struct {
                     envs[i].water = b.id == game_ids.flowing_water or b.id == game_ids.water;
                     envs[i].suff = view.isOpaqueCube(b.id);
                     if (b.id == game_ids.flowing_lava or b.id == game_ids.lava) envs[i].lava = true;
+                    if (b.id == game_ids.cactus) envs[i].cactus = true;
                 }
                 if (view.peekBlock(pool, self.gpa, ex, feet, ez) catch null) |b| {
                     if (b.id == game_ids.flowing_lava or b.id == game_ids.lava) envs[i].lava = true;
+                    if (b.id == game_ids.cactus) envs[i].cactus = true;
                 }
             }
             self.world_lock.unlock();
@@ -1258,6 +3976,34 @@ pub const Server = struct {
                 if (drop) e.stream.shutdown(self.io, .both) catch {};
                 continue;
             }
+            // Idle kick (`/setidletimeout`): play conns silent past the mark
+            // get the jar-hardcoded screen. last_active_ms refreshes per frame.
+            self.state_lock.lock();
+            const idle_min = self.idle_timeout_min;
+            self.state_lock.unlock();
+            if (idle_min > 0 and !e.conn.dead and e.conn.last_active_ms > 0 and
+                now_ms - e.conn.last_active_ms > @as(i64, idle_min) * 60000)
+            {
+                var db: [128]u8 = undefined;
+                var payload: [96]u8 = undefined;
+                var w = codec.PacketWriter.init(&payload);
+                w.writeString("{\"text\":\"You have been idle for too long!\"}") catch {};
+                if (codec.framePacket(@intFromEnum(ids.PlayClient.disconnect), w.written(), &db)) |f| {
+                    e.conn.queueFramed(f) catch {};
+                } else |_| {}
+                e.conn.dead = true;
+                e.conn.close_after_flush = true;
+                const pending = e.conn.takeOutput() catch {
+                    e.conn.lock.unlock();
+                    continue;
+                };
+                e.conn.lock.unlock();
+                if (pending.len > 0) writeFramed(e, self.io, pending);
+                e.conn.allocator.free(pending);
+                e.stream.shutdown(self.io, .both) catch {};
+                continue;
+            }
+            const tod = self.time_of_day.load(.acquire);
             const action = e.conn.queueTick(now_ms, age, tod) catch {
                 e.conn.lock.unlock();
                 continue;
@@ -1270,12 +4016,12 @@ pub const Server = struct {
                 if (!died_now) {
                     for (players[0..n_players], 0..) |p, i| {
                         if (p.eid != e.conn.eid or i >= envs.len) continue;
-                        if (envTick(e.conn, envs[i].water, envs[i].lava, envs[i].suff)) died_now = true;
+                        if (envTick(e.conn, envs[i].water, envs[i].lava, envs[i].suff, envs[i].cactus)) died_now = true;
                         break;
                     }
                 }
                 if (died_now) {
-                    const dd = collectDeathDrops(e.conn);
+                    const dd = if (self.keepInv()) null else collectDeathDrops(e.conn);
                     deaths.append(self.gpa, .{
                         .conn = e.conn,
                         .eid = e.conn.eid,
@@ -1384,7 +4130,7 @@ pub const Server = struct {
         // Deaths from hunger/environment this tick: spawn drops (ent_lock),
         // persist emptied rows (savePlayer locks), broadcast death metadata.
         for (deaths.items) |*di| {
-            self.spawnDeathDrops(&di.dd, di.x, di.y, di.z);
+            if (di.dd) |*d| self.spawnDeathDrops(d, di.x, di.y, di.z);
         }
         {
             var mb: [32]u8 = undefined;
@@ -1398,13 +4144,51 @@ pub const Server = struct {
         // Periodic autosave (WAL-durable; save-all/stop flush SSTs on top).
         // Counter rolls over naturally; the modulo stays aligned.
         self.tick_counter += 1;
-        if (self.world != null and self.tick_counter % autosave_ticks == 0) {
+        if (self.world != null and self.getAutosave() and self.tick_counter % autosave_ticks == 0) {
             _ = self.saveAllPlayers();
         }
     }
 
     /// Broadcast a 0x23 block change to viewers tracking the chunk
     /// (sent-set membership), excluding the originator.
+    /// Vanilla block step/break sound base for an id (`dig.<base>`).
+    /// Material approximation of per-block `stepSound`: wood, grass
+    /// (leaves use grass in vanilla), gravel, sand, glass (ice breaks
+    /// like glass), cloth, snow, stone default.
+    fn stepSound(id: game_ids.Id) []const u8 {
+        return switch (id) {
+            .grass, .tallgrass, .deadbush, .vine, .leaves, .leaves2, .sapling, .yellow_flower, .red_flower, .brown_mushroom, .red_mushroom, .reeds_block, .cactus, .waterlily => "dig.grass",
+            .dirt, .gravel, .clay, .soul_sand, .farmland, .mycelium => "dig.gravel",
+            .sand, .sandstone => "dig.sand",
+            .glass, .glass_pane, .stained_glass, .stained_glass_pane, .ice => "dig.glass",
+            .wool, .carpet => "dig.cloth",
+            .snow, .snow_layer => "dig.snow",
+            .planks, .log, .log2, .bookshelf, .crafting_table, .chest, .fence, .fence_gate, .wooden_door_block, .ladder, .wooden_slab, .double_wooden_slab, .oak_stairs, .spruce_stairs, .birch_stairs, .jungle_stairs, .acacia_stairs, .dark_oak_stairs, .trapdoor, .jukebox, .pumpkin, .lit_pumpkin, .melon_block => "dig.wood",
+            else => "dig.stone",
+        };
+    }
+
+    /// S29 sound to every play conn within vanilla earshot (16 blocks).
+    /// Block place/break feedback (silent before: only /playsound made
+    /// noise). Volume 1.0, pitch 0.8 like vanilla's break/place calls.
+    pub fn broadcastSound(self: *Server, sound: []const u8, x: f64, y: f64, z: f64, volume: f32, pitch: f32) void {
+        var sb: [512]u8 = undefined;
+        const f = packets.frameSoundEffect(sound, x, y, z, volume, pitch, &sb) catch return;
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        for (snap) |e| {
+            e.conn.lock.lock();
+            const play = e.conn.state == .play and !e.conn.dead;
+            const dx = x - e.conn.pos_x;
+            const dy = y - e.conn.pos_y;
+            const dz = z - e.conn.pos_z;
+            const near = dx * dx + dy * dy + dz * dz <= 256.0;
+            if (play and near) e.conn.queueFramed(f) catch {};
+            e.conn.lock.unlock();
+        }
+    }
+
     pub fn broadcastBlockChange(self: *Server, exclude: ?*Conn, x: i32, y: u8, z: i32, id: game_ids.Id, meta: u4) !void {
         var fb: [32]u8 = undefined;
         const f = try packets.frameBlockChange(x, y, z, id, meta, &fb);
@@ -1480,7 +4264,7 @@ pub const Server = struct {
     const DeathInfo = struct {
         conn: *Conn,
         eid: i32,
-        dd: DeathDrop,
+        dd: ?DeathDrop,
         x: f64,
         y: f64,
         z: f64,
@@ -1532,10 +4316,10 @@ pub const Server = struct {
         return died;
     }
 
-    /// Drown/lava/fire/suffocation for one tick (vanilla Entity rules,
-    /// 1Hz-quantized; see deviations). Caller holds conn.lock.
+    /// Drown/lava/fire/suffocation/cactus for one tick (vanilla Entity
+    /// rules, 1Hz-quantized; see deviations). Caller holds conn.lock.
     /// Returns true on death.
-    fn envTick(conn: *Conn, water: bool, lava: bool, suff: bool) bool {
+    fn envTick(conn: *Conn, water: bool, lava: bool, suff: bool, cactus: bool) bool {
         if (conn.is_dead) return false;
         var died = false;
         if (water) {
@@ -1560,6 +4344,11 @@ pub const Server = struct {
         }
         if (!died and suff) {
             died = applyPlayerDamage(conn, 4.0); // lenient: vanilla is 1/tick
+        }
+        if (conn.cactus_cd > 0) conn.cactus_cd -= 1;
+        if (!died and cactus and conn.config.gamemode != 1 and conn.cactus_cd == 0) {
+            conn.cactus_cd = 10; // ~0.5s between hits (no hurt-resistance yet)
+            died = applyPlayerDamage(conn, 1.0);
         }
         return died;
     }
@@ -1652,7 +4441,7 @@ pub const Server = struct {
         conn.lock.lock();
         const died = applyPlayerDamage(conn, dmg);
         const hp = conn.health;
-        var dd: ?DeathDrop = if (died) collectDeathDrops(conn) else null;
+        var dd: ?DeathDrop = if (died and !self.keepInv()) collectDeathDrops(conn) else null;
         const eid = conn.eid;
         conn.lock.unlock();
         var mb: [32]u8 = undefined;
@@ -2194,11 +4983,12 @@ pub const Server = struct {
         defer releaseSnap(snap);
         for (snap) |e| {
             e.conn.lock.lock();
-            if (e.conn.tracked.contains(eid)) {
-                e.conn.queueFramed(framed) catch {};
-            }
+            const watching = e.conn.tracked.contains(eid);
+            if (watching) e.conn.queueFramed(framed) catch {};
             e.conn.lock.unlock();
-            flushEntry(e, self.io);
+            // Flush only viewers we queued to (untracked conns — and
+            // socket-less test conns — stay untouched).
+            if (watching) flushEntry(e, self.io);
         }
     }
 
@@ -2267,7 +5057,7 @@ pub const Server = struct {
             }
             const died = applyPlayerDamage(e.conn, ev.dmg);
             const hp = e.conn.health;
-            var dd: ?DeathDrop = if (died) collectDeathDrops(e.conn) else null;
+            var dd: ?DeathDrop = if (died and !self.keepInv()) collectDeathDrops(e.conn) else null;
             const px = e.conn.pos_x;
             const py = e.conn.pos_y;
             const pz = e.conn.pos_z;
@@ -2338,7 +5128,9 @@ pub const Server = struct {
     /// Bind on all interfaces (production entry).
     pub fn bindAny(io: std.Io, port: u16, config: Config) !Server {
         const addr = try std.Io.net.IpAddress.parse("0.0.0.0", port);
-        return .{ .net = try addr.listen(io, .{ .reuse_address = true }), .io = io, .config = config };
+        var srv = Server{ .net = try addr.listen(io, .{ .reuse_address = true }), .io = io, .config = config };
+        srv.world_spawn = .{ config.spawn_x, config.spawn_y, config.spawn_z };
+        return srv;
     }
 };
 
@@ -2355,6 +5147,7 @@ pub fn serveConn(
 ) !void {
     const conn = try allocator.create(Conn);
     conn.* = Conn.init(allocator, io, server.config, eid);
+    Server.captureIp(conn, stream);
     server.register(conn, stream) catch {
         conn.deinit();
         allocator.destroy(conn);
@@ -2412,21 +5205,28 @@ pub fn serveConn(
             remaining -= n;
         }
         while (try conn.poll()) |f| {
+            // Server list ping reads a live player count, not the copy taken
+            // at accept time. Refresh under conn.lock (held here); status
+            // pings are rare so the atomic load is free.
+            if (conn.state == .status and f.id == @as(i32, @intFromEnum(ids.StatusServer.request))) {
+                conn.config.online_count = @intCast(@min(server.play_count.load(.acquire), 255));
+            }
             const action = try conn.handleFrame(f);
             if (action == .entered_play) entered = true;
             switch (action) {
-                .block_set, .arm_swing, .chat, .attack, .command, .qdrop, .table_close, .furnace_click => try events.append(allocator, action),
+                .block_set, .arm_swing, .chat, .attack, .command, .tab_complete, .qdrop, .table_close, .furnace_click => try events.append(allocator, action),
                 else => {},
             }
         }
         if (entered) {
             entered = false;
             const age = server.world_age.load(.acquire);
-            const tod = server.time_of_day.load(.acquire);
             // Worldgen spawn: ensure land spawn before Join/SpawnPosition go out.
             // Returning players skip the search: loadPlayer restores pos.
+            var fresh = true;
             if (server.world) |pool| {
                 const loaded = server.loadPlayer(conn);
+                fresh = !loaded;
                 if (!loaded) {
                     if (server.gen) |gen| {
                         const sp = v5serve.findSpawn(pool, gen, &server.world_lock, allocator, 24) catch null;
@@ -2445,24 +5245,89 @@ pub fn serveConn(
                     conn.pitch = 0;
                 }
             }
-            try conn.queueJoinPackets(age, tod);
+            // Server defaults: difficulty is world-level (always applied);
+            // fresh logins also inherit the default gamemode + world spawn
+            // (an explicit /setworldspawn wins over the gen search above).
+            server.state_lock.lock();
+            const srv_diff = server.difficulty;
+            const srv_gm = server.default_gamemode;
+            const srv_spawn = server.world_spawn;
+            const srv_spawn_set = server.world_spawn_set;
+            server.state_lock.unlock();
+            conn.config.difficulty = srv_diff;
+            if (fresh) {
+                const was_forced = conn.spawn_forced;
+                conn.config.gamemode = srv_gm;
+                if (srv_spawn_set and !was_forced) {
+                    conn.config.spawn_x = srv_spawn[0];
+                    conn.config.spawn_y = srv_spawn[1];
+                    conn.config.spawn_z = srv_spawn[2];
+                    conn.pos_x = @as(f64, @floatFromInt(srv_spawn[0])) + 0.5;
+                    conn.pos_y = @as(f64, @floatFromInt(srv_spawn[1]));
+                    conn.pos_z = @as(f64, @floatFromInt(srv_spawn[2])) + 0.5;
+                }
+            }
+            // Ban/whitelist gate (jar-hardcoded screens). Runs before any
+            // join packets: rejected logins get a play disconnect + close.
+            var login_rejected = false;
+            if (server.loginRejected(conn.username[0..conn.username_len], conn.ip[0..conn.ip_len])) |rej| {
+                server.rejectLogin(conn, rej);
+                login_rejected = true;
+            }
+            if (!login_rejected) {
+                // Own this player row from here on: bump the save epoch so
+                // any older session's delayed save (quit/rejoin race, ghost
+                // autosave) is dropped instead of overwriting us.
+                conn.save_epoch = server.bumpSaveEpoch(conn.username[0..conn.username_len]);
+                // Duplicate login (vanilla `initializeConnection`): kick any
+                // OTHER fully-joined same-name conn. Without this, ghost
+                // sessions linger in the registry and `findInSnap` (first
+                // match) routes /gamemode, /tp, /tell, ... at the ghost —
+                // the live session keeps its old gamemode and saves it back
+                // on quit ("gamemode not saved"). Only announced targets:
+                // a racing newcomer isn't announced yet, so two simultaneous
+                // logins can't kick each other.
+                {
+                    var batch: [256]RegistryEntry = undefined;
+                    const snap = server.snapshot(&batch);
+                    defer Server.releaseSnap(snap);
+                    const nm = conn.username[0..conn.username_len];
+                    for (snap) |e| {
+                        if (e.conn == conn) continue;
+                        e.conn.lock.lock();
+                        const dup = e.conn.state == .play and e.conn.announced and std.ascii.eqlIgnoreCase(e.conn.username[0..e.conn.username_len], nm);
+                        e.conn.lock.unlock();
+                        if (dup) server.kickEntry(e, "You logged in from another location!");
+                    }
+                }
+                const tod = server.time_of_day.load(.acquire);
+                try conn.queueJoinPackets(age, tod);
+                // Current XP (vanilla re-sends S1F on login).
+                var eb: [16]u8 = undefined;
+                const xtotal: i16 = @truncate(conn.xp_total);
+                if (packets.frameSetExperience(conn.xp_bar, @truncate(conn.xp_level), xtotal, &eb)) |xf| {
+                    try conn.queueFramed(xf);
+                } else |_| {}
+            }
             // Login completion: inventory sync, chunks, PosLook last.
             // (announceJoin runs after unlock — it takes conn.lock itself).
-            if (server.world) |pool| {
-                // Persisted inventory (or empty for fresh players): full
-                // Window Items + cursor so the client starts in sync.
-                const wf = try packets.frameWindowItemsAlloc(allocator, 0, &conn.inv);
-                defer allocator.free(wf);
-                try conn.queueFramed(wf);
-                const cf = try packets.frameSetSlotAlloc(allocator, -1, -1, conn.cursor);
-                defer allocator.free(cf);
-                try conn.queueFramed(cf);
-                const cc = conn.playerChunk();
-                try view.completeLogin(conn, server.chunkSource(pool), 0, cc.cx, cc.cz, server.view_distance, true);
-            } else {
-                try conn.queuePlayerPosLook();
+            if (!login_rejected) {
+                if (server.world) |pool| {
+                    // Persisted inventory (or empty for fresh players): full
+                    // Window Items + cursor so the client starts in sync.
+                    const wf = try packets.frameWindowItemsAlloc(allocator, 0, &conn.inv);
+                    defer allocator.free(wf);
+                    try conn.queueFramed(wf);
+                    const cf = try packets.frameSetSlotAlloc(allocator, -1, -1, conn.cursor);
+                    defer allocator.free(cf);
+                    try conn.queueFramed(cf);
+                    const cc = conn.playerChunk();
+                    try view.completeLogin(conn, server.chunkSource(pool), 0, cc.cx, cc.cz, server.view_distance, true);
+                } else {
+                    try conn.queuePlayerPosLook();
+                }
+                need_announce = true;
             }
-            need_announce = true;
         }
         if (conn.chunks_dirty) {
             // Movement / respawn follow-up (no-op without a world).
@@ -2478,9 +5343,13 @@ pub fn serveConn(
         // worker threads since. Gated on the pool sequence (idle = one atomic
         // load) and rate-limited to 1Hz: the rescan re-reads the view disk,
         // and a gen storm would otherwise redo 1k+ store reads every frame.
+        // Capped at 16 pool reads per tick (spiral order => nearest holes
+        // heal first) plus outbox backpressure: without the cap a serve
+        // thread stalls in store reads while generation is active and
+        // stops noticing disconnects (quit->save lands minutes late).
         if (server.world) |pool| {
             if (server.gen_pool) |gp| {
-                if (conn.baseline_sent) {
+                if (conn.baseline_sent and conn.out.items.len < 262144) {
                     const s = gp.sequence();
                     if (s != conn.last_gen_seq) {
                         const now_ms = std.Io.Timestamp.now(server.io, .awake).toMilliseconds();
@@ -2489,7 +5358,7 @@ pub fn serveConn(
                             conn.last_gen_retry_ms = now_ms;
                             const radius: u8 = @min(conn.client_view orelse server.view_distance, server.view_distance);
                             const cc = conn.playerChunk();
-                            try view.resyncDisk(conn, server.chunkSource(pool), 0, cc.cx, cc.cz, radius, true);
+                            try view.resyncDisk(conn, server.chunkSource(pool), 0, cc.cx, cc.cz, radius, true, 16);
                         }
                     }
                 }
@@ -2523,12 +5392,23 @@ pub fn serveConn(
                             }
                             const old = view.peekBlock(pool, allocator, b.x, b.y, b.z) catch null;
                             view.applyBlock(pool, allocator, b.x, b.y, b.z, b.id, b.meta) catch {};
+                            // Block sounds (S29 to nearby viewers; volume
+                            // 1.0, pitch 0.8 like vanilla break/place).
+                            const sx: f64 = @as(f64, @floatFromInt(b.x)) + 0.5;
+                            const sy: f64 = @as(f64, @floatFromInt(b.y)) + 0.5;
+                            const sz: f64 = @as(f64, @floatFromInt(b.z)) + 0.5;
+                            if (b.id != game_ids.air) {
+                                server.broadcastSound(Server.stepSound(b.id), sx, sy, sz, 1.0, 0.8);
+                            }
                             // Survival break of a real block: vanilla drops.
                             // (Creative breaks drop nothing; missing chunks
                             // peek null and stay dropless.)
                             if (b.id == game_ids.air) {
                                 if (old) |o| {
-                                    if (o.id != game_ids.air and conn.config.gamemode == 0) {
+                                    if (o.id != game_ids.air) {
+                                        server.broadcastSound(Server.stepSound(o.id), sx, sy, sz, 1.0, 0.8);
+                                    }
+                                    if (Server.shouldDropBreak(conn.config.gamemode, o.id, server.tileDrops())) {
                                         server.spawnBreakDrops(pool, allocator, b.x, b.y, b.z, o.id, o.meta);
                                     }
                                     // Table break with viewers: drop their
@@ -2576,11 +5456,12 @@ pub fn serveConn(
                     .arm_swing => |a| server.broadcastArmSwing(conn, cc_now.cx, cc_now.cz, conn.eid, a) catch {},
                     .chat => |m| server.broadcastChat(conn.chat_buf[0..m.json_len]),
                     .attack => |a| server.resolveAttack(conn, a),
+                    .tab_complete => |m| server.handleTabComplete(conn, conn.tab_buf[0..m.json_len]),
                     .command => |m| {
                         const text = conn.chat_buf[0..m.json_len];
                         server.handleCommand(conn, text);
                         if (Server.isStopCommand(text)) {
-                            // Flush the "Stopping server." reply first, then
+                            // Flush the stopping reply first, then
                             // persist + exit. (Ticker/serve loops die with us;
                             // the WAL makes the flush a performance plea, not
                             // a durability requirement.)
@@ -2705,6 +5586,68 @@ test "loopback status flow over real TCP" {
     try std.testing.expect(std.mem.indexOf(u8, js, "1.7.10") != null);
     stream.close(io);
     th.join();
+}
+
+test "play_count tracks announces and unregisters for the list ping" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.registry.deinit(a);
+    try std.testing.expectEqual(@as(u32, 0), srv.play_count.load(.acquire));
+
+    var port: u16 = 37971;
+    var listener: std.Io.net.Server = while (true) {
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+        break addr.listen(io, .{}) catch |err| switch (err) {
+            error.AddressInUse => {
+                port += 1;
+                if (port > 37999) return err;
+                continue;
+            },
+            else => return err,
+        };
+    };
+    defer listener.deinit(io);
+    const mk = struct {
+        fn run(l: *std.Io.net.Server, p: u16, name: []const u8) !struct {
+            conn: *Conn,
+            srv_stream: std.Io.net.Stream,
+            cli_stream: std.Io.net.Stream,
+        } {
+            const c = try a.create(Conn);
+            errdefer a.destroy(c);
+            c.* = Conn.init(a, io, .{}, 1);
+            c.state = .play;
+            @memcpy(c.username[0..name.len], name);
+            c.username_len = name.len;
+            const addr = try std.Io.net.IpAddress.parse("127.0.0.1", p);
+            const cli = try addr.connect(io, .{ .mode = .stream });
+            const sv = try l.accept(io);
+            return .{ .conn = c, .srv_stream = sv, .cli_stream = cli };
+        }
+    };
+    var alice = try mk.run(&listener, port, "Alice");
+    defer alice.cli_stream.close(io);
+    defer alice.srv_stream.close(io);
+    var bob = try mk.run(&listener, port, "Bob");
+    defer bob.cli_stream.close(io);
+    defer bob.srv_stream.close(io);
+
+    try srv.register(alice.conn, alice.srv_stream);
+    try srv.register(bob.conn, bob.srv_stream);
+    // Registered but not announced: not counted yet.
+    try std.testing.expectEqual(@as(u32, 0), srv.play_count.load(.acquire));
+    try srv.announceJoin(alice.conn, alice.srv_stream);
+    try std.testing.expectEqual(@as(u32, 1), srv.play_count.load(.acquire));
+    try srv.announceJoin(bob.conn, bob.srv_stream);
+    try std.testing.expectEqual(@as(u32, 2), srv.play_count.load(.acquire));
+    // Re-announce is idempotent for the count.
+    try srv.announceJoin(bob.conn, bob.srv_stream);
+    try std.testing.expectEqual(@as(u32, 2), srv.play_count.load(.acquire));
+    srv.unregister(bob.conn);
+    try std.testing.expectEqual(@as(u32, 1), srv.play_count.load(.acquire));
+    srv.unregister(alice.conn);
+    try std.testing.expectEqual(@as(u32, 0), srv.play_count.load(.acquire));
 }
 
 test "registry join/leave broadcast + tickOnce keepalive over loopback" {
@@ -2939,40 +5882,59 @@ test "env: drown countdown, lava+fire, suffocate; fall resolution" {
     c.state = .play;
     // drown: 15 ticks grace (air 300->0), damage on the 16th
     var i: usize = 0;
-    while (i < 15) : (i += 1) try std.testing.expect(!Server.envTick(&c, true, false, false));
+    while (i < 15) : (i += 1) try std.testing.expect(!Server.envTick(&c, true, false, false, false));
     try std.testing.expectEqual(@as(i16, 0), c.air);
     try std.testing.expectApproxEqAbs(@as(f32, 20.0), c.health, 1e-6);
-    try std.testing.expect(!Server.envTick(&c, true, false, false));
+    try std.testing.expect(!Server.envTick(&c, true, false, false, false));
     try std.testing.expectApproxEqAbs(@as(f32, 18.0), c.health, 1e-6);
     try std.testing.expectEqual(@as(i16, 0), c.air);
     // surface resets air
-    try std.testing.expect(!Server.envTick(&c, false, false, false));
+    try std.testing.expect(!Server.envTick(&c, false, false, false, false));
     try std.testing.expectEqual(@as(i16, 300), c.air);
     // lava: 4 dmg + 300 fire ticks; fire burns 1/tick after leaving
-    try std.testing.expect(!Server.envTick(&c, false, true, false));
+    try std.testing.expect(!Server.envTick(&c, false, true, false, false));
     try std.testing.expectApproxEqAbs(@as(f32, 14.0), c.health, 1e-6);
     try std.testing.expectEqual(@as(u32, 300), c.fire_ticks);
-    try std.testing.expect(!Server.envTick(&c, false, false, false));
+    try std.testing.expect(!Server.envTick(&c, false, false, false, false));
     try std.testing.expectApproxEqAbs(@as(f32, 13.0), c.health, 1e-6);
     // water extinguishes instead of burning
     c.fire_ticks = 100;
-    try std.testing.expect(!Server.envTick(&c, true, false, false));
+    try std.testing.expect(!Server.envTick(&c, true, false, false, false));
     try std.testing.expectEqual(@as(u32, 0), c.fire_ticks);
     // suffocate: 4 per tick
-    try std.testing.expect(!Server.envTick(&c, false, false, true));
+    try std.testing.expect(!Server.envTick(&c, false, false, true, false));
     try std.testing.expectApproxEqAbs(@as(f32, 9.0), c.health, 1e-6);
+    // cactus: 1.0 per touch, throttled to ~1/0.5s (10-tick cooldown)
+    try std.testing.expect(!Server.envTick(&c, false, false, false, true));
+    try std.testing.expectApproxEqAbs(@as(f32, 8.0), c.health, 1e-6);
+    try std.testing.expect(!Server.envTick(&c, false, false, false, true));
+    try std.testing.expectApproxEqAbs(@as(f32, 8.0), c.health, 1e-6); // cooldown: no double-hit
+    // creative is immune to cactus
+    c.config.gamemode = 1;
+    c.cactus_cd = 0;
+    try std.testing.expect(!Server.envTick(&c, false, false, false, true));
+    try std.testing.expectApproxEqAbs(@as(f32, 8.0), c.health, 1e-6);
+    c.config.gamemode = 0;
     // fall: ceil(dist-3) without a world (no water to save us)
     c.pending_fall = .{ .dist = 5.5, .x = 0, .y = 64, .z = 0 };
     var srv = Server{ .net = undefined, .io = std.testing.io, .config = .{}, .gpa = a };
     defer srv.registry.deinit(a);
     srv.resolvePendingFall(&c);
-    try std.testing.expectApproxEqAbs(@as(f32, 6.0), c.health, 1e-6); // 9-3
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), c.health, 1e-6); // 8-3
     try std.testing.expect(c.pending_fall == null);
     // short falls are free
     c.pending_fall = .{ .dist = 3.0, .x = 0, .y = 64, .z = 0 };
     srv.resolvePendingFall(&c);
-    try std.testing.expectApproxEqAbs(@as(f32, 6.0), c.health, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), c.health, 1e-6);
     { const o = try c.takeOutput(); defer a.free(o); }
+}
+
+test "dig-drop gate: survival+adventure drop, creative/gamerule/air do not" {
+    try std.testing.expect(Server.shouldDropBreak(0, .stone, true));
+    try std.testing.expect(Server.shouldDropBreak(2, .stone, true));
+    try std.testing.expect(!Server.shouldDropBreak(1, .stone, true));
+    try std.testing.expect(!Server.shouldDropBreak(0, .stone, false));
+    try std.testing.expect(!Server.shouldDropBreak(0, .air, true));
 }
 
 test "resolveAttack: mob damage/death/destroy, PvP, reach, pig respawn timer" {
@@ -3441,17 +6403,48 @@ test "commands help/list/save-all/unknown (+ console null-sender)" {
     };
     // Replies are queued to the sender's outbox (flushed by serve/tick
     // loops live); tests drain the outbox directly, no sockets needed.
+    // Multi-frame replies (e.g. /save-all's two lines) are consumed one
+    // chat frame at a time; leftovers are re-queued untouched.
     const readChat = struct {
         fn run(c: *Conn) ![]u8 {
+            // Returns the first 0x02 payload, restoring every other frame
+            // (abilities/setslot interleavings + multi-line replies).
             c.lock.lock();
             const raw = try c.takeOutput();
+            var off: usize = 0;
+            var found: ?[]u8 = null;
+            var fstart: usize = 0;
+            var fend: usize = 0;
+            while (off < raw.len) {
+                var r = codec.PacketReader.init(raw[off..]);
+                const h = codec.decodeFrame(&r) catch break;
+                const flen: usize = @as(usize, @intCast(codec.PacketWriter.varIntLen(h.length))) + @as(usize, @intCast(h.length));
+                if (h.id == 0x02 and found == null) {
+                    var pr = codec.PacketReader.init(r.buffer[r.index..]);
+                    found = try a.dupe(u8, try pr.readString());
+                    fstart = off;
+                    fend = off + flen;
+                }
+                off += flen;
+            }
+            if (found) |f| {
+                var rest: [8192]u8 = undefined;
+                var rl: usize = 0;
+                const pre = raw[0..fstart];
+                const post = raw[fend..];
+                if (pre.len + post.len <= rest.len) {
+                    @memcpy(rest[0..pre.len], pre);
+                    @memcpy(rest[pre.len..][0..post.len], post);
+                    rl = pre.len + post.len;
+                    if (rl > 0) c.queueFramed(rest[0..rl]) catch {};
+                }
+                c.lock.unlock();
+                defer a.free(raw);
+                return f;
+            }
             c.lock.unlock();
             defer a.free(raw);
-            var r = codec.PacketReader.init(raw);
-            const h = try codec.decodeFrame(&r);
-            try std.testing.expectEqual(@as(i32, 0x02), h.id);
-            var pr = codec.PacketReader.init(r.buffer[r.index..]);
-            return try a.dupe(u8, try pr.readString());
+            return error.NoChat;
         }
     }.run;
     var alice = try mk.run("AliceD", 1);
@@ -3460,7 +6453,7 @@ test "commands help/list/save-all/unknown (+ console null-sender)" {
     srv.handleCommand(alice, "/list");
     const l0 = try readChat(alice);
     defer a.free(l0);
-    try std.testing.expectEqualStrings("{\"text\":\"Connected (0):\"}", l0);
+    try std.testing.expectEqualStrings("{\"text\":\"There are 0/20 players online:\"}", l0);
     // Register both (commands never touch streams; leave them undefined).
     try srv.registry.append(a, .{ .conn = alice, .stream = undefined });
     try srv.registry.append(a, .{ .conn = bob, .stream = undefined });
@@ -3468,7 +6461,10 @@ test "commands help/list/save-all/unknown (+ console null-sender)" {
     srv.handleCommand(alice, "/list");
     const l1 = try readChat(alice);
     defer a.free(l1);
-    try std.testing.expectEqualStrings("{\"text\":\"Connected (2): AliceD, BobD\"}", l1);
+    try std.testing.expectEqualStrings("{\"text\":\"There are 2/20 players online:\"}", l1);
+    const l1b = try readChat(alice);
+    defer a.free(l1b);
+    try std.testing.expectEqualStrings("{\"text\":\"AliceD, BobD\"}", l1b);
     {
         bob.lock.lock();
         const pending = try bob.takeOutput();
@@ -3476,16 +6472,46 @@ test "commands help/list/save-all/unknown (+ console null-sender)" {
         defer a.free(pending);
         try std.testing.expectEqual(@as(usize, 0), pending.len);
     }
-    // /help (extra args ignored): level-0 callers only see level-0 commands.
+    // /help page 1: level-0 callers only see level-0 commands (vanilla
+    // 7-per-page layout, one chat packet per line).
+    srv.handleCommand(bob, "/help");
+    const h_lines = [_][]const u8{
+        "--- Showing help page 1 of 1 (/help <page>) ---",
+        "/kill",
+        "/me <action ...>",
+        "/help [page|command name]",
+        "/tell <player> <private message ...>",
+        "/list",
+        "/netstat",
+        "Tip: Use the <tab> key while typing a command to auto-complete the command or its arguments",
+    };
+    for (h_lines) |want| {
+        const h = try readChat(bob);
+        defer a.free(h);
+        var eb: [512]u8 = undefined;
+        const esc = try packets.escapeJsonText(want, &eb);
+        var jb: [560]u8 = undefined;
+        const json = try std.fmt.bufPrint(&jb, "{{\"text\":\"{s}\"}}", .{esc});
+        try std.testing.expectEqualStrings(json, h);
+    }
+    // /help with extra args ignores the extras (vanilla reads args[0]).
     srv.handleCommand(bob, "/help with extra args ignored");
-    const h1 = try readChat(bob);
-    defer a.free(h1);
-    try std.testing.expectEqualStrings("{\"text\":\"Commands: /help /list\"}", h1);
+    const h1b = try readChat(bob);
+    defer a.free(h1b);
+    try std.testing.expectEqualStrings("{\"text\":\"Unknown command. Try /help for a list of commands\"}", h1b);
+    // /help <command> prints that command's usage (header + usage lines).
+    srv.handleCommand(bob, "/help list");
+    const h1c = try readChat(bob);
+    defer a.free(h1c);
+    try std.testing.expectEqualStrings("{\"text\":\"--- list ---\"}", h1c);
+    const h1d = try readChat(bob);
+    defer a.free(h1d);
+    try std.testing.expectEqualStrings("{\"text\":\"/list\"}", h1d);
     // unknown
     srv.handleCommand(alice, "/frobnicate");
     const unk = try readChat(alice);
     defer a.free(unk);
-    try std.testing.expectEqualStrings("{\"text\":\"Unknown command. Try /help\"}", unk);
+    try std.testing.expectEqualStrings("{\"text\":\"Unknown command. Try /help for a list of commands\"}", unk);
     // denied == unknown (no oracle): level-0 /save-all gets the same reply.
     srv.handleCommand(alice, "/save-all");
     const denied = try readChat(alice);
@@ -3529,15 +6555,56 @@ test "permissions gate commands: op/deop/grant/deny/show/clear/reload" {
     };
     const readChat = struct {
         fn run(c: *Conn) ![]u8 {
+            // Returns the first 0x02 payload, restoring every other frame
+            // (abilities/setslot interleavings + multi-line replies).
             c.lock.lock();
             const raw = try c.takeOutput();
+            var off: usize = 0;
+            var found: ?[]u8 = null;
+            var fstart: usize = 0;
+            var fend: usize = 0;
+            while (off < raw.len) {
+                var r = codec.PacketReader.init(raw[off..]);
+                const h = codec.decodeFrame(&r) catch break;
+                const flen: usize = @as(usize, @intCast(codec.PacketWriter.varIntLen(h.length))) + @as(usize, @intCast(h.length));
+                if (h.id == 0x02 and found == null) {
+                    var pr = codec.PacketReader.init(r.buffer[r.index..]);
+                    found = try a.dupe(u8, try pr.readString());
+                    fstart = off;
+                    fend = off + flen;
+                }
+                off += flen;
+            }
+            if (found) |f| {
+                var rest: [8192]u8 = undefined;
+                var rl: usize = 0;
+                const pre = raw[0..fstart];
+                const post = raw[fend..];
+                if (pre.len + post.len <= rest.len) {
+                    @memcpy(rest[0..pre.len], pre);
+                    @memcpy(rest[pre.len..][0..post.len], post);
+                    rl = pre.len + post.len;
+                    if (rl > 0) c.queueFramed(rest[0..rl]) catch {};
+                }
+                c.lock.unlock();
+                defer a.free(raw);
+                return f;
+            }
             c.lock.unlock();
             defer a.free(raw);
-            var r = codec.PacketReader.init(raw);
-            const h = try codec.decodeFrame(&r);
-            try std.testing.expectEqual(@as(i32, 0x02), h.id);
-            var pr = codec.PacketReader.init(r.buffer[r.index..]);
-            return try a.dupe(u8, try pr.readString());
+            return error.NoChat;
+        }
+    }.run;
+    // Discard all pending chat frames (admin broadcasts to fellow ops).
+    const drainChat = struct {
+        fn run(c: *Conn) !void {
+            while (true) {
+                c.lock.lock();
+                const raw = try c.takeOutput();
+                c.lock.unlock();
+                defer a.free(raw);
+                if (raw.len == 0) return;
+            }
         }
     }.run;
     var alice = try mk.run("AliceP", 1);
@@ -3549,28 +6616,49 @@ test "permissions gate commands: op/deop/grant/deny/show/clear/reload" {
     srv.handleCommand(alice, "/op AliceP");
     const d0 = try readChat(alice);
     defer a.free(d0);
-    try std.testing.expectEqualStrings("{\"text\":\"Unknown command. Try /help\"}", d0);
+    try std.testing.expectEqualStrings("{\"text\":\"Unknown command. Try /help for a list of commands\"}", d0);
     srv.handleCommand(alice, "/perm show AliceP");
     const d0b = try readChat(alice);
     defer a.free(d0b);
     try std.testing.expectEqualStrings(d0, d0b);
-    // Console ops Alice (null sender): no chat, level applies immediately.
+    // Console ops Alice (null sender): silent here — Alice isn't registered
+    // yet, so the admin broadcast has no recipients (verified by level).
     srv.handleCommand(null, "/op AliceP");
     {
         srv.perm_lock.lock();
         defer srv.perm_lock.unlock();
         try std.testing.expectEqual(@as(u8, 4), srv.perms.?.levelFor("AliceP"));
     }
-    // /help now lists privileged commands for Alice.
+    // /help now lists privileged commands for Alice (vanilla 7-per-page).
     srv.handleCommand(alice, "/help");
-    const h1 = try readChat(alice);
-    defer a.free(h1);
-    try std.testing.expectEqualStrings("{\"text\":\"Commands: /help /list /save-all /op <player> /deop <player> /perm <grant|deny|clear|show|reload> [player] [node] /stop /gamemode <0|1|survival|creative> [player] /give <player> <id> [count] [damage] /tp <target|x> [y] [z] | /tp <victim> <target> /time <set|add> <value|day|night>\"}", h1);
-    // /save-all allowed now (pool present; flushes).
+    const h1_lines = [_][]const u8{
+        "--- Showing help page 1 of 7 (/help <page>) ---",
+        "/time <set|add> <value>",
+        "/gamemode <mode> [player]",
+        "/difficulty <new difficulty>",
+        "/defaultgamemode <mode>",
+        "/kill",
+        "/toggledownfall",
+        "/weather <clear|rain|thunder> [duration in seconds]",
+        "Tip: Use the <tab> key while typing a command to auto-complete the command or its arguments",
+    };
+    for (h1_lines) |want| {
+        const h = try readChat(alice);
+        defer a.free(h);
+        var eb2: [512]u8 = undefined;
+        const esc2 = try packets.escapeJsonText(want, &eb2);
+        var jb2: [560]u8 = undefined;
+        const json2 = try std.fmt.bufPrint(&jb2, "{{\"text\":\"{s}\"}}", .{esc2});
+        try std.testing.expectEqualStrings(json2, h);
+    }
+    // /save-all allowed now (pool present; flushes). Two vanilla lines.
     srv.handleCommand(alice, "/save-all");
+    const s1a = try readChat(alice);
+    defer a.free(s1a);
+    try std.testing.expectEqualStrings("{\"text\":\"Saving...\"}", s1a);
     const s1 = try readChat(alice);
     defer a.free(s1);
-    try std.testing.expectEqualStrings("{\"text\":\"Saved 0 player(s).\"}", s1);
+    try std.testing.expectEqualStrings("{\"text\":\"Saved the world\"}", s1);
     // /perm show
     srv.handleCommand(alice, "/perm show AliceP");
     const sh1 = try readChat(alice);
@@ -3587,29 +6675,36 @@ test "permissions gate commands: op/deop/grant/deny/show/clear/reload" {
     srv.handleCommand(alice, "/op BobP");
     const opb = try readChat(alice);
     defer a.free(opb);
-    try std.testing.expectEqualStrings("{\"text\":\"Opped BobP.\"}", opb);
+    try std.testing.expectEqualStrings("{\"text\":\"Opped BobP\"}", opb);
+    // Vanilla admin-notify reaches the target too (he is op now and can use
+    // /op himself — the bl.a loop only skips the sender).
     const noteb = try readChat(bob);
     defer a.free(noteb);
-    try std.testing.expectEqualStrings("{\"text\":\"You are now op.\"}", noteb);
+    try std.testing.expectEqualStrings("{\"text\":\"[AliceP: Opped BobP]\",\"color\":\"gray\",\"italic\":true}", noteb);
     // Node grant to a level-0 player: /save-all via node, not level.
     srv.handleCommand(null, "/deop BobP"); // back to 0, nodes cleared
-    const db1 = try readChat(bob);
-    defer a.free(db1);
-    try std.testing.expectEqualStrings("{\"text\":\"You are no longer op.\"}", db1);
+    // Console deop admin-notifies Alice (the other op): drain it.
+    const dbdrain = try readChat(alice);
+    defer a.free(dbdrain);
+    try std.testing.expectEqualStrings("{\"text\":\"[Server: De-opped BobP]\",\"color\":\"gray\",\"italic\":true}", dbdrain);
     srv.handleCommand(bob, "/save-all");
     const denied = try readChat(bob);
     defer a.free(denied);
     try std.testing.expectEqualStrings(d0, denied);
-    srv.handleCommand(alice, "/perm grant BobP zigcraft.command.save-all");
+    srv.handleCommand(alice, "/perm grant BobP asteorite.command.save-all");
     const g1 = try readChat(alice);
     defer a.free(g1);
     try std.testing.expectEqualStrings("{\"text\":\"Granted.\"}", g1);
     srv.handleCommand(bob, "/save-all");
+    const s2a = try readChat(bob);
+    defer a.free(s2a);
+    try std.testing.expectEqualStrings("{\"text\":\"Saving...\"}", s2a);
     const s2 = try readChat(bob);
     defer a.free(s2);
-    try std.testing.expectEqualStrings("{\"text\":\"Saved 2 player(s).\"}", s2);
+    try std.testing.expectEqualStrings("{\"text\":\"Saved the world\"}", s2);
+    try drainChat(alice);
     // Deny beats grant.
-    srv.handleCommand(alice, "/perm deny BobP zigcraft.command.save-all");
+    srv.handleCommand(alice, "/perm deny BobP asteorite.command.save-all");
     const denyack = try readChat(alice);
     defer a.free(denyack);
     srv.handleCommand(bob, "/save-all");
@@ -3617,7 +6712,7 @@ test "permissions gate commands: op/deop/grant/deny/show/clear/reload" {
     defer a.free(denied2);
     try std.testing.expectEqualStrings(d0, denied2);
     // Clear restores denial-by-default.
-    srv.handleCommand(alice, "/perm clear BobP zigcraft.command.save-all");
+    srv.handleCommand(alice, "/perm clear BobP asteorite.command.save-all");
     const clearack = try readChat(alice);
     defer a.free(clearack);
     srv.handleCommand(bob, "/save-all");
@@ -3625,27 +6720,35 @@ test "permissions gate commands: op/deop/grant/deny/show/clear/reload" {
     defer a.free(denied3);
     try std.testing.expectEqualStrings(d0, denied3);
     // Wildcard grant covers save-all.
-    srv.handleCommand(alice, "/perm grant BobP zigcraft.command.*");
+    srv.handleCommand(alice, "/perm grant BobP asteorite.command.*");
     const wildack = try readChat(alice);
     defer a.free(wildack);
     srv.handleCommand(bob, "/save-all");
+    const s3a = try readChat(bob);
+    defer a.free(s3a);
+    try std.testing.expectEqualStrings("{\"text\":\"Saving...\"}", s3a);
     const s3 = try readChat(bob);
     defer a.free(s3);
-    try std.testing.expectEqualStrings("{\"text\":\"Saved 2 player(s).\"}", s3);
+    try std.testing.expectEqualStrings("{\"text\":\"Saved the world\"}", s3);
+    try drainChat(alice);
     // /perm show lists nodes.
     srv.handleCommand(alice, "/perm show BobP");
     const sh2 = try readChat(alice);
     defer a.free(sh2);
-    try std.testing.expectEqualStrings("{\"text\":\"BobP: level 0 +zigcraft.command.*\"}", sh2);
+    try std.testing.expectEqualStrings("{\"text\":\"BobP: level 0 +asteorite.command.*\"}", sh2);
     // Reload round-trips the matrix through the LSM row.
     srv.handleCommand(alice, "/perm reload");
     const rl = try readChat(alice);
     defer a.free(rl);
     try std.testing.expectEqualStrings("{\"text\":\"Permissions reloaded.\"}", rl);
     srv.handleCommand(bob, "/save-all");
+    const s4a = try readChat(bob);
+    defer a.free(s4a);
+    try std.testing.expectEqualStrings("{\"text\":\"Saving...\"}", s4a);
     const s4 = try readChat(bob);
     defer a.free(s4);
-    try std.testing.expectEqualStrings("{\"text\":\"Saved 2 player(s).\"}", s4);
+    try std.testing.expectEqualStrings("{\"text\":\"Saved the world\"}", s4);
+    try drainChat(alice);
     // Malformed inputs get usage, not crashes.
     srv.handleCommand(alice, "/op");
     const usage1 = try readChat(alice);
@@ -3654,17 +6757,71 @@ test "permissions gate commands: op/deop/grant/deny/show/clear/reload" {
     srv.handleCommand(alice, "/op Bad!Name");
     const usage2 = try readChat(alice);
     defer a.free(usage2);
-    try std.testing.expectEqualStrings("{\"text\":\"Usage: /op <player>\"}", usage2);
+    try std.testing.expectEqualStrings("{\"text\":\"Opped Bad!Name\"}", usage2);
     srv.handleCommand(alice, "/perm grant BobP HAS SPACE");
     const usage3 = try readChat(alice);
     defer a.free(usage3);
-    try std.testing.expectEqualStrings("{\"text\":\"Bad node. Use [a-z0-9_.-], optional trailing .*\"}", usage3);
-    srv.handleCommand(alice, "/perm frobnicate BobP zigcraft.command.list");
+    try std.testing.expectEqualStrings("{\"text\":\"Usage: /perm <grant|deny|clear|show|reload> [player] [node]\"}", usage3);
+    srv.handleCommand(alice, "/perm frobnicate BobP asteorite.command.list");
     const usage4 = try readChat(alice);
     defer a.free(usage4);
-    try std.testing.expectEqualStrings("{\"text\":\"Usage: /perm <grant|deny|clear|show|reload> [player] [node] /stop\"}", usage4);
+    try std.testing.expectEqualStrings("{\"text\":\"Usage: /perm <grant|deny|clear|show|reload> [player] [node]\"}", usage4);
     _ = srv.registry.pop();
     _ = srv.registry.pop();
+}
+
+test "tab-complete: single-token candidates carry the slash" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.registry.deinit(a);
+    defer if (srv.perms) |*db| db.deinit();
+    const mk = struct {
+        fn run(name: []const u8) !*Conn {
+            const c = try a.create(Conn);
+            c.* = Conn.init(a, io, .{}, 7);
+            @memcpy(c.username[0..name.len], name);
+            c.username_len = name.len;
+            c.state = .play;
+            return c;
+        }
+    }.run;
+    var alice = try mk("AliceT");
+    defer {
+        alice.deinit();
+        a.destroy(alice);
+    }
+    try srv.registry.append(a, .{ .conn = alice, .stream = undefined });
+    srv.handleCommand(null, "/op AliceT");
+    // Drain the op admin-notice so only the S3A remains.
+    {
+        alice.lock.lock();
+        const pending = try alice.takeOutput();
+        alice.lock.unlock();
+        defer a.free(pending);
+    }
+    // "/game" must complete to "/gamemode" (with slash): the 1.7.10
+    // client replaces the whole word, so bare names ate the "/".
+    srv.handleTabComplete(alice, "/game");
+    {
+        alice.lock.lock();
+        const raw = try alice.takeOutput();
+        alice.lock.unlock();
+        defer a.free(raw);
+        var r = codec.PacketReader.init(raw);
+        const h = try codec.decodeFrame(&r);
+        try std.testing.expectEqual(@as(i32, 0x3A), h.id);
+        const n = try r.readVarInt();
+        try std.testing.expect(n >= 1);
+        var seen_slash = false;
+        var i: i32 = 0;
+        while (i < n) : (i += 1) {
+            const cand = try r.readString();
+            try std.testing.expect(cand.len > 0 and cand[0] == '/');
+            if (std.mem.eql(u8, cand, "/gamemode")) seen_slash = true;
+        }
+        try std.testing.expect(seen_slash);
+    }
 }
 
 test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
@@ -3673,6 +6830,12 @@ test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
     var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
     defer srv.registry.deinit(a);
     defer if (srv.perms) |*db| db.deinit();
+    defer {
+        srv.ent_lock.lock();
+        srv.entities.deinit(a);
+        srv.items.deinit(a);
+        srv.ent_lock.unlock();
+    }
     const mk = struct {
         fn run(name: []const u8, id: i32) !*Conn {
             const c = try a.create(Conn);
@@ -3719,11 +6882,56 @@ test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
     };
     const readChat = struct {
         fn run(c: *Conn) ![]u8 {
-            var fr = try Drain.run(c);
-            defer Drain.free(&fr);
-            const body = Drain.find(&fr, 0x02) orelse return error.NoChat;
-            var pr = codec.PacketReader.init(body);
-            return try a.dupe(u8, try pr.readString());
+            // Returns the first 0x02 payload, restoring every other frame
+            // (abilities/setslot interleavings + multi-line replies).
+            c.lock.lock();
+            const raw = try c.takeOutput();
+            var off: usize = 0;
+            var found: ?[]u8 = null;
+            var fstart: usize = 0;
+            var fend: usize = 0;
+            while (off < raw.len) {
+                var r = codec.PacketReader.init(raw[off..]);
+                const h = codec.decodeFrame(&r) catch break;
+                const flen: usize = @as(usize, @intCast(codec.PacketWriter.varIntLen(h.length))) + @as(usize, @intCast(h.length));
+                if (h.id == 0x02 and found == null) {
+                    var pr = codec.PacketReader.init(r.buffer[r.index..]);
+                    found = try a.dupe(u8, try pr.readString());
+                    fstart = off;
+                    fend = off + flen;
+                }
+                off += flen;
+            }
+            if (found) |f| {
+                var rest: [8192]u8 = undefined;
+                var rl: usize = 0;
+                const pre = raw[0..fstart];
+                const post = raw[fend..];
+                if (pre.len + post.len <= rest.len) {
+                    @memcpy(rest[0..pre.len], pre);
+                    @memcpy(rest[pre.len..][0..post.len], post);
+                    rl = pre.len + post.len;
+                    if (rl > 0) c.queueFramed(rest[0..rl]) catch {};
+                }
+                c.lock.unlock();
+                defer a.free(raw);
+                return f;
+            }
+            c.lock.unlock();
+            defer a.free(raw);
+            return error.NoChat;
+        }
+    }.run;
+    // Discard pending admin broadcasts (fellow-op noise).
+    const drainChat = struct {
+        fn run(c: *Conn) !void {
+            while (true) {
+                c.lock.lock();
+                const raw = try c.takeOutput();
+                c.lock.unlock();
+                defer a.free(raw);
+                if (raw.len == 0) return;
+            }
         }
     }.run;
     var alice = try mk.run("AliceG", 1);
@@ -3742,13 +6950,13 @@ test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
     srv.handleCommand(bob, "/gamemode 0");
     const _r1 = try readChat(bob);
     defer a.free(_r1);
-    try std.testing.expectEqualStrings("{\"text\":\"Unknown command. Try /help\"}", _r1);
+    try std.testing.expectEqualStrings("{\"text\":\"Unknown command. Try /help for a list of commands\"}", _r1);
     // Op Alice via console; Bob stays level 0.
     srv.handleCommand(null, "/op AliceG");
-    // Alice got the op notify (she was already registered).
+    // Console op admin-notifies the target (she can use /op now herself).
     const _r2 = try readChat(alice);
     defer a.free(_r2);
-    try std.testing.expectEqualStrings("{\"text\":\"You are now op.\"}", _r2);
+    try std.testing.expectEqualStrings("{\"text\":\"[Server: Opped AliceG]\",\"color\":\"gray\",\"italic\":true}", _r2);
     // /gamemode on Bob by Alice: config flips + 0x39 abilities (flags 0x00).
     srv.handleCommand(alice, "/gamemode 0 BobG");
     try std.testing.expectEqual(@as(u8, 0), bob.config.gamemode);
@@ -3757,27 +6965,37 @@ test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
         defer Drain.free(&fr);
         const ab = Drain.find(&fr, 0x39) orelse return error.NoAbilities;
         try std.testing.expectEqual(@as(u8, 0x00), ab[0]);
+        // Vanilla flips the client controller via S2B reason 3.
+        const gs = Drain.find(&fr, 0x2B) orelse return error.NoGameState;
+        try std.testing.expectEqual(@as(u8, 3), gs[0]);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.0), @as(f32, @bitCast(std.mem.readInt(u32, gs[1..5], .big))), 1e-6);
     }
     const gm = try readChat(alice);
     defer a.free(gm);
-    try std.testing.expectEqualStrings("{\"text\":\"Set BobG to survival.\"}", gm);
+    try std.testing.expectEqualStrings("{\"text\":\"Set BobG's game mode to survival\"}", gm);
     // /gamemode self form + invalid forms.
     srv.handleCommand(alice, "/gamemode creative");
     try std.testing.expectEqual(@as(u8, 1), alice.config.gamemode);
     const _d1 = try readChat(alice);
     defer a.free(_d1);
+    try std.testing.expectEqualStrings("{\"text\":\"Set own game mode to creative\"}", _d1);
     srv.handleCommand(alice, "/gamemode");
     const _r3 = try readChat(alice);
     defer a.free(_r3);
-    try std.testing.expectEqualStrings("{\"text\":\"Usage: /gamemode <0|1|survival|creative> [player]\"}", _r3);
+    try std.testing.expectEqualStrings("{\"text\":\"Usage: /gamemode <mode> [player]\"}", _r3);
     srv.handleCommand(alice, "/gamemode 7");
     const _r4 = try readChat(alice);
     defer a.free(_r4);
-    try std.testing.expectEqualStrings("{\"text\":\"Usage: /gamemode <0|1|survival|creative> [player]\"}", _r4);
+    try std.testing.expectEqualStrings("{\"text\":\"Usage: /gamemode <mode> [player]\"}", _r4);
     srv.handleCommand(alice, "/gamemode 0 NobodyHere");
     const _r5 = try readChat(alice);
     defer a.free(_r5);
-    try std.testing.expectEqualStrings("{\"text\":\"Player not found.\"}", _r5);
+    try std.testing.expectEqualStrings("{\"text\":\"That player cannot be found\"}", _r5);
+    srv.handleCommand(alice, "/gamemode adventure BobG");
+    try std.testing.expectEqual(@as(u8, 2), bob.config.gamemode);
+    const _d1b = try readChat(alice);
+    defer a.free(_d1b);
+    try std.testing.expectEqualStrings("{\"text\":\"Set BobG's game mode to adventure\"}", _d1b);
     // /give: 64 dirt to Bob (first empty main slot = 9).
     srv.handleCommand(alice, "/give BobG 1 64");
     {
@@ -3793,32 +7011,36 @@ test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
         try std.testing.expectEqual(@as(i16, 1), it.id);
         try std.testing.expectEqual(@as(i8, 64), it.count);
     }
+    // Numeric ids warn first, then the vanilla success line.
+    const gw = try readChat(alice);
+    defer a.free(gw);
+    try std.testing.expectEqualStrings("{\"text\":\"Warning: Using numeric IDs will not be supported in the future. Please use names, such as 'stone'\"}", gw);
     const gv = try readChat(alice);
     defer a.free(gv);
-    try std.testing.expectEqualStrings("{\"text\":\"Gave 64x1 to BobG.\"}", gv);
+    try std.testing.expectEqualStrings("{\"text\":\"Given stone * 64 to BobG\"}", gv);
     // /give validation: bad id/count/damage, offline target, defaults.
     srv.handleCommand(alice, "/give BobG 0 1");
     const _r6 = try readChat(alice);
     defer a.free(_r6);
-    try std.testing.expectEqualStrings("{\"text\":\"Usage: /give <player> <id> [count] [damage]\"}", _r6);
+    try std.testing.expectEqualStrings("{\"text\":\"There is no such item with ID 0\"}", _r6);
     srv.handleCommand(alice, "/give BobG 4096 1");
     const _r7 = try readChat(alice);
     defer a.free(_r7);
-    try std.testing.expectEqualStrings("{\"text\":\"Usage: /give <player> <id> [count] [damage]\"}", _r7);
+    try std.testing.expectEqualStrings("{\"text\":\"There is no such item with ID 4096\"}", _r7);
     srv.handleCommand(alice, "/give BobG 1 0");
     const _r8 = try readChat(alice);
     defer a.free(_r8);
-    try std.testing.expectEqualStrings("{\"text\":\"Count must be 1..64.\"}", _r8);
+    try std.testing.expectEqualStrings("{\"text\":\"The number you have entered (0) is too small, it must be at least 1\"}", _r8);
     srv.handleCommand(alice, "/give BobG 1 65");
     const _r9 = try readChat(alice);
     defer a.free(_r9);
-    try std.testing.expectEqualStrings("{\"text\":\"Count must be 1..64.\"}", _r9);
+    try std.testing.expectEqualStrings("{\"text\":\"The number you have entered (65) is too big, it must be at most 64\"}", _r9);
     srv.handleCommand(alice, "/give Ghost 1 1");
     const _r10 = try readChat(alice);
     defer a.free(_r10);
-    try std.testing.expectEqualStrings("{\"text\":\"Player not found.\"}", _r10);
+    try std.testing.expectEqualStrings("{\"text\":\"That player cannot be found\"}", _r10);
     // Node grant lets level-0 Bob /give; deny revokes it again.
-    srv.handleCommand(alice, "/perm grant BobG zigcraft.command.give");
+    srv.handleCommand(alice, "/perm grant BobG asteorite.command.give");
     const _d2 = try readChat(alice);
     defer a.free(_d2);
     srv.handleCommand(bob, "/give BobG 3 5");
@@ -3827,15 +7049,33 @@ test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
         try std.testing.expectEqual(game_ids.dirt, bob.inv[10].?.id);
         try std.testing.expectEqual(@as(i8, 5), bob.inv[10].?.count);
     }
+    const _d3w = try readChat(bob);
+    defer a.free(_d3w);
+    try std.testing.expectEqualStrings("{\"text\":\"Warning: Using numeric IDs will not be supported in the future. Please use names, such as 'dirt'\"}", _d3w);
     const _d3 = try readChat(bob);
     defer a.free(_d3);
-    srv.handleCommand(alice, "/perm deny BobG zigcraft.command.give");
+    try std.testing.expectEqualStrings("{\"text\":\"Given dirt * 5 to BobG\"}", _d3);
+    // Bob's success admin-notifies Alice (fellow op with the node).
+    try drainChat(alice);
+    srv.handleCommand(alice, "/perm deny BobG asteorite.command.give");
     const _d4 = try readChat(alice);
     defer a.free(_d4);
     srv.handleCommand(bob, "/give BobG 3 1");
     const _r11 = try readChat(bob);
     defer a.free(_r11);
-    try std.testing.expectEqualStrings("{\"text\":\"Unknown command. Try /help\"}", _r11);
+    try std.testing.expectEqualStrings("{\"text\":\"Unknown command. Try /help for a list of commands\"}", _r11);
+    // Name form needs no warning and skips the deprecation line.
+    srv.handleCommand(alice, "/perm grant BobG asteorite.command.give");
+    const _d2b = try readChat(alice);
+    defer a.free(_d2b);
+    srv.handleCommand(bob, "/give BobG dirt 2");
+    const _d3b = try readChat(bob);
+    defer a.free(_d3b);
+    try std.testing.expectEqualStrings("{\"text\":\"Given dirt * 2 to BobG\"}", _d3b);
+    try drainChat(alice);
+    srv.handleCommand(alice, "/perm deny BobG asteorite.command.give");
+    const _d4b = try readChat(alice);
+    defer a.free(_d4b);
     // /tp Alice -> Bob (1-arg), then coords, then victim form.
     bob.pos_x = 100.0;
     bob.pos_y = 70.0;
@@ -3851,9 +7091,9 @@ test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
         try std.testing.expectApproxEqAbs(100.0, @as(f64, @bitCast(pux)), 1e-9);
         const rp = Drain.find(&fr, 0x02) orelse return error.NoReply;
         var pr = codec.PacketReader.init(rp);
-        try std.testing.expectEqualStrings("{\"text\":\"Teleported AliceG to BobG.\"}", try pr.readString());
+        try std.testing.expectEqualStrings("{\"text\":\"Teleported AliceG to BobG\"}", try pr.readString());
     }
-    srv.handleCommand(alice, "/perm grant BobG zigcraft.command.tp");
+    srv.handleCommand(alice, "/perm grant BobG asteorite.command.tp");
     const _d5 = try readChat(alice);
     defer a.free(_d5);
     srv.handleCommand(bob, "/tp 10 70 10");
@@ -3861,48 +7101,59 @@ test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
     try std.testing.expectApproxEqAbs(70.0, bob.pos_y, 1e-9);
     const tp2 = try readChat(bob);
     defer a.free(tp2);
-    try std.testing.expectEqualStrings("{\"text\":\"Teleported BobG to 10.0, 70.0, 10.0.\"}", tp2);
+    try std.testing.expectEqualStrings("{\"text\":\"Teleported BobG to 10.00,70.00,10.00\"}", tp2);
+    // Bob's tp admin-notifies Alice (fellow op).
+    try drainChat(alice);
     srv.handleCommand(alice, "/tp BobG AliceG");
     try std.testing.expectApproxEqAbs(100.0, bob.pos_x, 1e-9);
     const tpv = try readChat(alice);
     defer a.free(tpv);
-    try std.testing.expectEqualStrings("{\"text\":\"Teleported BobG to AliceG.\"}", tpv);
+    try std.testing.expectEqualStrings("{\"text\":\"Teleported BobG to AliceG\"}", tpv);
+    // Bob holds the tp node now, so he saw an admin copy: drain it.
+    try drainChat(bob);
     // /tp usage + bad coords + unknown players.
     srv.handleCommand(alice, "/tp");
     const _r12 = try readChat(alice);
     defer a.free(_r12);
-    try std.testing.expectEqualStrings("{\"text\":\"Usage: /tp <target|x> [y] [z] | /tp <victim> <target>\"}", _r12);
+    try std.testing.expectEqualStrings("{\"text\":\"Usage: /tp [target player] <destination player> OR /tp [target player] <x> <y> <z>\"}", _r12);
     srv.handleCommand(alice, "/tp one two three");
     const _r13 = try readChat(alice);
     defer a.free(_r13);
-    try std.testing.expectEqualStrings("{\"text\":\"Usage: /tp <target|x> [y] [z] | /tp <victim> <target>\"}", _r13);
+    try std.testing.expectEqualStrings("{\"text\":\"Usage: /tp [target player] <destination player> OR /tp [target player] <x> <y> <z>\"}", _r13);
     srv.handleCommand(alice, "/tp 0 nan 0");
     const _r14 = try readChat(alice);
     defer a.free(_r14);
-    try std.testing.expectEqualStrings("{\"text\":\"Bad coordinates (y must be 0..256).\"}", _r14);
+    try std.testing.expectEqualStrings("{\"text\":\"Usage: /tp [target player] <destination player> OR /tp [target player] <x> <y> <z>\"}", _r14);
+    // Vanilla tp has no y clamp: y=999 works, coords render %.2f.
     srv.handleCommand(alice, "/tp 0 999 0");
     const _r15 = try readChat(alice);
     defer a.free(_r15);
-    try std.testing.expectEqualStrings("{\"text\":\"Bad coordinates (y must be 0..256).\"}", _r15);
+    try std.testing.expectEqualStrings("{\"text\":\"Teleported AliceG to 0.00,999.00,0.00\"}", _r15);
+    try drainChat(bob);
+    srv.handleCommand(alice, "/tp 0 70 0");
+    const _r15b = try readChat(alice);
+    defer a.free(_r15b);
+    try std.testing.expectEqualStrings("{\"text\":\"Teleported AliceG to 0.00,70.00,0.00\"}", _r15b);
+    try drainChat(bob);
     srv.handleCommand(alice, "/tp Ghost");
     const _r16 = try readChat(alice);
     defer a.free(_r16);
-    try std.testing.expectEqualStrings("{\"text\":\"Player not found.\"}", _r16);
+    try std.testing.expectEqualStrings("{\"text\":\"That player cannot be found\"}", _r16);
     // /time set/add, keywords, usage, denial for level 0.
     srv.handleCommand(bob, "/time set 0");
     const _r17 = try readChat(bob);
     defer a.free(_r17);
-    try std.testing.expectEqualStrings("{\"text\":\"Unknown command. Try /help\"}", _r17);
+    try std.testing.expectEqualStrings("{\"text\":\"Unknown command. Try /help for a list of commands\"}", _r17);
     srv.handleCommand(alice, "/time set 13000");
     try std.testing.expectEqual(@as(i64, 13000), srv.time_of_day.load(.acquire));
     const _r18 = try readChat(alice);
     defer a.free(_r18);
-    try std.testing.expectEqualStrings("{\"text\":\"Set time to 13000.\"}", _r18);
+    try std.testing.expectEqualStrings("{\"text\":\"Set the time to 13000\"}", _r18);
     srv.handleCommand(alice, "/time add 1000");
     try std.testing.expectEqual(@as(i64, 14000), srv.time_of_day.load(.acquire));
     const _r19 = try readChat(alice);
     defer a.free(_r19);
-    try std.testing.expectEqualStrings("{\"text\":\"Time is now 14000.\"}", _r19);
+    try std.testing.expectEqualStrings("{\"text\":\"Added 1000 to the time\"}", _r19);
     srv.handleCommand(alice, "/time set day");
     try std.testing.expectEqual(@as(i64, 1000), srv.time_of_day.load(.acquire));
     const _d6 = try readChat(alice);
@@ -3914,29 +7165,89 @@ test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
     srv.handleCommand(alice, "/time");
     const _r20 = try readChat(alice);
     defer a.free(_r20);
-    try std.testing.expectEqualStrings("{\"text\":\"Usage: /time <set|add> <value|day|night>\"}", _r20);
+    try std.testing.expectEqualStrings("{\"text\":\"Usage: /time <set|add> <value>\"}", _r20);
     srv.handleCommand(alice, "/time frobnicate 1");
     const _r21 = try readChat(alice);
     defer a.free(_r21);
-    try std.testing.expectEqualStrings("{\"text\":\"Usage: /time <set|add> <value|day|night>\"}", _r21);
+    try std.testing.expectEqualStrings("{\"text\":\"Usage: /time <set|add> <value>\"}", _r21);
     srv.handleCommand(alice, "/time set xyz");
     const _r22 = try readChat(alice);
     defer a.free(_r22);
-    try std.testing.expectEqualStrings("{\"text\":\"Usage: /time <set|add> <value|day|night>\"}", _r22);
+    try std.testing.expectEqualStrings("{\"text\":\"'xyz' is not a valid number\"}", _r22);
     // Full inventory: /give reports partial with leftover.
     for (9..45) |s| bob.inv[s] = .{ .id = game_ids.planks, .count = 64, .damage = 0, .nbt = null };
-    srv.handleCommand(alice, "/perm clear BobG zigcraft.command.give");
+    srv.handleCommand(alice, "/perm clear BobG asteorite.command.give");
     const _d8 = try readChat(alice);
     defer a.free(_d8);
     srv.handleCommand(alice, "/op BobG");
     const _d9 = try readChat(alice);
     defer a.free(_d9);
-    const _d10 = try readChat(bob);
-    defer a.free(_d10); // "You are now op."
+    // The new op is admin-notified too (vanilla bl.a loop skips only sender).
+    const _d9b = try readChat(bob);
+    defer a.free(_d9b);
+    try std.testing.expectEqualStrings("{\"text\":\"[AliceG: Opped BobG]\",\"color\":\"gray\",\"italic\":true}", _d9b);
     srv.handleCommand(bob, "/give BobG 1 10");
+    const nospacew = try readChat(bob);
+    defer a.free(nospacew);
     const nospace = try readChat(bob);
     defer a.free(nospace);
-    try std.testing.expectEqualStrings("{\"text\":\"Gave 0 of 10 (no space for 10).\"}", nospace);
+    try std.testing.expectEqualStrings("{\"text\":\"Given stone * 10 to BobG\"}", nospace);
+    // Overflow drops at Bob's feet; Alice (fellow op) saw the admin copy.
+    try std.testing.expect(srv.items.items.len > 0);
+    try drainChat(alice);
+    // /enchant success path: sword in the held slot gets an `ench` NBT list
+    // and a 0x2F refresh; incompatible/silly targets get vanilla errors.
+    bob.inv[36] = .{ .id = game_ids.diamond_sword, .count = 1, .damage = 0, .nbt = null };
+    bob.selected = 0;
+    srv.handleCommand(alice, "/enchant BobG 16 2");
+    const ench1 = try readChat(alice);
+    defer a.free(ench1);
+    try std.testing.expectEqualStrings("{\"text\":\"Enchanting succeeded\"}", ench1);
+    {
+        const st = bob.inv[36].?;
+        try std.testing.expect(st.nbt != null);
+        // ench list contains (16, 2).
+        var found = false;
+        var i: usize = 0;
+        const raw = st.nbt.?;
+        // Entry layout: 03 <00 02> "id" <i16> 03 <00 03> "lvl" <i16> 00.
+        while (i + 2 <= raw.len) : (i += 1) {
+            if (raw[i] == 'i' and raw[i + 1] == 'd' and i + 12 <= raw.len) {
+                const id = std.mem.readInt(i16, raw[i + 2 ..][0..2], .big);
+                const lvl = std.mem.readInt(i16, raw[i + 10 ..][0..2], .big);
+                if (id == 16 and lvl == 2) found = true;
+            }
+        }
+        try std.testing.expect(found);
+    }
+    try drainChat(bob); // 0x2F setslot refresh
+    // Smite on a sharp sword: vanilla cantCombine.
+    srv.handleCommand(alice, "/enchant BobG 17 1");
+    const ench2 = try readChat(alice);
+    defer a.free(ench2);
+    try std.testing.expectEqualStrings("{\"text\":\"The selected enchantment can't be added to the target item\"}", ench2);
+    // Unbreaking on dirt: not damageable.
+    item_mod.freeStack(a, &bob.inv[36]);
+    bob.inv[36] = .{ .id = game_ids.dirt, .count = 1, .damage = 0, .nbt = null };
+    srv.handleCommand(alice, "/enchant BobG 34 1");
+    const ench3 = try readChat(alice);
+    defer a.free(ench3);
+    try std.testing.expectEqualStrings("{\"text\":\"The selected enchantment can't be added to the target item\"}", ench3);
+    // keepInventory: death keeps the inventory (no drops, no wipe).
+    bob.inv[9] = .{ .id = game_ids.stone, .count = 1, .damage = 0, .nbt = null };
+    srv.handleCommand(alice, "/gamerule keepInventory true");
+    const _ki = try readChat(alice);
+    defer a.free(_ki);
+    try std.testing.expect(srv.keepInv());
+    try std.testing.expect(srv.killPlayer("BobG"));
+    try std.testing.expect(bob.is_dead);
+    try std.testing.expect(bob.inv[9] != null);
+    // No death drops under keepInventory (only the earlier give overflow).
+    try std.testing.expectEqual(@as(usize, 1), srv.items.items.len);
+    srv.handleCommand(alice, "/gamerule keepInventory false");
+    const _ki2 = try readChat(alice);
+    defer a.free(_ki2);
+    try std.testing.expect(!srv.keepInv());
     _ = srv.registry.pop();
     _ = srv.registry.pop();
 }

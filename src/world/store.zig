@@ -408,6 +408,16 @@ pub const Store = struct {
     flush_threshold_bytes: usize,
     wal_sync_bytes: usize,
     compact_threshold_ssts: usize,
+    /// Guards memtable + live SST list (mem/put + get + flush/compact swap).
+    /// Serve threads read without the world lock while the ticker (player
+    /// saves) and gen workers write + flush/compact: without this, a
+    /// compaction swapping `ssts` under a concurrent `get` served transient
+    /// holes in already-generated chunks (client "chunk errors"). Leaf lock:
+    /// never held while acquiring world/conn locks. Uncontended cost is one
+    /// atomic op per call; flush/compact hold it across file IO (serve reads
+    /// stall for the duration — seconds worst case on big DBs, well under
+    /// the 30s keepalive timeout; backgrounding is Phase C/H5).
+    mutex: std.Io.Mutex = .init,
 
     pub const KeyCtx = struct {
         pub fn hash(_: KeyCtx, k: ChunkKey) u64 {
@@ -767,6 +777,8 @@ pub const Store = struct {
     }
 
     pub fn put(self: *Store, key: ChunkKey, value: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         try self.walAppend(key, value);
         const owned = try self.allocator.dupe(u8, value);
         if (self.mem.fetchRemove(key)) |old| {
@@ -786,6 +798,8 @@ pub const Store = struct {
     }
 
     pub fn delete(self: *Store, key: ChunkKey) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         try self.walAppend(key, null);
         if (self.mem.fetchRemove(key)) |old| {
             if (old.value) |ov| {
@@ -802,6 +816,8 @@ pub const Store = struct {
     /// own allocator may be a never-reset arena, which must never back
     /// per-request bytes.)
     pub fn get(self: *Store, alloc: std.mem.Allocator, key: ChunkKey) !?[]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         if (self.mem.get(key)) |v| {
             if (v) |bytes| return try alloc.dupe(u8, bytes);
             return null; // tombstone in memtable
@@ -903,6 +919,8 @@ pub const Store = struct {
     }
 
     pub fn flush(self: *Store) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         try self.flushLocked();
     }
 
@@ -972,6 +990,8 @@ pub const Store = struct {
     /// the merge covers every run, so a surviving tombstone means "absent".
     /// Crash-safe via tmp+rename + MANIFEST swap; old runs deleted after.
     pub fn compact(self: *Store) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         try self.compactLocked();
     }
 
@@ -1091,6 +1111,8 @@ pub const Store = struct {
     /// Quiesce writers across shards before snapshotting a pool (see
     /// `ShardPool.snapshotAll`). The copy opens as a working store.
     pub fn snapshot(self: *Store, snap_dir: std.Io.Dir) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         try self.flushLocked();
         try self.writeManifest();
         snap_dir.createDir(self.io, "sst", .default_dir) catch |err| switch (err) {

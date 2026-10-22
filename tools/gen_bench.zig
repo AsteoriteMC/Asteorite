@@ -1,6 +1,6 @@
 //! genbench: time single-chunk generation.
 const std = @import("std");
-const zigcraft = @import("zigcraft");
+const asteorite = @import("asteorite");
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -14,7 +14,7 @@ pub fn main(init: std.process.Init) !void {
     const cz: i32 = if (args.len > 3) try std.fmt.parseInt(i32, args[3], 0) else 0;
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
-    var gen = try zigcraft.v5gen.Gen.init(gpa.allocator(), seed, false, false);
+    var gen = try asteorite.v5gen.Gen.init(gpa.allocator(), seed, false, false);
     defer gen.deinit();
     const t0 = std.Io.Timestamp.now(init.io, .awake);
     {
@@ -29,5 +29,5 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test {
-    _ = @import("zigcraft");
+    _ = @import("asteorite");
 }

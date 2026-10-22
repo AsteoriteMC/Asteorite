@@ -29,7 +29,9 @@ const wire = @import("../proto/v5/wire_ids.zig");
 pub const player_dim: u8 = 255;
 pub const magic = "ZPLR";
 /// v2 adds trailing gamemode (v1 rows decode with gamemode defaulting to 1).
-pub const version: u8 = 3;
+/// v4 appends xp (level/total/bar) + spawn_forced; v3 rows still decode
+/// (append-only, defaults apply).
+pub const version: u8 = 4;
 pub const inv_size = 45;
 
 pub const Data = struct {
@@ -51,6 +53,12 @@ pub const Data = struct {
     /// Effective gamemode (0 survival, 1 creative). v1 rows lack the byte
     /// and decode with the old default (creative).
     gamemode: u8 = 1,
+    /// Experience (v4; v3 rows decode to zeroes).
+    xp_level: i32 = 0,
+    xp_total: i32 = 0,
+    xp_bar: f32 = 0,
+    /// Personal spawn via /spawnpoint (false = world spawn).
+    spawn_forced: bool = false,
     inv: [inv_size]?item_mod.Stack = [_]?item_mod.Stack{null} ** inv_size,
     cursor: ?item_mod.Stack = null,
 };
@@ -83,6 +91,7 @@ pub fn encode(alloc: std.mem.Allocator, d: *const Data) ![]u8 {
     for (d.inv) |s| n += slotSize(s);
     n += slotSize(d.cursor);
     n += 1; // v2 trailing gamemode
+    n += 4 + 4 + 4 + 1; // v4 xp_level, xp_total, xp_bar, spawn_forced
     const out = try alloc.alloc(u8, n);
     errdefer alloc.free(out);
     var i: usize = 0;
@@ -123,6 +132,14 @@ pub fn encode(alloc: std.mem.Allocator, d: *const Data) ![]u8 {
     for (d.inv) |s| i = writeSlot(out, i, s);
     i = writeSlot(out, i, d.cursor);
     out[i] = d.gamemode;
+    i += 1;
+    std.mem.writeInt(i32, out[i..][0..4], d.xp_level, .big);
+    i += 4;
+    std.mem.writeInt(i32, out[i..][0..4], d.xp_total, .big);
+    i += 4;
+    std.mem.writeInt(u32, out[i..][0..4], @bitCast(d.xp_bar), .big);
+    i += 4;
+    out[i] = if (d.spawn_forced) 1 else 0;
     i += 1;
     std.debug.assert(i == n);
     return out;
@@ -172,7 +189,8 @@ pub fn decode(alloc: std.mem.Allocator, bytes: []const u8, expect_username: []co
     const ver = (try take(&r, 1))[0];
     // v1/v2 stored wire ids; v3+ stores canonical ids. No migration path:
     // reimport from Anvil/vanilla player.dat instead (same rule as ZC1).
-    if (ver != version) return error.CorruptPlayer;
+    // v3 rows decode with xp/spawn_forced defaulting (append-only v4).
+    if (ver != version and ver != 3) return error.CorruptPlayer;
     const ulen: usize = (try take(&r, 1))[0];
     if (ulen == 0 or ulen > 16) return error.CorruptPlayer;
     const uname = try take(&r, ulen);
@@ -201,6 +219,14 @@ pub fn decode(alloc: std.mem.Allocator, bytes: []const u8, expect_username: []co
     d.cursor = try readSlot(alloc, &r, take);
     d.gamemode = (try take(&r, 1))[0];
     if (d.gamemode > 1) return error.CorruptPlayer;
+    if (ver >= 4) {
+        d.xp_level = std.mem.readInt(i32, (try take(&r, 4))[0..4], .big);
+        d.xp_total = std.mem.readInt(i32, (try take(&r, 4))[0..4], .big);
+        d.xp_bar = @bitCast(std.mem.readInt(u32, (try take(&r, 4))[0..4], .big));
+        d.spawn_forced = (try take(&r, 1))[0] != 0;
+        if (d.xp_level < 0 or d.xp_total < 0) return error.CorruptPlayer;
+        if (!std.math.isFinite(d.xp_bar) or d.xp_bar < 0 or d.xp_bar > 1) return error.CorruptPlayer;
+    }
     if (r.len != 0) return error.CorruptPlayer;
     return d;
 }
@@ -317,9 +343,10 @@ test "player v1/v2 rows are rejected (wire ids, not canonical)" {
         try std.testing.expect(err == error.CorruptPlayer);
     }
     // garbage gamemode rejected (7 = neither survival nor creative).
+    // v4 layout tails with gamemode + xp_level/total/bar + spawn_forced.
     const bad = try a.dupe(u8, enc);
     defer a.free(bad);
-    bad[bad.len - 1] = 7;
+    bad[bad.len - 14] = 7;
     var r_bad = decode(a, bad, "Al");
     if (r_bad) |*b| {
         freeData(a, b);

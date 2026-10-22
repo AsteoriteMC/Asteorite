@@ -90,7 +90,7 @@ def send_frame(s: socket.socket, pid: int, body: bytes) -> None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="headless load bot for zigcraft")
+    ap = argparse.ArgumentParser(description="headless load bot for asteorite")
     ap.add_argument("host", nargs="?", default="127.0.0.1")
     ap.add_argument("port", nargs="?", type=int, default=25566)
     ap.add_argument("username", nargs="?", default="LoadBot")

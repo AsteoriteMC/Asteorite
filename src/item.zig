@@ -58,6 +58,42 @@ pub fn canMerge(dst: Stack, src: Stack) bool {
     return dst.id == src.id and dst.damage == src.damage and nbtEqual(dst.nbt, src.nbt);
 }
 
+/// Result of filling a player inventory.
+pub const FillResult = struct {
+    placed: i32,
+    remaining: i32,
+};
+
+/// Fill a 45-slot player inventory like vanilla addItemStackToInventory:
+/// merge into main-inventory stacks (slots 9..44), then empties; NBT
+/// stacks never merge. Marks touched slots in `dirty`. Shared by the
+/// /give command backend (and any future dispenser/pickup paths) so the
+/// merge rule lives in exactly one place.
+pub fn fillInventory(inv: *[45]?Stack, id: ids.Id, count: i32, damage: i16, dirty: *[45]bool) FillResult {
+    var remaining = count;
+    const limit: i32 = maxStackSize(id);
+    for (9..45) |s| {
+        if (remaining <= 0) break;
+        const st = inv[s] orelse continue;
+        if (st.id != id or st.damage != damage or st.nbt != null) continue;
+        if (st.count >= limit) continue;
+        const room = limit - @as(i32, st.count);
+        const take = @min(room, remaining);
+        inv[s].?.count += @intCast(take);
+        remaining -= take;
+        dirty[s] = true;
+    }
+    var s: usize = 9;
+    while (remaining > 0 and s < 45) : (s += 1) {
+        if (inv[s] != null) continue;
+        const put: i8 = @intCast(@min(@as(i32, limit), remaining));
+        inv[s] = .{ .id = id, .count = put, .damage = damage, .nbt = null };
+        remaining -= put;
+        dirty[s] = true;
+    }
+    return .{ .placed = count - remaining, .remaining = remaining };
+}
+
 /// Max stack size (vanilla 1.7 limits). Damageable gear stacks to 1;
 /// small throwables/utility to 16; everything else 64.
 /// Approximation boundary: exotic 16-stacks beyond this table fall back to

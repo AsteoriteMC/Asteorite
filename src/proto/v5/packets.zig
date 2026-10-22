@@ -171,6 +171,13 @@ pub fn frameTimeUpdate(world_age: i64, time_of_day: i64, out: []u8) codec.CodecE
 }
 
 /// Player Abilities 0x39. flags bit0=creative,bit1=flying,bit2=fly-allowed,bit3=god.
+/// S39 ability flags (jar-verified `hk.b`: bit0 = disableDamage,
+/// bit1 = isFlying, bit2 = allowFlying, bit3 = isCreativeMode). Grounded
+/// creative = 0x0D, survival/adventure = 0x00.
+pub fn abilityFlags(creative: bool) u8 {
+    return if (creative) 0x0D else 0x00;
+}
+
 pub fn framePlayerAbilities(flags: u8, flying_speed: f32, walking_speed: f32, out: []u8) codec.CodecError![]const u8 {
     var pb: [9]u8 = undefined;
     pb[0] = flags;
@@ -361,6 +368,56 @@ pub fn frameChat(json: []const u8, out: []u8) codec.CodecError![]const u8 {
     var w = codec.PacketWriter.init(&payload);
     try w.writeString(json);
     return try codec.framePacket(@intFromEnum(ids.PlayClient.chat_message), w.written(), out);
+}
+
+/// Escape one raw string for embedding in JSON (quotes, backslashes,
+/// control chars). Rejects invalid UTF-8 like formatChatJson does.
+pub fn escapeJsonText(in: []const u8, out: []u8) error{ BadMessage, OutOfMemory }![]const u8 {
+    if (!std.unicode.utf8ValidateSlice(in)) return error.BadMessage;
+    const hex = "0123456789abcdef";
+    var p: usize = 0;
+    for (in) |c| {
+        if (c == '"') {
+            if (p + 2 > out.len) return error.OutOfMemory;
+            out[p] = '\\';
+            out[p + 1] = '"';
+            p += 2;
+        } else if (c == '\\') {
+            if (p + 2 > out.len) return error.OutOfMemory;
+            out[p] = '\\';
+            out[p + 1] = '\\';
+            p += 2;
+        } else if (c == '\n') {
+            if (p + 2 > out.len) return error.OutOfMemory;
+            out[p] = '\\';
+            out[p + 1] = 'n';
+            p += 2;
+        } else if (c == '\r') {
+            if (p + 2 > out.len) return error.OutOfMemory;
+            out[p] = '\\';
+            out[p + 1] = 'r';
+            p += 2;
+        } else if (c == '\t') {
+            if (p + 2 > out.len) return error.OutOfMemory;
+            out[p] = '\\';
+            out[p + 1] = 't';
+            p += 2;
+        } else if (c < 0x20) {
+            if (p + 6 > out.len) return error.OutOfMemory;
+            out[p] = '\\';
+            out[p + 1] = 'u';
+            out[p + 2] = '0';
+            out[p + 3] = '0';
+            out[p + 4] = hex[c >> 4];
+            out[p + 5] = hex[c & 0xF];
+            p += 6;
+        } else {
+            if (p + 1 > out.len) return error.OutOfMemory;
+            out[p] = c;
+            p += 1;
+        }
+    }
+    return out[0..p];
 }
 
 /// `<name> message` chat line as JSON with escaping. Rejects invalid UTF-8,
@@ -1296,6 +1353,218 @@ test "chat format + frame roundtrip" {
     var w = codec.PacketWriter.init(&sb);
     try w.writeString("hello there");
     try std.testing.expectEqualStrings("hello there", try parseChat(w.written()));
+}
+
+// ---------- tab completion (serverbound 0x14, clientbound 0x3A) ----------
+
+/// Serverbound 0x14 text (vanilla cap 32767 chars — same as chat).
+pub fn parseTabComplete(body: []const u8) codec.CodecError![]const u8 {
+    var r = codec.PacketReader.init(body);
+    return try r.readString();
+}
+
+/// Clientbound 0x3A: VarInt count + candidate strings.
+pub fn frameTabComplete(cands: []const []const u8, out: []u8) codec.CodecError![]const u8 {
+    var payload: [4096]u8 = undefined;
+    var w = codec.PacketWriter.init(&payload);
+    try w.writeVarInt(@intCast(cands.len));
+    for (cands) |c| try w.writeString(c);
+    return try codec.framePacket(@intFromEnum(ids.PlayClient.tab_complete), w.written(), out);
+}
+
+// ---------- game state / effects / scoreboard ----------
+
+/// Clientbound 0x2B ChangeGameState: reason byte + float value.
+/// (1 = begin rain, 2 = end rain, 3 = change gamemode.)
+pub fn frameGameState(reason: u8, value: f32, out: []u8) codec.CodecError![]const u8 {
+    var payload: [8]u8 = undefined;
+    var w = codec.PacketWriter.init(&payload);
+    try w.writeByte(reason);
+    try w.writeFloat(value);
+    return try codec.framePacket(@intFromEnum(ids.PlayClient.change_game_state), w.written(), out);
+}
+
+/// Clientbound 0x29 NamedSoundEffect: coords are absolute blocks * 8,
+/// volume float, pitch byte (vanilla scale: pitch * 63).
+pub fn frameSoundEffect(name: []const u8, x: f64, y: f64, z: f64, volume: f32, pitch: f32, out: []u8) codec.CodecError![]const u8 {
+    var payload: [512]u8 = undefined;
+    var w = codec.PacketWriter.init(&payload);
+    try w.writeString(name);
+    try w.writeInt(@as(i32, @intFromFloat(@floor(x * 8.0))));
+    try w.writeInt(@as(i32, @intFromFloat(@floor(y * 8.0))));
+    try w.writeInt(@as(i32, @intFromFloat(@floor(z * 8.0))));
+    try w.writeFloat(volume);
+    const pb: i32 = @as(i32, @intFromFloat(pitch * 63.0));
+    try w.writeByte(@intCast(@max(0, @min(255, pb))));
+    return try codec.framePacket(@intFromEnum(ids.PlayClient.sound_effect), w.written(), out);
+}
+
+/// Clientbound 0x1D EntityEffect: duration in ticks (vanilla truncates to
+/// i16 — huge /effect durations wrap exactly like the 1.7.10 client shows).
+pub fn frameEntityEffect(eid: i32, effect_id: u8, amplifier: u8, duration_ticks: i32, out: []u8) codec.CodecError![]const u8 {
+    var payload: [16]u8 = undefined;
+    var w = codec.PacketWriter.init(&payload);
+    try w.writeVarInt(eid);
+    try w.writeByte(effect_id);
+    try w.writeByte(amplifier);
+    try w.writeShort(@truncate(duration_ticks));
+    return try codec.framePacket(@intFromEnum(ids.PlayClient.entity_effect), w.written(), out);
+}
+
+/// Clientbound 0x1E RemoveEntityEffect.
+pub fn frameRemoveEntityEffect(eid: i32, effect_id: u8, out: []u8) codec.CodecError![]const u8 {
+    var payload: [8]u8 = undefined;
+    var w = codec.PacketWriter.init(&payload);
+    try w.writeVarInt(eid);
+    try w.writeByte(effect_id);
+    return try codec.framePacket(@intFromEnum(ids.PlayClient.remove_entity_effect), w.written(), out);
+}
+
+/// Clientbound 0x3B ScoreboardObjective: action 0 = create, 1 = remove,
+/// 2 = update display text.
+pub fn frameObjective(name: []const u8, display: []const u8, action: u8, out: []u8) codec.CodecError![]const u8 {
+    var payload: [512]u8 = undefined;
+    var w = codec.PacketWriter.init(&payload);
+    try w.writeString(name);
+    try w.writeString(display);
+    try w.writeByte(action);
+    return try codec.framePacket(@intFromEnum(ids.PlayClient.scoreboard_objective), w.written(), out);
+}
+
+/// Clientbound 0x3C UpdateScore: action 0 = create/update (objective +
+/// value follow), 1 = remove (name only).
+pub fn frameUpdateScore(player: []const u8, action: u8, objective: []const u8, value: i32, out: []u8) codec.CodecError![]const u8 {
+    var payload: [512]u8 = undefined;
+    var w = codec.PacketWriter.init(&payload);
+    try w.writeString(player);
+    try w.writeByte(action);
+    if (action == 0) {
+        try w.writeString(objective);
+        try w.writeInt(value);
+    }
+    return try codec.framePacket(@intFromEnum(ids.PlayClient.update_score), w.written(), out);
+}
+
+/// Clientbound 0x3D DisplayScoreboard: position 0 = list, 1 = sidebar,
+/// 2 = below name.
+pub fn frameDisplayScoreboard(position: u8, objective: []const u8, out: []u8) codec.CodecError![]const u8 {
+    var payload: [256]u8 = undefined;
+    var w = codec.PacketWriter.init(&payload);
+    try w.writeByte(position);
+    try w.writeString(objective);
+    return try codec.framePacket(@intFromEnum(ids.PlayClient.display_scoreboard), w.written(), out);
+}
+
+/// Clientbound 0x3E Teams, create/update/remove-team/player modes.
+/// Modes: 0 = create, 1 = remove, 2 = update info, 3 = add players,
+/// 4 = remove players. Info triple only for modes 0/2, player list only
+/// for modes 0/3/4.
+pub const TeamInfo = struct {
+    display: []const u8,
+    prefix: []const u8,
+    suffix: []const u8,
+    friendly_fire: u8,
+};
+
+pub fn frameTeams(name: []const u8, mode: u8, info: ?TeamInfo, players: []const []const u8, out: []u8) codec.CodecError![]const u8 {
+    var payload: [4096]u8 = undefined;
+    var w = codec.PacketWriter.init(&payload);
+    try w.writeString(name);
+    try w.writeByte(mode);
+    if (mode == 0 or mode == 2) {
+        const t = info orelse return error.InvalidLength;
+        try w.writeString(t.display);
+        try w.writeString(t.prefix);
+        try w.writeString(t.suffix);
+        try w.writeByte(t.friendly_fire);
+    }
+    if (mode == 0 or mode == 3 or mode == 4) {
+        try w.writeShort(@intCast(players.len));
+        for (players) |p| try w.writeString(p);
+    }
+    return try codec.framePacket(@intFromEnum(ids.PlayClient.teams), w.written(), out);
+}
+
+/// Clientbound 0x2C SpawnGlobalEntity (lightning = type 1): fixed-point
+/// absolute coords (* 32, floored like vanilla).
+pub fn frameSpawnGlobalEntity(eid: i32, kind: u8, x: f64, y: f64, z: f64, out: []u8) codec.CodecError![]const u8 {
+    var payload: [24]u8 = undefined;
+    var w = codec.PacketWriter.init(&payload);
+    try w.writeVarInt(eid);
+    try w.writeByte(kind);
+    try w.writeInt(@as(i32, @intFromFloat(@floor(x * 32.0))));
+    try w.writeInt(@as(i32, @intFromFloat(@floor(y * 32.0))));
+    try w.writeInt(@as(i32, @intFromFloat(@floor(z * 32.0))));
+    return try codec.framePacket(@intFromEnum(ids.PlayClient.spawn_global_entity), w.written(), out);
+}
+
+/// Clientbound 0x28 Effect (world event: 2001 = block break particles).
+/// Coords are absolute blocks * 8 (vanilla S28 layout).
+pub fn frameWorldEffect(event_id: i32, x: i32, y: u8, z: i32, data: i32, out: []u8) codec.CodecError![]const u8 {
+    var payload: [24]u8 = undefined;
+    var w = codec.PacketWriter.init(&payload);
+    try w.writeInt(event_id);
+    try w.writeInt(x * 8);
+    try w.writeInt(@as(i32, y) * 8);
+    try w.writeInt(z * 8);
+    try w.writeInt(data);
+    try w.writeByte(0); // volume decrease flag: 0 = full range
+    return try codec.framePacket(@intFromEnum(ids.PlayClient.effect), w.written(), out);
+}
+
+test "tab-complete frame roundtrip" {
+    var fb: [256]u8 = undefined;
+    const cands = [_][]const u8{ "give", "gamemode" };
+    const f = try frameTabComplete(&cands, &fb);
+    var r = codec.PacketReader.init(f);
+    try std.testing.expectEqual(@as(i32, 0x3A), (try codec.decodeFrame(&r)).id);
+    try std.testing.expectEqual(@as(i32, 2), try r.readVarInt());
+    try std.testing.expectEqualStrings("give", try r.readString());
+    try std.testing.expectEqualStrings("gamemode", try r.readString());
+    try std.testing.expectEqual(@as(usize, 0), r.remaining());
+    // serverbound parse is a plain string
+    var sb: [32]u8 = undefined;
+    var w = codec.PacketWriter.init(&sb);
+    try w.writeString("/wea");
+    try std.testing.expectEqualStrings("/wea", try parseTabComplete(w.written()));
+}
+
+test "game state / sound / effect frames" {
+    var b: [512]u8 = undefined;
+    var r = codec.PacketReader.init(try frameGameState(1, 0, &b));
+    try std.testing.expectEqual(@as(i32, 0x2B), (try codec.decodeFrame(&r)).id);
+    try std.testing.expectEqual(@as(u8, 1), try r.readByte());
+    var s = codec.PacketReader.init(try frameSoundEffect("mob.pig.say", 1, 64, -3, 1.0, 1.0, &b));
+    try std.testing.expectEqual(@as(i32, 0x29), (try codec.decodeFrame(&s)).id);
+    try std.testing.expectEqualStrings("mob.pig.say", try s.readString());
+    try std.testing.expectEqual(@as(i32, 8), try s.readInt());
+    try std.testing.expectEqual(@as(i32, 512), try s.readInt());
+    try std.testing.expectEqual(@as(i32, -24), try s.readInt());
+    try std.testing.expectEqual(@as(u8, 63), try s.readByte());
+    var e = codec.PacketReader.init(try frameEntityEffect(7, 1, 0, 600, &b));
+    try std.testing.expectEqual(@as(i32, 0x1D), (try codec.decodeFrame(&e)).id);
+    try std.testing.expectEqual(@as(i32, 7), try e.readVarInt());
+    try std.testing.expectEqual(@as(u8, 1), try e.readByte());
+    try std.testing.expectEqual(@as(u8, 0), try e.readByte());
+    try std.testing.expectEqual(@as(i16, 600), try e.readShort());
+}
+
+test "scoreboard frames" {
+    var b: [1024]u8 = undefined;
+    var r = codec.PacketReader.init(try frameObjective("obj", "Obj", 0, &b));
+    try std.testing.expectEqual(@as(i32, 0x3B), (try codec.decodeFrame(&r)).id);
+    var u = codec.PacketReader.init(try frameUpdateScore("Al", 0, "obj", 5, &b));
+    try std.testing.expectEqual(@as(i32, 0x3C), (try codec.decodeFrame(&u)).id);
+    try std.testing.expectEqualStrings("Al", try u.readString());
+    try std.testing.expectEqual(@as(u8, 0), try u.readByte());
+    try std.testing.expectEqualStrings("obj", try u.readString());
+    var d = codec.PacketReader.init(try frameDisplayScoreboard(1, "obj", &b));
+    try std.testing.expectEqual(@as(i32, 0x3D), (try codec.decodeFrame(&d)).id);
+    try std.testing.expectEqual(@as(u8, 1), try d.readByte());
+    var t = codec.PacketReader.init(try frameTeams("red", 0, .{ .display = "Red", .prefix = "[R]", .suffix = "", .friendly_fire = 0 }, &.{ "Al", "Bo" }, &b));
+    try std.testing.expectEqual(@as(i32, 0x3E), (try codec.decodeFrame(&t)).id);
+    try std.testing.expectEqualStrings("red", try t.readString());
+    try std.testing.expectEqual(@as(u8, 0), try t.readByte());
 }
 
 test "entity action parse (sprint start/stop)" {

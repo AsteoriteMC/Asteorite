@@ -24,6 +24,43 @@ pub const section_size = 4096;
 pub const nibble_size = 2048;
 pub const section_bytes = section_size * 2 + nibble_size * 4; // 16384
 
+/// Vanilla light opacity (`aji.k()`, jar-verified over all 175 block ids):
+/// water/ice k=3, leaves k=1, air + flora + snow layer + glass + lava k=0,
+/// everything else 255. Single source of truth — worldgen and relight
+/// share this (previously duplicated in worldgen/v5/gen.zig).
+pub fn lightOpacity(id: ids.Id) u8 {
+    return switch (id) {
+        .leaves, .leaves2 => 1,
+        .water, .flowing_water, .ice => 3,
+        .air, .sapling, .lava, .flowing_lava, .glass, .tallgrass, .deadbush,
+        .yellow_flower, .red_flower, .brown_mushroom, .red_mushroom,
+        .snow_layer, .cactus, .reeds_block, .vine, .waterlily,
+        .stained_glass, .glass_pane, .stained_glass_pane,
+        .torch, .ladder, .rail, .golden_rail, .detector_rail, .activator_rail,
+        .standing_sign, .wall_sign, .lever, .stone_pressure_plate,
+        .wooden_pressure_plate, .light_weighted_pressure_plate,
+        .heavy_weighted_pressure_plate, .unlit_redstone_torch, .redstone_torch,
+        .stone_button, .wooden_button, .snow, .carpet, .flower_pot_block,
+        .skull_block, .tripwire, .tripwire_hook,
+        => 0,
+        else => 255,
+    };
+}
+
+/// Block-light emission (`aji.l`, vanilla values for the blocks we can
+/// store): lava 15, torch/glowstone/jack-o-lantern 14/15, lit furnace 13,
+/// lit redstone/lapis-ish 9/7. Everything else 0.
+pub fn emitLight(id: ids.Id) u4 {
+    return switch (id) {
+        .lava, .flowing_lava, .fire, .glowstone, .lit_pumpkin, .lit_redstone_lamp => 15,
+        .torch => 14,
+        .lit_furnace => 13,
+        .lit_redstone_ore => 9,
+        .redstone_torch => 7,
+        else => 0,
+    };
+}
+
 pub const ChunkError = error{
     BadMagic,
     UnsupportedVersion,
@@ -93,6 +130,124 @@ pub const Chunk = struct {
             if (s != null) m |= @as(u16, 1) << @intCast(i);
         }
         return m;
+    }
+
+    /// Block at local (lx 0..15, y 0..255, lz 0..15); missing sections
+    /// are air.
+    pub fn blockAt(self: *const Chunk, lx: usize, y: usize, lz: usize) ids.Id {
+        const s = self.sections[y >> 4] orelse return .air;
+        return s.blocks[Section.index(@intCast(lx), @intCast(y & 15), @intCast(lz))];
+    }
+
+    fn setSkyAt(self: *Chunk, lx: usize, y: usize, lz: usize, v: u4) void {
+        const s = &(self.sections[y >> 4] orelse return);
+        Section.setNibble(&s.sky, Section.index(@intCast(lx), @intCast(y & 15), @intCast(lz)), v);
+    }
+
+    fn getLightAt(self: *const Chunk, lx: usize, y: usize, lz: usize) u4 {
+        const s = self.sections[y >> 4] orelse return 0;
+        return Section.getNibble(&s.light, Section.index(@intCast(lx), @intCast(y & 15), @intCast(lz)));
+    }
+
+    fn setLightAt(self: *Chunk, lx: usize, y: usize, lz: usize, v: u4) void {
+        const s = &(self.sections[y >> 4] orelse return);
+        Section.setNibble(&s.light, Section.index(@intCast(lx), @intCast(y & 15), @intCast(lz)), v);
+    }
+
+    /// Recompute one column's skylight + heightmap entry (vanilla-like
+    /// vertical rule: each block subtracts its opacity from the light
+    /// above (leaves 15->14, ice 15->12, opaque 255->0); still water stays
+    /// transparent. Heights = topmost opacity!=0). Call after any block
+    /// edit in the column. (Was binary 15/0 at the first opacity!=0
+    /// block, which turned everything under a tree canopy pitch black.)
+    pub fn relightColumn(self: *Chunk, lx: usize, lz: usize) void {
+        var sky: u4 = 15;
+        var y: i32 = 255;
+        while (y >= 0) : (y -= 1) {
+            const uy: usize = @intCast(y);
+            self.setSkyAt(lx, uy, lz, sky);
+            const b = self.blockAt(lx, uy, lz);
+            const op = lightOpacity(b);
+            if (b != .water and op != 0) {
+                const drop: u4 = if (op > 15) 15 else @truncate(op);
+                sky = if (drop >= sky) 0 else sky - drop;
+            }
+        }
+        var top: u8 = 0;
+        var yy: i32 = 255;
+        while (yy >= 0) : (yy -= 1) {
+            if (lightOpacity(self.blockAt(lx, @intCast(yy), lz)) != 0) {
+                top = @intCast(yy);
+                break;
+            }
+        }
+        self.heights[lz * 16 + lx] = top;
+    }
+
+    /// Flood block light from all emissive cells (torches, lava, ...).
+    /// `queue` is scratch space for the BFS (needs 65536 x u32 for a
+    /// full chunk; smaller is fine — excess sources are skipped, never
+    /// mislit). Opaque cells (opacity 255) block; water/ice cost an
+    /// extra level. Cross-chunk bleed is ignored (neighbors resend with
+    /// their own flood; 1-level seam error at borders, documented).
+    pub fn relightBlock(self: *Chunk, queue: []u32) void {
+        for (&self.sections) |*maybe| {
+            if (maybe.*) |*s| @memset(&s.light, 0);
+        }
+        var head: usize = 0;
+        var tail: usize = 0;
+        var y: usize = 0;
+        while (y < 256) : (y += 1) {
+            const s = self.sections[y >> 4] orelse continue;
+            var z: usize = 0;
+            while (z < 16) : (z += 1) {
+                var x: usize = 0;
+                while (x < 16) : (x += 1) {
+                    const e = emitLight(s.blocks[Section.index(@intCast(x), @intCast(y & 15), @intCast(z))]);
+                    if (e == 0) continue;
+                    Section.setNibble(
+                        &self.sections[y >> 4].?.light,
+                        Section.index(@intCast(x), @intCast(y & 15), @intCast(z)),
+                        e,
+                    );
+                    if (tail < queue.len) {
+                        queue[tail] = @intCast((y * 16 + z) * 16 + x);
+                        tail += 1;
+                    }
+                }
+            }
+        }
+        while (head < tail) {
+            const cell = queue[head];
+            head += 1;
+            const cx: usize = cell & 15;
+            const cz: usize = (cell >> 4) & 15;
+            const cy: usize = cell >> 8;
+            const cur = self.getLightAt(cx, cy, cz);
+            if (cur == 0) continue;
+            const dirs = [_][3]i32{ .{ 1, 0, 0 }, .{ -1, 0, 0 }, .{ 0, 1, 0 }, .{ 0, -1, 0 }, .{ 0, 0, 1 }, .{ 0, 0, -1 } };
+            for (dirs) |d| {
+                const nx = @as(i32, @intCast(cx)) + d[0];
+                const ny = @as(i32, @intCast(cy)) + d[1];
+                const nz = @as(i32, @intCast(cz)) + d[2];
+                if (nx < 0 or nx > 15 or ny < 0 or ny > 255 or nz < 0 or nz > 15) continue;
+                const ux: usize = @intCast(nx);
+                const uy: usize = @intCast(ny);
+                const uz: usize = @intCast(nz);
+                const op = lightOpacity(self.blockAt(ux, uy, uz));
+                if (op == 255) continue;
+                const drop: u4 = if (op >= 3) 2 else 1;
+                if (cur <= drop) continue;
+                const nl: u4 = cur - drop;
+                if (nl <= self.getLightAt(ux, uy, uz)) continue;
+                if (self.sections[uy >> 4] == null) continue; // don't inflate the mask for air-only sections
+                self.setLightAt(ux, uy, uz, nl);
+                if (tail < queue.len) {
+                    queue[tail] = @intCast((uy * 16 + uz) * 16 + ux);
+                    tail += 1;
+                }
+            }
+        }
     }
 
     pub fn encodedLen(self: *const Chunk) usize {
@@ -464,4 +619,66 @@ test "fromAnvilNbt minimal one-section chunk" {
     const dec = try Chunk.decode(a, enc);
     defer dec.destroy(a);
     try std.testing.expectEqual(ids.diamond_block, dec.sections[0].?.getBlock(15, 15, 15));
+}
+
+test "relightColumn: sky closes below opaque, heights skip snow" {
+    const a = std.testing.allocator;
+    const ch = try Chunk.createEmpty(a, 0, 0, 0);
+    defer ch.destroy(a);
+    ch.sections[0] = Section{};
+    ch.sections[4] = Section{};
+    // stone floor at y=64 (section 4, ly 0), snow_layer at 65.
+    ch.sections[4].?.setBlock(0, 0, 0, .stone);
+    ch.sections[4].?.setBlock(0, 1, 0, .snow_layer);
+    ch.relightColumn(0, 0);
+    // surface cell (65, snow k=0) still sees full sky; stone below is lit
+    // at its own cell, dark underneath.
+    try std.testing.expectEqual(@as(u4, 15), Section.getNibble(&ch.sections[4].?.sky, Section.index(0, 1, 0)));
+    try std.testing.expectEqual(@as(u4, 15), Section.getNibble(&ch.sections[4].?.sky, Section.index(0, 0, 0)));
+    try std.testing.expectEqual(@as(u4, 0), Section.getNibble(&ch.sections[0].?.sky, Section.index(0, 0, 0)));
+    // heights skip the transparent snow (topmost opacity!=0 is the stone).
+    try std.testing.expectEqual(@as(u8, 64), ch.heights[0]);
+    // Placing opaque above closes the sky below it.
+    ch.sections[4].?.setBlock(0, 2, 0, .stone);
+    ch.relightColumn(0, 0);
+    try std.testing.expectEqual(@as(u4, 0), Section.getNibble(&ch.sections[4].?.sky, Section.index(0, 1, 0)));
+    try std.testing.expectEqual(@as(u8, 66), ch.heights[0]);
+    // Leaves only dim (15->14): under-canopy is bright, not black.
+    ch.sections[4].?.setBlock(0, 2, 0, .air);
+    ch.sections[4].?.setBlock(0, 3, 0, .leaves);
+    ch.relightColumn(0, 0);
+    try std.testing.expectEqual(@as(u4, 15), Section.getNibble(&ch.sections[4].?.sky, Section.index(0, 3, 0)));
+    try std.testing.expectEqual(@as(u4, 14), Section.getNibble(&ch.sections[4].?.sky, Section.index(0, 2, 0)));
+    try std.testing.expectEqual(@as(u4, 14), Section.getNibble(&ch.sections[4].?.sky, Section.index(0, 1, 0)));
+    try std.testing.expectEqual(@as(u8, 67), ch.heights[0]);
+}
+
+test "relightBlock: torch floods, stone blocks" {
+    const a = std.testing.allocator;
+    const ch = try Chunk.createEmpty(a, 0, 0, 0);
+    defer ch.destroy(a);
+    ch.sections[0] = Section{};
+    // stone shell at y=0..2 around (8,1,8), torch at center.
+    var dx: i32 = -1;
+    while (dx <= 1) : (dx += 1) {
+        var dz: i32 = -1;
+        while (dz <= 1) : (dz += 1) {
+            ch.sections[0].?.setBlock(@intCast(8 + dx), 0, @intCast(8 + dz), .stone);
+            ch.sections[0].?.setBlock(@intCast(8 + dx), 2, @intCast(8 + dz), .stone);
+        }
+    }
+    ch.sections[0].?.setBlock(8, 1, 8, .torch);
+    const q = try a.alloc(u32, 65536);
+    defer a.free(q);
+    ch.relightBlock(q);
+    // torch cell 14, open neighbor 13.
+    try std.testing.expectEqual(@as(u4, 14), Section.getNibble(&ch.sections[0].?.light, Section.index(8, 1, 8)));
+    try std.testing.expectEqual(@as(u4, 13), Section.getNibble(&ch.sections[0].?.light, Section.index(9, 1, 8)));
+    // stone above/below the torch stays dark (opaque stops the flood).
+    try std.testing.expectEqual(@as(u4, 0), Section.getNibble(&ch.sections[0].?.light, Section.index(8, 0, 8)));
+    try std.testing.expectEqual(@as(u4, 0), Section.getNibble(&ch.sections[0].?.light, Section.index(8, 2, 8)));
+    // Removing the torch extinguishes the flood.
+    ch.sections[0].?.setBlock(8, 1, 8, .air);
+    ch.relightBlock(q);
+    try std.testing.expectEqual(@as(u4, 0), Section.getNibble(&ch.sections[0].?.light, Section.index(9, 1, 8)));
 }

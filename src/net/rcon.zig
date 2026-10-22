@@ -409,17 +409,17 @@ test "rcon loopback: auth, gating, dispatch, close rules" {
         defer rl.free();
         try std.testing.expectEqual(@as(i32, 8), rl.id());
         try std.testing.expectEqual(RESPONSE_VALUE, rl.typ());
-        try std.testing.expectEqualStrings("Connected (0):", rl.payload());
+        try std.testing.expectEqualStrings("There are 0/20 players online:\n", rl.payload());
         // unknown command -> same unknown reply as in-game
         try c.send(9, EXECCOMMAND, "frobnicate");
         var ru = try c.recv();
         defer ru.free();
-        try std.testing.expectEqualStrings("Unknown command. Try /help", ru.payload());
+        try std.testing.expectEqualStrings("Unknown command. Try /help for a list of commands", ru.payload());
         // leading slash tolerated
         try c.send(10, EXECCOMMAND, "/help");
         var rh = try c.recv();
         defer rh.free();
-        try std.testing.expect(std.mem.startsWith(u8, rh.payload(), "Commands: /help"));
+        try std.testing.expect(std.mem.startsWith(u8, rh.payload(), "--- Showing help page 1 of 7 (/help <page>) ---"));
         c.close();
         th.join();
     }
@@ -434,7 +434,7 @@ test "rcon loopback: auth, gating, dispatch, close rules" {
         try c.send(32, EXECCOMMAND, "op MalloryR");
         var ro = try c.recv();
         defer ro.free();
-        try std.testing.expectEqualStrings("Opped MalloryR.", ro.payload());
+        try std.testing.expectEqualStrings("Opped MalloryR", ro.payload());
         srv.perm_lock.lock();
         const lvl = if (srv.perms) |*db| db.levelFor("MalloryR") else 0;
         srv.perm_lock.unlock();

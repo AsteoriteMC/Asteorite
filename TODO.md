@@ -1,4 +1,4 @@
-# ZigCraft TODO — everything left to do
+# AsteoriteMC TODO — everything left to do
 
 Derived from the implementation plan (pure-Zig 1.7.10/proto-5 server:
 io_uring net, Folia-style regions, LSM store, comptime modding API, GPU
@@ -11,7 +11,7 @@ Status snapshot (done, tested, live-verified over TCP):
 - [x] Pure-Zig LSM (WAL + SST + `ShardPool`), ZC1 payloads, Anvil→ZC1 import (`tools/anvil_import.zig`)
 - [x] H1 worldgen foundation: `java.util.Random` LCG port (JVM-verified goldens incl. `nextInt(bound)` rejection path), fdlibm `log` port (StrictMath bit-exact — Zig/glibc differ by 1 ulp, proven live), Xoroshiro128++ + Mojang seeding, version-agnostic pipeline driver, `worldgen_dump` tool (`src/worldgen/`, `tools/worldgen_dump.zig`)
 - [x] Region tick stub, MPSC handoff queue, player position tracking (stance quirk handled)
-- [x] 184/184 `zig build test` green (21/21 steps; was 183/183 — count the real number when touching this line)
+- [x] 283/283 `zig build test` green (21/21 steps; was 184/184 — count the real number when touching this line)
 
 Legend: `[ ]` todo, `[~]` partial. Each phase ends with acceptance criteria.
 
@@ -26,6 +26,7 @@ Without these the client connects but the world is dead. All bodies are
 ### A1. Chunk lifecycle on the move ✅ (done, live-verified)
 - [x] Per-conn sent-set (`Conn.sent`, `sentKey`), groundUp re-send impossible by construction
 - [x] Movement-driven streaming: `syncPlayerChunks` diffs view disk vs sent-set (`x<<32|z`), unloads left columns, bulks entered ones in spiral order; no-op when the center chunk is unchanged
+- [x] Hole-heal rescan is capped (16 pool reads/tick, spiral = nearest-first) with outbox backpressure: an uncapped rescan stalled serve threads in store reads while generation was active, delaying disconnect processing (quit→save landed minutes late)
 - [x] View distance from Client Settings (`0x15`, clamped 1..16, server max wins at use site)
 - [x] Respawn: `0x16` status → Respawn `0x07` + full unload + re-burst + PosLook (`fullResync`); same-dimension only, dimension change is P-next
 - [x] Acceptance: live E2E — login `[2,1,5,0x26,8]`, same-chunk move silent, cross-chunk move `[0x21,0x21]`, respawn `[7,0x26,8]`; holes skipped (terrain gen is Phase H)
@@ -41,7 +42,12 @@ Without these the client connects but the world is dead. All bodies are
 ### A3. Block interaction ✅ (done, live-verified)
 - [x] Block Change `0x23` (1.7 form: X int, Y **ubyte**, Z int, id VarInt + meta u8) broadcast to chunk viewers (sent-set filtered); `0x22` batching + `0x25` crack stages are follow-ups
 - [x] Serverbound Digging `0x07` / Placement `0x08` / Held `0x09` / Arm `0x0A` / Creative `0x10` handlers: 6-block reach check, creative instant-break, survival start→finish validation (break-timing anti-cheat is P-next), face-offset placement, per-conn hotbar + selected slot, NBT skipped not preserved (documented)
-- [x] ZC1 read-modify-write + LSM persist per edit (`view.applyBlock`; section created on place, no-op break of air, holes ignored)
+- [x] ZC1 read-modify-write + LSM persist per edit (`view.applyBlock`; section created on place, no-op break of air, holes ignored; relights the column sky + re-floods chunk block light, updates heights)
+- [x] Dig-drop gate was inverted (`!tileDrops`) — survival digging dropped nothing while `/setblock destroy` dropped; fixed + unit-tested (`shouldDropBreak`: survival/adventure drop, creative/gamerule/air don't)
+- [x] Block place/break sounds: S29 `dig.<base>` broadcast to viewers in earshot (volume 1.0, pitch 0.8), vanilla step-sound mapping (was: silent digging/placing)
+- [x] Lighting (subtractive sky + block-light flood): shared `chunk.lightOpacity`/`emitLight` tables; gen computes column skylight (leaves 15→14, ice 15→12, opaque→0; water stays transparent) + BFS block light (torch 14, lava 15, ...) at gen time; edits relight (stale nibbles were the "light only fixes on re-enter" bug); horizontal sky spread + cross-chunk bleed remain documented approximations
+- [x] Cactus contact damage: 1.0 per touch throttled to ~1/0.5s (`cactus_cd`), survival/adventure only (was: harmless)
+- [x] Tab-complete sends the slash (`/gamemode`, not `gamemode` — vanilla S3A; the client replaces the whole word, so bare names ate the `/`)
 - [x] Arm-swing `0x0B` relay to viewers; cross-thread path is conn lock → world lock → per-target locks, never nested (documented in `server.zig`)
 - [x] Acceptance, all live with keepalive-echoing clients: dig+place visible to second client with exact coords/id, swing relayed; restart serves the edited chunk from WAL replay (section mask `10001`, block `3` at the exact cell)
 - [x] Survival inventory: Click Window `0x0E` (pickup/place/merge/swap, shift-click move, number-key swap, action-number desync → full `0x30` resync) + Close Window `0x0D` no-op on the 45-slot player inventory; NBT-preserving storage, per-change `0x2F` updates, dead-player gates; drop/drag/collect are documented no-ops (no item entities yet); live-verified over TCP
@@ -61,13 +67,15 @@ Without these the client connects but the world is dead. All bodies are
 - [x] Login timeout: conns stuck in handshake/login dropped after 30s of no progress (login state gets `0x00` disconnect + close; handshaking/status just closed — no disconnect packet exists in those states). Verified live: handshake-only conn gets clean EOF at ~31s
 - [x] Disconnect audit: all paths use JSON reason with the right packet — `0x00` in login, `0x40` in play, keepalive timeout `0x40 "Timed out"`, login timeout `0x00`. Ticker shuts the socket down (unblocks serve loops); close happens exactly once in serveConn's defer
 - [x] Acceptance, all live with echoing clients: broadcast reaches sender + others with byte-exact vanilla-style JSON (unicode preserved, not `\uXXXX`-escaped); spam → `0x40`; invalid UTF-8 → silent drop; idle handshake → clean drop at 30s
-- [ ] Follow-ups: per-IP connection rate limiting, RCON (remote) kick, chat reporting/muting hooks for the mod API (F), tab-complete `0x3A` (local stdin console done — see A6)
+- [ ] Follow-ups: per-IP connection rate limiting, RCON (remote) kick, chat reporting/muting hooks for the mod API (F)
 
-### A6. Player persistence + permissions + commands ✅ (done, live-verified)- [x] LSM-backed player rows (`src/sim/players.zig`): `ZPLR` v2 binary (pos/yaw/pitch, spawn, health/food/saturation, 45-slot NBT-verbatim inventory + cursor + selected + gamemode; v1 rows decode with gamemode defaulting to creative), key `encodeKey(255, Wyhash(name))` with stored-username mismatch guard; corrupt rows treated as fresh spawn (overwritten on next save)
+### A6. Player persistence + permissions + commands ✅ (done, live-verified)- [x] LSM-backed player rows (`src/sim/players.zig`): `ZPLR` v4 binary (pos/yaw/pitch, spawn, health/food/saturation, 45-slot NBT-verbatim inventory + cursor + selected + gamemode + xp level/total/bar + spawn_forced; v3 rows decode with xp/spawn_forced defaults, v1/v2 rejected as wire-id rows), key `encodeKey(255, Wyhash(name))` with stored-username mismatch guard; corrupt rows treated as fresh spawn (overwritten on next save)
 - [x] Save triggers: disconnect (`unregister`), in-game `/save-all`, console `save-all`, ticker autosave every 300 ticks (WAL-durable; save-all/stop flush SSTs). Load on login (conn.lock held): restores pos/health/inv/cursor/selected/gamemode, skips land-spawn search; dead-at-save normalizes to alive-at-spawn on load
 - [x] Login inventory sync: full Window Items `0x30` + cursor Set Slot after chunk burst; PosLook now sends actual player pos (fresh logins land at found spawn via pos sync — burst center + PosLook consistent)
-- [x] Permission model (`src/sim/permissions.zig`): op levels 0-4 + per-player node grants/denies in one LSM row (`ZPRM` v1, dim 254), deny-beats-grant-beats-level, `.*` wildcards, console implicitly 4, secure default (no ops → console only). Denied and unknown commands share one reply (no oracle); `/help` filters to usable commands; validated names/nodes everywhere
-- [x] Commands: `/help`, `/list` (0), `/save-all` (4), `/op|/deop` (4, notify target), `/perm grant|deny|clear|show|reload` (4), `/gamemode <0|1|survival|creative> [player]` (2, live abilities update), `/give <player> <id> [count] [damage]` (2, merges into main inv 9..44, per-slot 0x2F sync, no-space accounting), `/tp` 1-/2-/3-arg forms (2, immediate chunk sync + PosLook), `/time set|add <value|day|night>` (2). Bootstrap via repeatable `--op <name>` (bad names rejected). Operator stdin console: `help|list|save-all|stop` (stop saves + flushes + exits)
+- [x] Permission model (`src/sim/permissions.zig`): op levels 0-4 + per-player node grants/denies in one LSM row (`ZPRM` v1, dim 254), deny-beats-grant-beats-level, `.*` wildcards, console implicitly 4, secure default (no ops → console only). Player-name matching is case-insensitive throughout (vanilla `UserList` folds: `/op Alice` covers login `alice`, target lookup + `/perm show` too — the "opped but every command unknown" class of bug). Denied and unknown commands share one reply (no oracle); `/help` filters to usable commands; validated names/nodes everywhere
+- [x] Session integrity: duplicate-login kick ("You logged in from another location!", vanilla) flushes + shuts the ghost down so it unregisters promptly; per-player save epochs (`bumpSaveEpoch`/`saveEpochCurrent`) drop stale saves on quit/rejoin races and ghost autosaves; name-targeted commands skip kicked/dying conns (first-match `findInSnap` used to route at the ghost — the "gamemode not saved" class of bug)
+- [x] Default world folder is `world` (vanilla name; `"db": null` disables persistence)
+- [x] Commands: full vanilla 1.7.10 dedicated roster (48 commands in vanilla registration order) + `perm` extension. Spec-driven defs (`src/cmd/spec.zig`): usage strings, argument parsing, and tab-completion all derived from one typed spec per command (comptime-rendered usage; `usage_override` only for the few vanilla texts the generator cannot spell). Jar-verified usage strings/messages/perm levels/aliases (`?`, `w`, `msg`); admin feedback to fellow ops as gray-italic `[Name: msg]`; vanilla tab-complete (`0x14`->`0x3A`: case-insensitive, perm-filtered, aliases, per-command dynamic sets for items/gamerules/mobs/enchants) with non-slash player completion and unknown-command suppression. Systems: name/IP bans + whitelist + login gates (jar-hardcoded screens), 9 gamerules (doDaylightCycle/keepInventory live), weather w/ countdowns + S2B, difficulty/default-gamemode, XP (vanilla formulas, level-up chime, ZPLR v4), effects (S1D/S1E + ticker expiry), ench NBT (hand-merged list, canApply/cantCombine tables), summon, setblock/testforblock (replace/keep/destroy + drops + S28), testfor (command-block-only), spreadplayers (vanilla iterations + teams), playsound (hearing check), scoreboard (objectives/players/teams/slots + S3B-E), achievements, save-on/off, idle kick, debug, seed, kill, publish (dedicated-fail), netstat. Bootstrap via repeatable `--op <name>`. Operator stdin console unchanged
 - [x] Acceptance, live over TCP: permission gating (deny==unknown, grant/deny/wildcard, op/deop + notify); full gameplay loop (gamemode flags, give slots/damage, tp PosLook + chunks, time set/add/day, gamemode persist across restart); restart persistence (pos + staged dirt + perms matrix); inventory E2E still green
 - [x] RCON remote console (`src/net/rcon.zig`): vanilla-style Source framing (LE length/id/type + double-NUL), password auth with constant-time compare, fail-closed without `--rcon-password`, 3-strike auth cap, no-auth/oversize/unknown-type → close, single-packet truncated replies. Full console authority (all 14 commands incl. `/stop`, which saves + flushes + exits after the reply flushes). `--rcon-password` (short-password warning) / `--rcon-port` (default 25575); password never logged (localhost/SSH-tunnel posture documented)
 - [x] Acceptance, live: RCON auth/id-echo, no-auth close, 3-strike cap, roster/save-all/op/perm/unknown round-trips, oversize/unknown-type close, game conn undisturbed; in-game `/stop` (reply flushes, exit 0) + console `stop` re-verified after the executeCommand refactor
@@ -108,11 +116,105 @@ independently live-verifiable):
 - [x] Container window 1 (crafting table): right-click opens 0x2D type 1 + full 0x30, sneak bypass places instead, click routing incl. shift/number, 0x0D close drops grid, table-break force-closes viewers + drops + 0x2E
 - [x] Acceptance, live E2E: 2x2 planks take, table open, 3x3 pickaxe take, close drops, break-close ack, sneak bypass (fresh-DB runs; note: E2E reruns on a dirty DB can desync — restart server per run)
 - [x] J3b furnace (`src/sim/furnace.zig` tick/canSmelt ported from CFR `apg.h/k/j` + `src/sim/smelting{,_data}.zig` burn/result tables; 20-tick quanta at 1Hz): window-2 open/click/close routing, lit/unlit 61/62 swaps, per-viewer 0x30 + 0x31 (cook/burn/total) sync, shift/number-key moves, break drops contents + 0x2E, entity leak fixed (removeFurnace wired)
-- [x] Acceptance, live E2E vs vanilla 1.7.10 reference (cold-start: ignite 61->62 + fuel-1 + burn/total 1600, cook +20/tick, output at 200, take/park, burnout 62->61 + cook freeze, shift/number moves, break-close + drops; vanilla 0x0E clicked-item = pre-click slot, match = silent accept + client-applies-locally, mismatch = confirm-0 + resync + container blacklist — zigcraft validates action-seq instead, compatible with real clients)
-- [x] 184/184 `zig build test` green (21/21 steps; was 183/183 — count the real number when touching this line)
+- [x] Acceptance, live E2E vs vanilla 1.7.10 reference (cold-start: ignite 61->62 + fuel-1 + burn/total 1600, cook +20/tick, output at 200, take/park, burnout 62->61 + cook freeze, shift/number moves, break-close + drops; vanilla 0x0E clicked-item = pre-click slot, match = silent accept + client-applies-locally, mismatch = confirm-0 + resync + container blacklist — asteorite validates action-seq instead, compatible with real clients)
+- [x] 283/283 `zig build test` green (21/21 steps; was 184/184 — count the real number when touching this line)
 
 ### J4. Mobs: spawning + hostiles + drops
 - [ ] Spawner by light/position, wander/chase/attack AI, mob drops via J1 pipeline, entity persistence
+
+---
+
+## Phase K — Interactive simulation (redstone, brewing, enchanting, explosives)
+
+All four are greenfield (wire/torches/levers place as dead blocks today; only
+the crafting table + furnace open UIs on right-click), but every hook they
+need exists: right-click routing (`tryOpenTable`/`tryOpenFurnace`), container
+windows (J3b), effect application (`/effect` S1D/S1E + ticker expiry, A6),
+enchantment legality tables (`cmd_data.enchantsCombine/enchantApplies`, A6),
+item-entity sim + drops pipeline (J1), block-light relight on edit (A3).
+Suggested build order: K1 first (scheduler + power query everything else
+needs), then K4, then K2/K3 (independent of K1, can interleave).
+
+### K1. Block-tick scheduler + redstone circuits (the foundation)
+- [ ] Scheduled-tick queue (vanilla `scheduleBlockUpdate` semantics): per-position dedupe (reschedule replaces), ticker drains with a per-tick budget (anti-lag-machine; the Phase C breaker counts this load per region). Powers repeater delays, button timers, torch burnout, lamp updates.
+- [ ] Power model: strong/weak power 0–15 per face, recomputed never stored (component state lives in id/meta as vanilla does); neighbor-change fan-out to 6 neighbors + diagonal wire, budgeted, recursion-capped.
+- [ ] Components in order: wire (placement shape, 1/block falloff), torch (inverter + vanilla burnout: N rapid toggles → 160-tick burnout, golden-tested), lever/button (stone 20-tick / wooden 30-tick pulses via scheduler), pressure plates (stone vs wooden detection sets over entity AABBs), doors/trapdoors/fence gates (open/close + `dig.*`/click sounds), lamps (on/off id swap drives the A3 relight path), redstone-ore lit/unlit swap on touch (lit emits 9 — already in `emitLight`).
+- [ ] Follow-ups (explicitly not this slice): pistons (block pushing), comparators, note blocks, dispensers/droppers (needs a dispense-behavior table; shooting TNT/arrows ties to K4/J4).
+- [ ] Acceptance, live E2E: lever→wire(15)→lamp on/off; torch inverter + burnout lockout; button pulse length in ticks; repeater 1–4 delay settings; lamp toggle visibly relights; update storm (clock loop) stays under tick budget.
+
+### K2. Brewing + potions
+- [ ] Brewing-stand window (type 5) on the J3b pattern: 3 bottle slots + ingredient (1.7.10 has no blaze-powder fuel — time only, 400 ticks, progress on window property 0 via the same `0x31` path as the furnace).
+- [ ] Potion item model: vanilla 1.7.10 damage-value table as checked-in data + unit tests (mirrors the `smelting_data` convention); splash bit; display names.
+- [ ] Brewing chain as data: nether wart → awkward, effect ingredients, glowstone/redstone modifiers, gunpowder → splash, fermented-spider-eye corruption; ingredient consumed, bottles convert in place.
+- [ ] Drinking: Use-Item path (32-tick consume) → effect via the A6 `/effect` infra + glass bottle back; splash: Spawn Object type 73 (verify against proto.yml), direct-hit full effect + AoE falloff on impact.
+- [ ] Acceptance, live E2E: awkward→swiftness brews in 20s with progress bar; drink applies Speed (S1D visible, ticks down); splash entity arcs and applies on impact; recipe-table unit goldens for the full chain.
+
+### K3. Enchanting table
+- [ ] Table window (type 4) on the J3b pattern: item slot only (1.7.10 has no lapis cost), 3 level options; bookshelf counting (15 max, vanilla air-gap rule) gates the 30-level option.
+- [ ] Outcome RNG: vanilla enchantability + weighted-draw algorithm, deterministic under a fixed seed — golden-tested (reuses `cmd_data` max-level/canApply/exclusion tables and the `/enchant` NBT merge; `/enchant` stays as the operator override).
+- [ ] XP deduction through the existing XP/level infra (A6).
+- [ ] Follow-up: anvil combine/repair UI (can reuse the J3 repair matcher + XP cost rules).
+- [ ] Acceptance, live E2E: 15-shelf setup offers 30; same seed → same outcome as the golden; applied enchants visible in NBT; XP levels deducted; insufficient levels reject with the vanilla screen text.
+
+### K4. TNT + optimized explosions
+- [ ] Primed TNT entity (Spawn Object type 50), 80-tick fuse, gravity/drag on the J1 entity-motion path; ignition via K1 redstone power and flint-and-steel Use-Item action (shared with K2 drinking); fire-spread ignition deferred (no fire-spread sim yet — say so).
+- [ ] Explosion core, batched (the "optimized TNT" design): one 16³-raycast exposure pass per blast (vanilla attenuation by blast resistance), per-tick update budget with a chain queue (no recursion, chained TNT never skips ticks — closes the G1 acceptance item), single collect-then-apply block pass; drops through the J1 pipeline at the vanilla size-scaled chance; entity damage with exposure falloff + knockback; S27 Explosion packet (pos + radius + records) + `random.explode` S29.
+- [ ] Chain reactions ride the same queue; per-region load counted by the Phase C breaker; GPU raycast stays a Phase G1 job only after this CPU reference proves out with goldens.
+- [ ] Follow-ups: creeper/ghast-fireball variants on the same core.
+- [ ] Acceptance: fuse→S27→crater matches a vanilla raycast golden on flat stone; 64-TNT chain clears with zero skipped ticks (timing logged); drops + damage + knockback live-verified over TCP.
+
+## Phase L — Vanilla parity sweep (everything else 1.7.10 does that we don't)
+
+Verified missing by code search (no handler, no packet framer, no sim —
+ids/items/recipes alone don't count). Each slice states its dependency;
+all acceptance is live E2E over TCP with a real 1.7.10 client plus unit
+goldens where the algorithm is deterministic.
+
+### L1. Block simulation (fluids, falling blocks, growth, decay, fire)
+- [ ] Random-tick family (distinct from K1's scheduled ticks; shares the per-tick budget discipline): leaf decay, grass spread, wheat/carrot/potato + stems + saplings + cactus/reeds/mushroom/vine growth, farmland hydration/decay.
+- [ ] Fluids: water/lava flow spread + settling (the G1 fluid-CA candidate needs this CPU reference first); placed buckets (L7) and springs feed the same sim.
+- [ ] Falling sand/gravel (entity type 70 + landing logic), fire spread + burnout (gated on the existing `doFireTick` gamerule, inert today), ice/snow melt near light, snow/iron golem assembly (block-pattern build → entity spawn).
+- [ ] Acceptance: poured water reaches 7-block still level; floating sand column collapses; leaves 4+ from wood decay; wheat grows through stages; fire set by flint (L7) spreads and burns out; golem built by hand comes alive.
+
+### L2. Potion-effect application (server side)
+- [ ] Today effects are tracked + displayed + expired (A6) but change no gameplay; K2's potions are cosmetic without this. Apply server-side: Strength/Weakness damage scaling, Fire Resistance immunity, Water Breathing (no drown), Regeneration/Poison/Wither ticks, Absorption/Health-Boost hearts.
+- [ ] Client-side effects (Speed, Haste, Night Vision…) need no server code beyond S1D — verify each id is correctly classified, don't simulate what the client owns.
+- [ ] Acceptance: Strength II raises melee damage by the vanilla formula; Fire Resist swims in lava; poison ticks; absorption hearts show and absorb; unit goldens for the damage formulas.
+
+### L3. Combat depth
+- [ ] Armor damage reduction (armor bar exists client-side; server applies nothing today) incl. Protection-family reduction reusing the `cmd_data` enchant tables; sword blocking (right-click Use-Item → damage halved while held); falling crits (×1.5 + S2A crit particles — needs L8's particle packet).
+- [ ] Thorns if the enchant table carries it (else follow-up with K3's anvil).
+- [ ] Acceptance: full iron takes the vanilla-reduced hit (golden formula test + live E2E); blocking halves; crits proc only while falling.
+
+### L4. Dimensions: Nether + End
+- [ ] Nether gen (netherrack caves, lava ocean, glowstone, quartz, fortresses — structures ride the L5 generator work), End gen (island, obsidian pillars, crystals as entities or scheduled ticks).
+- [ ] Portals: obsidian-frame detection + flint-and-steel lighting (shares L7's Use-Item path), cross-dim travel with per-dim chunk namespaces (store keys already carry dim), per-dimension rules (no skylight/weather in Nether, beds, respawn-at-bed only in Overworld, End exit → Overworld spawn).
+- [ ] Acceptance: light portal → walk through → Nether terrain + lava ocean; die there → correct respawn; return portal links back within vanilla search radius.
+
+### L5. Structures + villagers + trading
+- [ ] Overworld structures the v5 generator skips (H2 documents the gap): villages, desert/jungle temples, witch huts, mineshafts, strongholds (+ lake/carve suppression near them, already stubbed in `decor.zig`), scattered loot chests.
+- [ ] Villagers (extend J4/L6 AI minimally: idle + door-seeking is enough for v1), trading UI + offer generation/re-stock, Eye of Ender flight toward the nearest stronghold (needs stronghold gen above).
+- [ ] Acceptance: locate a village live, trade wheat → emerald, eye of ender flies true; loot chests contain vanilla-table rolls.
+
+### L6. Mobs: the full roster (extends J4, don't duplicate it)
+- [ ] J4 covers spawner/AI/drops/persistence; this slice is breadth: passives (cow/sheep/pig/chicken/squid/bat/ocelot/wolf), hostiles (zombie/skeleton/spider/creeper/enderman/slime/witch/silverfish-from-infested-block), breeding/taming/saddles/horses/leads/nametags, Nether mobs behind L4.
+- [ ] Acceptance: night spawns hostiles that path to the player; wheat lures cows + breeding makes calves; tamed wolf fights back; difficulty scales damage.
+
+### L7. Items, vehicles, XP orbs
+- [ ] Use-Item path (shared with K2 drinking / K4 flint-and-steel): bows (draw power → arrow SpawnObject + damage), fishing (bobber entity + catch table), buckets (place water/lava, milk clears effects, fill from source), shears/hoes/bonemeal/cauldron interactions, ender pearls (teleport + fall damage), maps/books/sign-text (`0x12` Update Sign handler — signs are blank wood today), jukebox playback.
+- [ ] Vehicles: minecarts (+ chest/furnace/hopper/powered variants, detector/powered rails) and boats as entities with boarding (`0x0C` Steer Vehicle exists but nothing drives it); minecart/boat items craft today and do nothing.
+- [ ] XP orbs (Spawn Experience Orb `0x11` framer + magnet on the J1 item path): mining/smelting/breeding/trading XP awards (`drops.zig` explicitly excludes orbs today).
+- [ ] Paintings (`0x10` framer exists as an id only) + item frames (place + rotate + hold item).
+- [ ] Acceptance: bow one-shots at full draw per vanilla formula; fish bite on vanilla timing; bucket places source water that flows (L1); XP bar fills from mining coal ore; painting hangs on wall.
+
+### L8. Multiplayer + misc parity
+- [ ] Query protocol (GS4 `enable-query` equivalent) for server lists.
+- [ ] Statistics triggers (blocks mined, distance walked — the `stat.*` criteria strings exist, nothing feeds them) + achievement grants on action (today only via command).
+- [ ] Death messages (`<name> was slain by …`, `… fell out of the world`) broadcast on death + void damage below y=-64.
+- [ ] Spawn protection (16-block, op-bypassed, vanilla radius) + sleeping in beds (skip-night vote + spawn set) + hardcore world flag.
+- [ ] Presentation sweep: S2A particle packet (potion splash, crits, note smoke — K2/K4/L3 consume it), remaining S29 voices (hurt, eat, splash, explode is K4, doors), server-list favicon.
+- [ ] Command blocks (redstone-powered command execution via K1 power + existing dispatch; `testfor` already hardcodes its message).
+- [ ] Acceptance: query responds to GameSpy packets; death by creeper prints the vanilla line; non-op can't break spawn; all sleepers → dawn; hardcore death bans (vanilla SMP rule).
 
 ---
 
@@ -231,7 +333,7 @@ Worldgen version follows the world's version, not the client's (ties to Phase I)
 - [~] `src/worldgen/v5/`: GenLayer chain ✅ + hill noise ✅ + density ✅ + fill ✅ + surface ✅ (base + mesa plateau w/ Bryce) + cave ✅ + ravine ✅ carvers + ores ✅ / trees ✅ decorators — all JVM-verified per-stage incl. 10 full-pipeline chunks (terrain+carve bit-exact); decorator positions differ from vanilla (structures/lakes/dungeons skipped, documented) but shapes/counts/distributions are vanilla-exact via JVM goldens
 - [x] Chunk gen as background worker pool (`src/worldgen/v5/genpool.zig`): per-worker private `Gen` (chain state isn't shareable), compute lock-free + recheck/store under the world lock; serve threads never generate inline — misses enqueue + serve holes, retry when the pool sequence advances; `--gen-workers N` (default all cores, cap 16); boot `preGen` fans out + drains (81 chunks: 8.9s serial → 2.3s on 4 workers, Debug build). Live-verified over TCP
 - [ ] CPU light propagation (vanilla BFS reference — the current `gen.zig` skylight is a 15/0 column stub and block light is never written, so clients see a binary lightmap and caves are pitch black): skylight flood fill from the surface with vanilla opacity/attenuation (not the 15/0 column hack), block-light BFS from emissives (lava/glowstone/torches/furnace-lit) with vanilla emission tables; incremental relight on the `view.applyBlock` path (never a full re-flood per edit). Must stay scalar — branchy BFS like noise sampling, same H5 rule; GPU (G2 light passes) only after the CPU reference proves out with goldens
-- [~] Acceptance: fresh DB → login shows terrain ✅, F3 biomes sane ✅ (voronoi biomes on the wire), same-seed parity ✅ per-stage (biomes, density, fill, surface, carve, full-pipeline bit-exact); ores ✅ / trees ✅ present (live-verified: 249-353 ore blocks/chunk, logs+leaves in forest chunks); decorator positions differ from vanilla (documented approximation, structures/lakes/dungeons are future work); lighting stubbed (sky 15/0 column, block light zero — see light item above); boot pre-gen parallelized (81 chunks 8.9s → 2.3s on 4 workers, Debug), serve path never blocks on gen (holes + sequence-gated retry); lighting stubbed (sky 15/0 column, block light zero — see light item above)
+- [~] Acceptance: fresh DB → login shows terrain ✅, F3 biomes sane ✅ (voronoi biomes on the wire), same-seed parity ✅ per-stage (biomes, density, fill, surface, carve, full-pipeline bit-exact); ores ✅ / trees ✅ present (live-verified: 249-353 ore blocks/chunk, logs+leaves in forest chunks); decorator positions differ from vanilla (documented approximation, structures/lakes/dungeons are future work); lighting is subtractive-sky + block-light flood at gen and on edits (horizontal spread + cross-chunk bleed remain approximations); boot pre-gen parallelized (81 chunks 8.9s → 2.3s on 4 workers, Debug), serve path never blocks on gen (holes + capped sequence-gated retry with outbox backpressure)
 
 ### H3. Data overlay: custom packs (Terralith / JJThunder-class terrain)
 

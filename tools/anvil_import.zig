@@ -8,7 +8,7 @@
 //! Layout matches the server runtime ShardPool (db/shard-NN/...).
 
 const std = @import("std");
-const zigcraft = @import("zigcraft");
+const asteorite = @import("asteorite");
 
 fn parseRegionName(path: []const u8) ?struct { rx: i32, rz: i32 } {
     const base = std.fs.path.basename(path);
@@ -59,10 +59,10 @@ pub fn main(init: std.process.Init) !void {
     // open sharded LSM db (creates dirs) — same layout as server runtime
     var db_dir = try cwd.createDirPathOpen(io, db_path, .{});
     defer db_dir.close(io);
-    var pool = try zigcraft.shard.ShardPool.open(arena_alloc, io, db_dir, n_shards, .{});
+    var pool = try asteorite.shard.ShardPool.open(arena_alloc, io, db_dir, n_shards, .{});
     defer pool.deinit();
 
-    const hdr = zigcraft.anvil.parseHeader(mca_data) catch {
+    const hdr = asteorite.anvil.parseHeader(mca_data) catch {
         try out.print("bad anvil header\n", .{});
         try out.flush();
         return;
@@ -71,16 +71,16 @@ pub fn main(init: std.process.Init) !void {
     for (0..32) |lz| {
         for (0..32) |lx| {
             const raw = hdr.locations[lx + lz * 32];
-            if (zigcraft.anvil.decodeLocation(raw).present == false) continue;
-            const payload = zigcraft.anvil.getChunkPayload(
+            if (asteorite.anvil.decodeLocation(raw).present == false) continue;
+            const payload = asteorite.anvil.getChunkPayload(
                 mca_data,
                 @intCast(lx),
                 @intCast(lz),
             ) catch continue;
-            const plain = zigcraft.anvil.decompressChunk(arena_alloc, payload) catch continue;
+            const plain = asteorite.anvil.decompressChunk(arena_alloc, payload) catch continue;
             const gx: i32 = region.rx * 32 + @as(i32, @intCast(lx));
             const gz: i32 = region.rz * 32 + @as(i32, @intCast(lz));
-            const ch = zigcraft.chunk.fromAnvilNbt(arena_alloc, plain, dim) catch continue;
+            const ch = asteorite.chunk.fromAnvilNbt(arena_alloc, plain, dim) catch continue;
             // trust filename region for coords (authoritative); override NBT pos
             ch.x = gx;
             ch.z = gz;

@@ -1,0 +1,15 @@
+{
+  "port": 25565,
+  "online": false,
+  "db": "world",
+  "view_distance": 8,
+  "seed": 42,
+  "gen_spawn": 4,
+  "gen_workers": 4,
+  "ops": [],
+  "rcon_password": null,
+  "rcon_port": 25575,
+  "motd": "Asteorite",
+  "max_players": 20,
+  "brand": "vanilla"
+}

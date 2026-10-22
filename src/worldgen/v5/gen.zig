@@ -16,6 +16,13 @@ const wire = @import("../../proto/v5/wire_ids.zig");
 
 pub const SEA_LEVEL: i32 = 63;
 
+/// Vanilla light opacity (`aji.k()`, jar-verified via Opac harness over all
+/// 175 block ids). Single table lives in world/chunk.zig (shared with the
+/// relight path); this delegates so the two can never drift.
+pub fn lightOpacity(id: ids.Id) u8 {
+    return chunk_mod.lightOpacity(id);
+}
+
 pub const Gen = struct {
     shaper: shaper_mod.Shaper,
     carver: carve_mod.Carver,
@@ -99,26 +106,23 @@ pub const Gen = struct {
             }
             ch.sections[s] = sec;
         }
-        // Column skylight on existing sections: 15 down to first opaque.
-        // NOTE: water is transparent here (vanilla attenuates; approximation
-        // documented in H2 notes). Nibble first, then close the sky below:
-        // the surface cell itself sees full skylight.
+        // Column skylight (shared vertical rule in chunk.relightColumn:
+        // each block subtracts its opacity — leaves 15->14, ice 15->12,
+        // opaque 255->0 — except still water which stays transparent)
+        // + block-light flood from emissive cells (lava, torches, ...).
+        // Horizontal spread is not modeled (documented approximation).
+        // The surface cell itself sees full skylight (snow/flora above
+        // don't dim it, jar-verified k=0).
         for (0..16) |lz| {
-            for (0..16) |lx| {
-                var sky: u4 = 15;
-                var y: i32 = 255;
-                while (y >= 0) : (y -= 1) {
-                    const uy: usize = @intCast(y);
-                    const s: usize = uy / 16;
-                    if (ch.sections[s]) |*sec| {
-                        const lsi = chunk_mod.Section.index(@intCast(lx), @intCast(uy % 16), @intCast(lz));
-                        chunk_mod.Section.setNibble(&sec.sky, lsi, sky);
-                    }
-                    if (blocks[(lx * 4096 + lz * 256) + uy] != ids.air and blocks[(lx * 4096 + lz * 256) + uy] != ids.water) sky = 0;
-                }
-            }
+            for (0..16) |lx| ch.relightColumn(lx, lz);
         }
-        // Biomes (voronoi) + heights (topmost non-air).
+        {
+            const q = try scratch.alloc(u32, 65536);
+            defer scratch.free(q);
+            ch.relightBlock(q);
+        }
+        // Biomes (voronoi) + heights (topmost light-blocking block, i.e.
+        // opacity!=0: flora/snow/glass/lava don't count, water/ice/leaves do).
         {
             const bio = try scratch.alloc(i32, 256);
             defer scratch.free(bio);
@@ -129,7 +133,7 @@ pub const Gen = struct {
                     var top: u8 = 0;
                     var y: i32 = 255;
                     while (y >= 0) : (y -= 1) {
-                        if (blocks[(lx * 4096 + lz * 256) + @as(usize, @intCast(y))] != ids.air) {
+                        if (lightOpacity(blocks[(lx * 4096 + lz * 256) + @as(usize, @intCast(y))]) != 0) {
                             top = @intCast(y);
                             break;
                         }
@@ -213,10 +217,7 @@ pub const Gen = struct {
             .sx = VS,
             .sz = VS,
         };
-        const vheights = try scratch.alloc(i32, VS * VS);
-        defer scratch.free(vheights);
-        decor_mod.computeHeights(&view, vheights);
-        try decor_mod.decorateCenter(&view, vheights, self.world_seed, cx, cz, &self.shaper.chain, self.shaper.roots[1], scratch);
+        try decor_mod.decorateCenter(&view, self.world_seed, cx, cz, &self.shaper.chain, self.shaper.roots[1], scratch);
         // Extract decorated center back into blocks/meta.
         var lx: usize = 0;
         while (lx < 16) : (lx += 1) {
@@ -228,6 +229,30 @@ pub const Gen = struct {
                     const src = ((lx + 16) * VS + (lz + 16)) * 256 + y;
                     blocks[dst] = vblocks[src];
                     meta[dst] = vmetas[src];
+                }
+            }
+        }
+        // Cross-chunk merge can undercut the snow/ice tail: a later
+        // populate's lake carves air below a neighbor's already-placed
+        // snow_layer (vanilla runs on one live world, so this never
+        // floats). Enforce the tail's own gate post-merge — snow_layer
+        // whose support fails `isSoilOpaque` (air, water, lava, leaves)
+        // is removed. Mirrors decor's gate exactly (leaves excluded).
+        {
+            var sx: usize = 0;
+            while (sx < 16) : (sx += 1) {
+                var sz: usize = 0;
+                while (sz < 16) : (sz += 1) {
+                    var yy: usize = 1;
+                    while (yy < 256) : (yy += 1) {
+                        if (blocks[(sx * 4096 + sz * 256) + yy] != ids.snow_layer) continue;
+                        const below = blocks[(sx * 4096 + sz * 256) + yy - 1];
+                        const solid = below != ids.air and below != ids.leaves and below != ids.leaves2 and below != ids.water and below != ids.flowing_water and below != ids.lava and below != ids.flowing_lava;
+                        if (!solid) {
+                            blocks[(sx * 4096 + sz * 256) + yy] = ids.air;
+                            meta[(sx * 4096 + sz * 256) + yy] = 0;
+                        }
+                    }
                 }
             }
         }
@@ -269,6 +294,31 @@ test "genChunk packs ZC1 faithfully (seed 42 chunk 3,-5)" {
     }
     // Heightmap: topmost non-air.
     try std.testing.expectEqual(@as(u8, 68), ch.heights[0]);
+}
+
+test "frozen chunk has no floating snow (seed 42 chunk 3,-5)" {
+    // Ice-plains window: the 3x3 merge used to undercut the snow/ice tail
+    // (neighbor lake carves below already-placed snow_layer), leaving
+    // snow floating over air/water in ponds. The post-merge sweep enforces
+    // the tail's own support gate.
+    const alloc = std.testing.allocator;
+    var gen = try Gen.init(alloc, 42, false, false);
+    defer gen.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const ch = try gen.genChunk(alloc, arena.allocator(), 3, -5);
+    defer ch.destroy(alloc);
+    for (0..16) |lx| {
+        for (0..16) |lz| {
+            var y: usize = 1;
+            while (y < 256) : (y += 1) {
+                const s = ch.sections[y >> 4] orelse continue;
+                if (s.blocks[chunk_mod.Section.index(@intCast(lx), @intCast(y & 15), @intCast(lz))] != ids.snow_layer) continue;
+                const below = ch.blockAt(lx, y - 1, lz);
+                try std.testing.expect(below != ids.air and below != ids.water and below != ids.flowing_water and below != ids.lava and below != ids.flowing_lava);
+            }
+        }
+    }
 }
 
 test "full pipeline matches JVM (seed 1 chunk 0,0)" {
@@ -500,4 +550,5 @@ test "full pipeline matches JVM (seed 7 chunk 8,8)" {
         try std.testing.expectEqual(sampm_want[k], flat.meta[idx]);
     }
 }
+
 

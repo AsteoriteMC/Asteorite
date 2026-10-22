@@ -1,8 +1,8 @@
 .{
-    .name = .zigcraft,
+    .name = .asteorite,
     .version = "0.0.1",
     .minimum_zig_version = "0.16.0",
-    .fingerprint = 0x6113d97cc0540e9d,
+    .fingerprint = 0x24092cea3dd0547a,
     .dependencies = .{
     },
     .paths = .{

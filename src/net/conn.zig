@@ -20,6 +20,7 @@ const rsa_mod = @import("rsa.zig");
 const mojang = @import("mojang.zig");
 const spin = @import("../sim/spin.zig");
 const game_ids = @import("../ids.zig");
+const status_mod = @import("status.zig");
 
 /// Server-driven tick intervals.
 pub const keepalive_interval_ms: i64 = 15000;
@@ -29,9 +30,16 @@ pub const time_interval_ms: i64 = 1000;
 pub const max_frame_len = 2 * 1024 * 1024; // 2MB guard
 
 pub const Config = struct {
-    motd: []const u8 = "zigcraft",
+    motd: []const u8 = "Asteorite",
     max_players: u8 = 20,
+    /// Fallback count when no live source refreshes it (tests, offline
+    /// tools). The serve thread overwrites this from the registry before
+    /// answering each status request.
     online_count: u8 = 0,
+    /// Handshake brand advertised in the status JSON (vanilla/fabric/forge).
+    /// Forge adds the FML modinfo block; the mod list stays empty until the
+    /// modding API registers mods.
+    brand: status_mod.Brand = .vanilla,
     gamemode: u8 = 1,
     difficulty: u8 = 1,
     level_type: []const u8 = "default",
@@ -114,6 +122,9 @@ pub const Action = union(enum) {
     table_close: TableClose,
     /// Relay arm swing 0x0B to chunk viewers (not sender).
     arm_swing: i8,
+    /// Serverbound 0x14 tab-complete text (raw, in tab_buf). Handled by the
+    /// serve thread (server.handleTabComplete), which may queue a 0x3A.
+    tab_complete: ChatEvent,
     /// Broadcast formatted chat line to all play conns.
     chat: ChatEvent,
     /// Serverbound chat starting with "/" (raw text in chat_buf, cmd_len
@@ -138,6 +149,13 @@ pub const Frame = struct {
     id: i32,
     /// Payload WITHOUT the packet id. Valid until next feedData/poll.
     body: []const u8,
+};
+
+/// One active potion effect (vanilla PotionEffect: id, amplifier, ticks).
+pub const PotionEffect = struct {
+    id: u8,
+    amplifier: u8,
+    ticks: i32,
 };
 
 pub const Conn = struct {
@@ -183,6 +201,12 @@ pub const Conn = struct {
     food_timer: u32 = 0,
     air: i16 = 300,
     fire_ticks: u32 = 0,
+    /// Cactus hurt throttle (ticks remaining; vanilla hits ~1/0.5s while
+    /// in contact, without this envTick's per-tick damage is 20dps).
+    cactus_cd: u8 = 0,
+    /// Save-epoch assigned at login (see Server.bumpSaveEpoch): a stale
+    /// session's delayed save is dropped once a newer login owns the row.
+    save_epoch: u64 = 0,
     sprinting: bool = false,
     /// Accumulated downward distance while airborne (vanilla fallDistance).
     fall_acc: f32 = 0,
@@ -196,6 +220,28 @@ pub const Conn = struct {
     /// Scratch for one validated outbound chat line (JSON).
     chat_buf: [1024]u8 = [_]u8{0} ** 1024,
     last_chat_ms: ?i64 = null,
+    /// Scratch for one serverbound 0x14 tab-complete request (raw text).
+    tab_buf: [1024]u8 = [_]u8{0} ** 1024,
+    /// Peer address ("127.0.0.1"-style; filled by the serve thread from the
+    /// accepted socket — used by /ban-ip matching and login IP-ban checks).
+    ip: [64]u8 = [_]u8{0} ** 64,
+    ip_len: usize = 0,
+    /// Last play-frame timestamp (ms). The ticker kicks past the idle
+    /// timeout (`/setidletimeout`); 0 disables. Updated per frame above.
+    last_active_ms: i64 = 0,
+    /// Experience (vanilla EntityPlayer fields; persisted in ZPLR v4).
+    xp_level: i32 = 0,
+    xp_total: i32 = 0,
+    xp_bar: f32 = 0,
+    /// Active potion effects (vanilla PotionEffect list, ephemeral across
+    /// logins — ZPLR keeps health/food/saturation only). Ticked down by
+    /// the server ticker, which sends S1E removals on expiry.
+    effects: [8]?PotionEffect = [_]?PotionEffect{null} ** 8,
+    /// Personal spawn set via /spawnpoint (vs world default).
+    spawn_forced: bool = false,
+    /// Awarded achievement names (`achievement.*`, max 32, ephemeral).
+    achieved: [32][40]u8 = [_][40]u8{[_]u8{0} ** 40} ** 32,
+    achieved_len: usize = 0,
     // tracked player state (serverbound position packets; stance consumed)
     pos_x: f64 = 8.5,
     pos_y: f64 = 64.0,
@@ -345,6 +391,7 @@ pub const Conn = struct {
     }
 
     pub fn handleFrame(self: *Conn, frame: Frame) !Action {
+        self.last_active_ms = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
         return switch (self.state) {
             .handshaking => try self.handleHandshaking(frame),
             .status => try self.handleStatus(frame),
@@ -388,14 +435,18 @@ pub const Conn = struct {
 
     fn handleStatus(self: *Conn, frame: Frame) !Action {
         if (frame.id == @as(i32, @intFromEnum(ids.StatusServer.request))) {
-            var json: [512]u8 = undefined;
-            const j = try std.fmt.bufPrint(&json,
-                "{{\"version\":{{\"name\":\"1.7.10\",\"protocol\":5}}," ++
-                    "\"players\":{{\"max\":{d},\"online\":{d}}}," ++
-                    "\"description\":{{\"text\":\"{s}\"}}}}",
-                .{ self.config.max_players, self.config.online_count, self.config.motd });
-            var out: [1024]u8 = undefined;
-            try self.queueRaw(try packets.frameStatusResponse(j, &out));
+            // Struct-stringified (never raw format strings: MOTDs with quotes
+            // used to emit invalid JSON). Sized by the MOTD, not a fixed buffer.
+            const j = try status_mod.writeJson(self.allocator, .{
+                .motd = self.config.motd,
+                .max_players = self.config.max_players,
+                .online_players = self.config.online_count,
+                .brand = self.config.brand,
+            });
+            defer self.allocator.free(j);
+            const out = try self.allocator.alloc(u8, j.len + 10);
+            defer self.allocator.free(out);
+            try self.queueRaw(try packets.frameStatusResponse(j, out));
             return .none;
         }
         if (frame.id == @as(i32, @intFromEnum(ids.StatusServer.ping))) {
@@ -698,6 +749,14 @@ pub const Conn = struct {
             };
             self.last_chat_ms = now;
             return .{ .chat = .{ .json_len = json.len } };
+        }
+        if (frame.id == @as(i32, @intFromEnum(ids.PlayServer.tab_complete))) {
+            const text = try packets.parseTabComplete(frame.body);
+            // Bound the request (vanilla allows 32767 chars; completion only
+            // needs the tail — drop absurd inputs instead of truncating).
+            if (text.len > self.tab_buf.len) return .none;
+            @memcpy(self.tab_buf[0..text.len], text);
+            return .{ .tab_complete = .{ .json_len = text.len } };
         }
         if (frame.id == @as(i32, @intFromEnum(ids.PlayServer.use_entity))) {
             const u = try packets.parseUseEntity(frame.body);
@@ -1333,7 +1392,7 @@ pub const Conn = struct {
     pub fn queueJoinPackets(self: *Conn, world_age: i64, time_of_day: i64) !void {
         const creative = self.config.gamemode == 1;
         var ab: [32]u8 = undefined;
-        try self.queueRaw(try packets.framePlayerAbilities(if (creative) 0x07 else 0x00, 0.05, 0.1, &ab));
+        try self.queueRaw(try packets.framePlayerAbilities(packets.abilityFlags(creative), 0.05, 0.1, &ab));
         var hb: [32]u8 = undefined;
         try self.queueRaw(try packets.frameUpdateHealth(self.health, self.food, self.saturation, &hb));
         var xb: [32]u8 = undefined;
@@ -1479,7 +1538,19 @@ test "status flow with split feeds" {
     const h1 = try codec.decodeFrame(&r);
     try std.testing.expectEqual(@as(i32, 0x00), h1.id);
     const js = try r.readString();
-    try std.testing.expect(std.mem.indexOf(u8, js, "zigcraft") != null);
+    try std.testing.expect(std.mem.indexOf(u8, js, "Asteorite") != null);
+    // Structured payload (not raw bufPrint): parse and check fields.
+    {
+        const pv = try std.json.parseFromSlice(std.json.Value, a, js, .{});
+        defer pv.deinit();
+        const root = pv.value.object;
+        try std.testing.expectEqualStrings("Asteorite", root.get("description").?.object.get("text").?.string);
+        try std.testing.expectEqual(@as(i64, 20), root.get("players").?.object.get("max").?.integer);
+        try std.testing.expectEqual(@as(i64, 0), root.get("players").?.object.get("online").?.integer);
+        try std.testing.expectEqualStrings("1.7.10", root.get("version").?.object.get("name").?.string);
+        try std.testing.expectEqual(@as(i64, 5), root.get("version").?.object.get("protocol").?.integer);
+        try std.testing.expect(root.get("modinfo") == null);
+    }
     // ping -> pong + close_after_flush
     var pg: [16]u8 = undefined;
     var pw: [8]u8 = undefined;
@@ -1494,6 +1565,36 @@ test "status flow with split feeds" {
     var r2 = codec.PacketReader.init(out2);
     _ = try codec.decodeFrame(&r2);
     try std.testing.expectEqual(@as(i64, 987654321), try packets.parsePing(r2.buffer[r2.index..]));
+}
+
+test "forge status carries FML modinfo; live count is used verbatim" {
+    const a = std.testing.allocator;
+    var c = Conn.init(a, std.testing.io, .{ .motd = "hi", .max_players = 50, .online_count = 7, .brand = .forge }, 1);
+    defer c.deinit();
+    var hb: [64]u8 = undefined;
+    var w = codec.PacketWriter.init(&hb);
+    try w.writeVarInt(5);
+    try w.writeString("localhost");
+    try w.writeUShort(25565);
+    try w.writeVarInt(1);
+    var hf: [80]u8 = undefined;
+    try c.feedData(try codec.framePacket(0x00, w.written(), &hf));
+    _ = try c.handleFrame((try c.poll()).?);
+    var rq: [8]u8 = undefined;
+    try c.feedData(try codec.framePacket(0x00, &.{}, &rq));
+    _ = try c.handleFrame((try c.poll()).?);
+    const out = try c.takeOutput();
+    defer a.free(out);
+    var r = codec.PacketReader.init(out);
+    _ = try codec.decodeFrame(&r);
+    const js = try r.readString();
+    const pv = try std.json.parseFromSlice(std.json.Value, a, js, .{});
+    defer pv.deinit();
+    const root = pv.value.object;
+    try std.testing.expectEqual(@as(i64, 7), root.get("players").?.object.get("online").?.integer);
+    const modinfo = root.get("modinfo").?.object;
+    try std.testing.expectEqualStrings("FML", modinfo.get("type").?.string);
+    try std.testing.expectEqual(@as(usize, 0), modinfo.get("modList").?.array.items.len);
 }
 
 test "offline login -> play bootstrap" {
@@ -2331,7 +2432,7 @@ test "join packets order + fields" {
         try std.testing.expectEqual(id, h.id);
         switch (id) {
             0x39 => {
-                try std.testing.expectEqual(@as(u8, 0x07), try r.readByte()); // creative flags
+                try std.testing.expectEqual(@as(u8, 0x0D), try r.readByte()); // creative flags (jar S39 bits)
                 _ = try r.readFloat(); // flying speed
                 _ = try r.readFloat(); // walking speed
             },

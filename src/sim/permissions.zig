@@ -2,7 +2,7 @@
 //!
 //! Shape (deliberately vanilla-inspired, not vanilla-identical):
 //! - Every command declares a minimum op level (0 = everyone, 4 = owner)
-//!   and a node (`zigcraft.command.<name>`).
+//!   and a node (`asteorite.command.<name>`).
 //! - A player's effective level is their explicit entry, else 0. Console
 //!   is implicitly 4 and is never stored.
 //! - Node check order: explicit DENY wins, then explicit GRANT, then
@@ -12,7 +12,7 @@
 //!   offline-UUID derivation and the player-row scheme). "Steve" and
 //!   "steve" are different players.
 //! - Nodes are `[a-z0-9_.-]` segments, 1..64 chars; a grant/deny ending
-//!   in `.*` matches that prefix (`zigcraft.command.*` covers all
+//!   in `.*` matches that prefix (`asteorite.command.*` covers all
 //!   commands). Exact match otherwise.
 //!
 //! Storage: one LSM row (`encodeKey(254, 0, 0)`) holding the whole matrix
@@ -24,6 +24,58 @@
 const std = @import("std");
 const store_mod = @import("../world/store.zig");
 const shard_mod = @import("../world/shard.zig");
+const cmd_mod = @import("../cmd/mod.zig");
+// Vanilla 1.7.10 dedicated registration order (bl clinit), `perm` last
+// (server extension, not a vanilla command).
+const cmd_time = @import("../cmd/time.zig");
+const cmd_gamemode = @import("../cmd/gamemode.zig");
+const cmd_difficulty = @import("../cmd/difficulty.zig");
+const cmd_defaultgamemode = @import("../cmd/defaultgamemode.zig");
+const cmd_kill = @import("../cmd/kill.zig");
+const cmd_toggledownfall = @import("../cmd/toggledownfall.zig");
+const cmd_weather = @import("../cmd/weather.zig");
+const cmd_xp = @import("../cmd/xp.zig");
+const cmd_tp = @import("../cmd/tp.zig");
+const cmd_give = @import("../cmd/give.zig");
+const cmd_effect = @import("../cmd/effect.zig");
+const cmd_enchant = @import("../cmd/enchant.zig");
+const cmd_me = @import("../cmd/me.zig");
+const cmd_seed = @import("../cmd/seed.zig");
+const cmd_help = @import("../cmd/help.zig");
+const cmd_debug = @import("../cmd/debug.zig");
+const cmd_tell = @import("../cmd/tell.zig");
+const cmd_say = @import("../cmd/say.zig");
+const cmd_spawnpoint = @import("../cmd/spawnpoint.zig");
+const cmd_setworldspawn = @import("../cmd/setworldspawn.zig");
+const cmd_gamerule = @import("../cmd/gamerule.zig");
+const cmd_clear = @import("../cmd/clear.zig");
+const cmd_testfor = @import("../cmd/testfor.zig");
+const cmd_spreadplayers = @import("../cmd/spreadplayers.zig");
+const cmd_playsound = @import("../cmd/playsound.zig");
+const cmd_scoreboard = @import("../cmd/scoreboard.zig");
+const cmd_achievement = @import("../cmd/achievement.zig");
+const cmd_summon = @import("../cmd/summon.zig");
+const cmd_setblock = @import("../cmd/setblock.zig");
+const cmd_testforblock = @import("../cmd/testforblock.zig");
+const cmd_tellraw = @import("../cmd/tellraw.zig");
+const cmd_op = @import("../cmd/op.zig");
+const cmd_deop = @import("../cmd/deop.zig");
+const cmd_stop = @import("../cmd/stop.zig");
+const cmd_save_all = @import("../cmd/save_all.zig");
+const cmd_save_off = @import("../cmd/save_off.zig");
+const cmd_save_on = @import("../cmd/save_on.zig");
+const cmd_ban_ip = @import("../cmd/ban_ip.zig");
+const cmd_pardon_ip = @import("../cmd/pardon_ip.zig");
+const cmd_ban = @import("../cmd/ban.zig");
+const cmd_banlist = @import("../cmd/banlist.zig");
+const cmd_pardon = @import("../cmd/pardon.zig");
+const cmd_kick = @import("../cmd/kick.zig");
+const cmd_list = @import("../cmd/list.zig");
+const cmd_whitelist = @import("../cmd/whitelist.zig");
+const cmd_setidletimeout = @import("../cmd/setidletimeout.zig");
+const cmd_netstat = @import("../cmd/netstat.zig");
+const cmd_publish = @import("../cmd/publish.zig");
+const cmd_perm = @import("../cmd/perm.zig");
 
 pub const MAX_LEVEL: u8 = 4;
 pub const DEFAULT_LEVEL: u8 = 0;
@@ -39,25 +91,75 @@ pub const max_node_len = 64;
 /// Built-in command metadata. Levels follow a vanilla-inspired ladder
 /// (0 everyone, 2 future gameplay cheats, 3 unused, 4 owner-only); only
 /// 0 and 4 gate anything today. Nodes give fine-grained control now.
-pub const Command = struct {
-    name: []const u8,
-    node: []const u8,
-    min_level: u8,
-    usage: []const u8,
+///
+/// Single source of truth: each file under src/cmd/ owns its `def`
+/// (validated at comptime by `cmd.define`); this table is generated from
+/// those defs, so help text, permission checks, and dispatch can never
+/// drift apart. To add a command: write src/cmd/<name>.zig and add it to
+/// `modules` below (dispatch is registry-driven, one file per command).
+pub const Command = cmd_mod.Command;
+
+/// One module per command, in vanilla `/help` display order (the dedicated
+/// manager's registration order). Server dispatch iterates this same list,
+/// so there is exactly one place to update.
+pub const modules = [_]type{
+    cmd_time,
+    cmd_gamemode,
+    cmd_difficulty,
+    cmd_defaultgamemode,
+    cmd_kill,
+    cmd_toggledownfall,
+    cmd_weather,
+    cmd_xp,
+    cmd_tp,
+    cmd_give,
+    cmd_effect,
+    cmd_enchant,
+    cmd_me,
+    cmd_seed,
+    cmd_help,
+    cmd_debug,
+    cmd_tell,
+    cmd_say,
+    cmd_spawnpoint,
+    cmd_setworldspawn,
+    cmd_gamerule,
+    cmd_clear,
+    cmd_testfor,
+    cmd_spreadplayers,
+    cmd_playsound,
+    cmd_scoreboard,
+    cmd_achievement,
+    cmd_summon,
+    cmd_setblock,
+    cmd_testforblock,
+    cmd_tellraw,
+    cmd_op,
+    cmd_deop,
+    cmd_stop,
+    cmd_save_all,
+    cmd_save_off,
+    cmd_save_on,
+    cmd_ban_ip,
+    cmd_pardon_ip,
+    cmd_ban,
+    cmd_banlist,
+    cmd_pardon,
+    cmd_kick,
+    cmd_list,
+    cmd_whitelist,
+    cmd_setidletimeout,
+    cmd_netstat,
+    cmd_publish,
+    cmd_perm,
 };
 
-pub const commands = [_]Command{
-    .{ .name = "help", .node = "zigcraft.command.help", .min_level = 0, .usage = "/help" },
-    .{ .name = "list", .node = "zigcraft.command.list", .min_level = 0, .usage = "/list" },
-    .{ .name = "save-all", .node = "zigcraft.command.save-all", .min_level = 4, .usage = "/save-all" },
-    .{ .name = "op", .node = "zigcraft.command.op", .min_level = 4, .usage = "/op <player>" },
-    .{ .name = "deop", .node = "zigcraft.command.deop", .min_level = 4, .usage = "/deop <player>" },
-    .{ .name = "perm", .node = "zigcraft.command.perm", .min_level = 4, .usage = "/perm <grant|deny|clear|show|reload> [player] [node]" },
-    .{ .name = "stop", .node = "zigcraft.command.stop", .min_level = 4, .usage = "/stop" },
-    .{ .name = "gamemode", .node = "zigcraft.command.gamemode", .min_level = 2, .usage = "/gamemode <0|1|survival|creative> [player]" },
-    .{ .name = "give", .node = "zigcraft.command.give", .min_level = 2, .usage = "/give <player> <id> [count] [damage]" },
-    .{ .name = "tp", .node = "zigcraft.command.tp", .min_level = 2, .usage = "/tp <target|x> [y] [z] | /tp <victim> <target>" },
-    .{ .name = "time", .node = "zigcraft.command.time", .min_level = 2, .usage = "/time <set|add> <value|day|night>" },
+/// One module per command, in /help display order. Server dispatch
+/// iterates this same list, so there is exactly one place to update.
+pub const commands: [modules.len]Command = blk: {
+    var table: [modules.len]Command = undefined;
+    for (modules, 0..) |M, i| table[i] = M.def;
+    break :blk table;
 };
 
 pub fn findCommand(name: []const u8) ?*const Command {
@@ -127,25 +229,47 @@ pub const Db = struct {
         self.players.deinit();
     }
 
+    /// Player keys are ASCII-lowercased (vanilla `UserList` lowercases
+    /// profile names, so `/op Alice` covers login `alice`). The conn's
+    /// live username keeps its exact case; only the matrix key is folded.
+    pub fn normKey(name: []const u8, buf: *[max_name_len]u8) []const u8 {
+        const n = @min(name.len, max_name_len);
+        for (name[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
+        return buf[0..n];
+    }
+
     fn getOrPut(self: *Db, name: []const u8) !*PlayerPerms {
-        if (self.players.get(name)) |p| return p;
-        const key = try self.alloc.dupe(u8, name);
-        errdefer self.alloc.free(key);
+        var buf: [max_name_len]u8 = undefined;
+        const key = normKey(name, &buf);
+        if (self.players.get(key)) |p| return p;
+        const owned = try self.alloc.dupe(u8, key);
+        errdefer self.alloc.free(owned);
         const p = try self.alloc.create(PlayerPerms);
         errdefer self.alloc.destroy(p);
         p.* = .{
-            .name = key,
+            .name = owned,
             .level = DEFAULT_LEVEL,
             .grants = std.StringHashMap(void).init(self.alloc),
             .denies = std.StringHashMap(void).init(self.alloc),
         };
-        try self.players.put(key, p);
+        try self.players.put(owned, p);
         return p;
+    }
+
+    fn lookup(self: *const Db, name: []const u8) ?*PlayerPerms {
+        var buf: [max_name_len]u8 = undefined;
+        return self.players.get(normKey(name, &buf));
+    }
+
+    /// Case-insensitive row lookup for display paths (`/perm show`).
+    /// Returns the stored (lowercased) row, if any.
+    pub fn lookupRow(self: *const Db, name: []const u8) ?*PlayerPerms {
+        return self.lookup(name);
     }
 
     /// Explicit level, else DEFAULT_LEVEL. Console never reaches here.
     pub fn levelFor(self: *const Db, name: []const u8) u8 {
-        const p = self.players.get(name) orelse return DEFAULT_LEVEL;
+        const p = self.lookup(name) orelse return DEFAULT_LEVEL;
         return p.level;
     }
 
@@ -154,12 +278,14 @@ pub const Db = struct {
         std.debug.assert(level <= MAX_LEVEL);
         const p = try self.getOrPut(name);
         p.level = level;
-        try self.gc(name);
+        try self.gc(p.name);
     }
 
     /// Full reset (deop): level 0 and all nodes dropped.
     pub fn clearPlayer(self: *Db, name: []const u8) void {
-        if (self.players.fetchRemove(name)) |kv| {
+        var buf: [max_name_len]u8 = undefined;
+        const key = normKey(name, &buf);
+        if (self.players.fetchRemove(key)) |kv| {
             self.alloc.free(kv.key);
             freePerms(self.alloc, kv.value);
         }
@@ -189,7 +315,7 @@ pub const Db = struct {
 
     /// Remove a node from both sets (returns true when something changed).
     pub fn clearNode(self: *Db, name: []const u8, node: []const u8) !bool {
-        const p = self.players.get(name) orelse return false;
+        const p = self.lookup(name) orelse return false;
         var changed = false;
         if (p.grants.fetchRemove(node)) |kv| {
             self.alloc.free(kv.key);
@@ -199,21 +325,21 @@ pub const Db = struct {
             self.alloc.free(kv.key);
             changed = true;
         }
-        try self.gc(name);
+        try self.gc(p.name);
         return changed;
     }
 
     fn gc(self: *Db, name: []const u8) !void {
-        const p = self.players.get(name) orelse return;
+        const p = self.lookup(name) orelse return;
         if (p.level == DEFAULT_LEVEL and p.grants.count() == 0 and p.denies.count() == 0) {
-            self.clearPlayer(name);
+            self.clearPlayer(p.name);
         }
     }
 
     /// Decision core: deny-match wins, then grant-match, then level gate.
     /// `sender_level` is CONSOLE_LEVEL for console, else levelFor(name).
     pub fn allows(self: *const Db, name: []const u8, node: []const u8, min_level: u8) bool {
-        const p = self.players.get(name) orelse return DEFAULT_LEVEL >= min_level;
+        const p = self.lookup(name) orelse return DEFAULT_LEVEL >= min_level;
         var it = p.denies.iterator();
         while (it.next()) |e| {
             if (nodeMatches(e.key_ptr.*, node)) return false;
@@ -353,8 +479,11 @@ pub fn decode(alloc: std.mem.Allocator, bytes: []const u8) DbError!Db {
         if (!validPlayerName(name)) return error.CorruptPerms;
         const level = (try take(&r, 1))[0];
         if (level > MAX_LEVEL) return error.CorruptPerms;
-        // Duplicate names would fork the matrix — reject.
-        if (db.players.contains(name)) return error.CorruptPerms;
+        // Duplicate names would fork the matrix — reject (compare folded:
+        // old DBs may hold mixed case; folding merges them into one row).
+        var fold: [max_name_len]u8 = undefined;
+        const fname = Db.normKey(name, &fold);
+        if (db.players.contains(fname)) return error.CorruptPerms;
         const p = try db.getOrPut(name);
         p.level = level;
         const ng = std.mem.readInt(u16, (try take(&r, 2))[0..2], .big);
@@ -418,38 +547,54 @@ test "levels + grants + denies + wildcards" {
     var db = Db.init(a);
     defer db.deinit();
     // default deny
-    try std.testing.expect(!db.allows("Steve", "zigcraft.command.save-all", 4));
-    try std.testing.expect(db.allows("Steve", "zigcraft.command.list", 0));
+    try std.testing.expect(!db.allows("Steve", "asteorite.command.save-all", 4));
+    try std.testing.expect(db.allows("Steve", "asteorite.command.list", 0));
     // op level
     try db.setLevel("Steve", 4);
-    try std.testing.expect(db.allows("Steve", "zigcraft.command.save-all", 4));
+    try std.testing.expect(db.allows("Steve", "asteorite.command.save-all", 4));
     // deny beats level
-    try db.deny("Steve", "zigcraft.command.save-all");
-    try std.testing.expect(!db.allows("Steve", "zigcraft.command.save-all", 4));
-    try std.testing.expect(db.allows("Steve", "zigcraft.command.list", 0));
+    try db.deny("Steve", "asteorite.command.save-all");
+    try std.testing.expect(!db.allows("Steve", "asteorite.command.save-all", 4));
+    try std.testing.expect(db.allows("Steve", "asteorite.command.list", 0));
     // grant beats level-gate for a low player
-    try db.grant("Bob", "zigcraft.command.save-all");
-    try std.testing.expect(db.allows("Bob", "zigcraft.command.save-all", 4));
+    try db.grant("Bob", "asteorite.command.save-all");
+    try std.testing.expect(db.allows("Bob", "asteorite.command.save-all", 4));
     // wildcard grant
-    try db.grant("Bob", "zigcraft.command.*");
-    try std.testing.expect(db.allows("Bob", "zigcraft.command.op", 4));
+    try db.grant("Bob", "asteorite.command.*");
+    try std.testing.expect(db.allows("Bob", "asteorite.command.op", 4));
     // wildcard does not cross the dot boundary
-    try std.testing.expect(!db.allows("Bob", "zigcraft.cmd", 4));
+    try std.testing.expect(!db.allows("Bob", "asteorite.cmd", 4));
     // exact deny inside a granted wildcard still wins
-    try db.deny("Bob", "zigcraft.command.stop");
-    try std.testing.expect(!db.allows("Bob", "zigcraft.command.stop", 0));
+    try db.deny("Bob", "asteorite.command.stop");
+    try std.testing.expect(!db.allows("Bob", "asteorite.command.stop", 0));
     // clearNode restores level behavior
-    try std.testing.expect(try db.clearNode("Bob", "zigcraft.command.stop"));
-    try std.testing.expect(db.allows("Bob", "zigcraft.command.stop", 0));
+    try std.testing.expect(try db.clearNode("Bob", "asteorite.command.stop"));
+    try std.testing.expect(db.allows("Bob", "asteorite.command.stop", 0));
     // deop resets everything
     db.clearPlayer("Steve");
-    try std.testing.expect(!db.allows("Steve", "zigcraft.command.save-all", 4));
+    try std.testing.expect(!db.allows("Steve", "asteorite.command.save-all", 4));
     try std.testing.expect(db.levelFor("Nobody") == 0);
 }
 
+test "player names are case-insensitive (vanilla UserList folds)" {
+    const a = std.testing.allocator;
+    var db = Db.init(a);
+    defer db.deinit();
+    // /op Alice from console covers login `alice` (the reported "opped
+    // but every command unknown" was an exact-case lookup miss).
+    try db.setLevel("Alice", 4);
+    try std.testing.expectEqual(@as(u8, 4), db.levelFor("alice"));
+    try std.testing.expectEqual(@as(u8, 4), db.levelFor("ALICE"));
+    try std.testing.expect(db.allows("aLiCe", "asteorite.command.save-all", 4));
+    // deop with any case clears the same row.
+    db.clearPlayer("ALICE");
+    try std.testing.expectEqual(@as(u8, 0), db.levelFor("alice"));
+    try std.testing.expect(!db.allows("alice", "asteorite.command.save-all", 4));
+}
+
 test "node validation" {
-    try std.testing.expect(validNode("zigcraft.command.list"));
-    try std.testing.expect(validNode("zigcraft.command.*"));
+    try std.testing.expect(validNode("asteorite.command.list"));
+    try std.testing.expect(validNode("asteorite.command.*"));
     try std.testing.expect(validNode("a"));
     try std.testing.expect(!validNode(""));
     try std.testing.expect(!validNode("UPPER"));
@@ -470,17 +615,17 @@ test "perms roundtrip incl empty + corrupt rejection" {
     var db = Db.init(a);
     defer db.deinit();
     try db.setLevel("Steve", 4);
-    try db.grant("Bob", "zigcraft.command.save-all");
-    try db.deny("Bob", "zigcraft.command.stop");
-    try db.grant("Al", "zigcraft.*");
+    try db.grant("Bob", "asteorite.command.save-all");
+    try db.deny("Bob", "asteorite.command.stop");
+    try db.grant("Al", "asteorite.*");
     const enc = try encode(a, &db);
     defer a.free(enc);
     var back = try decode(a, enc);
     defer back.deinit();
     try std.testing.expectEqual(@as(u8, 4), back.levelFor("Steve"));
-    try std.testing.expect(back.allows("Bob", "zigcraft.command.save-all", 4));
-    try std.testing.expect(!back.allows("Bob", "zigcraft.command.stop", 4));
-    try std.testing.expect(back.allows("Al", "zigcraft.command.stop", 4));
+    try std.testing.expect(back.allows("Bob", "asteorite.command.save-all", 4));
+    try std.testing.expect(!back.allows("Bob", "asteorite.command.stop", 4));
+    try std.testing.expect(back.allows("Al", "asteorite.command.stop", 4));
     try std.testing.expect(!back.allows("Al", "other.tree", 4));
     // deterministic bytes (sorted rows + nodes)
     const enc2 = try encode(a, &back);

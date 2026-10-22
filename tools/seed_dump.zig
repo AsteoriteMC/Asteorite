@@ -1,6 +1,6 @@
 //! seedump: print (kind, seed, worldGenSeed, baseSeed) for each chain layer.
 const std = @import("std");
-const zigcraft = @import("zigcraft");
+const asteorite = @import("asteorite");
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -12,7 +12,7 @@ pub fn main(init: std.process.Init) !void {
     const seed: i64 = if (args.len >= 2) try std.fmt.parseInt(i64, args[1], 0) else 1;
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
-    var built = try zigcraft.v5genlayer.Chain.buildDefault(gpa.allocator(), seed, false);
+    var built = try asteorite.v5genlayer.Chain.buildDefault(gpa.allocator(), seed, false);
     defer built.chain.deinit();
     for (built.chain.layers, 0..) |lay, i| {
         const st = built.chain.states[i];
@@ -22,5 +22,5 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test {
-    _ = @import("zigcraft");
+    _ = @import("asteorite");
 }

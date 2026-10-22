@@ -1,5 +1,7 @@
 const std = @import("std");
-const zigcraft = @import("zigcraft");
+const asteorite = @import("asteorite");
+const cli = @import("cli.zig");
+const config = @import("config.zig");
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -9,68 +11,111 @@ pub fn main(init: std.process.Init) !void {
     const w = &out.interface;
 
     const args = try init.minimal.args.toSlice(arena);
-    if (args.len >= 2 and std.mem.eql(u8, args[1], "serve")) {
-        var port: u16 = 25565;
-        var online = false;
-        var db_path: ?[]const u8 = null;
-        var view_distance: u8 = 4;
-        var seed: ?i64 = null;
-        var gen_spawn: ?i32 = null;
+    if (args.len < 2 or std.mem.eql(u8, args[1], "help") or
+        std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h"))
+    {
+        try cli.printTopHelp(w);
+        try w.flush();
+        return;
+    }
+    if (!std.mem.eql(u8, args[1], "serve")) {
+        try w.print("asteorite: unknown subcommand '{s}'\n\n", .{args[1]});
+        try cli.printTopHelp(w);
+        try w.flush();
+        return error.UnknownSubcommand;
+    }
+    {
+        var perr = cli.ParseError{};
+        var parsed = cli.parseServe(arena, args[2..], &perr) catch {
+            var mbuf: [192]u8 = undefined;
+            try w.print("{s}\n", .{cli.message(&perr, &mbuf)});
+            try w.flush();
+            return perrToError(&perr);
+        };
+        defer parsed.ops.deinit(arena);
+        if (parsed.help) {
+            try cli.printServeHelp(w);
+            try w.flush();
+            return;
+        }
+        // Config file: explicit --config (must exist) or ./asteorite.json if
+        // present. Precedence: defaults < file < CLI flags.
+        var eff = config.Effective{};
+        var cfg_source: []const u8 = "defaults";
+        const cfg_path = parsed.config_path orelse config.default_path;
+        const cfg_required = parsed.config_path != null;
+        const cfg_dir = std.Io.Dir.cwd();
+        const cfg_text = cfg_dir.readFileAlloc(io, cfg_path, arena, .limited(1 << 20)) catch |err| blk: {
+            if (!cfg_required and err == error.FileNotFound) break :blk null;
+            try w.print("serve: cannot read config '{s}' ({s})\n", .{ cfg_path, @errorName(err) });
+            try w.flush();
+            return err;
+        };
+        var file_seed: ?i64 = null;
+        if (cfg_text) |text| {
+            var fc = config.parseJson(arena, text) catch |err| {
+                try w.print("serve: bad config '{s}' ({s})\n", .{ cfg_path, @errorName(err) });
+                try w.flush();
+                return err;
+            };
+            // NOTE: no fc.deinit() — eff borrows the file's strings (db,
+            // ops, rcon_password) for the life of the server and the process
+            // arena never frees anyway (see above).
+            file_seed = fc.value.resolveSeed() catch |err| {
+                try w.print("serve: bad \"seed\" in '{s}' ({s}: integer or string)\n", .{ cfg_path, @errorName(err) });
+                try w.flush();
+                return err;
+            };
+            eff = config.merge(eff, &fc.value, file_seed);
+            eff.source = .file;
+            cfg_source = cfg_path;
+        }
+        // CLI overrides (only keys actually given).
+        if (parsed.port) |v| eff.port = v;
+        if (parsed.online) |v| eff.online = v;
+        if (parsed.db) |v| eff.db = v;
+        if (parsed.view_distance) |v| eff.view_distance = v;
+        if (parsed.gen_spawn) |v| eff.gen_spawn = v;
+        if (parsed.gen_workers) |v| eff.gen_workers = v;
+        if (parsed.ops.items.len > 0) eff.ops = parsed.ops.items;
+        if (parsed.rcon_password) |v| eff.rcon_password = v;
+        if (parsed.rcon_port) |v| eff.rcon_port = v;
+        if (parsed.motd) |v| eff.motd = v;
+        if (parsed.max_players) |v| eff.max_players = v;
+        if (parsed.brand) |v| eff.brand = v;
+        config.validate(&eff) catch |err| {
+            try w.print("serve: {s}\n", .{config.validateMessage(err)});
+            try w.flush();
+            return err;
+        };
+        const port: u16 = eff.port;
+        const online = eff.online;
+        const db_path: ?[]const u8 = eff.db;
+        const view_distance: u8 = eff.view_distance;
+        const seed: ?i64 = eff.seed;
+        const gen_spawn: ?i32 = eff.gen_spawn;
         var ops: std.ArrayList([]const u8) = .empty;
         defer ops.deinit(arena);
-        var rcon_password: ?[]const u8 = null;
-        var rcon_port: u16 = 25575;
-        var gen_workers: ?usize = null;
-        var i: usize = 2;
-        while (i < args.len) : (i += 1) {
-            const a = args[i];
-            if (std.mem.eql(u8, a, "--online")) {
-                online = true;
-            } else if (std.mem.eql(u8, a, "--db")) {
-                i += 1;
-                if (i >= args.len) return error.MissingDbPath;
-                db_path = args[i];
-            } else if (std.mem.eql(u8, a, "--view")) {
-                i += 1;
-                if (i >= args.len) return error.MissingViewDistance;
-                view_distance = try std.fmt.parseInt(u8, args[i], 10);
-            } else if (std.mem.eql(u8, a, "--seed")) {
-                i += 1;
-                if (i >= args.len) return error.MissingSeed;
-                seed = try std.fmt.parseInt(i64, args[i], 0);
-            } else if (std.mem.eql(u8, a, "--gen-spawn")) {
-                i += 1;
-                if (i >= args.len) return error.MissingGenSpawn;
-                gen_spawn = try std.fmt.parseInt(i32, args[i], 10);
-            } else if (std.mem.eql(u8, a, "--gen-workers")) {
-                i += 1;
-                if (i >= args.len) return error.MissingGenWorkers;
-                gen_workers = try std.fmt.parseInt(usize, args[i], 10);
-            } else if (std.mem.eql(u8, a, "--op")) {
-                i += 1;
-                if (i >= args.len) return error.MissingOpName;
-                try ops.append(arena, args[i]);
-            } else if (std.mem.eql(u8, a, "--rcon-password")) {
-                i += 1;
-                if (i >= args.len) return error.MissingRconPassword;
-                rcon_password = args[i];
-            } else if (std.mem.eql(u8, a, "--rcon-port")) {
-                i += 1;
-                if (i >= args.len) return error.MissingRconPort;
-                rcon_port = try std.fmt.parseInt(u16, args[i], 10);
-            } else {
-                port = try std.fmt.parseInt(u16, a, 10);
-            }
-        }
-        var cfg = zigcraft.conn.Config{};
-        var keys: ?zigcraft.rsa.RsaKeyPair = null;
+        for (eff.ops) |name| try ops.append(arena, name);
+        const rcon_password: ?[]const u8 = eff.rcon_password;
+        const rcon_port: u16 = eff.rcon_port;
+        const gen_workers: ?usize = eff.gen_workers;
+        var cfg = asteorite.conn.Config{};
+        cfg.motd = eff.motd;
+        cfg.max_players = eff.max_players;
+        cfg.brand = asteorite.status.Brand.parse(eff.brand) catch |err| {
+            try w.print("serve: bad brand '{s}' (want vanilla, fabric, or forge)\n", .{eff.brand});
+            try w.flush();
+            return err;
+        };
+        var keys: ?asteorite.rsa.RsaKeyPair = null;
         if (online) {
             const cwd = std.Io.Dir.cwd();
-            keys = try zigcraft.rsa.ensureKeys(io, arena, cwd, "server_rsa.key", "server_rsa.der");
+            keys = try asteorite.rsa.ensureKeys(io, arena, cwd, "server_rsa.key", "server_rsa.der");
             cfg.online_mode = true;
             cfg.rsa = &keys.?;
         }
-        var srv = try zigcraft.server.Server.bindAny(io, port, cfg);
+        var srv = try asteorite.server.Server.bindAny(io, port, cfg);
         defer srv.deinit();
         srv.view_distance = view_distance;
         if (seed) |s| srv.drop_seed = s;
@@ -83,20 +128,21 @@ pub fn main(init: std.process.Init) !void {
         const salloc = store_gpa.allocator();
         var db_dir: ?std.Io.Dir = null;
         defer if (db_dir) |*d| d.close(io);
-        var pool: ?*zigcraft.shard.ShardPool = null;
+        var pool: ?*asteorite.shard.ShardPool = null;
         if (db_path) |p| {
             db_dir = try std.Io.Dir.cwd().createDirPathOpen(io, p, .{});
-            pool = try zigcraft.shard.ShardPool.open(salloc, io, db_dir.?, 4, .{});
+            pool = try asteorite.shard.ShardPool.open(salloc, io, db_dir.?, 4, .{});
             srv.world = pool;
         }
         defer if (pool) |pl| pl.deinit();
-        // Worldgen (needs the pool): --seed enables on-demand fill, and
-        // --gen-spawn N pre-generates a spiral disk of radius N on boot.
-        var gen: ?zigcraft.v5gen.Gen = null;
+        // Worldgen (needs the pool): a "seed" in the config file enables
+        // on-demand fill, and --gen-spawn N pre-generates a spiral disk of
+        // radius N on boot.
+        var gen: ?asteorite.v5gen.Gen = null;
         defer if (gen) |*g| g.deinit();
         if (seed) |s| {
             if (db_path == null) return error.GenNeedsDb;
-            gen = try zigcraft.v5gen.Gen.init(salloc, s, false, false);
+            gen = try asteorite.v5gen.Gen.init(salloc, s, false, false);
             srv.gen = &gen.?;
             srv.gen_src = .{ .pool = pool.?, .gen = &gen.?, .lock = &srv.world_lock };
             // Background gen workers: misses enqueue + serve holes instead
@@ -106,11 +152,13 @@ pub fn main(init: std.process.Init) !void {
             // sheds load past its queue cap instead of growing memory.
             const cpus = std.Thread.getCpuCount() catch 4;
             const n_workers = @min(@max(gen_workers orelse cpus, 1), 8);
-            const gp = try zigcraft.v5genpool.GenPool.create(salloc, io, pool.?, &srv.world_lock, s, false, false, n_workers);
+            const gp = try asteorite.v5genpool.GenPool.create(salloc, io, pool.?, &srv.world_lock, s, false, false, n_workers);
             srv.gen_pool = gp;
             srv.gen_src.?.gen_pool = gp;
             try w.print("gen: {d} background workers\n", .{n_workers});
         } else if (gen_spawn != null) {
+            try w.print("serve: --gen-spawn needs \"seed\" in the config file\n", .{});
+            try w.flush();
             return error.GenSpawnNeedsSeed;
         }
         defer if (srv.gen_pool) |gp| {
@@ -119,7 +167,7 @@ pub fn main(init: std.process.Init) !void {
         };
         if (gen_spawn) |r| {
             const t0 = std.Io.Timestamp.now(io, .awake);
-            const n = try zigcraft.v5serve.preGen(pool.?, &gen.?, &srv.world_lock, salloc, r, srv.gen_pool);
+            const n = try asteorite.v5serve.preGen(pool.?, &gen.?, &srv.world_lock, salloc, r, srv.gen_pool);
             const ms = @divFloor(t0.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds, 1000000);
             try w.print("gen: pre-generated {d} chunks around spawn in {d} ms\n", .{ n, ms });
         }
@@ -129,7 +177,7 @@ pub fn main(init: std.process.Init) !void {
         srv.gpa = salloc;
         srv.loadPerms();
         for (ops.items) |name| {
-            if (!zigcraft.conn.Conn.validPlayerName(name)) {
+            if (!asteorite.conn.Conn.validPlayerName(name)) {
                 try w.print("ignoring --op {s}: bad player name\n", .{name});
                 continue;
             }
@@ -141,12 +189,12 @@ pub fn main(init: std.process.Init) !void {
             srv.perm_lock.unlock();
             if (n == 0) try w.print("perms: no ops stored (console only). use --op <name> to bootstrap.\n", .{});
         }
-        try w.print("zigcraft listening on 0.0.0.0:{d} (proto 5, online={}, db={s}, view={d}, seed={?d})\n", .{ port, online, db_path orelse "none", view_distance, seed });
+        try w.print("Asteorite listening on 0.0.0.0:{d} (proto 5, online={}, db={s}, view={d}, seed={?d}, config={s})\n", .{ port, online, db_path orelse "none", view_distance, seed, cfg_source });
         try w.flush();
         // Operator console (stdin): help | list | save-all | stop.
         // Detached; in-game commands share Server.handleCommand.
         const Console = struct {
-            fn run(s: *zigcraft.server.Server) void {
+            fn run(s: *asteorite.server.Server) void {
                 var fbuf: [256]u8 = undefined;
                 var reader = std.Io.File.stdin().reader(s.io, &fbuf);
                 const rin = &reader.interface;
@@ -166,7 +214,7 @@ pub fn main(init: std.process.Init) !void {
                         @memcpy(tmp[1..][0..n], cmd[0..n]);
                         const full = tmp[0 .. n + 1];
                         s.handleCommand(null, full);
-                        if (zigcraft.server.Server.isStopCommand(full)) {
+                        if (asteorite.server.Server.isStopCommand(full)) {
                             const ns = s.saveAllPlayers();
                             if (s.world) |pl| pl.flushAll() catch {};
                             std.log.info("stop: saved {d} player(s), flushed. bye.", .{ns});
@@ -191,8 +239,8 @@ pub fn main(init: std.process.Init) !void {
             } else {
                 if (pw.len < 8) try w.print("rcon: WARNING: password is short; use a long random secret.\n", .{});
                 const R = struct {
-                    fn run(s: *zigcraft.server.Server, p: []const u8, rport: u16) void {
-                        zigcraft.rcon.serve(s.io, s, p, rport) catch |err| {
+                    fn run(s: *asteorite.server.Server, p: []const u8, rport: u16) void {
+                        asteorite.rcon.serve(s.io, s, p, rport) catch |err| {
                             std.log.err("rcon failed to start: {}", .{err});
                         };
                     }
@@ -204,8 +252,23 @@ pub fn main(init: std.process.Init) !void {
         // serveForever never returns; per-conn + store allocs hang off the
         // GPA above (the process arena never frees — see above).
         try srv.serveForever(salloc);
-        return;
     }
-    try w.print("zigcraft 1.7.10 proto v5. Try `zig build run -- serve [port] [--online] [--db <path>] [--view N] [--seed S] [--gen-spawn N] [--gen-workers N] [--op <name>...] [--rcon-password <pw> [--rcon-port N]]`, `zig build test`, `zig build dump -- <region.mca>`, `zig build import -- <region.mca> <db> [dim] [shards]`\n", .{});
-    try w.flush();
+}
+
+/// Map a CLI parse failure to a process error (message already printed).
+/// `.none` with an error means allocation failure (the only path that
+/// returns without recording a flag error).
+fn perrToError(perr: *const cli.ParseError) anyerror {
+    return switch (perr.kind) {
+        .none => error.OutOfMemory,
+        .unknown_flag => error.UnknownFlag,
+        .missing_value => error.MissingValue,
+        .bad_value => error.BadValue,
+        .unexpected_positional => error.UnexpectedPositional,
+    };
+}
+
+test {
+    _ = @import("cli.zig");
+    _ = @import("config.zig");
 }

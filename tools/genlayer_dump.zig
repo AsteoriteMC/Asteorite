@@ -5,7 +5,7 @@
 //!   L{idx} {kind}: ..
 
 const std = @import("std");
-const zigcraft = @import("zigcraft");
+const asteorite = @import("asteorite");
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -36,7 +36,7 @@ pub fn main(init: std.process.Init) !void {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    var built = try zigcraft.v5genlayer.Chain.buildDefault(alloc, seed, false);
+    var built = try asteorite.v5genlayer.Chain.buildDefault(alloc, seed, false);
     defer built.chain.deinit();
 
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -68,5 +68,5 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test {
-    _ = @import("zigcraft");
+    _ = @import("asteorite");
 }

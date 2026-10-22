@@ -79,12 +79,17 @@ pub const ColPos = struct { x: i32, z: i32 };
 
 /// Send explicit columns (spiral order preferred), skipping + recording via
 /// the conn sent-set. Each column goes out at most once per unload cycle.
+/// `budget` caps pool reads (null = unlimited): the 1Hz hole-heal rescan
+/// passes a small budget so a serve thread never stalls in store reads
+/// while generation is active (spiral order => nearest holes heal first).
+/// Login/movement bursts pass null (whole disk, one shot).
 pub fn sendColumns(
     conn: *conn_mod.Conn,
     src: Source,
     dim: u8,
     positions: []const ColPos,
     sky: bool,
+    budget: ?usize,
 ) !void {
     // Reusable conn-owned scratch (never-reset arena: per-call allocs here
     // leak until process exit — see Conn.bulk_raw).
@@ -112,12 +117,17 @@ pub fn sendColumns(
     var cols: [max_bulk_cols]chunks.BulkColumn = undefined;
     var ncols: usize = 0;
     var raw_len: usize = 0;
+    var gets: usize = 0;
     for (positions) |pos| {
         var col_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer col_arena.deinit();
         const t = col_arena.allocator();
         const k = conn_mod.Conn.sentKey(pos.x, pos.z);
         if (conn.sent.contains(k)) continue; // already out (no groundUp re-send)
+        if (budget) |b| {
+            if (gets >= b) break; // hole-heal tick: leave the rest for next time
+            gets += 1;
+        }
         const zc1 = src.get(dim, pos.x, pos.z, t) orelse continue; // hole (terrain gen P-next)
         const ch = chunk_mod.Chunk.decode(t, zc1) catch continue;
         const layout = chunks.encodeColumn(ch, sky, raw_all[raw_len..]);
@@ -151,6 +161,7 @@ pub fn resyncDisk(
     cz: i32,
     radius: u8,
     sky: bool,
+    budget: ?usize,
 ) !void {
     if (source) |src| {
         var list: [1089]ColPos = undefined;
@@ -160,7 +171,7 @@ pub fn resyncDisk(
             list[n] = .{ .x = cx + off.dx, .z = cz + off.dz };
             n += 1;
         }
-        try sendColumns(conn, src, dim, list[0..n], sky);
+        try sendColumns(conn, src, dim, list[0..n], sky, budget);
     }
 }
 
@@ -175,7 +186,7 @@ pub fn completeLogin(
     radius: u8,
     sky: bool,
 ) !void {
-    try resyncDisk(conn, source, dim, cx, cz, radius, sky);
+    try resyncDisk(conn, source, dim, cx, cz, radius, sky, null);
     try conn.queuePlayerPosLook();
     conn.sent_center = .{ .cx = cx, .cz = cz };
     conn.baseline_sent = true;
@@ -247,7 +258,7 @@ pub fn syncPlayerChunks(
         try conn.queueFramed(try chunks.frameUnloadChunk(c.x, c.z, &ubuf));
     }
     if (source) |src| {
-        try sendColumns(conn, src, dim, entered[0..n_entered], sky);
+        try sendColumns(conn, src, dim, entered[0..n_entered], sky, null);
     }
     conn.sent_center = .{ .cx = cc.cx, .cz = cc.cz };
     conn.chunks_dirty = false;
@@ -348,6 +359,14 @@ pub fn applyBlock(pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, x: i
     const li: usize = chunk_mod.Section.index(@intCast(@as(u4, @truncate(@as(u32, @bitCast(x & 15))))), @truncate(y & 15), @truncate(@as(u32, @bitCast(z & 15))));
     s.blocks[li] = id;
     chunk_mod.Section.setNibble(&s.meta, li, meta);
+    // Keep lighting + heightmap consistent with the edit (vanilla
+    // re-lights on block change; stale nibbles would otherwise persist
+    // until the next full chunk resend). Column sky is vertical-exact;
+    // block light re-floods the chunk from emissive cells.
+    ch.relightColumn(@intCast(@as(u4, @truncate(@as(u32, @bitCast(x & 15))))), @intCast(@as(u4, @truncate(@as(u32, @bitCast(z & 15))))));
+    const q = try allocator.alloc(u32, 65536);
+    defer allocator.free(q);
+    ch.relightBlock(q);
     const enc = try ch.encode(allocator);
     defer allocator.free(enc);
     try pool.put(key, enc);

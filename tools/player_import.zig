@@ -9,7 +9,7 @@
 //! layout; see the doc comment there for the field mapping).
 
 const std = @import("std");
-const zigcraft = @import("zigcraft");
+const asteorite = @import("asteorite");
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -46,23 +46,23 @@ pub fn main(init: std.process.Init) !void {
         try out.flush();
         return;
     };
-    const plain = zigcraft.nbt.gunzipAlloc(arena_alloc, gz) catch {
+    const plain = asteorite.nbt.gunzipAlloc(arena_alloc, gz) catch {
         try out.print("cannot gunzip {s} (not a vanilla player.dat?)\n", .{dat_path});
         try out.flush();
         return;
     };
-    var imported = zigcraft.players.fromVanillaNbt(arena_alloc, plain, username) catch {
+    var imported = asteorite.players.fromVanillaNbt(arena_alloc, plain, username) catch {
         try out.print("cannot parse {s} as 1.7.10 player NBT\n", .{dat_path});
         try out.flush();
         return;
     };
-    defer zigcraft.players.freeData(arena_alloc, &imported.data);
+    defer asteorite.players.freeData(arena_alloc, &imported.data);
 
     var db_dir = try std.Io.Dir.cwd().createDirPathOpen(io, db_path, .{});
     defer db_dir.close(io);
-    var pool = try zigcraft.shard.ShardPool.open(arena_alloc, io, db_dir, shards, .{});
+    var pool = try asteorite.shard.ShardPool.open(arena_alloc, io, db_dir, shards, .{});
     defer pool.deinit();
-    try zigcraft.players.save(pool, username, &imported.data);
+    try asteorite.players.save(pool, username, &imported.data);
     try pool.flushAll();
 
     var nbt_total: usize = 0;

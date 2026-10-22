@@ -9,9 +9,9 @@
 //! must report clean.
 
 const std = @import("std");
-const zigcraft = @import("zigcraft");
+const asteorite = @import("asteorite");
 
-const store_mod = zigcraft.store;
+const store_mod = asteorite.store;
 
 fn startsWithShard(name: []const u8) bool {
     return std.mem.startsWith(u8, name, "shard-");
@@ -133,5 +133,5 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test {
-    _ = @import("zigcraft");
+    _ = @import("asteorite");
 }

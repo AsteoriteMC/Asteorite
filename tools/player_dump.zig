@@ -7,8 +7,8 @@
 //! NBT byte counts (never dumps raw NBT — use an NBT tool for that).
 
 const std = @import("std");
-const zigcraft = @import("zigcraft");
-const wire = zigcraft.v5wire;
+const asteorite = @import("asteorite");
+const wire = asteorite.v5wire;
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -30,15 +30,15 @@ pub fn main(init: std.process.Init) !void {
     const cwd = std.Io.Dir.cwd();
     var db_dir = try cwd.createDirPathOpen(io, db_path, .{});
     defer db_dir.close(io);
-    var pool = try zigcraft.shard.ShardPool.open(arena_alloc, io, db_dir, 4, .{});
+    var pool = try asteorite.shard.ShardPool.open(arena_alloc, io, db_dir, 4, .{});
     defer pool.deinit();
 
-    var data = try zigcraft.players.load(pool, arena_alloc, username) orelse {
+    var data = try asteorite.players.load(pool, arena_alloc, username) orelse {
         try out.print("no save found for {s} in {s}\n", .{ username, db_path });
         try out.flush();
         return;
     };
-    defer zigcraft.players.freeData(arena_alloc, &data);
+    defer asteorite.players.freeData(arena_alloc, &data);
     try out.print(
         "{s}: pos=({d:.1},{d:.1},{d:.1}) yaw={d:.1} pitch={d:.1} spawn=({d},{d},{d}) health={d:.1} food={d} sat={d:.1} gamemode={d} selected={d}\n",
         .{

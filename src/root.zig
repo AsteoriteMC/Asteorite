@@ -1,4 +1,4 @@
-//! zigcraft root library — re-exports modules.
+//! asteorite root library — re-exports modules.
 pub const codec = @import("net/codec.zig");
 pub const cfb8 = @import("net/cfb8.zig");
 pub const rsa = @import("net/rsa.zig");
@@ -66,6 +66,9 @@ pub const entity = @import("sim/entity.zig");
 pub const players = @import("sim/players.zig");
 /// Permission model: op levels + per-player node grants/denies (LSM-backed).
 pub const permissions = @import("sim/permissions.zig");
+/// Server list ping payload: struct-stringified status JSON with
+/// vanilla/fabric/forge handshake brands (FML modinfo for forge).
+pub const status = @import("net/status.zig");
 /// RCON remote console (vanilla-style Source framing, password auth).
 pub const rcon = @import("net/rcon.zig");
 /// Test-and-set spinlock for short critical sections.
@@ -80,8 +83,12 @@ test {
     _ = @import("net/conn.zig");
     _ = @import("net/server.zig");
     _ = @import("net/rcon.zig");
+    _ = @import("net/status.zig");
     _ = @import("proto/v5/ids.zig");
     _ = @import("proto/v5/packets.zig");
+    _ = @import("proto/v5/cmd_data.zig");
+    _ = @import("sim/bans.zig");
+    _ = @import("sim/scoreboard.zig");
     _ = @import("proto/v5/chunks.zig");
     _ = @import("world/nbt.zig");
     _ = @import("world/anvil.zig");
@@ -113,4 +120,17 @@ test {
     _ = @import("sim/players.zig");
     _ = @import("sim/permissions.zig");
     _ = @import("sim/spin.zig");
+    _ = @import("cmd/mod.zig");
+    _ = @import("cmd/help.zig");
+    _ = @import("cmd/list.zig");
+    _ = @import("cmd/save_all.zig");
+    _ = @import("cmd/op.zig");
+    _ = @import("cmd/deop.zig");
+    _ = @import("cmd/perm.zig");
+    _ = @import("cmd/stop.zig");
+    _ = @import("cmd/spec.zig");
+    _ = @import("cmd/gamemode.zig");
+    _ = @import("cmd/give.zig");
+    _ = @import("cmd/tp.zig");
+    _ = @import("cmd/time.zig");
 }
