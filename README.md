@@ -1,6 +1,6 @@
-# AsteoriteMC
+# Asteorite
 
-<img src="assets/brand/logo.png" width="320" align="right" alt="AsteoriteMC logo">
+<img src="assets/brand/logo.png" width="320" align="right" alt="Asteorite logo">
 
 _Asteorite_ server software.
 
