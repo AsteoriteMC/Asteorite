@@ -17,16 +17,16 @@ zig build                  # debug binaries -> zig-out/bin/
 zig build -Doptimize=ReleaseFast   # release binaries -> zig-out/bin/
 ```
 
-The `asteorite` binary is ~13 MB in release mode. Both flavors land in
+The `asteorite` binary is ~15 MB in release mode. Both flavors land in
 `zig-out/bin/` (a release build overwrites the debug binaries there and
 vice versa).
 
 ## Starting a server
 
 ```sh
-./zig-out/bin/asteorite serve --db world --view 8
+./zig-out/bin/asteorite serve
 # or without installing first:
-zig build run -- serve --db world --view 8
+zig build run -- serve
 # (put "seed": 42 in asteorite.json for worldgen — see below)
 ```
 
@@ -40,11 +40,12 @@ First-run notes:
   in-game/console commands from there. Console commands: `help`, `list`,
   `save-all`, `stop`.
 - The world **seed lives in the config file** (`"seed"` in `asteorite.json`;
-  there is no `--seed` flag). It requires `--db` (the seed drives
-  on-demand chunk generation into the database). Without `--db` the server
-  serves stored chunks only.
+  there is no `--seed` flag). It drives on-demand chunk generation into
+  the world folder (default `./world`, overridable with `--db`; set
+  `"db": null` to disable persistence). If the seed changes, delete the
+  world folder — stored chunks are never regenerated.
 - `--gen-spawn <r>` pre-generates a spawn disk of radius `r` on boot
-  (needs `"seed"` in the config file + `--db`), so players don't wait on
+  (needs `"seed"` in the config file), so players don't wait on
   first join.
 - `--online` enables Mojang auth; RSA keys (`server_rsa.key/.der`) are
   created automatically in the working directory.
@@ -61,14 +62,14 @@ Precedence is **built-in defaults < config file < CLI flags**.
 | `--online` / `--no-online` | off | Mojang auth; `--no-` wins over a config file |
 | `--db <path>` | `world` | LSM world database directory (`"db": null` disables persistence) |
 | `--view <1..16>` | 4 | view distance; 1.7.10 clients cap at 16 |
-| `--gen-spawn <r>` | none | pre-generate spawn disk, needs `"seed"` in config + `--db` |
+| `--gen-spawn <r>` | none | pre-generate spawn disk, needs `"seed"` in config |
 | `--gen-workers <n>` | cpu count (max 8) | background chunk-gen workers |
 | `--op <name>` | — | repeatable; grants op, persisted |
 | `--rcon-password <pw>` | none | enables RCON |
 | `--rcon-port <port>` | 25575 | RCON port |
 | `--motd <text>` | `Asteorite` | server list message |
 | `--max-players <n>` | 20 | server list player cap |
-| `--brand <name>` | `vanilla` | `vanilla`, `fabric`, or `forge` (see below) |
+| `--brand <name>` | `vanilla` | `vanilla`, `fabric`, or `forge` (`fml` accepted; see below) |
 | `-c, --config <path>` | `./asteorite.json` if present | JSON config file |
 | `-h, --help` | — | help |
 
@@ -104,7 +105,10 @@ The world seed is set with `"seed"` in `asteorite.json` (there is no
 seed works,
 including negatives and the whole 19-digit range (`-2^63..2^63-1`).
 Non-numeric strings hash with Java `String.hashCode`, exactly like typing
-text into the vanilla seed field (`"Notch"` → `75456088`).
+text into the vanilla seed field (`"Notch"` → `75456088`). Quoted numeric
+strings parse as integers (decimal, `0x` hex, `0o` octal); over-long ones
+fall back to hashing, like vanilla's `Long.parseLong` catch path. Bare
+JSON floats and integers outside int64 are rejected at startup.
 
 ### Brands
 
