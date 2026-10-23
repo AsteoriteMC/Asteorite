@@ -1,8 +1,8 @@
 //! anvil_import: migrate a 1.7.10 .mca region file INTO the LSM store.
 //! Usage: zig build import -- <region.mca> <db-dir> [dim=0] [shards=4]
 //!
-//! Each present chunk is converted Anvil NBT -> ZC1 payload (see chunk.zig)
-//! and stored under key [dim:u8|x:i32 BE|z:i32 BE]. Region filename r.X.Z.mca
+//! Each present chunk is converted Anvil NBT -> ZC1 payload (see
+//! world/import/anvil.zig) and stored under key [dim:u8|x:i32 BE|z:i32 BE]. Region filename r.X.Z.mca
 //! gives the base chunk coords; local (lx,lz) -> global (X*32+lx, Z*32+lz).
 //! Tombstones are NOT written for missing chunks (fresh DB assumed).
 //! Layout matches the server runtime ShardPool (db/shard-NN/...).
@@ -80,7 +80,7 @@ pub fn main(init: std.process.Init) !void {
             const plain = asteorite.anvil.decompressChunk(arena_alloc, payload) catch continue;
             const gx: i32 = region.rx * 32 + @as(i32, @intCast(lx));
             const gz: i32 = region.rz * 32 + @as(i32, @intCast(lz));
-            const ch = asteorite.chunk.fromAnvilNbt(arena_alloc, plain, dim) catch continue;
+            const ch = asteorite.anvil_import.fromAnvilNbt(arena_alloc, plain, dim) catch continue;
             // trust filename region for coords (authoritative); override NBT pos
             ch.x = gx;
             ch.z = gz;

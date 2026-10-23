@@ -16,6 +16,124 @@ const wire = @import("../../proto/v5/wire_ids.zig");
 
 pub const SEA_LEVEL: i32 = 63;
 
+/// 48-wide light grid edge (3x3 chunks, same layout as the decorate View:
+/// idx = (x*48+z)*256+y). The extracted center 16x16 sits >=16 cells from
+/// every grid border; both channels decay >=1 per block from a max of 15,
+/// so no path outside the grid can reach the center: border-exact light.
+pub const LW48: usize = 48;
+pub const LCELLS48: usize = LW48 * LW48 * 256;
+
+const LDIRS48: [6][3]i32 = .{
+    .{ 1, 0, 0 }, .{ -1, 0, 0 }, .{ 0, 1, 0 }, .{ 0, -1, 0 }, .{ 0, 0, 1 }, .{ 0, 0, -1 },
+};
+
+inline fn lpack48(x: usize, y: usize, z: usize) u32 {
+    return @intCast((y * LW48 + z) * LW48 + x);
+}
+
+inline fn lunpack48(c: u32) struct { x: usize, y: usize, z: usize } {
+    const x: usize = c % LW48;
+    const t: usize = c / LW48;
+    return .{ .x = x, .y = t / LW48, .z = t % LW48 };
+}
+
+/// Exact vertical skylight over the 48-wide view (same rule as
+/// Chunk.relightColumn: set-then-decay, still water transparent).
+fn columnSky48(sky: []u8, blocks48: []const ids.Id) void {
+    std.debug.assert(sky.len == LCELLS48 and blocks48.len == LCELLS48);
+    for (0..LW48) |lz| {
+        for (0..LW48) |lx| {
+            var s: u4 = 15;
+            var y: i32 = 255;
+            while (y >= 0) : (y -= 1) {
+                const uy: usize = @intCast(y);
+                sky[(lx * LW48 + lz) * 256 + uy] = s;
+                const b = blocks48[(lx * LW48 + lz) * 256 + uy];
+                const op = chunk_mod.lightOpacity(b);
+                if (b != .water and op != 0) {
+                    const drop: u4 = if (op > 15) 15 else @truncate(op);
+                    s = if (drop >= s) 0 else s - drop;
+                }
+            }
+        }
+    }
+}
+
+/// Raise-BFS over the 48-wide grid (mirror of Chunk.bfsRaise's exact
+/// per-edge contract: sky never spreads FROM opaque cells, min cost 1,
+/// strict increases only). Dense: every scratch-grid cell exists.
+fn bfsRaise48(arr: []u8, blocks48: []const ids.Id, channel: chunk_mod.Chunk.LightChannel, queue: []u32, head: *usize, tail: *usize) void {
+    while (head.* < tail.*) {
+        const c = lunpack48(queue[head.*]);
+        head.* += 1;
+        const ci = (c.x * LW48 + c.z) * 256 + c.y;
+        const cur: u4 = @truncate(arr[ci]);
+        if (cur == 0) continue;
+        if (channel == .sky and chunk_mod.lightOpacity(blocks48[ci]) == 255) continue;
+        for (LDIRS48) |d| {
+            const nx = @as(i32, @intCast(c.x)) + d[0];
+            const ny = @as(i32, @intCast(c.y)) + d[1];
+            const nz = @as(i32, @intCast(c.z)) + d[2];
+            if (nx < 0 or nx >= LW48 or ny < 0 or ny > 255 or nz < 0 or nz >= LW48) continue;
+            const ux: usize = @intCast(nx);
+            const uy: usize = @intCast(ny);
+            const uz: usize = @intCast(nz);
+            const ni = (ux * LW48 + uz) * 256 + uy;
+            const op = chunk_mod.lightOpacity(blocks48[ni]);
+            const cost: u4 = if (channel == .sky)
+                (chunk_mod.Chunk.skyCost(op) orelse continue)
+            else
+                (chunk_mod.Chunk.blockCost(op) orelse continue);
+            if (cur <= cost) continue;
+            const nl: u4 = cur - cost;
+            if (nl <= arr[ni]) continue;
+            arr[ni] = nl;
+            if (tail.* < queue.len) {
+                queue[tail.*] = lpack48(ux, uy, uz);
+                tail.* += 1;
+            }
+        }
+    }
+}
+
+/// Full 48-wide gen flood: exact column skylight, sideways sky spread,
+/// emissive block flood. Callers extract the center 16x16 (border-exact
+/// by the 16-cell margin argument above).
+pub fn lightGrid48(blocks48: []const ids.Id, sky48: []u8, light48: []u8, queue: []u32) void {
+    std.debug.assert(blocks48.len == LCELLS48 and sky48.len == LCELLS48 and light48.len == LCELLS48);
+    std.debug.assert(queue.len >= LCELLS48);
+    columnSky48(sky48, blocks48);
+    @memset(light48, 0);
+    // Sky spread: every bright cell seeds (mirror Chunk.spreadSky's >1 gate;
+    // value-1 cells spread nothing since min cost is 1).
+    var tail: usize = 0;
+    var head: usize = 0;
+    for (sky48, 0..) |v, i| {
+        if (v > 1) {
+            if (tail >= queue.len) break;
+            const y: usize = i % 256;
+            const t: usize = i / 256;
+            queue[tail] = lpack48(t / LW48, y, t % LW48);
+            tail += 1;
+        }
+    }
+    bfsRaise48(sky48, blocks48, .sky, queue, &head, &tail);
+    // Block flood from emissives (mirror Chunk.relightBlock, dense).
+    head = 0;
+    tail = 0;
+    for (blocks48, 0..) |b, i| {
+        const e = chunk_mod.emitLight(b);
+        if (e == 0) continue;
+        light48[i] = e;
+        if (tail >= queue.len) break;
+        const y: usize = i % 256;
+        const t: usize = i / 256;
+        queue[tail] = lpack48(t / LW48, y, t % LW48);
+        tail += 1;
+    }
+    bfsRaise48(light48, blocks48, .block, queue, &head, &tail);
+}
+
 /// Vanilla light opacity (`aji.k()`, jar-verified via Opac harness over all
 /// 175 block ids). Single table lives in world/chunk.zig (shared with the
 /// relight path); this delegates so the two can never drift.
@@ -73,7 +191,10 @@ pub const Gen = struct {
         defer alloc.destroy(flat.blocks);
         defer alloc.destroy(flat.meta);
         // 3x3 decorate: neighbors + center terrain into a 48x48 view.
-        try self.decorateInto(alloc, scratch, cx, cz, flat.blocks, flat.meta);
+        // Also computes border-exact center light (48-wide flood below).
+        var sky_c: [16 * 256 * 16]u8 = undefined;
+        var light_c: [16 * 256 * 16]u8 = undefined;
+        try self.decorateInto(alloc, scratch, cx, cz, flat.blocks, flat.meta, &sky_c, &light_c);
         const blocks = flat.blocks;
         const meta_fixed: *[shaper_mod.BLOCKS_LEN]u8 = flat.meta;
 
@@ -105,21 +226,20 @@ pub const Gen = struct {
                 }
             }
             ch.sections[s] = sec;
-        }
-        // Column skylight (shared vertical rule in chunk.relightColumn:
-        // each block subtracts its opacity — leaves 15->14, ice 15->12,
-        // opaque 255->0 — except still water which stays transparent)
-        // + block-light flood from emissive cells (lava, torches, ...).
-        // Horizontal spread is not modeled (documented approximation).
-        // The surface cell itself sees full skylight (snow/flora above
-        // don't dim it, jar-verified k=0).
-        for (0..16) |lz| {
-            for (0..16) |lx| ch.relightColumn(lx, lz);
-        }
-        {
-            const q = try scratch.alloc(u32, 65536);
-            defer scratch.free(q);
-            ch.relightBlock(q);
+            // Border-exact light from the 48-wide gen flood (same vertical
+            // rule as relightColumn — leaves 15->14, ice 15->12, opaque
+            // 255->0, still water transparent — plus the cross-border
+            // sideways spread the old per-chunk flood clamped away).
+            for (0..16) |ly| {
+                for (0..16) |lz| {
+                    for (0..16) |lx| {
+                        const si = chunk_mod.Section.index(@intCast(lx), @intCast(ly), @intCast(lz));
+                        const cpos = (lx * 16 + lz) * 256 + (s * 16 + ly);
+                        chunk_mod.Section.setNibble(&ch.sections[s].?.sky, si, @truncate(sky_c[cpos]));
+                        chunk_mod.Section.setNibble(&ch.sections[s].?.light, si, @truncate(light_c[cpos]));
+                    }
+                }
+            }
         }
         // Biomes (voronoi) + heights (topmost light-blocking block, i.e.
         // opacity!=0: flora/snow/glass/lava don't count, water/ice/leaves do).
@@ -153,7 +273,7 @@ pub const Gen = struct {
         }
         return SEA_LEVEL + 1;
     }
-    fn decorateInto(self: *Gen, alloc: std.mem.Allocator, scratch: std.mem.Allocator, cx: i32, cz: i32, blocks: *[shaper_mod.BLOCKS_LEN]ids.Id, meta: *[shaper_mod.BLOCKS_LEN]u8) !void {
+    fn decorateInto(self: *Gen, alloc: std.mem.Allocator, scratch: std.mem.Allocator, cx: i32, cz: i32, blocks: *[shaper_mod.BLOCKS_LEN]ids.Id, meta: *[shaper_mod.BLOCKS_LEN]u8, out_sky: *[16 * 256 * 16]u8, out_light: *[16 * 256 * 16]u8) !void {
         const VS: usize = 48;
         const vblocks = try scratch.alloc(ids.Id, VS * 256 * VS);
         defer scratch.free(vblocks);
@@ -218,7 +338,17 @@ pub const Gen = struct {
             .sz = VS,
         };
         try decor_mod.decorateCenter(&view, self.world_seed, cx, cz, &self.shaper.chain, self.shaper.roots[1], scratch);
-        // Extract decorated center back into blocks/meta.
+        // Border-exact light over the merged 48x48 view (cross-chunk
+        // flood; the old per-chunk flood clamped at borders and seamed).
+        // Layout matches View: idx = (x*48+z)*256+y.
+        const sky48 = try scratch.alloc(u8, LW48 * LW48 * 256);
+        defer scratch.free(sky48);
+        const light48 = try scratch.alloc(u8, LW48 * LW48 * 256);
+        defer scratch.free(light48);
+        const q48 = try scratch.alloc(u32, LW48 * LW48 * 256);
+        defer scratch.free(q48);
+        lightGrid48(vblocks, sky48, light48, q48);
+        // Extract decorated center back into blocks/meta (+ center light).
         var lx: usize = 0;
         while (lx < 16) : (lx += 1) {
             var lz: usize = 0;
@@ -229,6 +359,10 @@ pub const Gen = struct {
                     const src = ((lx + 16) * VS + (lz + 16)) * 256 + y;
                     blocks[dst] = vblocks[src];
                     meta[dst] = vmetas[src];
+                    const cpos = (lx * 16 + lz) * 256 + y;
+                    const gpos = ((lx + 16) * LW48 + (lz + 16)) * 256 + y;
+                    out_sky[cpos] = sky48[gpos];
+                    out_light[cpos] = light48[gpos];
                 }
             }
         }
@@ -549,6 +683,89 @@ test "full pipeline matches JVM (seed 7 chunk 8,8)" {
         try std.testing.expectEqual(samp_want[k], flat.blocks[idx]);
         try std.testing.expectEqual(sampm_want[k], flat.meta[idx]);
     }
+}
+
+test "lightGrid48 flows skylight across chunk borders" {
+    // Hill fills x>=16 (center+east), open air to the west; a west-opening
+    // tunnel y=64..66 spans the x=16 border. The old per-chunk flood
+    // clamped at the border and left the mouth at 0; the 48-wide flood
+    // must carry 15 in from the open side with exact per-block decay.
+    const alloc = std.testing.allocator;
+    const grid = try alloc.alloc(ids.Id, LCELLS48);
+    defer alloc.free(grid);
+    @memset(grid, ids.air);
+    for (16..48) |x| {
+        for (0..48) |z| {
+            for (0..101) |y| grid[(x * LW48 + z) * 256 + y] = ids.stone;
+        }
+    }
+    for (10..31) |x| {
+        for (24..27) |z| {
+            for (64..67) |y| grid[(x * LW48 + z) * 256 + y] = ids.air;
+        }
+    }
+    const sky = try alloc.alloc(u8, LCELLS48);
+    defer alloc.free(sky);
+    const light = try alloc.alloc(u8, LCELLS48);
+    defer alloc.free(light);
+    const q = try alloc.alloc(u32, LCELLS48);
+    defer alloc.free(q);
+    lightGrid48(grid, sky, light, q);
+    // Mouth cell just inside the hill: 15 - 1 (air cost).
+    try std.testing.expectEqual(@as(u8, 14), sky[(16 * LW48 + 24) * 256 + 64]);
+    // 14 steps in: 15 - 14 = 1.
+    try std.testing.expectEqual(@as(u8, 1), sky[(29 * LW48 + 24) * 256 + 64]);
+    // 15 steps of decay: dark.
+    try std.testing.expectEqual(@as(u8, 0), sky[(30 * LW48 + 24) * 256 + 64]);
+    // Past the tunnel end (solid stone): dark.
+    try std.testing.expectEqual(@as(u8, 0), sky[(40 * LW48 + 24) * 256 + 64]);
+    // Open air above the hill stays bright; no emitters so no block light.
+    try std.testing.expectEqual(@as(u8, 15), sky[(20 * LW48 + 24) * 256 + 200]);
+    try std.testing.expectEqual(@as(u8, 0), light[(16 * LW48 + 24) * 256 + 64]);
+    // Same terrain through the OLD per-chunk engine stays dark at the
+    // mouth (border clamp drops cross-chunk inflow): the regression this
+    // flood fixes.
+    {
+        var solo = try chunk_mod.Chunk.createEmpty(alloc, 0, 0, 0);
+        defer solo.destroy(alloc);
+        for (0..7) |s| solo.sections[s] = chunk_mod.Section{};
+        for (0..16) |lz| {
+            for (0..16) |lx| {
+                for (0..101) |y| solo.sections[y >> 4].?.blocks[chunk_mod.Section.index(@intCast(lx), @intCast(y & 15), @intCast(lz))] = ids.stone;
+                for (64..67) |y| solo.sections[y >> 4].?.blocks[chunk_mod.Section.index(@intCast(lx), @intCast(y & 15), @intCast(lz))] = ids.air;
+            }
+        }
+        for (0..16) |lz| {
+            for (0..16) |lx| solo.relightColumn(lx, lz);
+        }
+        const q2 = try alloc.alloc(u32, 65536);
+        defer alloc.free(q2);
+        solo.spreadSky(q2);
+        try std.testing.expectEqual(@as(u4, 0), chunk_mod.Section.getNibble(&solo.sections[4].?.sky, chunk_mod.Section.index(0, 0, 8)));
+    }
+}
+
+test "lightGrid48 flows block light across chunk borders" {
+    // Open air everywhere; one torch just west of the center window.
+    // The old per-chunk flood left the center dark; the 48-wide flood
+    // must carry torch light (emit 14) across with exact decay.
+    const alloc = std.testing.allocator;
+    const grid = try alloc.alloc(ids.Id, LCELLS48);
+    defer alloc.free(grid);
+    @memset(grid, ids.air);
+    grid[(15 * LW48 + 24) * 256 + 64] = ids.torch;
+    const sky = try alloc.alloc(u8, LCELLS48);
+    defer alloc.free(sky);
+    const light = try alloc.alloc(u8, LCELLS48);
+    defer alloc.free(light);
+    const q = try alloc.alloc(u32, LCELLS48);
+    defer alloc.free(q);
+    lightGrid48(grid, sky, light, q);
+    try std.testing.expectEqual(@as(u8, 13), light[(16 * LW48 + 24) * 256 + 64]);
+    try std.testing.expectEqual(@as(u8, 12), light[(17 * LW48 + 24) * 256 + 64]);
+    try std.testing.expectEqual(@as(u8, 0), light[(29 * LW48 + 24) * 256 + 64]);
+    try std.testing.expectEqual(@as(u8, 14), light[(15 * LW48 + 24) * 256 + 64]);
+    try std.testing.expectEqual(@as(u8, 15), sky[(16 * LW48 + 24) * 256 + 64]);
 }
 
 

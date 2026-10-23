@@ -14,6 +14,23 @@
 const std = @import("std");
 const config = @import("config.zig");
 
+/// Profile metadata needed by top-level CLI output. Kept as a value so the
+/// parser does not import the selected profile or `build_options` itself.
+pub const VersionInfo = struct {
+    name: []const u8,
+    protocol: i32,
+    profile_id: []const u8,
+};
+
+/// `asteorite --version` / `asteorite version`.
+pub fn printVersion(w: *std.Io.Writer, info: VersionInfo) !void {
+    try w.print("Asteorite {s} (protocol {d}, profile {s})\n", .{
+        info.name,
+        info.protocol,
+        info.profile_id,
+    });
+}
+
 /// Parsed `serve` arguments. Every option is optional: null means "not
 /// given", so config-file values and defaults fill in underneath.
 pub const ServeArgs = struct {
@@ -30,6 +47,24 @@ pub const ServeArgs = struct {
     max_players: ?u8 = null,
     brand: ?[]const u8 = null,
     config_path: ?[]const u8 = null,
+    /// Phase B: transport backend (auto|uring|kqueue|iocp|blocking).
+    transport: ?[]const u8 = null,
+    /// Storage profile (auto|hdd|ssd|nvme): SST sizing, compaction
+    /// cadence, and the io_uring SST read path (nvme).
+    storage_profile: ?[]const u8 = null,
+    /// Phase B: io_uring worker threads (0 = auto).
+    transport_workers: ?usize = null,
+    /// Phase C: region tick threads (0 = auto = cpus max 8; 1 = sequential).
+    region_threads: ?usize = null,
+    /// Phase B: per-connection outbox cap in bytes (backpressure).
+    out_cap_bytes: ?usize = null,
+    /// Phase B: zerocopy send threshold in bytes.
+    send_zc_threshold: ?usize = null,
+    /// Phase B: TCP_NODELAY on accepted sockets.
+    tcp_nodelay: ?bool = null,
+    /// Phase B: SO_SNDBUF / SO_RCVBUF (0 = OS default).
+    sndbuf: ?usize = null,
+    rcvbuf: ?usize = null,
     help: bool = false,
 };
 
@@ -206,6 +241,79 @@ pub fn parseServe(arena: std.mem.Allocator, argv: []const []const u8, err: *Pars
                 if (!config.isKnownBrand(v)) return fail(err, .bad_value, "--brand", v, error.BadValue);
                 out.brand = v;
                 continue;
+            } else if (std.mem.eql(u8, name, "--transport")) {
+                const v = inline_val orelse blk: {
+                    i += 1;
+                    if (i >= argv.len) return fail(err, .missing_value, "--transport", "", error.MissingValue);
+                    break :blk argv[i];
+                };
+                out.transport = v;
+                continue;
+            } else if (std.mem.eql(u8, name, "--storage-profile")) {
+                const v = inline_val orelse blk: {
+                    i += 1;
+                    if (i >= argv.len) return fail(err, .missing_value, "--storage-profile", "", error.MissingValue);
+                    break :blk argv[i];
+                };
+                out.storage_profile = v;
+                continue;
+            } else if (std.mem.eql(u8, name, "--transport-workers")) {
+                const v = inline_val orelse blk: {
+                    i += 1;
+                    if (i >= argv.len) return fail(err, .missing_value, "--transport-workers", "", error.MissingValue);
+                    break :blk argv[i];
+                };
+                out.transport_workers = std.fmt.parseInt(usize, v, 10) catch return fail(err, .bad_value, "--transport-workers", v, error.BadValue);
+                continue;
+            } else if (std.mem.eql(u8, name, "--region-threads")) {
+                const v = inline_val orelse blk: {
+                    i += 1;
+                    if (i >= argv.len) return fail(err, .missing_value, "--region-threads", "", error.MissingValue);
+                    break :blk argv[i];
+                };
+                out.region_threads = std.fmt.parseInt(usize, v, 10) catch return fail(err, .bad_value, "--region-threads", v, error.BadValue);
+                continue;
+            } else if (std.mem.eql(u8, name, "--out-cap")) {
+                const v = inline_val orelse blk: {
+                    i += 1;
+                    if (i >= argv.len) return fail(err, .missing_value, "--out-cap", "", error.MissingValue);
+                    break :blk argv[i];
+                };
+                out.out_cap_bytes = std.fmt.parseInt(usize, v, 10) catch return fail(err, .bad_value, "--out-cap", v, error.BadValue);
+                continue;
+            } else if (std.mem.eql(u8, name, "--send-zc-threshold")) {
+                const v = inline_val orelse blk: {
+                    i += 1;
+                    if (i >= argv.len) return fail(err, .missing_value, "--send-zc-threshold", "", error.MissingValue);
+                    break :blk argv[i];
+                };
+                out.send_zc_threshold = std.fmt.parseInt(usize, v, 10) catch return fail(err, .bad_value, "--send-zc-threshold", v, error.BadValue);
+                continue;
+            } else if (std.mem.eql(u8, name, "--tcp-nodelay")) {
+                if (inline_val) |v| {
+                    out.tcp_nodelay = parseBool(v) orelse return fail(err, .bad_value, "--tcp-nodelay", v, error.BadValue);
+                } else out.tcp_nodelay = true;
+                continue;
+            } else if (std.mem.eql(u8, name, "--no-tcp-nodelay")) {
+                if (inline_val != null) return fail(err, .bad_value, "--no-tcp-nodelay", inline_val.?, error.BadValue);
+                out.tcp_nodelay = false;
+                continue;
+            } else if (std.mem.eql(u8, name, "--sndbuf")) {
+                const v = inline_val orelse blk: {
+                    i += 1;
+                    if (i >= argv.len) return fail(err, .missing_value, "--sndbuf", "", error.MissingValue);
+                    break :blk argv[i];
+                };
+                out.sndbuf = std.fmt.parseInt(usize, v, 10) catch return fail(err, .bad_value, "--sndbuf", v, error.BadValue);
+                continue;
+            } else if (std.mem.eql(u8, name, "--rcvbuf")) {
+                const v = inline_val orelse blk: {
+                    i += 1;
+                    if (i >= argv.len) return fail(err, .missing_value, "--rcvbuf", "", error.MissingValue);
+                    break :blk argv[i];
+                };
+                out.rcvbuf = std.fmt.parseInt(usize, v, 10) catch return fail(err, .bad_value, "--rcvbuf", v, error.BadValue);
+                continue;
             }
             return fail(err, .unknown_flag, name, "", error.UnknownFlag);
         }
@@ -253,6 +361,19 @@ pub fn printServeHelp(w: *std.Io.Writer) !void {
         \\  --brand <name>         handshake brand: vanilla, fabric, or forge
         \\                         (forge adds the FML modinfo block; the mod
         \\                         list stays empty until the modding API)
+        \\  --transport <kind>     network transport: auto, uring, kqueue,
+        \\                         iocp, or blocking (default auto)
+        \\  --storage-profile <p>  storage profile: auto, hdd, ssd, nvme
+        \\                         (default auto; nvme = io_uring SST reads)
+        \\  --transport-workers <n>  io_uring worker threads (default: cpus, max 8)
+        \\  --region-threads <n>  region tick threads (default: cpus, max 8;
+        \\                         1 = sequential legacy path)
+        \\  --out-cap <bytes>      per-connection outbox cap (default 4 MiB;
+        \\                         a slow consumer past this is kicked)
+        \\  --send-zc-threshold <bytes>  zerocopy send threshold (default 8192)
+        \\  --tcp-nodelay / --no-tcp-nodelay  TCP_NODELAY on accepted sockets
+        \\  --sndbuf <bytes>       SO_SNDBUF on accepted sockets (0 = default)
+        \\  --rcvbuf <bytes>       SO_RCVBUF on accepted sockets (0 = default)
         \\  -c, --config <path>    JSON config file (default ./asteorite.json
         \\                         if present; CLI flags override file keys)
         \\  -h, --help             this help
@@ -277,19 +398,20 @@ pub fn printServeHelp(w: *std.Io.Writer) !void {
 }
 
 /// Top-level help (no/unknown subcommand).
-pub fn printTopHelp(w: *std.Io.Writer) !void {
+pub fn printTopHelp(w: *std.Io.Writer, info: VersionInfo) !void {
     try w.print(
-        \\Asteorite 1.7.10 (proto v5) server + tools.
+        \\Asteorite {s} (proto v{d}) server + tools.
         \\
         \\usage: asteorite <subcommand> [options]
         \\
         \\subcommands:
         \\  serve    run the server (see 'asteorite serve --help')
+        \\  version  print the selected profile (also --version)
         \\  help     this help
         \\
         \\tools (separate binaries): zig build dump|import|wgen|genlayer|check|player-import|player-dump
         \\
-    , .{});
+    , .{ info.name, info.protocol });
 }
 
 test "parse: long flags with space and =" {
@@ -352,7 +474,7 @@ test "parse: errors carry flag and value" {
     try std.testing.expectError(error.MissingValue, parseServe(alloc, &.{"--db"}, &err));
     try std.testing.expectEqual(ParseError.Kind.missing_value, err.kind);
     try std.testing.expectEqualStrings("--db", err.flag);
-    try std.testing.expectError(error.BadValue, parseServe(alloc, &.{"--view", "abc"}, &err));
+    try std.testing.expectError(error.BadValue, parseServe(alloc, &.{ "--view", "abc" }, &err));
     try std.testing.expectEqualStrings("--view", err.flag);
     try std.testing.expectEqualStrings("abc", err.value);
     try std.testing.expectError(error.UnexpectedPositional, parseServe(alloc, &.{ "25565", "25566" }, &err));
@@ -368,4 +490,23 @@ test "help text mentions seed semantics and config" {
     try std.testing.expect(std.mem.indexOf(u8, text, "\"seed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "asteorite.json") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "hash") != null);
+}
+
+test "version output uses the selected profile metadata" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try printVersion(&w, .{ .name = "1.8.9", .protocol = 47, .profile_id = "mc47" });
+    try std.testing.expectEqualStrings(
+        "Asteorite 1.8.9 (protocol 47, profile mc47)\n",
+        w.buffered(),
+    );
+}
+
+test "top help renders the selected profile metadata" {
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try printTopHelp(&w, .{ .name = "1.7.10", .protocol = 5, .profile_id = "mc5" });
+    const text = w.buffered();
+    try std.testing.expect(std.mem.startsWith(u8, text, "Asteorite 1.7.10 (proto v5) server + tools."));
+    try std.testing.expect(std.mem.indexOf(u8, text, "version  print the selected profile") != null);
 }

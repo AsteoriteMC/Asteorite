@@ -3,7 +3,7 @@
 //! Match rule (afa.a): id equal AND (recipe dmg wild 32767 OR exact).
 //! XP values recorded but unused (no XP system yet).
 
-const ids = @import("../ids.zig");
+const ids = @import("../../ids.zig");
 
 pub const Smelt = struct { in_id: ids.Id, in_dmg: i16, out_id: ids.Id, out_count: i8, out_dmg: i16 };
 

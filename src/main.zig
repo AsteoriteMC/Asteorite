@@ -2,6 +2,11 @@ const std = @import("std");
 const asteorite = @import("asteorite");
 const cli = @import("cli.zig");
 const config = @import("config.zig");
+const console_tui = asteorite.console_tui;
+
+pub const std_options: std.Options = .{
+    .logFn = console_tui.logFn,
+};
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -11,16 +16,30 @@ pub fn main(init: std.process.Init) !void {
     const w = &out.interface;
 
     const args = try init.minimal.args.toSlice(arena);
+    const version_info = cli.VersionInfo{
+        .name = asteorite.version.meta.name,
+        .protocol = asteorite.version.meta.protocol,
+        .profile_id = asteorite.version.meta.profile_id,
+    };
+    if (args.len >= 2 and
+        (std.mem.eql(u8, args[1], "--version") or
+            std.mem.eql(u8, args[1], "-v") or
+            std.mem.eql(u8, args[1], "version")))
+    {
+        try cli.printVersion(w, version_info);
+        try w.flush();
+        return;
+    }
     if (args.len < 2 or std.mem.eql(u8, args[1], "help") or
         std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h"))
     {
-        try cli.printTopHelp(w);
+        try cli.printTopHelp(w, version_info);
         try w.flush();
         return;
     }
     if (!std.mem.eql(u8, args[1], "serve")) {
         try w.print("asteorite: unknown subcommand '{s}'\n\n", .{args[1]});
-        try cli.printTopHelp(w);
+        try cli.printTopHelp(w, version_info);
         try w.flush();
         return error.UnknownSubcommand;
     }
@@ -83,6 +102,15 @@ pub fn main(init: std.process.Init) !void {
         if (parsed.motd) |v| eff.motd = v;
         if (parsed.max_players) |v| eff.max_players = v;
         if (parsed.brand) |v| eff.brand = v;
+        if (parsed.transport) |v| eff.transport = v;
+        if (parsed.storage_profile) |v| eff.storage_profile = v;
+        if (parsed.transport_workers) |v| eff.transport_workers = v;
+        if (parsed.region_threads) |v| eff.region_threads = v;
+        if (parsed.out_cap_bytes) |v| eff.out_cap_bytes = v;
+        if (parsed.send_zc_threshold) |v| eff.send_zc_threshold = v;
+        if (parsed.tcp_nodelay) |v| eff.tcp_nodelay = v;
+        if (parsed.sndbuf) |v| eff.sndbuf = v;
+        if (parsed.rcvbuf) |v| eff.rcvbuf = v;
         config.validate(&eff) catch |err| {
             try w.print("serve: {s}\n", .{config.validateMessage(err)});
             try w.flush();
@@ -117,7 +145,27 @@ pub fn main(init: std.process.Init) !void {
         }
         var srv = try asteorite.server.Server.bindAny(io, port, cfg);
         defer srv.deinit();
+        // OS shutdown signals (SIGINT/SIGTERM/SIGHUP/SIGQUIT, Windows
+        // console events) set an atomic flag; the ticker loop turns it
+        // into finishStop() (same save+flush+exit as /stop). Installed
+        // before pregen so a signal during boot still shuts down cleanly.
+        asteorite.shutdown.install();
         srv.view_distance = view_distance;
+        // Phase B: transport selection + tuning.
+        srv.transport_kind = asteorite.transport.Kind.parse(eff.transport) orelse .auto;
+        srv.transport_opts = .{
+            .kind = srv.transport_kind,
+            .send_zc_threshold = eff.send_zc_threshold,
+            .out_cap_bytes = eff.out_cap_bytes,
+            .tcp_nodelay = eff.tcp_nodelay,
+            .send_buf_bytes = eff.sndbuf,
+            .recv_buf_bytes = eff.rcvbuf,
+            .workers = eff.transport_workers,
+        };
+        // The per-connection outbox cap travels with the conn config.
+        srv.config.out_cap_bytes = eff.out_cap_bytes;
+        // Phase C: region tick threads (0 = auto).
+        srv.region_threads = eff.region_threads;
         if (seed) |s| srv.drop_seed = s;
         // Long-lived mutable state (LSM memtable/SSTs, gen tables, conn
         // buffers, registry) must NOT sit on the process arena: free is a
@@ -131,8 +179,19 @@ pub fn main(init: std.process.Init) !void {
         var pool: ?*asteorite.shard.ShardPool = null;
         if (db_path) |p| {
             db_dir = try std.Io.Dir.cwd().createDirPathOpen(io, p, .{});
-            pool = try asteorite.shard.ShardPool.open(salloc, io, db_dir.?, 4, .{});
+            // Storage profile: SST sizing, compaction cadence, and the
+            // io_uring SST read path (nvme). `auto` detects rotational
+            // storage on Linux, else keeps today's defaults.
+            const storage = asteorite.storage_profile.resolve(io, p, asteorite.storage_profile.Profile.parse(eff.storage_profile) orelse .auto);
+            pool = try asteorite.shard.ShardPool.open(salloc, io, db_dir.?, 4, storage.opts);
             srv.world = pool;
+            srv.storage_profile_name = storage.profile.name();
+            try w.print("storage: profile {s} (SST flush {d} KiB, compact at {d} runs, uring_io={any})\n", .{
+                storage.profile.name(),
+                storage.opts.flush_threshold_bytes / 1024,
+                storage.opts.compact_threshold_ssts,
+                storage.opts.use_uring_io,
+            });
         }
         defer if (pool) |pl| pl.deinit();
         // Worldgen (needs the pool): a "seed" in the config file enables
@@ -183,53 +242,61 @@ pub fn main(init: std.process.Init) !void {
             }
             srv.grantOp(name);
         }
+        // Operator console (stdin): full TUI with scrollback, history, colors.
+        var console_inst = console_tui.Console.init(salloc, io);
+        defer console_inst.deinit();
+        console_tui.setGlobal(&console_inst);
+
         {
             srv.perm_lock.lock();
             const n = if (srv.perms) |*db| db.countOps() else 0;
             srv.perm_lock.unlock();
-            if (n == 0) try w.print("perms: no ops stored (console only). use --op <name> to bootstrap.\n", .{});
+            if (n == 0) console_inst.logf(.info, "perms: no ops stored (console only). use --op <name> to bootstrap.", .{});
         }
-        try w.print("Asteorite listening on 0.0.0.0:{d} (proto 5, online={}, db={s}, view={d}, seed={?d}, config={s})\n", .{ port, online, db_path orelse "none", view_distance, seed, cfg_source });
-        try w.flush();
-        // Operator console (stdin): help | list | save-all | stop.
-        // Detached; in-game commands share Server.handleCommand.
-        const Console = struct {
-            fn run(s: *asteorite.server.Server) void {
-                var fbuf: [256]u8 = undefined;
-                var reader = std.Io.File.stdin().reader(s.io, &fbuf);
-                const rin = &reader.interface;
-                var line: [256]u8 = undefined;
-                var len: usize = 0;
-                while (true) {
-                    const b = rin.takeByte() catch return;
-                    if (b == '\n') {
-                        var cmd = line[0..len];
-                        len = 0;
-                        while (cmd.len > 0 and (cmd[cmd.len - 1] == '\r' or cmd[cmd.len - 1] == ' ')) cmd = cmd[0 .. cmd.len - 1];
-                        if (cmd.len == 0) continue;
-                        // Route through the same core (null sender = console).
-                        var tmp: [257]u8 = undefined;
-                        tmp[0] = '/';
-                        const n = @min(cmd.len, tmp.len - 1);
-                        @memcpy(tmp[1..][0..n], cmd[0..n]);
-                        const full = tmp[0 .. n + 1];
-                        s.handleCommand(null, full);
-                        if (asteorite.server.Server.isStopCommand(full)) {
-                            const ns = s.saveAllPlayers();
-                            if (s.world) |pl| pl.flushAll() catch {};
-                            std.log.info("stop: saved {d} player(s), flushed. bye.", .{ns});
-                            std.process.exit(0);
-                        }
-                    } else {
-                        if (len < line.len) {
-                            line[len] = b;
-                            len += 1;
-                        }
-                    }
+        
+        // Log startup message through TUI
+        var startup_buf: [256]u8 = undefined;
+        const startup_msg = std.fmt.bufPrint(&startup_buf, "Asteorite listening on 0.0.0.0:{d} (proto 5, online={}, db={s}, view={d}, seed={?d}, config={s})", .{ port, online, db_path orelse "none", view_distance, seed, cfg_source }) catch "Asteorite listening";
+        console_inst.logf(.info, "{s}", .{startup_msg});
+
+        // Set up command callback
+        console_inst.setUserData(&srv);
+        console_inst.setInputCallback(struct {
+            fn handle(console: *console_tui.Console, cmd: []const u8) void {
+                const srv_ptr: *asteorite.server.Server = @ptrCast(@alignCast(console.getUserData().?));
+                var tmp: [1025]u8 = undefined;
+                tmp[0] = '/';
+                const n = @min(cmd.len, tmp.len - 1);
+                @memcpy(tmp[1..][0..n], cmd[0..n]);
+                const full = tmp[0 .. n + 1];
+                srv_ptr.handleCommand(null, full);
+                if (asteorite.server.Server.isStopCommand(full)) {
+                        _ = srv_ptr.saveAllPlayers();
+                        srv_ptr.saveRedstone();
+                        if (srv_ptr.world) |pl| pl.flushAll() catch {};
+                        console.logf(.info, "stop: saved player(s), flushed. bye.", .{});
+                        // Drain + render synchronously: we are on the console
+                        // thread, and exit() below would drop queued lines.
+                        console.flush();
+                        // exit() skips runTty's defer: restore the terminal
+                        // or the user's shell is left without echo.
+                        console_tui.restoreTerminal();
+                        std.process.exit(0);
                 }
             }
-        };
-        const console_th = std.Thread.spawn(.{}, Console.run, .{&srv}) catch null;
+        }.handle);
+
+        // Update status line with server info
+        var status_buf: [128]u8 = undefined;
+        const status = std.fmt.bufPrint(&status_buf, "Asteorite 1.7.10 | Port: {d} | Online: {s} | DB: {s} | View: {d}", .{
+            port,
+            if (online) "yes" else "no",
+            db_path orelse "none",
+            view_distance,
+        }) catch "Asteorite";
+        console_inst.setStatus(status);
+
+        const console_th = std.Thread.spawn(.{}, console_tui.Console.run, .{ &console_inst }) catch null;
         if (console_th) |th| th.detach();
         // RCON remote console (disabled unless a password is configured).
         // Same command core as chat/console, full console authority.
@@ -249,6 +316,9 @@ pub fn main(init: std.process.Init) !void {
                 if (rcon_th) |th| th.detach();
             }
         }
+        // Signal during boot (pregen/perms/console setup can take seconds):
+        // don't start serving, run the /stop pipeline instead.
+        if (asteorite.shutdown.isRequested()) srv.finishStop();
         // serveForever never returns; per-conn + store allocs hang off the
         // GPA above (the process arena never frees — see above).
         try srv.serveForever(salloc);

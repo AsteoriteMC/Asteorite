@@ -123,6 +123,20 @@ pub const ShardPool = struct {
         return try chunk_mod.Chunk.decode(alloc, raw.?);
     }
 
+    /// Total live SST files across the shards (diagnostics / stats line).
+    pub fn sstCount(self: *ShardPool) usize {
+        var n: usize = 0;
+        for (self.shards) |sh| n += sh.sstCount();
+        return n;
+    }
+
+    /// Total pinned io_uring read-buffer bytes (diagnostics / stats line).
+    pub fn ringBytes(self: *ShardPool) usize {
+        var n: usize = 0;
+        for (self.shards) |sh| n += sh.ringBytes();
+        return n;
+    }
+
     pub fn flushAll(self: *ShardPool) !void {
         for (self.shards) |st| try st.flush();
     }
@@ -131,6 +145,43 @@ pub const ShardPool = struct {
     /// counts keep `get` from degrading to a 50-file linear scan (Phase E).
     pub fn compactAll(self: *ShardPool) !void {
         for (self.shards) |st| try st.compact();
+    }
+
+    /// Same as `compactAll`, one thread per shard. Shards are disjoint
+    /// (own WAL + SST dir + store mutex), so no shard ever waits on
+    /// another — the wall time is the slowest shard, not the sum. The NVMe
+    /// profile's small SSTs make per-shard compactions cheap and plentiful,
+    /// which is exactly the shape that parallelizes.
+    ///
+    /// The stores must share a thread-safe allocator (main's GPA is;
+    /// tests should use the page allocator, not the test allocator).
+    pub fn compactAllParallel(self: *ShardPool) !void {
+        if (self.shards.len == 1) return try self.shards[0].compact();
+        const Worker = struct {
+            fn run(store: *store_mod.Store, out: *?anyerror) void {
+                store.compact() catch |err| {
+                    out.* = err;
+                };
+            }
+        };
+        const errs = try self.allocator.alloc(?anyerror, self.shards.len);
+        defer self.allocator.free(errs);
+        @memset(errs, null);
+        var threads = try self.allocator.alloc(std.Thread, self.shards.len);
+        defer self.allocator.free(threads);
+        var spawned: usize = 0;
+        errdefer {
+            // Spawn failed midway: join what is running, never leak threads.
+            var j: usize = 0;
+            while (j < spawned) : (j += 1) threads[j].join();
+        }
+        while (spawned < self.shards.len) : (spawned += 1) {
+            threads[spawned] = try std.Thread.spawn(.{}, Worker.run, .{ self.shards[spawned], &errs[spawned] });
+        }
+        for (threads) |t| t.join();
+        for (errs) |e| {
+            if (e) |err| return err;
+        }
     }
 
     /// Consistent snapshot of every shard into `backup_root/shard-NN`.
@@ -147,6 +198,47 @@ pub const ShardPool = struct {
         }
     }
 };
+
+test "parallel compaction matches serial (same merged data)" {
+    // Page allocator: the stores share it across threads (the test
+    // allocator is not for concurrent use).
+    const alloc = std.heap.page_allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Two identical pools: one compacts serially, one in parallel.
+    var serial = try ShardPool.open(alloc, io, tmp.dir, 4, .{ .flush_threshold_bytes = 4096, .compact_threshold_ssts = 0 });
+    defer serial.deinit();
+    var sub = try tmp.dir.createDirPathOpen(io, "par", .{});
+    defer sub.close(io);
+    var parallel = try ShardPool.open(alloc, io, sub, 4, .{ .flush_threshold_bytes = 4096, .compact_threshold_ssts = 0 });
+    defer parallel.deinit();
+    // One flush per chunk: every shard accumulates several small runs.
+    var i: i32 = 0;
+    while (i < 32) : (i += 1) {
+        var ch = try chunk_mod.Chunk.createEmpty(alloc, 0, i, -i);
+        defer ch.destroy(alloc);
+        ch.biomes[0] = @intCast(i);
+        try serial.putChunk(alloc, ch);
+        try parallel.putChunk(alloc, ch);
+        try serial.flushAll();
+        try parallel.flushAll();
+    }
+    try std.testing.expect(serial.sstCount() > 4);
+    try serial.compactAll();
+    try parallel.compactAllParallel();
+    try std.testing.expectEqual(serial.sstCount(), parallel.sstCount());
+    // Same merged data on both.
+    var j: i32 = 0;
+    while (j < 32) : (j += 1) {
+        const a = try serial.getChunk(alloc, 0, j, -j);
+        const b = try parallel.getChunk(alloc, 0, j, -j);
+        try std.testing.expect(a != null and b != null);
+        defer a.?.destroy(alloc);
+        defer b.?.destroy(alloc);
+        try std.testing.expectEqual(a.?.biomes[0], b.?.biomes[0]);
+    }
+}
 
 test "region mapping floors negatives" {
     try std.testing.expectEqual(@as(i32, 0), regionOf(0));

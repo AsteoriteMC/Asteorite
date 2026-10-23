@@ -6,7 +6,8 @@
 const std = @import("std");
 const store_mod = @import("../world/store.zig");
 const shard_mod = @import("../world/shard.zig");
-const cmd_data = @import("../proto/v5/cmd_data.zig");
+const profile = @import("../version.zig");
+const cmd_data = profile.game.cmd_data;
 
 pub const scoreboard_dim: u8 = 251;
 pub const scoreboard_key = store_mod.encodeKey(scoreboard_dim, 0, 0);

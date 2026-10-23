@@ -39,6 +39,34 @@
 //! starts empty. Documented here because the code is the procedure.
 
 const std = @import("std");
+const builtin = @import("builtin");
+/// Linux-only ring (stub elsewhere): the `if` keeps `uring_io.zig` — and
+/// transitively `std.os.linux.IoUring`, which does not compile for other
+/// targets — out of analysis off Linux. Same pattern as the net backends.
+const uring_io = if (builtin.os.tag == .linux) @import("uring_io.zig") else struct {
+    pub const RingStats = struct {
+        ring_reads: u64 = 0,
+        fallback_reads: u64 = 0,
+    };
+    pub const RingIo = struct {
+        stats: RingStats = .{},
+        pub fn init(_: std.mem.Allocator, _: usize) !RingIo {
+            return error.NoUring;
+        }
+        pub fn deinit(_: *RingIo) void {}
+        pub fn bufLen(_: *const RingIo) usize {
+            return 0;
+        }
+        pub fn registerFiles(_: *RingIo, _: []const std.posix.fd_t) !void {}
+        pub fn readAt(_: *RingIo, _: u32, _: u64, _: usize) ![]u8 {
+            return error.Fallback;
+        }
+        pub fn noteFallback(_: *RingIo) void {}
+    };
+    pub fn probe() bool {
+        return false;
+    }
+};
 
 pub const key_len = 9;
 pub const ChunkKey = [key_len]u8;
@@ -102,8 +130,17 @@ pub const SstMeta = struct {
     bloom_bits: u32,
     index: []IndexEntry, // owned, sorted by key
     entries_end: usize, // offset where entries end (footer start for ZLS2)
+    /// Open read handle for the SST file (NVMe profile only: fixed-file
+    /// reads + no per-lookup open/close). Null on the plain path.
+    file: ?std.Io.File = null,
+    /// Fixed-file table index after `syncRingFiles` (null = pread path).
+    fixed_index: ?u32 = null,
 
-    pub fn deinit(self: *SstMeta, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *SstMeta, alloc: std.mem.Allocator, io: std.Io) void {
+        if (self.file) |f| {
+            f.close(io);
+            self.file = null;
+        }
         alloc.free(self.name);
         if (self.bloom.len > 0) alloc.free(self.bloom);
         if (self.index.len > 0) alloc.free(self.index);
@@ -408,6 +445,17 @@ pub const Store = struct {
     flush_threshold_bytes: usize,
     wal_sync_bytes: usize,
     compact_threshold_ssts: usize,
+    /// NVMe profile: keep SST files open for the store lifetime (no
+    /// per-lookup open/close) and serve stride reads from the io_uring
+    /// ring (registered buffers + fixed files). The ring is best-effort:
+    /// a kernel that refuses it still serves, on plain pread.
+    keep_sst_open: bool = false,
+    /// Largest stride the ring will serve (bigger strides use pread even
+    /// when the ring buffer could hold them).
+    uring_max_bytes: usize = 8 * 1024 * 1024,
+    /// io_uring read ring (null = plain pread path). Owned; only present
+    /// when `keep_sst_open` and the kernel accepted the ring.
+    ring: ?uring_io.RingIo = null,
     /// Guards memtable + live SST list (mem/put + get + flush/compact swap).
     /// Serve threads read without the world lock while the ticker (player
     /// saves) and gen workers write + flush/compact: without this, a
@@ -437,6 +485,14 @@ pub const Store = struct {
         /// Auto-compact when live SST count reaches this (0 = manual only).
         /// Synchronous (simplest-correct-first); backgrounding is Phase C/H5.
         compact_threshold_ssts: usize = 8,
+        /// NVMe storage path: keep SST files open + serve stride reads
+        /// through io_uring (registered buffers + fixed files). Best
+        /// effort — a kernel that refuses the ring still serves on pread.
+        use_uring_io: bool = false,
+        /// Largest stride the ring will serve (bigger strides use pread).
+        /// Covers the 8 MiB stride cap by default; tests set it tiny to
+        /// exercise the fallback path deterministically.
+        uring_max_bytes: usize = 8 * 1024 * 1024,
     };
 
     /// Open (or create) db in `dir`. Creates `sst/` + `wal.log` as needed,
@@ -468,6 +524,8 @@ pub const Store = struct {
             .flush_threshold_bytes = opts.flush_threshold_bytes,
             .wal_sync_bytes = opts.wal_sync_bytes,
             .compact_threshold_ssts = opts.compact_threshold_ssts,
+            .keep_sst_open = opts.use_uring_io,
+            .uring_max_bytes = opts.uring_max_bytes,
         };
         errdefer {
             self.sst_dir.close(io);
@@ -477,7 +535,7 @@ pub const Store = struct {
         // Element deinit for anything appended to ssts below (runs before
         // the array itself is freed above on error unwind).
         errdefer {
-            for (self.ssts.items) |*m| m.deinit(allocator);
+            for (self.ssts.items) |*m| m.deinit(allocator, io);
         }
 
         try self.cleanupTmps();
@@ -553,6 +611,27 @@ pub const Store = struct {
         // Persist the reconciled live set (also upgrades legacy dir-scan DBs).
         try self.writeManifest();
 
+        // NVMe path: bring up the ring (best-effort) and register the
+        // live SST files as fixed files. A kernel that refuses the ring
+        // still serves: the kept-open files take the plain pread path.
+        if (self.keep_sst_open) {
+            self.ring = uring_io.RingIo.init(allocator, opts.uring_max_bytes) catch |err| blk: {
+                if (err != error.NoUring) return err;
+                std.log.info("store: io_uring unavailable, SST reads use pread", .{});
+                break :blk null;
+            };
+            if (self.ring != null) {
+                self.syncRingFiles() catch {
+                    // Registration failed after init: drop the ring, keep
+                    // the open files (plain pread from here on).
+                    self.ring.?.deinit();
+                    self.ring = null;
+                };
+            }
+        }
+        // NOTE: no errdefer for the ring here: it is created after the
+        // last fallible call, so open() cannot fail with a live ring.
+
         return self;
     }
 
@@ -573,7 +652,11 @@ pub const Store = struct {
             if (e.value_ptr.*) |v| self.allocator.free(v);
         }
         self.mem.deinit();
-        for (self.ssts.items) |*m| m.deinit(self.allocator);
+        // The ring holds kernel references to the SST files: unregister
+        // first, then close the files via the metas below.
+        if (self.ring) |*r| r.deinit();
+        self.ring = null;
+        for (self.ssts.items) |*m| m.deinit(self.allocator, self.io);
         self.ssts.deinit(self.allocator);
         self.allocator.destroy(self);
     }
@@ -657,7 +740,7 @@ pub const Store = struct {
             .index = &.{},
             .entries_end = p.entries_end,
         };
-        errdefer meta.deinit(self.allocator);
+        errdefer meta.deinit(self.allocator, self.io);
         if (p.zls2) {
             meta.bloom = try self.allocator.dupe(u8, p.bloom);
             errdefer self.allocator.free(meta.bloom);
@@ -669,7 +752,48 @@ pub const Store = struct {
             meta.index = idx;
             meta.bloom_bits = @as(u32, @intCast(meta.bloom.len * 8));
         }
+        // NVMe path: keep the file open for fixed-file reads. A file
+        // that cannot be opened degrades to per-lookup open (the plain
+        // behavior) — never a hard error.
+        if (self.keep_sst_open) {
+            meta.file = self.sst_dir.openFile(self.io, meta.name, .{}) catch null;
+        }
         return meta;
+    }
+
+    /// Rebuild the ring's fixed-file table from the live SST list
+    /// (positional: each meta's `fixed_index` is its slot). No-op without
+    /// a ring. Called after every SST-set change (open/flush/compact).
+    /// On failure the caller tears the ring down (plain path from then on).
+    fn syncRingFiles(self: *Store) !void {
+        const r = &(self.ring orelse return);
+        errdefer {
+            // Registration failed: the indices below describe a table
+            // that was never installed — clear them so no stale index
+            // can ever address the wrong file.
+            for (self.ssts.items) |*m| m.fixed_index = null;
+        }
+        var fds = std.ArrayList(std.posix.fd_t).empty;
+        defer fds.deinit(self.allocator);
+        for (self.ssts.items) |*m| {
+            m.fixed_index = null;
+            if (m.file) |f| {
+                m.fixed_index = @intCast(fds.items.len);
+                try fds.append(self.allocator, f.handle);
+            }
+        }
+        try r.registerFiles(fds.items);
+    }
+
+    /// Ring counters for tests/bench (zeros on the plain path).
+    pub fn ringStats(self: *Store) uring_io.RingStats {
+        if (self.ring) |*r| return r.stats;
+        return .{};
+    }
+
+    /// True when SST stride reads go through the ring (tests/bench).
+    pub fn ringActive(self: *Store) bool {
+        return self.ring != null;
     }
 
     fn deleteOrphans(self: *Store, live: ?[][]u8) !void {
@@ -836,6 +960,30 @@ pub const Store = struct {
         return null;
     }
 
+    /// Scan one stride buffer for `key`. Returns null = absent;
+    /// ?null = tombstone; ??bytes = found (owned dupe via `alloc`).
+    fn scanEntries(alloc: std.mem.Allocator, buf: []const u8, key: ChunkKey) !??[]u8 {
+        var pos: usize = 0;
+        while (pos < buf.len) {
+            if (pos + key_len + 4 > buf.len) return error.CorruptSst;
+            const k: ChunkKey = buf[pos..][0..key_len].*;
+            pos += key_len;
+            const vlen = std.mem.readInt(u32, buf[pos..][0..4], .big);
+            pos += 4;
+            if (vlen == tombstone_len) {
+                if (std.mem.eql(u8, &k, &key)) return @as(?[]u8, null);
+                continue;
+            }
+            if (pos + vlen > buf.len) return error.CorruptSst;
+            if (std.mem.eql(u8, &k, &key)) {
+                const out = try alloc.dupe(u8, buf[pos .. pos + vlen]);
+                return @as(?[]u8, out);
+            }
+            pos += vlen;
+        }
+        return null;
+    }
+
     fn sstGet(self: *Store, alloc: std.mem.Allocator, meta: *const SstMeta, key: ChunkKey) !??[]u8 {
         // Returns null = not in this sst; ?null = tombstone; ??bytes = found owned.
         if (meta.index.len == 0) return self.sstGetLegacy(alloc, meta, key);
@@ -862,38 +1010,52 @@ pub const Store = struct {
         // ~1MB worst case. Refuse absurd ranges (torn file) instead of
         // trusting a corrupt offset into a huge alloc + read.
         if (range_len > 8 * 1024 * 1024) return error.CorruptSst;
-        var f = try self.sst_dir.openFile(self.io, meta.name, .{});
-        defer f.close(self.io);
+        // NVMe path: the stride goes through the ring (fixed file +
+        // registered buffer, no per-IO pinning or fd lookup). The slice
+        // aliases the ring buffer — parsed (and the hit duped) below,
+        // before any other ring use. Any miss here falls through to the
+        // plain pread path: same bytes, slower road.
+        if (self.ring) |*r| {
+            if (meta.fixed_index) |fi| {
+                if (range_len <= self.uring_max_bytes) {
+                    if (r.readAt(fi, start, range_len)) |rb| {
+                        return try scanEntries(alloc, rb, key);
+                    } else |_| r.noteFallback();
+                } else r.noteFallback();
+            } else r.noteFallback();
+        }
+        // Plain path: one stride via pread. The kept-open file (NVMe
+        // profile without a working ring) still skips the per-lookup
+        // open/close; otherwise the file is opened per lookup as before.
+        var owned: ?std.Io.File = null;
+        defer if (owned) |f| f.close(self.io);
+        const fh: std.Io.File = meta.file orelse blk: {
+            owned = try self.sst_dir.openFile(self.io, meta.name, .{});
+            break :blk owned.?;
+        };
         const buf = try alloc.alloc(u8, range_len);
         defer alloc.free(buf);
-        const n = try f.readPositionalAll(self.io, buf, start);
+        const n = try fh.readPositionalAll(self.io, buf, start);
         if (n != range_len) return error.CorruptSst;
-        var pos: usize = 0;
-        while (pos < range_len) {
-            if (pos + key_len + 4 > range_len) return error.CorruptSst;
-            const k: ChunkKey = buf[pos..][0..key_len].*;
-            pos += key_len;
-            const vlen = std.mem.readInt(u32, buf[pos..][0..4], .big);
-            pos += 4;
-            if (vlen == tombstone_len) {
-                if (std.mem.eql(u8, &k, &key)) return @as(?[]u8, null);
-                continue;
-            }
-            if (pos + vlen > range_len) return error.CorruptSst;
-            if (std.mem.eql(u8, &k, &key)) {
-                const out = try alloc.dupe(u8, buf[pos .. pos + vlen]);
-                return @as(?[]u8, out);
-            }
-            pos += vlen;
-        }
-        return null;
+        return try scanEntries(alloc, buf, key);
     }
 
     fn sstGetLegacy(self: *Store, alloc: std.mem.Allocator, meta: *const SstMeta, key: ChunkKey) !??[]u8 {
         // Legacy ZLS1 (no footer index): whole-file scan. Correct, slower;
         // only runs on pre-ZLS2 databases.
         // Returns null = not in this sst; ?null = tombstone; ??bytes = found owned.
-        const data = try self.sst_dir.readFileAlloc(self.io, meta.name, alloc, .limited(256 * 1024 * 1024));
+        // The kept-open file (NVMe profile) still skips the per-lookup
+        // open/close; the whole-file read itself stays plain pread (large
+        // sequential reads gain nothing from the ring).
+        const data = if (meta.file) |fh| blk: {
+            const size = try fh.length(self.io);
+            if (size > 256 * 1024 * 1024) return error.CorruptSst;
+            const buf = try alloc.alloc(u8, @intCast(size));
+            errdefer alloc.free(buf);
+            const n = try fh.readPositionalAll(self.io, buf, 0);
+            if (n != buf.len) return error.CorruptSst;
+            break :blk buf;
+        } else try self.sst_dir.readFileAlloc(self.io, meta.name, alloc, .limited(256 * 1024 * 1024));
         defer alloc.free(data);
         const p = try parseSst(data);
         if (p.count != meta.count) return error.CorruptSst;
@@ -958,7 +1120,7 @@ pub const Store = struct {
         var meta = try self.loadSstMeta(name);
         {
             errdefer {
-                meta.deinit(self.allocator);
+                meta.deinit(self.allocator, self.io);
                 self.sst_dir.deleteFile(self.io, name) catch {};
             }
             try self.ssts.append(self.allocator, meta);
@@ -966,13 +1128,20 @@ pub const Store = struct {
         {
             errdefer {
                 var m = self.ssts.pop().?;
-                m.deinit(self.allocator);
+                m.deinit(self.allocator, self.io);
                 self.sst_dir.deleteFile(self.io, name) catch {};
             }
             // MANIFEST swap BEFORE wal truncate (crash order: SST durable,
             // then live-set durable, then inputs discardable).
             try self.writeManifest();
         }
+        // The live set grew: re-register the fixed-file table (no-op
+        // without a ring; drops the ring on registration failure).
+        self.syncRingFiles() catch |err| {
+            std.log.warn("store: fixed-file registration failed ({}), SST reads use pread", .{err});
+            if (self.ring) |*r| r.deinit();
+            self.ring = null;
+        };
         // clear memtable + truncate WAL
         var mit = self.mem.iterator();
         while (mit.next()) |e| {
@@ -989,6 +1158,21 @@ pub const Store = struct {
     /// Merge all live SSTs into one run (newest wins). Tombstones are dropped:
     /// the merge covers every run, so a surviving tombstone means "absent".
     /// Crash-safe via tmp+rename + MANIFEST swap; old runs deleted after.
+    /// Number of live SST files (diagnostics / stats line).
+    pub fn sstCount(self: *Store) usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.ssts.items.len;
+    }
+
+    /// Pinned io_uring read-buffer bytes (diagnostics / stats line).
+    pub fn ringBytes(self: *Store) usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.ring) |*r| return r.bufLen();
+        return 0;
+    }
+
     pub fn compact(self: *Store) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -1011,7 +1195,20 @@ pub const Store = struct {
         var i = self.ssts.items.len;
         while (i > 0) {
             i -= 1;
-            const data = try self.sst_dir.readFileAlloc(self.io, self.ssts.items[i].name, self.allocator, .limited(256 * 1024 * 1024));
+            // Whole-file sequential read: the kept-open file (NVMe
+            // profile) skips the per-file open/close; the bytes still
+            // travel by plain pread (large sequential reads gain nothing
+            // from the ring).
+            const meta = &self.ssts.items[i];
+            const data = if (meta.file) |fh| blk: {
+                const size = try fh.length(self.io);
+                if (size > 256 * 1024 * 1024) return error.CorruptSst;
+                const buf = try self.allocator.alloc(u8, @intCast(size));
+                errdefer self.allocator.free(buf);
+                const n = try fh.readPositionalAll(self.io, buf, 0);
+                if (n != buf.len) return error.CorruptSst;
+                break :blk buf;
+            } else try self.sst_dir.readFileAlloc(self.io, meta.name, self.allocator, .limited(256 * 1024 * 1024));
             defer self.allocator.free(data);
             const p = try parseSst(data);
             var pos: usize = 8;
@@ -1057,7 +1254,7 @@ pub const Store = struct {
         errdefer {
             // MANIFEST never listed the new file: orphan on disk (next open
             // cleans it), in-memory ownership freed here.
-            for (new_list.items) |*m| m.deinit(self.allocator);
+            for (new_list.items) |*m| m.deinit(self.allocator, self.io);
         }
         if (live.items.len > 0) {
             var entries = try self.allocator.alloc(SstEntry, live.items.len);
@@ -1077,7 +1274,7 @@ pub const Store = struct {
             {
                 errdefer {
                     var m = meta;
-                    m.deinit(self.allocator);
+                    m.deinit(self.allocator, self.io);
                     self.sst_dir.deleteFile(self.io, name) catch {};
                 }
                 try new_list.append(self.allocator, meta);
@@ -1085,10 +1282,17 @@ pub const Store = struct {
         }
         try self.writeManifestList(new_list.items);
         // Commit point passed: swap in-memory list, delete old runs.
-        for (self.ssts.items) |*m| m.deinit(self.allocator);
+        for (self.ssts.items) |*m| m.deinit(self.allocator, self.io);
         self.ssts.clearRetainingCapacity();
         for (new_list.items) |*m| try self.ssts.append(self.allocator, m.*);
         new_list.clearRetainingCapacity();
+        // The live set changed wholesale: re-register the fixed-file
+        // table (no-op without a ring; drops the ring on failure).
+        self.syncRingFiles() catch |err| {
+            std.log.warn("store: fixed-file registration failed ({}), SST reads use pread", .{err});
+            if (self.ring) |*r| r.deinit();
+            self.ring = null;
+        };
         // Old files are superseded; best-effort delete (a crash here leaves
         // orphans that `check` lists and the next open cleans).
         var di = self.sst_dir.iterate();
@@ -1579,6 +1783,90 @@ test "multi-sst get correct with bloom (compaction off)" {
     while (m < 110) : (m += 1) {
         const miss = try store.get(std.testing.allocator, encodeKey(0, m, 0));
         try std.testing.expect(miss == null);
+    }
+}
+
+test "uring_io: stride reads go through the ring when available" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const opts: Store.Options = .{ .flush_threshold_bytes = 1 << 30, .compact_threshold_ssts = 0, .use_uring_io = true };
+    {
+        var store = try Store.open(std.testing.allocator, io, tmp.dir, opts);
+        defer store.deinit();
+        // One SST per key (flush each) so every get walks the SST path.
+        var i: i32 = 0;
+        while (i < 10) : (i += 1) {
+            var vbuf: [32]u8 = undefined;
+            const v = try std.fmt.bufPrint(&vbuf, "v-{d}", .{i});
+            try store.put(encodeKey(0, i, 0), v);
+            try store.flush();
+        }
+        try std.testing.expectEqual(@as(usize, 10), store.ssts.items.len);
+        var k: i32 = 0;
+        while (k < 10) : (k += 1) {
+            const g = try store.get(std.testing.allocator, encodeKey(0, k, 0));
+            try std.testing.expect(g != null);
+            var ebuf: [32]u8 = undefined;
+            const want = try std.fmt.bufPrint(&ebuf, "v-{d}", .{k});
+            try std.testing.expectEqualStrings(want, g.?);
+            std.testing.allocator.free(g.?);
+        }
+        if (store.ringActive()) {
+            // Every present key read its home SST through the ring (Bloom
+            // never false-negatives, so at least one ring read per key).
+            try std.testing.expect(store.ringStats().ring_reads >= 10);
+            // Every live SST has an open file + a fixed-file index.
+            for (store.ssts.items) |*m| {
+                try std.testing.expect(m.file != null);
+                try std.testing.expect(m.fixed_index != null);
+            }
+        }
+    }
+    // Reopen: keep-open files + ring come back, data intact.
+    {
+        var store2 = try Store.open(std.testing.allocator, io, tmp.dir, opts);
+        defer store2.deinit();
+        var j: i32 = 0;
+        while (j < 10) : (j += 1) {
+            const g = try store2.get(std.testing.allocator, encodeKey(0, j, 0));
+            try std.testing.expect(g != null);
+            var ebuf: [32]u8 = undefined;
+            const want = try std.fmt.bufPrint(&ebuf, "v-{d}", .{j});
+            try std.testing.expectEqualStrings(want, g.?);
+            std.testing.allocator.free(g.?);
+        }
+        if (store2.ringActive()) {
+            try std.testing.expect(store2.ringStats().ring_reads >= 10);
+        }
+    }
+}
+
+test "uring_io: oversized strides fall back to pread (same bytes)" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // 64-byte ring cap with 200-byte values: every stride misses the
+    // ring and takes the plain pread road — same bytes, counted.
+    var store = try Store.open(std.testing.allocator, io, tmp.dir, .{ .flush_threshold_bytes = 1 << 30, .compact_threshold_ssts = 0, .use_uring_io = true, .uring_max_bytes = 64 });
+    defer store.deinit();
+    var vbuf: [200]u8 = undefined;
+    @memset(&vbuf, 0xAB);
+    var i: i32 = 0;
+    while (i < 4) : (i += 1) {
+        try store.put(encodeKey(0, i, 0), &vbuf);
+        try store.flush();
+    }
+    var k: i32 = 0;
+    while (k < 4) : (k += 1) {
+        const g = try store.get(std.testing.allocator, encodeKey(0, k, 0));
+        try std.testing.expect(g != null);
+        try std.testing.expectEqualSlices(u8, &vbuf, g.?);
+        std.testing.allocator.free(g.?);
+    }
+    if (store.ringActive()) {
+        try std.testing.expect(store.ringStats().fallback_reads > 0);
+        try std.testing.expectEqual(@as(u64, 0), store.ringStats().ring_reads);
     }
 }
 

@@ -16,7 +16,6 @@
 const std = @import("std");
 const nbt = @import("nbt.zig");
 const ids = @import("../ids.zig");
-const wire = @import("../proto/v5/wire_ids.zig");
 
 pub const version: u8 = 2;
 pub const magic = "ZC1";
@@ -32,16 +31,48 @@ pub fn lightOpacity(id: ids.Id) u8 {
     return switch (id) {
         .leaves, .leaves2 => 1,
         .water, .flowing_water, .ice => 3,
-        .air, .sapling, .lava, .flowing_lava, .glass, .tallgrass, .deadbush,
-        .yellow_flower, .red_flower, .brown_mushroom, .red_mushroom,
-        .snow_layer, .cactus, .reeds_block, .vine, .waterlily,
-        .stained_glass, .glass_pane, .stained_glass_pane,
-        .torch, .ladder, .rail, .golden_rail, .detector_rail, .activator_rail,
-        .standing_sign, .wall_sign, .lever, .stone_pressure_plate,
-        .wooden_pressure_plate, .light_weighted_pressure_plate,
-        .heavy_weighted_pressure_plate, .unlit_redstone_torch, .redstone_torch,
-        .stone_button, .wooden_button, .snow, .carpet, .flower_pot_block,
-        .skull_block, .tripwire, .tripwire_hook,
+        .air,
+        .sapling,
+        .lava,
+        .flowing_lava,
+        .glass,
+        .tallgrass,
+        .deadbush,
+        .yellow_flower,
+        .red_flower,
+        .brown_mushroom,
+        .red_mushroom,
+        .snow_layer,
+        .cactus,
+        .reeds_block,
+        .vine,
+        .waterlily,
+        .stained_glass,
+        .glass_pane,
+        .stained_glass_pane,
+        .torch,
+        .ladder,
+        .rail,
+        .golden_rail,
+        .detector_rail,
+        .activator_rail,
+        .standing_sign,
+        .wall_sign,
+        .lever,
+        .stone_pressure_plate,
+        .wooden_pressure_plate,
+        .light_weighted_pressure_plate,
+        .heavy_weighted_pressure_plate,
+        .unlit_redstone_torch,
+        .redstone_torch,
+        .stone_button,
+        .wooden_button,
+        .snow,
+        .carpet,
+        .flower_pot_block,
+        .skull_block,
+        .tripwire,
+        .tripwire_hook,
         => 0,
         else => 255,
     };
@@ -144,7 +175,7 @@ pub const Chunk = struct {
         Section.setNibble(&s.sky, Section.index(@intCast(lx), @intCast(y & 15), @intCast(lz)), v);
     }
 
-    fn getLightAt(self: *const Chunk, lx: usize, y: usize, lz: usize) u4 {
+    pub fn getLightAt(self: *const Chunk, lx: usize, y: usize, lz: usize) u4 {
         const s = self.sections[y >> 4] orelse return 0;
         return Section.getNibble(&s.light, Section.index(@intCast(lx), @intCast(y & 15), @intCast(lz)));
     }
@@ -152,6 +183,277 @@ pub const Chunk = struct {
     fn setLightAt(self: *Chunk, lx: usize, y: usize, lz: usize, v: u4) void {
         const s = &(self.sections[y >> 4] orelse return);
         Section.setNibble(&s.light, Section.index(@intCast(lx), @intCast(y & 15), @intCast(lz)), v);
+    }
+
+    /// Light channels for the BFS engine below.
+    pub const LightChannel = enum { sky, block };
+
+    /// Packed cell coords for light queues (17 bits; matches relightBlock).
+    pub const Cell = struct { x: usize, y: usize, z: usize };
+
+    pub inline fn packCell(x: usize, y: usize, z: usize) u32 {
+        return @intCast((y * 16 + z) * 16 + x);
+    }
+
+    pub inline fn unpackCell(cell: u32) Cell {
+        return .{ .x = cell & 15, .z = (cell >> 4) & 15, .y = cell >> 8 };
+    }
+
+    /// A cell pinned to a value (phase-A old values, reflood rewrite floors).
+    pub const CellValue = struct { cell: u32, value: u4 };
+
+    /// Phase-A queue entries pack the flow-through (old) value alongside
+    /// the cell: entry = old:4 @ [17:21] | cell @ [0:17].
+    inline fn packOld(cell: u32, old: u4) u32 {
+        return (@as(u32, old) << 17) | cell;
+    }
+
+    inline fn unpackOld(e: u32) struct { cell: u32, old: u4 } {
+        return .{ .cell = e & 0x1FFFF, .old = @truncate(e >> 17) };
+    }
+
+    fn getSkyAt(self: *const Chunk, lx: usize, y: usize, lz: usize) u4 {
+        const s = self.sections[y >> 4] orelse return 0;
+        return Section.getNibble(&s.sky, Section.index(@intCast(lx), @intCast(y & 15), @intCast(lz)));
+    }
+
+    fn getChannelAt(self: *const Chunk, ch: LightChannel, lx: usize, y: usize, lz: usize) u4 {
+        return switch (ch) {
+            .sky => self.getSkyAt(lx, y, lz),
+            .block => self.getLightAt(lx, y, lz),
+        };
+    }
+
+    fn setChannelAt(self: *Chunk, ch: LightChannel, lx: usize, y: usize, lz: usize, v: u4) void {
+        switch (ch) {
+            .sky => self.setSkyAt(lx, y, lz, v),
+            .block => self.setLightAt(lx, y, lz, v),
+        }
+    }
+
+    /// Attenuation entering a cell of opacity `op`, or null when fully
+    /// blocked. Sky floors at 1 per step (so a stored 15 always means
+    /// column-ruled: sideways spread can never mint one — the fact phase
+    /// A relies on to never zero open-sky cells). Block keeps the
+    /// established op>=3?2:1 rule.
+    pub fn skyCost(op: u8) ?u4 {
+        if (op == 255) return null;
+        return @intCast(@max(@as(u8, 1), @min(op, 15)));
+    }
+
+    pub fn blockCost(op: u8) ?u4 {
+        if (op == 255) return null;
+        return if (op >= 3) 2 else 1;
+    }
+
+    fn spreadCost(channel: LightChannel, op: u8) ?u4 {
+        return switch (channel) {
+            .sky => skyCost(op),
+            .block => blockCost(op),
+        };
+    }
+
+    /// A cell that sustains its own value (never zeroed in phase A, always
+    /// a valid reflood source): block emitters, and sky cells at 15 (only
+    /// the column rule mints those — see spreadCost).
+    fn isSourceCell(self: *const Chunk, channel: LightChannel, lx: usize, y: usize, lz: usize, v: u4) bool {
+        return switch (channel) {
+            .sky => v == 15,
+            .block => emitLight(self.blockAt(lx, y, lz)) > 0,
+        };
+    }
+
+    const light_dirs = [_][3]i32{ .{ 1, 0, 0 }, .{ -1, 0, 0 }, .{ 0, 1, 0 }, .{ 0, -1, 0 }, .{ 0, 0, 1 }, .{ 0, 0, -1 } };
+
+    /// Raise-BFS core: propagate increases until the fixed point. Only
+    /// strict increases enqueue, values cap at 15, so this terminates.
+    /// Intra-chunk only (documented seam: neighbors resend with their own
+    /// flood; ~1-level error at borders, same as relightBlock).
+    fn bfsRaise(self: *Chunk, channel: LightChannel, queue: []u32, head: *usize, tail: *usize) void {
+        while (head.* < tail.*) {
+            const c = unpackCell(queue[head.*]);
+            head.* += 1;
+            const cur = self.getChannelAt(channel, c.x, c.y, c.z);
+            if (cur == 0) continue;
+            // Sky never spreads FROM opaque cells (their stored 15 is the
+            // top-face value, not a source: without this, roof undersides
+            // leak 14 downward everywhere and nothing under a roof ever
+            // goes dark). Block light has no such restriction (opaque
+            // emitters like lit furnaces must radiate).
+            if (channel == .sky and lightOpacity(self.blockAt(c.x, c.y, c.z)) == 255) continue;
+            for (light_dirs) |d| {
+                const nx = @as(i32, @intCast(c.x)) + d[0];
+                const ny = @as(i32, @intCast(c.y)) + d[1];
+                const nz = @as(i32, @intCast(c.z)) + d[2];
+                if (nx < 0 or nx > 15 or ny < 0 or ny > 255 or nz < 0 or nz > 15) continue;
+                const ux: usize = @intCast(nx);
+                const uy: usize = @intCast(ny);
+                const uz: usize = @intCast(nz);
+                const cost = spreadCost(channel, lightOpacity(self.blockAt(ux, uy, uz))) orelse continue;
+                if (cur <= cost) continue;
+                const nl: u4 = cur - cost;
+                if (nl <= self.getChannelAt(channel, ux, uy, uz)) continue;
+                if (self.sections[uy >> 4] == null) continue; // don't inflate the mask
+                self.setChannelAt(channel, ux, uy, uz, nl);
+                if (tail.* < queue.len) {
+                    queue[tail.*] = packCell(ux, uy, uz);
+                    tail.* += 1;
+                }
+            }
+        }
+    }
+
+    /// Raise pass: propagate increases from seeds holding final values.
+    /// Seeds at 0/1 spread nothing (min cost is 1) but are harmless.
+    pub fn spreadLight(self: *Chunk, queue: []u32, channel: LightChannel, seeds: []const u32) void {
+        var tail: usize = 0;
+        for (seeds) |cell| {
+            if (tail >= queue.len) break;
+            queue[tail] = cell;
+            tail += 1;
+        }
+        var head: usize = 0;
+        self.bfsRaise(channel, queue, &head, &tail);
+    }
+
+    /// Full-chunk skylight spread (gen path): the columns already hold
+    /// exact vertical values (relightColumn); every bright cell seeds the
+    /// horizontal flood. Block light keeps its own full flood
+    /// (relightBlock seeds emissives directly).
+    pub fn spreadSky(self: *Chunk, queue: []u32) void {
+        var tail: usize = 0;
+        for (0..16) |lz| {
+            for (0..16) |lx| {
+                for (0..256) |y| {
+                    if (self.getSkyAt(lx, y, lz) > 1) {
+                        if (tail >= queue.len) break;
+                        queue[tail] = packCell(lx, y, lz);
+                        tail += 1;
+                    }
+                }
+            }
+        }
+        var head: usize = 0;
+        self.bfsRaise(.sky, queue, &head, &tail);
+    }
+
+    /// Two-phase decrease (edit path): invalidate cells plausibly lit
+    /// through `old_seeds` (which carry pre-change values), then reflood
+    /// from survivors + `rewrite` floors. `rewrite` cells hold final
+    /// values (column-rule cells / new emission): restored if phase A
+    /// zeroed them, then seeded into the reflood.
+    ///
+    /// Correctness: phase A only zeroes cells strictly dimmer than the
+    /// value light flowed through (self-sustained cells immune), so every
+    /// zeroed cell genuinely depended on a changed path; the reflood
+    /// rescan covers bbox±1, which contains every neighbor of every
+    /// zeroed cell, plus the explicit rewrite seeds — so every cell whose
+    /// true final value exceeds its post-phase-A value is reachable from
+    /// a seed, and raise-BFS computes the exact fixed point. Typical
+    /// edits touch tens of cells (never the full re-flood per edit);
+    /// pathological cases degrade toward chunk-scale work, still correct.
+    pub fn unspreadLight(self: *Chunk, queue: []u32, channel: LightChannel, old_seeds: []const CellValue, rewrite: []const CellValue) void {
+        var head: usize = 0;
+        var tail: usize = 0;
+        // Bounding box over seeds + rewrite (expanded ±1 at rescan).
+        var minx: usize = 16;
+        var maxx: usize = 0;
+        var miny: usize = 256;
+        var maxy: usize = 0;
+        var minz: usize = 16;
+        var maxz: usize = 0;
+        const expand = struct {
+            fn f(c: Cell, x0: *usize, x1: *usize, y0: *usize, y1: *usize, z0: *usize, z1: *usize) void {
+                x0.* = @min(x0.*, c.x);
+                x1.* = @max(x1.*, c.x);
+                y0.* = @min(y0.*, c.y);
+                y1.* = @max(y1.*, c.y);
+                z0.* = @min(z0.*, c.z);
+                z1.* = @max(z1.*, c.z);
+            }
+        }.f;
+        // Seeds are processed inline (not queued): each cell zeroes at
+        // most once, so the cascade queue can never overflow 64K.
+        for (old_seeds) |s| {
+            const c = unpackCell(s.cell);
+            expand(c, &minx, &maxx, &miny, &maxy, &minz, &maxz);
+            self.invalidateAround(channel, c.x, c.y, c.z, s.value, queue, &tail, &minx, &maxx, &miny, &maxy, &minz, &maxz);
+        }
+        for (rewrite) |s| {
+            const c = unpackCell(s.cell);
+            expand(c, &minx, &maxx, &miny, &maxy, &minz, &maxz);
+        }
+        while (head < tail) {
+            const e = unpackOld(queue[head]);
+            head += 1;
+            const c = unpackCell(e.cell);
+            self.invalidateAround(channel, c.x, c.y, c.z, e.old, queue, &tail, &minx, &maxx, &miny, &maxy, &minz, &maxz);
+        }
+        // Rewrite floors (restores anything phase A zeroed), then reflood
+        // from the bbox shell: every value>0 cell in bbox±1, which covers
+        // all neighbors of all zeroed cells.
+        for (rewrite) |s| {
+            const c = unpackCell(s.cell);
+            self.setChannelAt(channel, c.x, c.y, c.z, s.value);
+        }
+        var rtail: usize = 0;
+        const x0 = minx -| 1;
+        const x1 = @min(maxx + 1, 15);
+        const y0 = miny -| 1;
+        const y1 = @min(maxy + 1, 255);
+        const z0 = minz -| 1;
+        const z1 = @min(maxz + 1, 15);
+        // Empty seed set (no-op decrease): bbox stayed inverted.
+        if (maxx >= minx) {
+            var y = y0;
+            while (y <= y1) : (y += 1) {
+                var z = z0;
+                while (z <= z1) : (z += 1) {
+                    var x = x0;
+                    while (x <= x1) : (x += 1) {
+                        if (self.getChannelAt(channel, x, y, z) > 0) {
+                            if (rtail < queue.len) {
+                                queue[rtail] = packCell(x, y, z);
+                                rtail += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        var rhead: usize = 0;
+        self.bfsRaise(channel, queue, &rhead, &rtail);
+    }
+
+    /// Phase-A step: examine the 6 neighbors of (x,y,z) against the value
+    /// `flowed` that light traveled with; zero plausibly-dependent cells
+    /// (enqueueing them with their old values) and grow the bbox.
+    fn invalidateAround(self: *Chunk, channel: LightChannel, x: usize, y: usize, z: usize, flowed: u4, queue: []u32, tail: *usize, minx: *usize, maxx: *usize, miny: *usize, maxy: *usize, minz: *usize, maxz: *usize) void {
+        for (light_dirs) |d| {
+            const nx = @as(i32, @intCast(x)) + d[0];
+            const ny = @as(i32, @intCast(y)) + d[1];
+            const nz = @as(i32, @intCast(z)) + d[2];
+            if (nx < 0 or nx > 15 or ny < 0 or ny > 255 or nz < 0 or nz > 15) continue;
+            const ux: usize = @intCast(nx);
+            const uy: usize = @intCast(ny);
+            const uz: usize = @intCast(nz);
+            const vn = self.getChannelAt(channel, ux, uy, uz);
+            if (self.isSourceCell(channel, ux, uy, uz, vn)) continue;
+            if (vn != 0 and vn < flowed) {
+                self.setChannelAt(channel, ux, uy, uz, 0);
+                minx.* = @min(minx.*, ux);
+                maxx.* = @max(maxx.*, ux);
+                miny.* = @min(miny.*, uy);
+                maxy.* = @max(maxy.*, uy);
+                minz.* = @min(minz.*, uz);
+                maxz.* = @max(maxz.*, uz);
+                // Exact fit: each cell zeroes (and enqueues) at most once.
+                if (tail.* < queue.len) {
+                    queue[tail.*] = packOld(packCell(ux, uy, uz), vn);
+                    tail.* += 1;
+                }
+            }
+        }
     }
 
     /// Recompute one column's skylight + heightmap entry (vanilla-like
@@ -340,133 +642,6 @@ pub const Chunk = struct {
     }
 };
 
-/// Build a ZC1 chunk from decompressed Anvil chunk NBT (1.7.10 Level format).
-/// Reads Level.{xPos,zPos,Sections[{Y,Blocks[4096],Data[2048],Add?,SkyLight,BlockLight}],Biomes[256],HeightMap[256]}.
-pub fn fromAnvilNbt(allocator: std.mem.Allocator, nbt_bytes: []const u8, dim: u8) ChunkError!*Chunk {
-    var r = nbt.Reader.init(nbt_bytes);
-    _ = try r.readRoot();
-    // find Level compound at root
-    var found_level = false;
-    const c = try allocator.create(Chunk);
-    c.* = .{ .dim = dim, .x = 0, .z = 0 };
-    errdefer allocator.destroy(c);
-
-    while (true) {
-        const t = try r.readTagType();
-        if (t == .end) break;
-        const name = try r.readString();
-        if (t == .compound and std.mem.eql(u8, name, "Level")) {
-            found_level = true;
-            try parseLevel(&r, c);
-        } else {
-            try r.skipPayload(t);
-        }
-    }
-    if (!found_level) {
-        allocator.destroy(c);
-        return error.Truncated;
-    }
-    return c;
-}
-
-fn parseLevel(r: *nbt.Reader, c: *Chunk) ChunkError!void {
-    while (true) {
-        const t = try r.readTagType();
-        if (t == .end) break;
-        const name = try r.readString();
-        if (t == .int and std.mem.eql(u8, name, "xPos")) {
-            c.x = try r.readBE(i32);
-        } else if (t == .int and std.mem.eql(u8, name, "zPos")) {
-            c.z = try r.readBE(i32);
-        } else if (t == .list and std.mem.eql(u8, name, "Sections")) {
-            try parseSections(r, c);
-        } else if (t == .byte_array and std.mem.eql(u8, name, "Biomes")) {
-            const b = try r.readByteArray();
-            if (b.len != 256) return error.Truncated;
-            @memcpy(&c.biomes, b[0..256]);
-        } else if (t == .int_array and std.mem.eql(u8, name, "HeightMap")) {
-            const len = try r.readBE(i32);
-            if (len != 256) return error.Truncated;
-            for (&c.heights) |*h| {
-                const v = try r.readBE(i32);
-                h.* = @truncate(@as(u32, @intCast(@min(@max(v, 0), 255))));
-            }
-        } else {
-            try r.skipPayload(t);
-        }
-    }
-}
-
-fn parseSections(r: *nbt.Reader, c: *Chunk) ChunkError!void {
-    const elem = try r.readTagType();
-    if (elem != .compound) return error.Truncated;
-    const count = try r.readBE(i32);
-    if (count < 0 or count > 16) return error.Truncated;
-    var i: i32 = 0;
-    while (i < count) : (i += 1) {
-        // section compound entries
-        var y: ?u8 = null;
-        var blocks: ?[]const u8 = null;
-        var data: ?[]const u8 = null;
-        var add: ?[]const u8 = null;
-        var sky: ?[]const u8 = null;
-        var light: ?[]const u8 = null;
-        while (true) {
-            const t = try r.readTagType();
-            if (t == .end) break;
-            const name = try r.readString();
-            if (t == .byte and std.mem.eql(u8, name, "Y")) {
-                y = try r.readByte();
-            } else if (t == .byte_array and std.mem.eql(u8, name, "Blocks")) {
-                blocks = try r.readByteArray();
-            } else if (t == .byte_array and std.mem.eql(u8, name, "Data")) {
-                data = try r.readByteArray();
-            } else if (t == .byte_array and std.mem.eql(u8, name, "Add")) {
-                add = try r.readByteArray();
-            } else if (t == .byte_array and std.mem.eql(u8, name, "SkyLight")) {
-                sky = try r.readByteArray();
-            } else if (t == .byte_array and std.mem.eql(u8, name, "BlockLight")) {
-                light = try r.readByteArray();
-            } else {
-                try r.skipPayload(t);
-            }
-        }
-        const yi = y orelse return error.Truncated;
-        if (yi > 15) return error.Truncated;
-        const b = blocks orelse return error.Truncated;
-        const d = data orelse return error.Truncated;
-        if (b.len != 4096 or d.len != 2048) return error.Truncated;
-        if (add) |a| {
-            if (a.len != 2048) return error.Truncated;
-        }
-        if (sky) |s| {
-            if (s.len != 2048) return error.Truncated;
-        }
-        if (light) |l| {
-            if (l.len != 2048) return error.Truncated;
-        }
-        var s = Section{};
-        // Anvil order is YZX already: idx=(y*16+z)*16+x matches ours.
-        for (0..4096) |idx| {
-            const base: u16 = b[idx];
-            const an: u16 = if (add) |a| nibbleAt(a, idx) else 0;
-            const w: u16 = (an << 8) | base;
-            s.blocks[idx] = wire.fromWire(w) orelse return error.BlockIdRange;
-            s.meta[idx >> 1] = d[idx >> 1]; // copy whole byte once (loop hits twice, idempotent)
-        }
-        if (add) |a| @memcpy(&s.add, a[0..2048]);
-        @memcpy(&s.meta, d[0..2048]);
-        if (sky) |sk| @memcpy(&s.sky, sk[0..2048]);
-        if (light) |li| @memcpy(&s.light, li[0..2048]);
-        c.sections[yi] = s;
-    }
-}
-
-inline fn nibbleAt(arr: []const u8, idx: usize) u8 {
-    const v = arr[idx >> 1];
-    return if (idx & 1 == 0) v & 0x0F else v >> 4;
-}
-
 test "section index order + nibbles" {
     // corners map to distinct slots; nibble pack/unpack roundtrips
     try std.testing.expectEqual(@as(usize, 0), Section.index(0, 0, 0));
@@ -525,100 +700,6 @@ test "zc1 rejects bad magic/trailing bytes" {
     bad[0] = 'X';
     try std.testing.expectError(error.BadMagic, Chunk.decode(a, bad));
     try std.testing.expectError(error.Truncated, Chunk.decode(a, enc[0 .. enc.len - 1]));
-}
-
-test "fromAnvilNbt minimal one-section chunk" {
-    const a = std.testing.allocator;
-    // Build NBT: root{ Level{ xPos=7(int), zPos=-3(int),
-    //   Sections=[ {Y=0B, Blocks[4096](id 1 at 0, 57 at 4095), Data[2048](0), SkyLight[2048](FF), BlockLight[2048](0)} ],
-    //   Biomes[256](7), HeightMap[256](64) } }
-    var aw: std.Io.Writer.Allocating = .init(a);
-    defer aw.deinit();
-    const w = &aw.writer;
-    try w.writeByte(10); // root compound
-    try w.writeInt(u16, 0, .big); // empty name
-    // Level compound
-    try w.writeByte(10);
-    try w.writeInt(u16, 5, .big);
-    try w.writeAll("Level");
-    try w.writeByte(3);
-    try w.writeInt(u16, 4, .big);
-    try w.writeAll("xPos");
-    try w.writeInt(i32, 7, .big);
-    try w.writeByte(3);
-    try w.writeInt(u16, 4, .big);
-    try w.writeAll("zPos");
-    try w.writeInt(i32, -3, .big);
-    // Sections list
-    try w.writeByte(9);
-    try w.writeInt(u16, 8, .big);
-    try w.writeAll("Sections");
-    try w.writeByte(10); // elem compound
-    try w.writeInt(i32, 1, .big); // len
-    try w.writeByte(1);
-    try w.writeInt(u16, 1, .big);
-    try w.writeAll("Y");
-    try w.writeByte(0);
-    // Blocks
-    var blocks: [4096]u8 = [_]u8{0} ** 4096;
-    blocks[0] = 1;
-    blocks[4095] = 57;
-    try w.writeByte(7);
-    try w.writeInt(u16, 6, .big);
-    try w.writeAll("Blocks");
-    try w.writeInt(i32, 4096, .big);
-    try w.writeAll(&blocks);
-    const zeros2048 = [_]u8{0} ** 2048;
-    const ff2048 = [_]u8{0xFF} ** 2048;
-    try w.writeByte(7);
-    try w.writeInt(u16, 4, .big);
-    try w.writeAll("Data");
-    try w.writeInt(i32, 2048, .big);
-    try w.writeAll(&zeros2048);
-    try w.writeByte(7);
-    try w.writeInt(u16, 8, .big);
-    try w.writeAll("SkyLight");
-    try w.writeInt(i32, 2048, .big);
-    try w.writeAll(&ff2048);
-    try w.writeByte(7);
-    try w.writeInt(u16, 10, .big);
-    try w.writeAll("BlockLight");
-    try w.writeInt(i32, 2048, .big);
-    try w.writeAll(&zeros2048);
-    try w.writeByte(0); // end section
-    // Biomes
-    const bio = [_]u8{7} ** 256;
-    try w.writeByte(7);
-    try w.writeInt(u16, 6, .big);
-    try w.writeAll("Biomes");
-    try w.writeInt(i32, 256, .big);
-    try w.writeAll(&bio);
-    // HeightMap
-    try w.writeByte(11);
-    try w.writeInt(u16, 9, .big);
-    try w.writeAll("HeightMap");
-    try w.writeInt(i32, 256, .big);
-    var hi: usize = 0;
-    while (hi < 256) : (hi += 1) try w.writeInt(i32, 64, .big);
-    try w.writeByte(0); // end Level
-    try w.writeByte(0); // end root
-
-    const ch = try fromAnvilNbt(a, aw.written(), 0);
-    defer ch.destroy(a);
-    try std.testing.expectEqual(@as(i32, 7), ch.x);
-    try std.testing.expectEqual(@as(i32, -3), ch.z);
-    try std.testing.expect(ch.sections[0] != null);
-    try std.testing.expect(ch.sections[1] == null);
-    try std.testing.expectEqual(ids.stone, ch.sections[0].?.getBlock(0, 0, 0));
-    try std.testing.expectEqual(ids.diamond_block, ch.sections[0].?.getBlock(15, 15, 15));
-    try std.testing.expectEqual(@as(u8, 7), ch.biomes[100]);
-    try std.testing.expectEqual(@as(u8, 64), ch.heights[100]);
-    // ZC1 encode of converted chunk decodes back
-    const enc = try ch.encode(a);
-    defer a.free(enc);
-    const dec = try Chunk.decode(a, enc);
-    defer dec.destroy(a);
-    try std.testing.expectEqual(ids.diamond_block, dec.sections[0].?.getBlock(15, 15, 15));
 }
 
 test "relightColumn: sky closes below opaque, heights skip snow" {
@@ -681,4 +762,224 @@ test "relightBlock: torch floods, stone blocks" {
     ch.sections[0].?.setBlock(8, 1, 8, .air);
     ch.relightBlock(q);
     try std.testing.expectEqual(@as(u4, 0), Section.getNibble(&ch.sections[0].?.light, Section.index(9, 1, 8)));
+}
+
+test "spreadSky: overhang leaks sideways with falloff, sealed rooms stay dark" {
+    // Vanilla shape: open columns hold 15 (column rule); light under a
+    // roof comes sideways from the opening, dimming 1/level through air;
+    // roof stones hold 15 on top but must NOT leak downward (else nothing
+    // under any roof would ever go dark and mobs would never spawn there).
+    const a = std.testing.allocator;
+    const ch = try Chunk.createEmpty(a, 0, 0, 0);
+    defer ch.destroy(a);
+    for (0..5) |s| ch.sections[s] = Section{};
+    // Stone floor y=64 everywhere; roof slab y=70..71 over x=8..15.
+    var x: usize = 0;
+    while (x < 16) : (x += 1) {
+        var z: usize = 0;
+        while (z < 16) : (z += 1) {
+            ch.sections[4].?.setBlock(@intCast(x), 0, @intCast(z), .stone);
+            if (x >= 8) {
+                ch.sections[4].?.setBlock(@intCast(x), 6, @intCast(z), .stone);
+                ch.sections[4].?.setBlock(@intCast(x), 7, @intCast(z), .stone);
+            }
+        }
+    }
+    // Sealed 1-cell room at (3,66,8): stone on all 6 sides.
+    const room = [_][3]u4{ .{ 2, 2, 8 }, .{ 4, 2, 8 }, .{ 3, 1, 8 }, .{ 3, 3, 8 }, .{ 3, 2, 7 }, .{ 3, 2, 9 } };
+    for (room) |c| ch.sections[4].?.setBlock(c[0], c[1], c[2], .stone);
+    for (0..16) |lz| {
+        for (0..16) |lx| ch.relightColumn(lx, lz);
+    }
+    const q = try a.alloc(u32, 65536);
+    defer a.free(q);
+    ch.spreadSky(q);
+    const sky = struct {
+        fn at(c: *Chunk, lx: usize, y: usize, lz: usize) u4 {
+            const s = c.sections[y >> 4] orelse return 0;
+            return Section.getNibble(&s.sky, Section.index(@intCast(lx), @intCast(y & 15), @intCast(lz)));
+        }
+    }.at;
+    // Open column untouched by the spread.
+    try std.testing.expectEqual(@as(u4, 15), sky(ch, 7, 69, 8));
+    try std.testing.expectEqual(@as(u4, 15), sky(ch, 7, 65, 8));
+    // Sideways falloff under the roof edge (15/14/13/12...).
+    try std.testing.expectEqual(@as(u4, 14), sky(ch, 8, 69, 8));
+    try std.testing.expectEqual(@as(u4, 12), sky(ch, 10, 69, 8));
+    // Roof top stones hold 15 but must not leak: (15,69) is 7 deep via
+    // the sideways chain, not 14 from the stone above it. (Second roof
+    // layer y=70 holds 0 — set-after-drop.)
+    try std.testing.expectEqual(@as(u4, 15), sky(ch, 8, 71, 8));
+    try std.testing.expectEqual(@as(u4, 0), sky(ch, 8, 70, 8));
+    try std.testing.expectEqual(@as(u4, 7), sky(ch, 15, 69, 8));
+    // Near-opening under-roof cells stay bright via the short sideways
+    // path, even though their own column reads dark.
+    try std.testing.expectEqual(@as(u4, 14), sky(ch, 8, 65, 8));
+    try std.testing.expectEqual(@as(u4, 7), sky(ch, 15, 65, 8));
+    // Sealed room: no path in, stays black.
+    try std.testing.expectEqual(@as(u4, 0), sky(ch, 3, 66, 8));
+}
+
+test "spreadSky: shaft stays bright, leaves and water attenuate sideways" {
+    const a = std.testing.allocator;
+    // 1x1 shaft at (4,*): stone y=0..63 except the shaft, open sky above.
+    {
+        const ch = try Chunk.createEmpty(a, 0, 0, 0);
+        defer ch.destroy(a);
+        for (0..4) |s| ch.sections[s] = Section{};
+        var y: usize = 0;
+        while (y < 64) : (y += 1) {
+            var z: usize = 0;
+            while (z < 16) : (z += 1) {
+                var x: usize = 0;
+                while (x < 16) : (x += 1) {
+                    if (x == 4 and z == 4) continue;
+                    const sec = &ch.sections[y >> 4].?;
+                    sec.setBlock(@intCast(x), @intCast(y & 15), @intCast(z), .stone);
+                }
+            }
+        }
+        for (0..16) |lz| {
+            for (0..16) |lx| ch.relightColumn(lx, lz);
+        }
+        const q = try a.alloc(u32, 65536);
+        defer a.free(q);
+        ch.spreadSky(q);
+        try std.testing.expectEqual(@as(u4, 15), ch.getSkyAt(4, 10, 4));
+        try std.testing.expectEqual(@as(u4, 15), ch.getSkyAt(4, 1, 4));
+        // Shaft walls are opaque: no sideways leak out of the shaft.
+        try std.testing.expectEqual(@as(u4, 0), ch.getSkyAt(5, 10, 4));
+    }
+    // Leaves dim by exactly 1 sideways; water costs 3 (jar opacity).
+    for ([_]ids.Id{ .leaves, .water }) |mat| {
+        const ch = try Chunk.createEmpty(a, 0, 0, 0);
+        defer ch.destroy(a);
+        for (0..5) |s| ch.sections[s] = Section{};
+        // Floor y=64, full-width roof y=70..71 over x=4..15, open x=0..3.
+        var x: usize = 0;
+        while (x < 16) : (x += 1) {
+            var z: usize = 0;
+            while (z < 16) : (z += 1) {
+                ch.sections[4].?.setBlock(@intCast(x), 0, @intCast(z), .stone);
+                if (x >= 4) {
+                    ch.sections[4].?.setBlock(@intCast(x), 6, @intCast(z), .stone);
+                    ch.sections[4].?.setBlock(@intCast(x), 7, @intCast(z), .stone);
+                }
+            }
+        }
+        ch.sections[4].?.setBlock(8, 5, 8, mat);
+        for (0..16) |lz| {
+            for (0..16) |lx| ch.relightColumn(lx, lz);
+        }
+        const q = try a.alloc(u32, 65536);
+        defer a.free(q);
+        ch.spreadSky(q);
+        // Chain from the opening: (3,69)=15, (4,69)=14 ... (7,69)=11.
+        try std.testing.expectEqual(@as(u4, 11), ch.getSkyAt(7, 69, 8));
+        const want: u4 = if (mat == .leaves) 10 else 8;
+        try std.testing.expectEqual(want, ch.getSkyAt(8, 69, 8));
+    }
+}
+
+test "unspreadLight block: torch removal extinguishes, replace restores" {
+    // Incremental two-phase at chunk level (the exact sequence
+    // applyBlock runs): removing the emitter must not leave stale light,
+    // and re-placing must restore the identical flood.
+    const a = std.testing.allocator;
+    const ch = try Chunk.createEmpty(a, 0, 0, 0);
+    defer ch.destroy(a);
+    ch.sections[0] = Section{};
+    ch.sections[0].?.setBlock(8, 1, 8, .torch);
+    const q = try a.alloc(u32, 65536);
+    defer a.free(q);
+    ch.relightBlock(q);
+    const at = struct {
+        fn light(c: *Chunk, x: u4, y: u4, z: u4) u4 {
+            return Section.getNibble(&c.sections[0].?.light, Section.index(x, y, z));
+        }
+    }.light;
+    try std.testing.expectEqual(@as(u4, 14), at(ch, 8, 1, 8));
+    try std.testing.expectEqual(@as(u4, 13), at(ch, 9, 1, 8));
+    // Remove the torch: pin the cell to 0, invalidate with the old value.
+    ch.sections[0].?.setBlock(8, 1, 8, .air);
+    Section.setNibble(&ch.sections[0].?.light, Section.index(8, 1, 8), 0);
+    const tc = Chunk.packCell(8, 1, 8);
+    const old = [_]Chunk.CellValue{.{ .cell = tc, .value = 14 }};
+    const rw = [_]Chunk.CellValue{.{ .cell = tc, .value = 0 }};
+    ch.unspreadLight(q, .block, &old, &rw);
+    try std.testing.expectEqual(@as(u4, 0), at(ch, 8, 1, 8));
+    try std.testing.expectEqual(@as(u4, 0), at(ch, 9, 1, 8));
+    // Re-place: pin to emission, raise-flood restores the same values.
+    ch.sections[0].?.setBlock(8, 1, 8, .torch);
+    Section.setNibble(&ch.sections[0].?.light, Section.index(8, 1, 8), 14);
+    const one = [_]u32{tc};
+    ch.spreadLight(q, .block, &one);
+    try std.testing.expectEqual(@as(u4, 14), at(ch, 8, 1, 8));
+    try std.testing.expectEqual(@as(u4, 13), at(ch, 9, 1, 8));
+}
+
+test "unspreadLight block: glass wall darkens corridor, break restores all" {
+    // Sealed 1-wide tube (torch - glass - air - air - air): replacing the
+    // glass with stone must darken everything past it (no alternate
+    // paths), and breaking it back must restore every level exactly
+    // (proves reflood completeness — no over-zeroing left behind).
+    const a = std.testing.allocator;
+    const ch = try Chunk.createEmpty(a, 0, 0, 0);
+    defer ch.destroy(a);
+    ch.sections[0] = Section{};
+    // Stone everywhere in section 0 except the tube cells.
+    var y: usize = 0;
+    while (y < 16) : (y += 1) {
+        var z: usize = 0;
+        while (z < 16) : (z += 1) {
+            var x: usize = 0;
+            while (x < 16) : (x += 1) {
+                const in_tube = (y == 1 and z == 8 and x >= 7 and x <= 11);
+                if (!in_tube) ch.sections[0].?.setBlock(@intCast(x), @intCast(y), @intCast(z), .stone);
+            }
+        }
+    }
+    ch.sections[0].?.setBlock(7, 1, 8, .torch);
+    ch.sections[0].?.setBlock(8, 1, 8, .glass);
+    const q = try a.alloc(u32, 65536);
+    defer a.free(q);
+    ch.relightBlock(q);
+    const at = struct {
+        fn light(c: *Chunk, ax: u4, ay: u4, az: u4) u4 {
+            return Section.getNibble(&c.sections[0].?.light, Section.index(ax, ay, az));
+        }
+    }.light;
+    try std.testing.expectEqual(@as(u4, 14), at(ch, 7, 1, 8));
+    try std.testing.expectEqual(@as(u4, 13), at(ch, 8, 1, 8));
+    try std.testing.expectEqual(@as(u4, 12), at(ch, 9, 1, 8));
+    try std.testing.expectEqual(@as(u4, 11), at(ch, 10, 1, 8));
+    try std.testing.expectEqual(@as(u4, 10), at(ch, 11, 1, 8));
+    // Glass -> stone: the cell goes dark, everything past it must too
+    // (stone is opaque: the flood stops at the wall, no alternate paths
+    // exist in the sealed tube).
+    ch.sections[0].?.setBlock(8, 1, 8, .stone);
+    Section.setNibble(&ch.sections[0].?.light, Section.index(8, 1, 8), 0);
+    const gc = Chunk.packCell(8, 1, 8);
+    const old = [_]Chunk.CellValue{.{ .cell = gc, .value = 13 }};
+    const rw0 = [_]Chunk.CellValue{.{ .cell = gc, .value = 0 }};
+    ch.unspreadLight(q, .block, &old, &rw0);
+    try std.testing.expectEqual(@as(u4, 0), at(ch, 8, 1, 8));
+    try std.testing.expectEqual(@as(u4, 0), at(ch, 9, 1, 8));
+    try std.testing.expectEqual(@as(u4, 0), at(ch, 10, 1, 8));
+    try std.testing.expectEqual(@as(u4, 0), at(ch, 11, 1, 8));
+    // Torch itself is untouched by the wall going up next to it.
+    try std.testing.expectEqual(@as(u4, 14), at(ch, 7, 1, 8));
+    // Stone -> air: recompute (13 via torch), invalidate the stale 0,
+    // rewrite + reflood restores every level exactly.
+    ch.sections[0].?.setBlock(8, 1, 8, .air);
+    Section.setNibble(&ch.sections[0].?.light, Section.index(8, 1, 8), 13);
+    const old2 = [_]Chunk.CellValue{.{ .cell = gc, .value = 0 }};
+    const rw2 = [_]Chunk.CellValue{.{ .cell = gc, .value = 13 }};
+    ch.unspreadLight(q, .block, &old2, &rw2);
+    const one = [_]u32{gc};
+    ch.spreadLight(q, .block, &one);
+    try std.testing.expectEqual(@as(u4, 13), at(ch, 8, 1, 8));
+    try std.testing.expectEqual(@as(u4, 12), at(ch, 9, 1, 8));
+    try std.testing.expectEqual(@as(u4, 11), at(ch, 10, 1, 8));
+    try std.testing.expectEqual(@as(u4, 10), at(ch, 11, 1, 8));
 }

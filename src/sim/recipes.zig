@@ -12,7 +12,8 @@
 //!   table (vanilla Item durability); full data is a Phase H follow-up.
 
 const std = @import("std");
-const data = @import("recipes_data.zig");
+const profile = @import("../version.zig");
+const data = profile.game.recipes_data;
 const item_mod = @import("../item.zig");
 const ids = @import("../ids.zig");
 

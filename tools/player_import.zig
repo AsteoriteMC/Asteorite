@@ -5,8 +5,8 @@
 //! world/playerdata/<uuid>.dat). The username is required explicitly: the
 //! filename carries only a UUID, while our key + stored name need the exact
 //! login bytes (case-sensitive, matching offline-UUID behavior).
-//! Conversion follows src/sim/players.zig.fromVanillaNbt (JVM-verified
-//! layout; see the doc comment there for the field mapping).
+//! Conversion follows src/world/import/player.zig.fromVanillaNbt
+//! (JVM-verified layout; see the doc comment there for the field mapping).
 
 const std = @import("std");
 const asteorite = @import("asteorite");
@@ -51,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
         try out.flush();
         return;
     };
-    var imported = asteorite.players.fromVanillaNbt(arena_alloc, plain, username) catch {
+    var imported = asteorite.player_import.fromVanillaNbt(arena_alloc, plain, username) catch {
         try out.print("cannot parse {s} as 1.7.10 player NBT\n", .{dat_path});
         try out.flush();
         return;
@@ -76,11 +76,13 @@ pub fn main(init: std.process.Init) !void {
     try out.print(
         "imported {s} -> {s}: pos=({d:.1},{d:.1},{d:.1}) spawn=({d},{d},{d}) health={d:.1} food={d} gamemode={d} inv_slots={d} nbt_bytes={d}",
         .{
-            dat_path,                    db_path,
-            imported.data.pos_x,         imported.data.pos_y, imported.data.pos_z,
-            imported.data.spawn_x,       imported.data.spawn_y, imported.data.spawn_z,
-            imported.data.health,        imported.data.food,    imported.data.gamemode,
-            filled,                      nbt_total,
+            dat_path,               db_path,
+            imported.data.pos_x,    imported.data.pos_y,
+            imported.data.pos_z,    imported.data.spawn_x,
+            imported.data.spawn_y,  imported.data.spawn_z,
+            imported.data.health,   imported.data.food,
+            imported.data.gamemode, filled,
+            nbt_total,
         },
     );
     if (imported.stats.defaulted_spawn) try out.print(" [spawn=defaulted-to-pos]", .{});

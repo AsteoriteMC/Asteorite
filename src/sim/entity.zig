@@ -7,14 +7,16 @@
 //! (clients never garbage-collect server-side entities on their own).
 
 const std = @import("std");
-const packets = @import("../proto/v5/packets.zig");
 const conn_mod = @import("../net/conn.zig");
 const item_mod = @import("../item.zig");
 const ids = @import("../ids.zig");
+const mob_mod = @import("../game/mob.zig");
+const packet_sink = @import("packet_sink.zig");
 
-pub const MOB_PIG: u8 = 90;
-pub const MOB_SHEEP: u8 = 91;
-pub const MOB_COW: u8 = 92;
+/// Canonical aliases kept for existing simulation/demo writers.
+pub const MOB_PIG: mob_mod.Kind = .pig;
+pub const MOB_SHEEP: mob_mod.Kind = .sheep;
+pub const MOB_COW: mob_mod.Kind = .cow;
 
 /// Dropped-item entity (vanilla EntityItem, type 2 on the wire).
 /// Ticks are 20tps units advanced 20 per 1Hz server tick (same convention as
@@ -64,7 +66,7 @@ pub const ItemSnap = struct {
 
 pub const Mob = struct {
     id: i32,
-    kind: u8,
+    kind: mob_mod.Kind,
     x: f64,
     y: f64,
     z: f64,
@@ -149,7 +151,7 @@ pub const PlayerSnap = struct {
 /// Mob snapshot (copied out from under the entity lock).
 pub const MobSnap = struct {
     id: i32,
-    kind: u8,
+    kind: mob_mod.Kind,
     x: f64,
     y: f64,
     z: f64,
@@ -206,12 +208,14 @@ fn grantToInventory(conn: *conn_mod.Conn, stack: item_mod.Stack) !?i16 {
 }
 
 /// Vanilla pickup reach: entity-collision AABBs (player 0.6 + item 0.5 +
-/// 0.2 expand) — centers within ~1 block horizontally, same height band.
-/// Generous static approximation (no per-tick physics in the 1Hz model).
+/// 0.2 expand) plus the item magnet — centers within ~2 blocks horizontally
+/// pick up, same height band. The magnet matters at 1Hz: with a 1-block
+/// radius a walking player steps past a drop between ticks and never
+/// overlaps it on a tick boundary, so walking over drops felt broken.
 fn inPickupReach(px: f64, py: f64, pz: f64, x: f64, y: f64, z: f64) bool {
     const dx = x - px;
     const dz = z - pz;
-    return dx * dx + dz * dz <= 1.0 and @abs(y - py) <= 2.0;
+    return dx * dx + dz * dz <= 4.0 and @abs(y - py) <= 2.0;
 }
 
 /// Reconcile one viewer's tracked set against the world snapshot.
@@ -220,6 +224,7 @@ fn inPickupReach(px: f64, py: f64, pz: f64, x: f64, y: f64, z: f64) bool {
 /// `present` answers: is (x,z) loaded for this viewer right now?
 pub fn reconcileViewer(
     conn: *conn_mod.Conn,
+    sink: packet_sink.PacketSink,
     players: []const PlayerSnap,
     mobs: []const MobSnap,
     items: []const ItemSnap,
@@ -231,46 +236,46 @@ pub fn reconcileViewer(
     for (players) |p| {
         if (p.eid == conn.eid) continue;
         if (!present(present_ctx, p.x, p.z)) {
-            if (conn.tracked.fetchRemove(p.eid)) |_| {
-                var db: [8]u8 = undefined;
-                try conn.queueFramed(try packets.frameDestroyEntitiesFramed(&[_]i32{p.eid}, &db));
-            }
+            if (conn.tracked.fetchRemove(p.eid)) |_| try sink.destroyEntities(&[_]i32{p.eid});
             continue;
         }
         const t = conn.tracked.get(p.eid);
         switch (planUpdate(if (t) |tv| tv else null, p.x, p.y, p.z, p.yaw, p.pitch)) {
             .none => {},
             .spawn => {
-                var sb: [256]u8 = undefined;
-                try conn.queueFramed(try packets.frameSpawnPlayer(p.eid, &p.uuid, p.name[0..p.name_len], p.x, p.y, p.z, p.yaw, p.pitch, 20.0, &sb));
-                var hb: [16]u8 = undefined;
-                try conn.queueFramed(try packets.frameEntityHeadLook(p.eid, p.yaw, &hb));
+                var spawn = packet_sink.PlayerSpawn{
+                    .eid = p.eid,
+                    .uuid = p.uuid,
+                    .name = p.name,
+                    .name_len = p.name_len,
+                    .x = p.x,
+                    .y = p.y,
+                    .z = p.z,
+                    .yaw = p.yaw,
+                    .pitch = p.pitch,
+                    .health = 20.0,
+                };
+                try sink.spawnPlayer(&spawn);
+                try sink.headLook(p.eid, p.yaw);
                 try conn.tracked.put(p.eid, .{ .x = p.x, .y = p.y, .z = p.z, .yaw = p.yaw, .pitch = p.pitch });
             },
             .rel_move => |d| {
-                var mb: [16]u8 = undefined;
-                try conn.queueFramed(try packets.frameEntityRelativeMove(p.eid, d.dx, d.dy, d.dz, &mb));
+                try sink.moveRelative(p.eid, d.dx, d.dy, d.dz);
                 try conn.tracked.put(p.eid, .{ .x = p.x, .y = p.y, .z = p.z, .yaw = p.yaw, .pitch = p.pitch });
             },
             .look => {
-                var lb: [16]u8 = undefined;
-                try conn.queueFramed(try packets.frameEntityLook(p.eid, p.yaw, p.pitch, &lb));
-                var hb: [16]u8 = undefined;
-                try conn.queueFramed(try packets.frameEntityHeadLook(p.eid, p.yaw, &hb));
+                try sink.look(p.eid, p.yaw, p.pitch);
+                try sink.headLook(p.eid, p.yaw);
                 try conn.tracked.put(p.eid, .{ .x = p.x, .y = p.y, .z = p.z, .yaw = p.yaw, .pitch = p.pitch });
             },
             .move_look => |d| {
-                var mb: [16]u8 = undefined;
-                try conn.queueFramed(try packets.frameEntityMoveLook(p.eid, d.dx, d.dy, d.dz, p.yaw, p.pitch, &mb));
-                var hb: [16]u8 = undefined;
-                try conn.queueFramed(try packets.frameEntityHeadLook(p.eid, p.yaw, &hb));
+                try sink.moveLook(p.eid, d.dx, d.dy, d.dz, p.yaw, p.pitch);
+                try sink.headLook(p.eid, p.yaw);
                 try conn.tracked.put(p.eid, .{ .x = p.x, .y = p.y, .z = p.z, .yaw = p.yaw, .pitch = p.pitch });
             },
             .teleport => {
-                var tb: [32]u8 = undefined;
-                try conn.queueFramed(try packets.frameEntityTeleport(p.eid, p.x, p.y, p.z, p.yaw, p.pitch, &tb));
-                var hb: [16]u8 = undefined;
-                try conn.queueFramed(try packets.frameEntityHeadLook(p.eid, p.yaw, &hb));
+                try sink.teleport(p.eid, p.x, p.y, p.z, p.yaw, p.pitch);
+                try sink.headLook(p.eid, p.yaw);
                 try conn.tracked.put(p.eid, .{ .x = p.x, .y = p.y, .z = p.z, .yaw = p.yaw, .pitch = p.pitch });
             },
         }
@@ -278,42 +283,43 @@ pub fn reconcileViewer(
     // mobs
     for (mobs) |m| {
         if (!present(present_ctx, m.x, m.z)) {
-            if (conn.tracked.fetchRemove(m.id)) |_| {
-                var db: [8]u8 = undefined;
-                try conn.queueFramed(try packets.frameDestroyEntitiesFramed(&[_]i32{m.id}, &db));
-            }
+            if (conn.tracked.fetchRemove(m.id)) |_| try sink.destroyEntities(&[_]i32{m.id});
             continue;
         }
         const t = conn.tracked.get(m.id);
         switch (planUpdate(if (t) |tv| tv else null, m.x, m.y, m.z, m.yaw, 0)) {
             .none => {},
             .spawn => {
-                var sb: [256]u8 = undefined;
-                try conn.queueFramed(try packets.frameSpawnMob(m.id, m.kind, m.x, m.y, m.z, m.yaw, 0, m.yaw, m.health, &sb));
-                var hb: [16]u8 = undefined;
-                try conn.queueFramed(try packets.frameEntityHeadLook(m.id, m.yaw, &hb));
+                var spawn = packet_sink.MobSpawn{
+                    .eid = m.id,
+                    .kind = m.kind,
+                    .x = m.x,
+                    .y = m.y,
+                    .z = m.z,
+                    .yaw = m.yaw,
+                    .pitch = 0,
+                    .head_pitch = m.yaw,
+                    .health = m.health,
+                };
+                try sink.spawnMob(&spawn);
+                try sink.headLook(m.id, m.yaw);
                 try conn.tracked.put(m.id, .{ .x = m.x, .y = m.y, .z = m.z, .yaw = m.yaw, .pitch = 0 });
             },
             .rel_move => |d| {
-                var mb: [16]u8 = undefined;
-                try conn.queueFramed(try packets.frameEntityRelativeMove(m.id, d.dx, d.dy, d.dz, &mb));
+                try sink.moveRelative(m.id, d.dx, d.dy, d.dz);
                 try conn.tracked.put(m.id, .{ .x = m.x, .y = m.y, .z = m.z, .yaw = m.yaw, .pitch = 0 });
             },
             .look => {
-                var hb: [16]u8 = undefined;
-                try conn.queueFramed(try packets.frameEntityHeadLook(m.id, m.yaw, &hb));
+                try sink.headLook(m.id, m.yaw);
                 try conn.tracked.put(m.id, .{ .x = m.x, .y = m.y, .z = m.z, .yaw = m.yaw, .pitch = 0 });
             },
             .move_look => |d| {
-                var mb: [16]u8 = undefined;
-                try conn.queueFramed(try packets.frameEntityMoveLook(m.id, d.dx, d.dy, d.dz, m.yaw, 0, &mb));
-                var hb: [16]u8 = undefined;
-                try conn.queueFramed(try packets.frameEntityHeadLook(m.id, m.yaw, &hb));
+                try sink.moveLook(m.id, d.dx, d.dy, d.dz, m.yaw, 0);
+                try sink.headLook(m.id, m.yaw);
                 try conn.tracked.put(m.id, .{ .x = m.x, .y = m.y, .z = m.z, .yaw = m.yaw, .pitch = 0 });
             },
             .teleport => {
-                var tb: [32]u8 = undefined;
-                try conn.queueFramed(try packets.frameEntityTeleport(m.id, m.x, m.y, m.z, m.yaw, 0, &tb));
+                try sink.teleport(m.id, m.x, m.y, m.z, m.yaw, 0);
                 try conn.tracked.put(m.id, .{ .x = m.x, .y = m.y, .z = m.z, .yaw = m.yaw, .pitch = 0 });
             },
         }
@@ -323,17 +329,11 @@ pub fn reconcileViewer(
         if (claimed.contains(it.id)) {
             // claimed by an earlier viewer this pass: self already got
             // Set Slot + Collect + Destroy; drop from our tracked set now.
-            if (conn.tracked.fetchRemove(it.id)) |_| {
-                var db: [8]u8 = undefined;
-                try conn.queueFramed(try packets.frameDestroyEntitiesFramed(&[_]i32{it.id}, &db));
-            }
+            if (conn.tracked.fetchRemove(it.id)) |_| try sink.destroyEntities(&[_]i32{it.id});
             continue;
         }
         if (!present(present_ctx, it.x, it.z)) {
-            if (conn.tracked.fetchRemove(it.id)) |_| {
-                var db: [8]u8 = undefined;
-                try conn.queueFramed(try packets.frameDestroyEntitiesFramed(&[_]i32{it.id}, &db));
-            }
+            if (conn.tracked.fetchRemove(it.id)) |_| try sink.destroyEntities(&[_]i32{it.id});
             continue;
         }
         if (conn.tracked.contains(it.id)) {
@@ -345,13 +345,9 @@ pub fn reconcileViewer(
                 const stack = item_mod.Stack{ .id = it.item_id, .count = it.count, .damage = it.damage, .nbt = it.nbt };
                 if (try grantToInventory(conn, stack)) |slot| {
                     if (claimed.add(it.id, conn.eid)) {
-                        const f = try packets.frameSetSlotAlloc(conn.allocator, 0, slot, conn.inv[@intCast(slot)]);
-                        defer conn.allocator.free(f);
-                        try conn.queueFramed(f);
-                        var cb: [16]u8 = undefined;
-                        try conn.queueFramed(try packets.frameCollect(it.id, conn.eid, &cb));
-                        var db: [8]u8 = undefined;
-                        try conn.queueFramed(try packets.frameDestroyEntitiesFramed(&[_]i32{it.id}, &db));
+                        try sink.inventorySlot(0, slot, conn.inv[@intCast(slot)]);
+                        try sink.collectItem(it.id, conn.eid);
+                        try sink.destroyEntities(&[_]i32{it.id});
                         // Already destroyed for self: drop from tracked now so
                         // the gone-scan below doesn't send a duplicate.
                         _ = conn.tracked.remove(it.id);
@@ -359,11 +355,9 @@ pub fn reconcileViewer(
                 }
             }
         } else if (!claimed.contains(it.id)) {
-            var sb: [64]u8 = undefined;
-            try conn.queueFramed(try packets.frameSpawnObject(it.id, 2, it.x, it.y, it.z, 0, 0, 1, null, &sb));
-            var mb: [1024]u8 = undefined;
             const stack = item_mod.Stack{ .id = it.item_id, .count = it.count, .damage = it.damage, .nbt = it.nbt };
-            try conn.queueFramed(try packets.frameItemMetadata(it.id, stack, &mb));
+            var spawn = packet_sink.ItemSpawn{ .eid = it.id, .stack = stack, .x = it.x, .y = it.y, .z = it.z };
+            try sink.spawnItem(&spawn);
             try conn.tracked.put(it.id, .{ .x = it.x, .y = it.y, .z = it.z, .yaw = 0, .pitch = 0 });
         }
     }
@@ -402,8 +396,7 @@ pub fn reconcileViewer(
     }
     for (gone[0..n_gone]) |id| {
         _ = conn.tracked.remove(id);
-        var db: [8]u8 = undefined;
-        try conn.queueFramed(try packets.frameDestroyEntitiesFramed(&[_]i32{id}, &db));
+        try sink.destroyEntities(&[_]i32{id});
     }
 }
 
@@ -451,37 +444,36 @@ test "pickup grants to inventory with collect + destroy" {
         .can_pickup = true,
     }};
     var claims = ClaimSet{};
+    const sink_test = @import("packet_sink_test.zig");
+    var recorder = sink_test.Recorder{};
+    const sink = recorder.sink();
     const Always = struct {
         fn f(_: *anyopaque, _: f64, _: f64) bool {
             return true;
         }
     }.f;
     const ctx: *anyopaque = @ptrCast(@alignCast(@as(*u8, @ptrFromInt(0x1000))));
-    // pass 1: untracked -> spawn + metadata (visible for >= 1 tick)
-    try reconcileViewer(&c, &[_]PlayerSnap{}, &[_]MobSnap{}, &items, &claims, Always, ctx);
+    // pass 1: untracked -> semantic item spawn (object + metadata at the edge)
+    try reconcileViewer(&c, sink, &[_]PlayerSnap{}, &[_]MobSnap{}, &items, &claims, Always, ctx);
     try std.testing.expect(!claims.contains(51));
     try std.testing.expect(c.tracked.contains(51));
+    try std.testing.expectEqualSlices(sink_test.Event, &[_]sink_test.Event{.item}, recorder.eventSlice());
+    try std.testing.expectEqual(@as(usize, 1), recorder.item_spawns);
+    try std.testing.expectEqual(ids.diamond, recorder.last_item.?.stack.id);
+    try std.testing.expectEqual(@as(i8, 3), recorder.last_item.?.stack.count);
+
     // pass 2: tracked + delay expired -> grant + collect + destroy
-    try reconcileViewer(&c, &[_]PlayerSnap{}, &[_]MobSnap{}, &items, &claims, Always, ctx);
+    recorder.reset();
+    try reconcileViewer(&c, sink, &[_]PlayerSnap{}, &[_]MobSnap{}, &items, &claims, Always, ctx);
     try std.testing.expect(claims.contains(51));
     // main inventory first slot (9) got the diamonds
     try std.testing.expect(c.inv[9] != null);
     try std.testing.expectEqual(ids.diamond, c.inv[9].?.id);
     try std.testing.expectEqual(@as(i8, 3), c.inv[9].?.count);
-    // outbox carries 0x2F set slot + 0x0D collect + 0x13 destroy, in order
-    const out = try c.takeOutput();
-    defer a.free(out);
-    var r = @import("../net/codec.zig").PacketReader.init(out);
-    var seen: [5]i32 = .{ -1, -1, -1, -1, -1 };
-    var k: usize = 0;
-    const Codec = @import("../net/codec.zig");
-    while (r.remaining() > 0 and k < seen.len) : (k += 1) {
-        const h = try Codec.decodeFrame(&r);
-        seen[k] = h.id;
-        const blen: usize = @intCast(h.length - @as(i32, @intCast(Codec.PacketWriter.varIntLen(h.id))));
-        r.index += blen;
-    }
-    try std.testing.expectEqualSlices(i32, &[_]i32{ 0x0E, 0x1C, 0x2F, 0x0D, 0x13 }, seen[0..k]);
+    try std.testing.expectEqualSlices(sink_test.Event, &[_]sink_test.Event{ .slot, .collect, .destroy }, recorder.eventSlice());
+    try std.testing.expectEqual(@as(i16, 9), recorder.last_slot.?.slot);
+    try std.testing.expectEqual(ids.diamond, recorder.last_slot.?.stack.?.id);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 51, 7 }, &recorder.last_collect.?);
 }
 
 test "planUpdate thresholds" {

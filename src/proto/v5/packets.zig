@@ -299,13 +299,14 @@ pub fn parseFlying(body: []const u8) codec.CodecError!bool {
     return try r.readBool();
 }
 
-/// Serverbound 0x04 position. 1.7 quirk: stance (eye height) double sits
-/// between X and Y and is consumed but unused server-side here.
+/// Serverbound 0x04 position. Wire order (jar `jf.a(et)`, `nh.a(jd)`):
+/// x, FEET y, stance (eye height = feet + 1.62), z. The stance double is
+/// consumed and unused (the server only tracks feet).
 pub fn parsePosition(body: []const u8) codec.CodecError!struct { x: f64, y: f64, z: f64, on_ground: bool } {
     var r = codec.PacketReader.init(body);
     const x = try r.readDouble();
-    _ = try r.readDouble(); // stance
-    const y = try r.readDouble();
+    const y = try r.readDouble(); // feet
+    _ = try r.readDouble(); // stance (eye height)
     const z = try r.readDouble();
     return .{ .x = x, .y = y, .z = z, .on_ground = try r.readBool() };
 }
@@ -318,12 +319,13 @@ pub fn parseLook(body: []const u8) codec.CodecError!struct { yaw: f32, pitch: f3
     return .{ .yaw = yaw, .pitch = pitch, .on_ground = try r.readBool() };
 }
 
-/// Serverbound 0x06 position+look (also carries stance).
+/// Serverbound 0x06 position+look. Same wire order as 0x04: x, FEET y,
+/// stance, z, yaw, pitch, on_ground.
 pub fn parsePositionLook(body: []const u8) codec.CodecError!struct { x: f64, y: f64, z: f64, yaw: f32, pitch: f32, on_ground: bool } {
     var r = codec.PacketReader.init(body);
     const x = try r.readDouble();
-    _ = try r.readDouble(); // stance
-    const y = try r.readDouble();
+    const y = try r.readDouble(); // feet
+    _ = try r.readDouble(); // stance (eye height)
     const z = try r.readDouble();
     const yaw = try r.readFloat();
     const pitch = try r.readFloat();
@@ -632,6 +634,13 @@ pub fn parseCloseWindow(body: []const u8) codec.CodecError!u8 {
     return try r.readByte();
 }
 
+/// Serverbound 0x11 enchant item (windowId u8, enchantment u8: 0/1/2 slot).
+/// 1.7.10 has no lapis: the cost is the full shown level.
+pub fn parseEnchantItem(body: []const u8) codec.CodecError!struct { window: u8, slot: u8 } {
+    var r = codec.PacketReader.init(body);
+    return .{ .window = try r.readByte(), .slot = try r.readByte() };
+}
+
 /// Block Change 0x23 (1.7 form: separate id VarInt + meta u8, NOT packed).
 pub fn frameBlockChange(x: i32, y: u8, z: i32, id: game_ids.Id, meta: u8, out: []u8) codec.CodecError![]const u8 {
     var payload: [16]u8 = undefined;
@@ -642,6 +651,22 @@ pub fn frameBlockChange(x: i32, y: u8, z: i32, id: game_ids.Id, meta: u8, out: [
     try w.writeVarInt(@as(i32, wire.toWire(id)));
     try w.writeByte(meta);
     return try codec.framePacket(@intFromEnum(ids.PlayClient.block_change), w.written(), out);
+}
+
+/// Block Action 0x24 (1.7.10: x, y as unsigned byte, z, byte1, byte2,
+/// VarInt blockId). Pistons animate the vanilla client from this packet —
+/// the client re-runs `onBlockEventReceived` locally and derives the same
+/// final blocks, so the server must NOT also echo 0x23 for those cells.
+pub fn frameBlockAction(x: i32, y: u16, z: i32, byte1: u8, byte2: u8, block_id: u16, out: []u8) codec.CodecError![]const u8 {
+    var payload: [20]u8 = undefined;
+    var w = codec.PacketWriter.init(&payload);
+    try w.writeInt(x);
+    try w.writeShort(@intCast(y));
+    try w.writeInt(z);
+    try w.writeByte(byte1);
+    try w.writeByte(byte2);
+    try w.writeVarInt(@as(i32, block_id));
+    return try codec.framePacket(@intFromEnum(ids.PlayClient.block_action), w.written(), out);
 }
 
 /// Animation 0x0B (swing arm etc, relayed to viewers).
@@ -731,12 +756,12 @@ test "encryption request/response framing" {
     try std.testing.expectEqualSlices(u8, &[_]u8{0xCC}, er.token_enc);
 }
 
-test "serverbound movement (stance quirk)" {
+test "serverbound movement: wire order is x, feet, stance, z" {
     var b: [64]u8 = undefined;
     var w = codec.PacketWriter.init(&b);
     try w.writeDouble(1.5);
-    try w.writeDouble(3.12); // stance, consumed
-    try w.writeDouble(65.0);
+    try w.writeDouble(65.0); // feet
+    try w.writeDouble(66.62); // stance = feet + 1.62, consumed
     try w.writeDouble(-7.25);
     try w.writeByte(0);
     const p = try parsePosition(w.written());
@@ -1599,4 +1624,16 @@ test "use entity parse (attack vs interact-at)" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.5), b.x, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 2.5), b.y, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 3.5), b.z, 1e-6);
+}
+
+test "enchant item 0x11 parses window + slot" {
+    var eb: [2]u8 = undefined;
+    var w = codec.PacketWriter.init(&eb);
+    try w.writeByte(4); // window 4
+    try w.writeByte(2); // bottom offer
+    const e = try parseEnchantItem(w.written());
+    try std.testing.expectEqual(@as(u8, 4), e.window);
+    try std.testing.expectEqual(@as(u8, 2), e.slot);
+    // truncated body fails closed
+    try std.testing.expectError(error.BufferUnderflow, parseEnchantItem(&[_]u8{4}));
 }

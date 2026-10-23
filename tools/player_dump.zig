@@ -33,7 +33,7 @@ pub fn main(init: std.process.Init) !void {
     var pool = try asteorite.shard.ShardPool.open(arena_alloc, io, db_dir, 4, .{});
     defer pool.deinit();
 
-    var data = try asteorite.players.load(pool, arena_alloc, username) orelse {
+    var data = try asteorite.players.loadLegacy(pool, arena_alloc, username, asteorite.player_import.legacySlot) orelse {
         try out.print("no save found for {s} in {s}\n", .{ username, db_path });
         try out.flush();
         return;
@@ -43,11 +43,19 @@ pub fn main(init: std.process.Init) !void {
         "{s}: pos=({d:.1},{d:.1},{d:.1}) yaw={d:.1} pitch={d:.1} spawn=({d},{d},{d}) health={d:.1} food={d} sat={d:.1} gamemode={d} selected={d}\n",
         .{
             username,
-            data.pos_x,     data.pos_y,     data.pos_z,
-            data.yaw,       data.pitch,
-            data.spawn_x,   data.spawn_y,   data.spawn_z,
-            data.health,    data.food,      data.saturation,
-            data.gamemode,  data.selected,
+            data.pos_x,
+            data.pos_y,
+            data.pos_z,
+            data.yaw,
+            data.pitch,
+            data.spawn_x,
+            data.spawn_y,
+            data.spawn_z,
+            data.health,
+            data.food,
+            data.saturation,
+            data.gamemode,
+            data.selected,
         },
     );
     for (data.inv, 0..) |slot, i| {

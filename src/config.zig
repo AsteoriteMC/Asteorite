@@ -53,6 +53,24 @@ pub const FileConfig = struct {
     /// Handshake brand advertised in status: "vanilla", "fabric", or "forge"
     /// ("fml" also accepted for forge). Forge adds the FML modinfo block.
     brand: ?[]const u8 = null,
+    /// Phase B: network transport backend ("auto", "uring", "kqueue",
+    /// "iocp", "blocking").
+    transport: ?[]const u8 = null,
+    /// Storage profile ("auto", "hdd", "ssd", "nvme").
+    storage_profile: ?[]const u8 = null,
+    /// Phase B: transport worker threads (0 = auto).
+    transport_workers: ?usize = null,
+    /// Phase C: region tick threads (0 = auto).
+    region_threads: ?usize = null,
+    /// Phase B: per-connection outbox cap in bytes (backpressure).
+    out_cap_bytes: ?usize = null,
+    /// Phase B: zerocopy send threshold in bytes.
+    send_zc_threshold: ?usize = null,
+    /// Phase B: TCP_NODELAY on accepted sockets.
+    tcp_nodelay: ?bool = null,
+    /// Phase B: socket buffer sizes (0 = OS default).
+    sndbuf: ?usize = null,
+    rcvbuf: ?usize = null,
 
     /// Resolve the seed union into a plain i64. Errors on float values
     /// and out-of-range integers (with the offending value echoed by the
@@ -91,6 +109,23 @@ pub const Effective = struct {
     motd: []const u8 = "Asteorite",
     max_players: u8 = 20,
     brand: []const u8 = "vanilla",
+    /// Phase B: transport backend ("auto" resolves per OS).
+    transport: []const u8 = "auto",
+    /// Storage profile ("auto" detects rotational storage on Linux).
+    storage_profile: []const u8 = "auto",
+    /// Phase B: transport worker threads (0 = auto).
+    transport_workers: usize = 0,
+    /// Phase C: region tick threads (0 = auto = cpus, max 8).
+    region_threads: usize = 0,
+    /// Phase B: per-connection outbox cap in bytes.
+    out_cap_bytes: usize = 4 * 1024 * 1024,
+    /// Phase B: zerocopy send threshold in bytes.
+    send_zc_threshold: usize = 8 * 1024,
+    /// Phase B: TCP_NODELAY on accepted sockets.
+    tcp_nodelay: bool = true,
+    /// Phase B: socket buffer sizes (0 = OS default).
+    sndbuf: usize = 0,
+    rcvbuf: usize = 0,
     /// Where non-default values came from (startup log + debugging).
     source: Source = .defaults,
 
@@ -109,6 +144,8 @@ pub const ValidateError = error{
     BadRconPort,
     BadMaxPlayers,
     BadBrand,
+    BadTransport,
+    BadStorageProfile,
 };
 
 /// Protocol/gameplay sanity checks. View is capped at 16: the 1.7.10
@@ -121,6 +158,24 @@ pub fn validate(c: *const Effective) ValidateError!void {
     if (c.rcon_port == 0 and c.rcon_password != null) return error.BadRconPort;
     if (c.max_players == 0) return error.BadMaxPlayers;
     if (!isKnownBrand(c.brand)) return error.BadBrand;
+    if (!isKnownTransport(c.transport)) return error.BadTransport;
+    if (!isKnownStorageProfile(c.storage_profile)) return error.BadStorageProfile;
+}
+
+/// Accepted storage-profile spellings (Phase B NVMe path).
+pub fn isKnownStorageProfile(s: []const u8) bool {
+    for ([_][]const u8{ "auto", "hdd", "ssd", "nvme" }) |known| {
+        if (std.mem.eql(u8, s, known)) return true;
+    }
+    return false;
+}
+
+/// Accepted transport spellings (Phase B).
+pub fn isKnownTransport(s: []const u8) bool {
+    for ([_][]const u8{ "auto", "uring", "kqueue", "iocp", "blocking" }) |known| {
+        if (std.mem.eql(u8, s, known)) return true;
+    }
+    return false;
 }
 
 /// Accepted `brand` spellings (mirrors status.Brand.parse; kept as plain
@@ -142,6 +197,8 @@ pub fn validateMessage(err: ValidateError) []const u8 {
         error.BadRconPort => "rcon_port must be 1-65535 when rcon_password is set",
         error.BadMaxPlayers => "max_players must be 1-255",
         error.BadBrand => "brand must be vanilla, fabric, or forge",
+        error.BadTransport => "transport must be auto, uring, kqueue, iocp, or blocking",
+        error.BadStorageProfile => "storage_profile must be auto, hdd, ssd, or nvme",
     };
 }
 
@@ -170,6 +227,15 @@ pub fn merge(base: Effective, file: *const FileConfig, file_seed: ?i64) Effectiv
     if (file.motd) |v| out.motd = v;
     if (file.max_players) |v| out.max_players = v;
     if (file.brand) |v| out.brand = v;
+    if (file.transport) |v| out.transport = v;
+    if (file.storage_profile) |v| out.storage_profile = v;
+    if (file.transport_workers) |v| out.transport_workers = v;
+    if (file.region_threads) |v| out.region_threads = v;
+    if (file.out_cap_bytes) |v| out.out_cap_bytes = v;
+    if (file.send_zc_threshold) |v| out.send_zc_threshold = v;
+    if (file.tcp_nodelay) |v| out.tcp_nodelay = v;
+    if (file.sndbuf) |v| out.sndbuf = v;
+    if (file.rcvbuf) |v| out.rcvbuf = v;
     return out;
 }
 
@@ -216,6 +282,11 @@ test "config json: full file parses" {
         \\  "motd": "hello \"quoted\"",
         \\  "max_players": 30,
         \\  "brand": "forge",
+        \\  "transport": "uring",
+        \\  "transport_workers": 4,
+        \\  "region_threads": 6,
+        \\  "storage_profile": "nvme",
+        \\  "out_cap_bytes": 1048576,
         \\  "future_key": "ignored"
         \\}
     ;
@@ -235,6 +306,30 @@ test "config json: full file parses" {
     try std.testing.expectEqualStrings("hello \"quoted\"", f.motd.?);
     try std.testing.expectEqual(@as(?u8, 30), f.max_players);
     try std.testing.expectEqualStrings("forge", f.brand.?);
+    try std.testing.expectEqualStrings("uring", f.transport.?);
+    try std.testing.expectEqual(@as(?usize, 4), f.transport_workers);
+    try std.testing.expectEqual(@as(?usize, 6), f.region_threads);
+    try std.testing.expectEqualStrings("nvme", f.storage_profile.?);
+    try std.testing.expectEqual(@as(?usize, 1048576), f.out_cap_bytes);
+}
+
+test "config validate: storage-profile spelling" {
+    try std.testing.expect(isKnownStorageProfile("auto"));
+    try std.testing.expect(isKnownStorageProfile("hdd"));
+    try std.testing.expect(isKnownStorageProfile("ssd"));
+    try std.testing.expect(isKnownStorageProfile("nvme"));
+    try std.testing.expect(!isKnownStorageProfile("tape"));
+    var bad = Effective{ .storage_profile = "tape" };
+    try std.testing.expectError(error.BadStorageProfile, validate(&bad));
+}
+
+test "config validate: transport spelling" {
+    try std.testing.expect(isKnownTransport("auto"));
+    try std.testing.expect(isKnownTransport("uring"));
+    try std.testing.expect(isKnownTransport("blocking"));
+    try std.testing.expect(!isKnownTransport("epoll"));
+    var bad = Effective{ .transport = "epoll" };
+    try std.testing.expectError(error.BadTransport, validate(&bad));
 }
 
 test "config validate: motd/brand/max_players" {

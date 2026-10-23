@@ -13,23 +13,35 @@
 //! - Registry snapshots take temp refs; destroy waits for refs == 0.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Conn = @import("conn.zig").Conn;
 const Config = @import("conn.zig").Config;
 const Action = @import("conn.zig").Action;
 const AttackEvent = @import("conn.zig").AttackEvent;
 const QDropEvent = @import("conn.zig").QDropEvent;
 const FurnaceClick = @import("conn.zig").FurnaceClick;
+const EnchantClick = @import("conn.zig").EnchantClick;
+const EnchantEvent = @import("conn.zig").EnchantEvent;
 const TableClose = @import("conn.zig").TableClose;
 const BlockEvent = @import("conn.zig").BlockEvent;
 const furnace_mod = @import("../sim/furnace.zig");
 const smelting_mod = @import("../sim/smelting.zig");
+const container_mod = @import("../sim/container.zig");
+const enchanting_mod = @import("../sim/enchanting.zig");
 const codec = @import("codec.zig");
 const view = @import("../sim/view.zig");
+const conn_sink = @import("packet_sink.zig");
+const sink_mod = @import("../sim/packet_sink.zig");
 const shard_mod = @import("../world/shard.zig");
+const store_mod = @import("../world/store.zig");
+const chunk_mod = @import("../world/chunk.zig");
 const player_db = @import("../sim/players.zig");
+const player_import = @import("../world/import/player.zig");
 const item_mod = @import("../item.zig");
-const perms_mod = @import("../sim/permissions.zig");const spin = @import("../sim/spin.zig");
-const drops_mod = @import("../sim/drops.zig");
+const perms_mod = @import("../sim/permissions.zig");
+const console_tui = @import("../console_tui.zig");
+const spin = @import("../sim/spin.zig");
+const drop_mod = @import("../game/drops.zig");
 const java_random = @import("../worldgen/rng/java_random.zig");
 const packets = @import("../proto/v5/packets.zig");
 const ids = @import("../proto/v5/ids.zig");
@@ -44,9 +56,42 @@ const cmd_spec = @import("../cmd/spec.zig");
 const cmd_data = @import("../proto/v5/cmd_data.zig");
 const bans_mod = @import("../sim/bans.zig");
 const scoreboard_mod = @import("../sim/scoreboard.zig");
+const redstone_mod = @import("../sim/redstone.zig");
+const interaction_mod = @import("../sim/interaction.zig");
+const profile = @import("../version.zig");
+const transport_mod = @import("transport.zig");
+const memstat_mod = @import("../sim/memstat.zig");
+const seqlock_mod = @import("../sim/seqlock.zig");
+const tick_mod = @import("../sim/tick.zig");
+const affinity_mod = @import("../sim/affinity.zig");
+const pool_mod = @import("../sim/pool.zig");
+/// The io_uring backend is Linux-only and the kqueue backend is
+/// macOS/BSD-only: the comptime condition makes the other import dead
+/// code (never analyzed) on the wrong target.
+const uring_mod = if (builtin.os.tag == .linux) @import("uring.zig") else struct {};
+const kqueue_mod = if (builtin.os.tag.isDarwin()) @import("kqueue.zig") else struct {};
+/// The IOCP backend is Windows-only (same dead-code gating). Its pure
+/// parts still compile everywhere (see root.zig) so the op layout and
+/// header math are unit-tested on every target.
+const iocp_mod = if (builtin.os.tag == .windows) @import("iocp.zig") else struct {};
+const shutdown_mod = @import("shutdown.zig");
 
 /// Handshake/login must complete within this window (anti-slowloris).
 pub const login_timeout_ms: i64 = 30000;
+
+/// The read-mostly gameplay config, published as one snapshot.
+///
+/// Phase D: readers take no lock at all (a seqlock read is two atomic
+/// loads and a compare) — region threads never block on the config.
+pub const CfgState = struct {
+    difficulty: u8 = 1,
+    default_gamemode: u8 = 1,
+    gamerules: [9]bool = .{ true, true, false, true, true, true, true, true, true },
+    autosave: bool = true,
+    idle_timeout_min: u32 = 0,
+    world_spawn: [3]i32 = .{ 8, 64, 8 },
+    world_spawn_set: bool = false,
+};
 
 pub const RegistryEntry = struct {
     conn: *Conn,
@@ -57,6 +102,66 @@ pub const Server = struct {
     net: std.Io.net.Server,
     io: std.Io,
     config: Config,
+    /// Phase B: transport selection. `auto` picks the best backend for
+    /// this OS (io_uring on Linux, kqueue on macOS, IOCP on Windows);
+    /// `blocking` keeps the portable thread-per-connection transport.
+    transport_kind: transport_mod.Kind = .auto,
+    /// Storage profile name for the stats line ("hdd", "ssd", "nvme";
+    /// set by main after resolving `--storage-profile`).
+    storage_profile_name: []const u8 = "auto",
+    /// Phase C: region tick threads (0 = auto = cpu count, max 8;
+    /// 1 = sequential legacy path). Viewers are grouped by 32x32-chunk
+    /// region and ticked fork-join; the join is the global barrier.
+    region_threads: usize = 0,
+    /// Phase C: live region set (created on demand per populated cell).
+    /// Leaf lock (see Registry docs): never take it holding conn/ent.
+    region_reg: tick_mod.Registry = .{},
+    /// Phase C: published age/time for region workers (atomics only).
+    region_clock: tick_mod.TickClock = .{},
+    /// Phase C: total shed entries across regions (stats line).
+    /// Written by the tick merge pass only (single-threaded there).
+    region_shed_total: u64 = 0,
+    /// Phase C: cached CPU topology for worker pinning (detected lazily
+    /// on the first parallel tick; flat mapping when undetectable).
+    region_topo: affinity_mod.Topology = .{},
+    region_topo_done: bool = false,
+    /// Phase C follow-up: persistent pool for the viewer pass (stable
+    /// worker identities, pinned once; created lazily on the first
+    /// parallel tick, null = fork-join fallback). Destroyed in deinit/
+    /// deinitRegions; never races a run (ticker-owned).
+    region_pool: ?*pool_mod.Pool = null,
+    /// Phase B: transport tuning (send_zc threshold, outbox cap, socket
+    /// options, ring geometry).
+    transport_opts: transport_mod.Options = .{},
+    /// Phase B: the running async transport (null = blocking transport).
+    transport_handle: ?transport_mod.Handle = null,
+    /// Phase B: the io_uring backend (owned by the server). Kept as an
+    /// opaque pointer so the struct compiles on every OS (the backend
+    /// itself is Linux-only).
+    uring_backend: ?*anyopaque = null,
+    /// Phase D: rolling window of tick durations (ns) and tick-flush
+    /// durations (ns) for the stats line (p50/p99).
+    tick_samples: [256]u64 = undefined,
+    tick_samples_n: usize = 0,
+    tick_samples_idx: usize = 0,
+    flush_samples: [256]u64 = undefined,
+    flush_samples_n: usize = 0,
+    flush_samples_idx: usize = 0,
+    /// Phase D: memory accounting (per subsystem, refreshed by the stats
+    /// line).
+    mem_accounting: memstat_mod.Accounting = .{},
+    /// Phase D: RSS at the last stats line (bytes).
+    rss_bytes: usize = 0,
+    /// Phase B/D: the last tick's split timings (entity reconcile vs the
+    /// output flush).
+    reconcile_ns_last: u64 = 0,
+    send_ns_last: u64 = 0,
+    /// Phase B: async conns by transport id (the worker threads look the
+    /// protocol state up through this map).
+    async_conns: std.AutoHashMapUnmanaged(u32, *Conn) = .empty,
+    /// Phase B: per-conn protocol state for the async transport.
+    async_states: std.AutoHashMapUnmanaged(u32, *SessionState) = .empty,
+    async_lock: spin.SpinLock = .{},
     /// Shared by players AND mobs (single accept thread + ticker thread).
     eid_counter: std.atomic.Value(i32) = std.atomic.Value(i32).init(1),
     /// Optional world store for login chunk bursts (null = no chunks).
@@ -78,8 +183,12 @@ pub const Server = struct {
     /// Serializes chunk read-modify-write cycles across connections.
     /// Never held together with any conn.lock (strict one-lock-at-a-time).
     world_lock: spin.SpinLock = .{},
-    /// Global mob list (ticker-owned; guarded by ent_lock).
-    entities: std.ArrayList(entity.Mob) = .empty,
+    // Live mobs are region-owned (Phase C follow-up): each tick Region
+    // owns its SoA slots; look up by id with Registry.findMob. (The old
+    // global SoA store is gone.) Item entities stay global (see items):
+    // merge + magnet pickup are cross-region pair interactions that would
+    // need a halo protocol to partition; the single ent_lock section is
+    // contention-free at 1Hz.
     ent_lock: spin.SpinLock = .{},
     /// Global item-entity list (break drops + Q-drops; guarded by ent_lock).
     items: std.ArrayList(entity.ItemEnt) = .empty,
@@ -89,6 +198,20 @@ pub const Server = struct {
     /// so nesting conn->furn is deadlock-free by construction).
     furnaces: std.ArrayList(FurnaceEnt) = .empty,
     furn_lock: spin.SpinLock = .{},
+    /// K1 redstone state: scheduled ticks, torch burnout trackers, and the
+    /// pressure-plate registry. No allocator, no locks of their own — only
+    /// ever touched with world_lock held (serve mutation + ticker pass).
+    rs_sched: redstone_mod.Scheduler = .{},
+    rs_burn: redstone_mod.BurnoutMap = .{},
+    rs_plates: redstone_mod.PlateSet = .{},
+    /// Redstone game-tick clock (equals world_age rate: 20/s; separate epoch
+    /// so sub-second scheduling doesn't disturb the day clock). Advanced by
+    /// the 10Hz redstone thread AND read by the serve threads; guarded by
+    /// world_lock like the rest of the K1 state. Tests set it directly.
+    rs_tick: i64 = 0,
+    /// Scheduler persistence: set after the first load attempt (lazy-load
+    /// from the `253,0,0` row like the permission matrix).
+    rs_loaded: bool = false,
     /// Gameplay RNG stream (block-drop quantities/offsets, vanilla draw order).
     /// Lazy-seeded from drop_seed under rand_lock; never held with other locks.
     drop_rand: ?java_random.JavaRandom = null,
@@ -122,29 +245,27 @@ pub const Server = struct {
     epoch_lock: spin.SpinLock = .{},
 
     // ---- command-driven world state (guarded by state_lock; leaf lock) ----
-    /// World difficulty 0-3 (peaceful..hard). New logins inherit it.
-    difficulty: u8 = 1,
-    /// Default gamemode for first-time logins (0 survival, 1 creative, 2 adventure).
-    default_gamemode: u8 = 1,
+    /// World difficulty 0-3 (peaceful..hard) and the default gamemode
+    /// live in the seqlock-published config snapshot (`cfg`).
     /// Weather: raining/thundering flags + remaining ticks (0 = hold state).
     raining: bool = false,
     thundering: bool = false,
     rain_time: u32 = 0,
     thunder_time: u32 = 0,
+    /// Client-visible rain/thunder strengths 0..1 (vanilla S2B 7/8). The
+    /// 1.7.10 client renders precipitation from strength, not the flag:
+    /// reason 1/2 alone leaves the sky clear. Lerped toward the flags in
+    /// tickWeather (0.2/s at our 1Hz tick = vanilla's 0.01/tick @20tps).
+    rain_strength: f32 = 0,
+    thunder_strength: f32 = 0,
+    /// Thunderstorm lightning cadence (ticks) + draw stream. Off the
+    /// gameplay RNG so strike draws never perturb vanilla draw order.
+    thunder_tick: u32 = 0,
+    thunder_rand: u64 = 0x9E3779B97F4A7C15,
     /// Idle kick threshold in minutes (0 = disabled, vanilla default).
-    idle_timeout_min: u32 = 0,
-    /// Master switch for periodic saves (`/save-on`, `/save-off`).
-    autosave: bool = true,
     /// Debug profiling window (`/debug start` sets both).
     debug_start_ms: ?i64 = null,
     debug_ticks: u64 = 0,
-    /// World spawn for first-time logins (`/setworldspawn`).
-    world_spawn: [3]i32 = .{ 8, 64, 8 },
-    /// Set once /setworldspawn runs: fresh logins keep the world spawn
-    /// instead of re-running the worldgen spawn search.
-    world_spawn_set: bool = false,
-    /// Nine vanilla gamerules (vanilla defaults; see cmd_data.gamerules).
-    gamerules: [9]bool = .{ true, true, false, true, true, true, true, true, true },
     /// Bans + whitelist (lazy-init alongside perms; own leaf lock).
     bans: ?bans_mod.BanDb = null,
     ban_lock: spin.SpinLock = .{},
@@ -156,6 +277,10 @@ pub const Server = struct {
     /// Serializes the scalar command state above (leaf lock: never held
     /// with conn or registry locks — copy out, release, then touch conns).
     state_lock: spin.SpinLock = .{},
+    /// Phase D: the read-mostly config (difficulty, gamemode, gamerules,
+    /// autosave, idle timeout, world spawn) behind a seqlock: readers
+    /// never take a lock.
+    cfg: seqlock_mod.Seqlock(CfgState) = seqlock_mod.Seqlock(CfgState).init(.{}),
     /// Autosave cadence in ticks (5 min at 1Hz).
     pub const autosave_ticks: u64 = 300;
     /// Anti-DoS cap on live item entities (snapshot arrays are fixed-size).
@@ -164,12 +289,23 @@ pub const Server = struct {
     pub fn bind(io: std.Io, port: u16, config: Config) !Server {
         const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
         var srv = Server{ .net = try addr.listen(io, .{}), .io = io, .config = config };
-        srv.world_spawn = .{ config.spawn_x, config.spawn_y, config.spawn_z };
+        {
+            var c = srv.cfg.load();
+            c.world_spawn = .{ config.spawn_x, config.spawn_y, config.spawn_z };
+            srv.cfg.store(c);
+        }
         return srv;
     }
 
     pub fn deinit(self: *Server) void {
         self.net.deinit(self.io);
+        // Regions are never removed mid-run, so an empty registry owns
+        // nothing (and deinit needs no allocator in that case).
+        if (self.region_reg.count() > 0) self.region_reg.deinit(self.gpa);
+        if (self.region_pool) |p| {
+            p.destroy();
+            self.region_pool = null;
+        }
     }
 
     /// Chunk source for view streaming: generating wrapper when gen is set,
@@ -218,13 +354,32 @@ pub const Server = struct {
 
     /// Flush one conn's queued output to its stream. Lock-free except the
     /// conn's own locks; safe to call while holding no locks.
+    ///
+    /// Phase B: with an async transport the bytes are handed to the
+    /// owning worker (which batches them into one send); the blocking
+    /// transport writes them to the socket right here.
     fn flushEntry(e: RegistryEntry, io: std.Io) void {
+        if (e.conn.transport_id != 0) {
+            if (e.conn.transport) |t| {
+                t.request_flush(t.ctx, e.conn.transport_id);
+                return;
+            }
+        }
         e.conn.lock.lock();
         const pending = e.conn.takeOutput() catch {
             e.conn.lock.unlock();
             return;
         };
+        const overflow = e.conn.overflow;
         e.conn.lock.unlock();
+        if (overflow) {
+            // Slow consumer: the outbox grew past the cap. Drop the
+            // connection instead of growing the heap.
+            e.conn.allocator.free(pending);
+            e.conn.overflow = false;
+            closeEntry(e, io);
+            return;
+        }
         if (pending.len == 0) {
             e.conn.allocator.free(pending);
             return;
@@ -238,13 +393,16 @@ pub const Server = struct {
         w.interface.flush() catch return;
     }
 
-    fn writeFramed(e: RegistryEntry, io: std.Io, framed: []const u8) void {
-        e.conn.wlock.lock();
-        defer e.conn.wlock.unlock();
-        var wbuf: [4096]u8 = undefined;
-        var w = e.stream.writer(io, &wbuf);
-        w.interface.writeAll(framed) catch return;
-        w.interface.flush() catch return;
+    /// Close the connection's socket. Phase B: with an async transport the
+    /// transport owns the fd and closes it (and stops the recv).
+    fn closeEntry(e: RegistryEntry, io: std.Io) void {
+        if (e.conn.transport_id != 0) {
+            if (e.conn.transport) |t| {
+                t.close_conn(t.ctx, e.conn.transport_id);
+                return;
+            }
+        }
+        e.stream.shutdown(io, .both) catch {};
     }
 
     /// Register a fresh conn right after accept (no packets). Ticks start
@@ -257,10 +415,23 @@ pub const Server = struct {
 
     /// Broadcast a join both ways (newcomer learns roster, roster learns
     /// newcomer) and mark announced so disconnects broadcast leave.
-    pub fn announceJoin(self: *Server, conn: *Conn, stream: std.Io.net.Stream) !void {
+    ///
+    /// Phase B: the packets are queued on each conn and flushed through
+    /// the transport (blocking: straight to the socket; async: batched
+    /// by the owning worker). One output path for every transport.
+    pub fn announceJoin(self: *Server, conn: *Conn) !void {
         var others: [256]RegistryEntry = undefined;
         const snap = self.snapshot(&others);
         defer releaseSnap(snap);
+        // The newcomer's own registry entry (it was registered at accept):
+        // its queued output goes out through the normal flush path.
+        var self_entry: ?RegistryEntry = null;
+        for (snap) |e| {
+            if (e.conn == conn) {
+                self_entry = e;
+                break;
+            }
+        }
         // newcomer learns existing players
         var nb: [64]u8 = undefined;
         for (snap) |e| {
@@ -272,13 +443,8 @@ pub const Server = struct {
             const f = try packets.framePlayerListItem(nm, true, ping, &nb);
             conn.lock.lock();
             conn.queueFramed(f) catch {};
-            const pending = conn.takeOutput() catch {
-                conn.lock.unlock();
-                continue;
-            };
             conn.lock.unlock();
-            writeFramed(.{ .conn = conn, .stream = stream }, self.io, pending);
-            conn.allocator.free(pending);
+            if (self_entry) |se| flushEntry(se, self.io);
         }
         // existing players learn the newcomer
         var jb: [64]u8 = undefined;
@@ -295,13 +461,8 @@ pub const Server = struct {
                 e.conn.lock.unlock();
                 continue;
             };
-            const pending = e.conn.takeOutput() catch {
-                e.conn.lock.unlock();
-                continue;
-            };
             e.conn.lock.unlock();
-            writeFramed(e, self.io, pending);
-            e.conn.allocator.free(pending);
+            flushEntry(e, self.io);
         }
         // Count once per conn: unregister drops iff announced, so these pair
         // exactly even if announceJoin is ever re-entered.
@@ -309,6 +470,17 @@ pub const Server = struct {
             conn.announced = true;
             _ = self.play_count.fetchAdd(1, .release);
         }
+        // Vanilla join line (yellow) to every online player, including the
+        // newcomer, plus the server console log.
+        conn.lock.lock();
+        const nm_len = conn.username_len;
+        var nm: [16]u8 = undefined;
+        @memcpy(nm[0..nm_len], conn.username[0..nm_len]);
+        conn.lock.unlock();
+        var jcb: [128]u8 = undefined;
+        const join = std.fmt.bufPrint(&jcb, "{{\"text\":\"{s} joined the game\",\"color\":\"yellow\"}}", .{nm[0..nm_len]}) catch null;
+        if (join) |j| self.broadcastChat(j);
+        std.log.info("{s} joined the game", .{nm[0..nm_len]});
     }
 
     /// Broadcast a chat line to every registered play conn (including sender;
@@ -358,21 +530,26 @@ pub const Server = struct {
             defer releaseSnap(snap);
             var lb: [64]u8 = undefined;
             const lf = packets.framePlayerListItem(conn.username[0..conn.username_len], false, 0, &lb) catch return;
-        for (snap) |e| {
-            if (e.conn == conn) continue;
-            e.conn.lock.lock();
-            e.conn.queueFramed(lf) catch {
+            for (snap) |e| {
+                if (e.conn == conn) continue;
+                e.conn.lock.lock();
+                e.conn.queueFramed(lf) catch {
+                    e.conn.lock.unlock();
+                    continue;
+                };
                 e.conn.lock.unlock();
-                continue;
-            };
-            const pending = e.conn.takeOutput() catch {
-                e.conn.lock.unlock();
-                continue;
-            };
-            e.conn.lock.unlock();
-            writeFramed(e, self.io, pending);
-            e.conn.allocator.free(pending);
-        }
+                // One output path: the transport decides how the bytes go out
+                // (blocking: straight to the socket; async: batched by the
+                // owning worker).
+                flushEntry(e, self.io);
+            }
+            // Vanilla leave line (yellow) to everyone still online, plus the
+            // server console log. The leaver is already unregistered, so they
+            // don't get their own line.
+            var jlb: [128]u8 = undefined;
+            const leave = std.fmt.bufPrint(&jlb, "{{\"text\":\"{s} left the game\",\"color\":\"yellow\"}}", .{conn.username[0..conn.username_len]}) catch null;
+            if (leave) |l| self.broadcastChat(l);
+            std.log.info("{s} left the game", .{conn.username[0..conn.username_len]});
         }
 
         while (conn.refs.load(.acquire) != 0) std.atomic.spinLoopHint();
@@ -391,7 +568,7 @@ pub const Server = struct {
         const pool = self.world orelse return false;
         if (conn.username_len == 0) return false;
         const name = conn.username[0..conn.username_len];
-        const data = player_db.load(pool, self.gpa, name) catch return false;
+        const data = player_db.loadLegacy(pool, self.gpa, name, player_import.legacySlot) catch return false;
         if (data == null) return false;
         var d = data.?;
         defer player_db.freeData(self.gpa, &d);
@@ -504,6 +681,76 @@ pub const Server = struct {
         return n;
     }
 
+    /// Sync-fill the landing disk (radius 2) around the login position so
+    /// the join completes on solid ground. Holes (no gen, dropped gen
+    /// requests, failed gen) stay holes; the login grace covers the rest.
+    /// Called with conn.lock held (login bootstrap): pool reads are leaf
+    /// locks, gen requests take the pool mutex, and drain() only waits on
+    /// workers (which never take conn locks) — no nesting, no deadlock.
+    fn ensureLanding(self: *Server, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, conn: *Conn) void {
+        const pcx: i32 = @intFromFloat(@floor(conn.pos_x / 16.0));
+        const pcz: i32 = @intFromFloat(@floor(conn.pos_z / 16.0));
+        var need: usize = 0;
+        var dx: i32 = -2;
+        while (dx <= 2) : (dx += 1) {
+            var dz: i32 = -2;
+            while (dz <= 2) : (dz += 1) {
+                const key = store_mod.encodeKey(0, pcx + dx, pcz + dz);
+                const raw = pool.get(allocator, key) catch continue;
+                if (raw) |r| {
+                    allocator.free(r);
+                    continue;
+                }
+                need += 1;
+                if (self.gen_pool) |gp| {
+                    gp.request(0, pcx + dx, pcz + dz);
+                } else if (self.gen) |gen| {
+                    // No workers (tests / no-seed fallback): sync fill.
+                    const filled = v5serve.getOrGen(pool, gen, &self.world_lock, 0, pcx + dx, pcz + dz, allocator) catch null;
+                    if (filled) |f| allocator.free(f);
+                }
+            }
+        }
+        // Wait out only what we enqueued (warm logins skip the wait).
+        if (need > 0) {
+            if (self.gen_pool) |gp| gp.drain();
+        }
+    }
+
+    /// Login-grace maintenance (serve thread; caller holds no locks).
+    /// While the grace is armed and the client fell below the login
+    /// teleport through missing ground, hold: once the ground column
+    /// exists, snap the client back up with a PosLook re-send (its echo
+    /// clears the grace). Timeout or horizontal movement clears it.
+    fn maybeLoginResync(self: *Server, conn: *Conn) void {
+        _ = self;
+        const now_ms = std.Io.Timestamp.now(conn.io, .awake).toMilliseconds();
+        conn.lock.lock();
+        defer conn.lock.unlock();
+        if (conn.login_grace_ms == 0) return;
+        if (now_ms > conn.login_grace_ms) {
+            conn.login_grace_ms = 0;
+            return;
+        }
+        // Ground delivered means the login column left in a bulk the client
+        // has actually received (sent-set), not merely present in the LSM:
+        // the client falls while its burst is still in flight.
+        const cx: i32 = @intFromFloat(@floor(conn.login_x / 16.0));
+        const cz: i32 = @intFromFloat(@floor(conn.login_z / 16.0));
+        if (!conn.sent.contains(Conn.sentKey(cx, cz))) return; // not delivered yet: keep holding
+        if (conn.login_fell and !conn.login_resynced) {
+            conn.login_resynced = true;
+            conn.login_fell = false;
+            // Re-baseline the grace at the agreed position (sub-threshold
+            // falls may have been adopted before suppression engaged): the
+            // client's echo of this exact snapshot clears the grace.
+            conn.login_x = conn.pos_x;
+            conn.login_y = conn.pos_y;
+            conn.login_z = conn.pos_z;
+            conn.queuePlayerPosLook() catch {};
+        }
+    }
+
     /// Lazy permission matrix (allocator = server gpa). Caller need hold no
     /// locks; the matrix has its own leaf lock.
     fn permDb(self: *Server) *perms_mod.Db {
@@ -560,6 +807,60 @@ pub const Server = struct {
             if (self.perms) |*old| old.deinit();
             self.perms = db;
         }
+    }
+
+    /// Persist the redstone scheduler (single row). Dues are re-derived
+    /// on load, so only positions+kinds are stored. Caller must NOT hold
+    /// world_lock (taken here, same as savePerms).
+    pub fn saveRedstone(self: *Server) void {
+        const pool = self.world orelse return;
+        self.world_lock.lock();
+        defer self.world_lock.unlock();
+        const enc = redstone_mod.encodeSched(self.gpa, &self.rs_sched) catch return;
+        defer self.gpa.free(enc);
+        pool.put(redstone_mod.sched_key, enc) catch {};
+    }
+
+    /// Load the scheduler row (lazy, once). Caller must hold world_lock
+    /// (all redstone mutation sites do). Corrupt rows fail closed to an
+    /// empty scheduler. Dues are re-derived from the blocks still present.
+    fn loadRedstone(self: *Server, pool: *shard_mod.ShardPool, now: i64) void {
+        if (self.rs_loaded) return;
+        self.rs_loaded = true;
+        const raw = pool.get(self.gpa, redstone_mod.sched_key) catch return;
+        defer if (raw) |r| self.gpa.free(r);
+        const bytes = raw orelse return;
+        const GetOnly = struct {
+            p: *shard_mod.ShardPool,
+            a: std.mem.Allocator,
+            pub fn get(s: *@This(), x: i32, y: i32, z: i32) ?redstone_mod.Block {
+                if (y < 0 or y > 255) return null;
+                const pb = view.peekBlock(s.p, s.a, x, @intCast(y), z) catch return null;
+                const b = pb orelse return null;
+                return .{ .id = b.id, .meta = b.meta };
+            }
+            pub fn set(s: *@This(), x: i32, y: i32, z: i32, id: game_ids.Id, meta: u4) void {
+                _ = s;
+                _ = x;
+                _ = y;
+                _ = z;
+                _ = id;
+                _ = meta;
+            }
+            pub fn pop(s: *@This(), x: i32, y: i32, z: i32, old_id: game_ids.Id, old_meta: u4) void {
+                _ = s;
+                _ = x;
+                _ = y;
+                _ = z;
+                _ = old_id;
+                _ = old_meta;
+            }
+            pub fn rsView(s: *@This()) redstone_mod.WorldView {
+                return redstone_mod.WorldView.init(s, &profile.game.blocks, &profile.rules.redstone);
+            }
+        };
+        var w = GetOnly{ .p = pool, .a = self.gpa };
+        _ = redstone_mod.loadSched(w.rsView(), bytes, &self.rs_sched, now);
     }
 
     /// Grant level 4 to a validated name (bootstrap + /op path helper).
@@ -822,9 +1123,7 @@ pub const Server = struct {
         while (left > 0) {
             const put: i8 = @intCast(@min(left, 64));
             left -= put;
-            self.ent_lock.lock();
-            _ = self.spawnItem(.{ .id = id, .count = put, .damage = damage, .nbt = null }, px, py + 0.5, pz, 10);
-            self.ent_lock.unlock();
+            self.spawnItemLive(.{ .id = id, .count = put, .damage = damage, .nbt = null }, px, py + 0.5, pz, 10);
         }
     }
 
@@ -954,7 +1253,7 @@ pub const Server = struct {
         // inside the chunk source) — never the reverse.
         if (self.world) |pool| {
             const radius: u8 = @min(mc.client_view orelse self.view_distance, self.view_distance);
-            view.syncPlayerChunks(mc, self.chunkSource(pool), 0, radius, true) catch {};
+            view.syncPlayerChunks(mc, conn_sink.bind(mc), self.chunkSource(pool), 0, radius, true) catch {};
         }
         return true;
     }
@@ -1346,14 +1645,10 @@ pub const Server = struct {
         };
         e.conn.queueFramed(d) catch {};
         e.conn.close_after_flush = true;
-        const pending = e.conn.takeOutput() catch {
-            e.conn.lock.unlock();
-            return;
-        };
         e.conn.lock.unlock();
-        if (pending.len > 0) writeFramed(e, self.io, pending);
-        e.conn.allocator.free(pending);
-        e.stream.shutdown(self.io, .both) catch {};
+        // One output path (blocking: to the socket; async: the worker).
+        flushEntry(e, self.io);
+        closeEntry(e, self.io);
     }
 
     /// Login rejection screen (conn.lock held by the caller). Queues a play
@@ -1865,6 +2160,9 @@ pub const Server = struct {
     }
 
     /// Countdown in tickOnce: rain/thunder expire to clear + S2B(2).
+    /// Strengths chase the flags (vanilla fade) and broadcast S2B(7/8) on
+    /// change — the 1.7.10 client renders from strength, so the flag
+    /// packets alone never show rain.
     fn tickWeather(self: *Server) void {
         self.state_lock.lock();
         var changed = false;
@@ -1887,11 +2185,119 @@ pub const Server = struct {
                 self.thunder_time -= 20;
             }
         }
+        const rs_target: f32 = if (self.raining) 1.0 else 0.0;
+        const ts_target: f32 = if (self.thundering) 1.0 else 0.0;
+        const rs = approach(self.rain_strength, rs_target, 0.2);
+        const ts = approach(self.thunder_strength, ts_target, 0.2);
+        const rs_moved = @abs(rs - self.rain_strength) > 0.0001;
+        const ts_moved = @abs(ts - self.thunder_strength) > 0.0001;
+        self.rain_strength = rs;
+        self.thunder_strength = ts;
         self.state_lock.unlock();
         if (changed) {
             var gb: [16]u8 = undefined;
             if (packets.frameGameState(2, 0, &gb)) |f| self.broadcastAll(f) else |_| {}
         }
+        if (rs_moved) {
+            var gb: [16]u8 = undefined;
+            if (packets.frameGameState(7, rs, &gb)) |f| self.broadcastAll(f) else |_| {}
+        }
+        if (ts_moved) {
+            var gb: [16]u8 = undefined;
+            if (packets.frameGameState(8, ts, &gb)) |f| self.broadcastAll(f) else |_| {}
+        }
+    }
+
+    /// Move `v` toward `target` by at most `step` (same sign convention
+    /// as vanilla's per-tick strength lerp).
+    fn approach(v: f32, target: f32, step: f32) f32 {
+        if (v < target) return @min(v + step, target);
+        if (v > target) return @max(v - step, target);
+        return v;
+    }
+
+    /// Send current weather state to a joining player (flag + strengths).
+    /// Without this a login during rain shows clear skies until the next
+    /// change, since strength defaults to 0 client-side.
+    pub fn syncWeatherTo(self: *Server, conn: *Conn) void {
+        self.state_lock.lock();
+        const raining = self.raining;
+        const rs = self.rain_strength;
+        const ts = self.thunder_strength;
+        self.state_lock.unlock();
+        var gb: [16]u8 = undefined;
+        if (packets.frameGameState(if (raining) 1 else 2, 0, &gb)) |f| {
+            conn.queueFramed(f) catch {};
+        } else |_| {}
+        if (packets.frameGameState(7, rs, &gb)) |f| {
+            conn.queueFramed(f) catch {};
+        } else |_| {}
+        if (packets.frameGameState(8, ts, &gb)) |f| {
+            conn.queueFramed(f) catch {};
+        } else |_| {}
+    }
+
+    /// Thunderstorm lightning: every ~5s strike near a random online
+    /// player (bolt entity + client-side thunder crack; no fire/damage —
+    /// fire spread is inert per the doFireTick gate).
+    fn tickLightning(self: *Server) void {
+        self.state_lock.lock();
+        const thundering = self.thundering;
+        self.state_lock.unlock();
+        if (!thundering) {
+            self.thunder_tick = 0;
+            return;
+        }
+        const pool = self.world orelse return;
+        self.thunder_tick += 1;
+        if (self.thunder_tick < 5) return;
+        self.thunder_tick = 0;
+        // Random online player (own draw stream; see thunder_rand).
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        var players: [256]*Conn = undefined;
+        var n: usize = 0;
+        for (snap) |e| {
+            if (n >= players.len) break;
+            e.conn.lock.lock();
+            const play = e.conn.state == .play and !e.conn.dead;
+            e.conn.lock.unlock();
+            if (play) {
+                players[n] = e.conn;
+                n += 1;
+            }
+        }
+        if (n == 0) return;
+        self.thunder_rand = self.thunder_rand *% 6364136223846793005 +% 1442695040888963407;
+        const pick = players[self.thunder_rand % n];
+        pick.lock.lock();
+        const px = pick.pos_x;
+        const pz = pick.pos_z;
+        pick.lock.unlock();
+        self.thunder_rand = self.thunder_rand *% 6364136223846793005 +% 1442695040888963407;
+        const dx: i32 = @as(i32, @intCast(self.thunder_rand % 49)) - 24;
+        self.thunder_rand = self.thunder_rand *% 6364136223846793005 +% 1442695040888963407;
+        const dz: i32 = @as(i32, @intCast((self.thunder_rand >> 16) % 49)) - 24;
+        const sx: i32 = @as(i32, @intFromFloat(@floor(px))) + dx;
+        const sz: i32 = @as(i32, @intFromFloat(@floor(pz))) + dz;
+        // Ground = topmost solid column cell (bolt renders sky-to-ground).
+        const gy: ?i32 = blk: {
+            const ch = pool.getChunk(self.gpa, 0, @divFloor(sx, 16), @divFloor(sz, 16)) catch null;
+            const c = ch orelse break :blk null;
+            defer c.destroy(self.gpa);
+            const lx: usize = @intCast(@as(u4, @truncate(@as(u32, @bitCast(sx & 15)))));
+            const lz: usize = @intCast(@as(u4, @truncate(@as(u32, @bitCast(sz & 15)))));
+            const h = c.heights[lz * 16 + lx];
+            if (h == 0) break :blk null;
+            break :blk @as(i32, h);
+        };
+        const gyaw = gy orelse return;
+        const eid = self.eid_counter.fetchAdd(1, .acq_rel);
+        var lb: [32]u8 = undefined;
+        if (packets.frameSpawnGlobalEntity(eid, 1, @as(f64, @floatFromInt(sx)) + 0.5, @as(f64, @floatFromInt(gyaw)), @as(f64, @floatFromInt(sz)) + 0.5, &lb)) |f| {
+            self.broadcastAll(f);
+        } else |_| {}
     }
 
     const diff_names = [_][]const u8{ "peaceful", "easy", "normal", "hard" };
@@ -1901,9 +2307,11 @@ pub const Server = struct {
     }
 
     pub fn setDifficulty(self: *Server, d: u8) void {
-        self.state_lock.lock();
-        self.difficulty = d;
-        self.state_lock.unlock();
+        {
+            var c = self.cfg.load();
+            c.difficulty = d;
+            self.cfg.store(c);
+        }
         var batch: [256]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
@@ -1915,9 +2323,7 @@ pub const Server = struct {
     }
 
     pub fn getDifficulty(self: *Server) u8 {
-        self.state_lock.lock();
-        defer self.state_lock.unlock();
-        return self.difficulty;
+        return self.cfg.load().difficulty;
     }
 
     const gamemode_names = [_][]const u8{ "survival", "creative", "adventure" };
@@ -1927,27 +2333,26 @@ pub const Server = struct {
     }
 
     pub fn setDefaultGamemode(self: *Server, m: u8) void {
-        self.state_lock.lock();
-        self.default_gamemode = m;
-        self.state_lock.unlock();
+        var c = self.cfg.load();
+        c.default_gamemode = m;
+        self.cfg.store(c);
     }
 
     pub fn gameruleGet(self: *Server, name: []const u8) ?bool {
-        self.state_lock.lock();
-        defer self.state_lock.unlock();
+        const c = self.cfg.load();
         for (cmd_data.gamerules, 0..) |g, i| {
-            if (std.mem.eql(u8, g.name, name)) return self.gamerules[i];
+            if (std.mem.eql(u8, g.name, name)) return c.gamerules[i];
         }
         return null;
     }
 
     /// Returns false for unknown rules (caller prints norule).
     pub fn gameruleSet(self: *Server, name: []const u8, value: bool) bool {
-        self.state_lock.lock();
-        defer self.state_lock.unlock();
+        var c = self.cfg.load();
         for (cmd_data.gamerules, 0..) |g, i| {
             if (std.mem.eql(u8, g.name, name)) {
-                self.gamerules[i] = value;
+                c.gamerules[i] = value;
+                self.cfg.store(c);
                 return true;
             }
         }
@@ -1956,24 +2361,19 @@ pub const Server = struct {
 
     /// keepInventory gamerule (death drops).
     pub fn keepInv(self: *Server) bool {
-        self.state_lock.lock();
-        defer self.state_lock.unlock();
-        return self.gamerules[2];
+        return self.cfg.load().gamerules[2];
     }
 
     /// doTileDrops gamerule (block-break drops).
     pub fn tileDrops(self: *Server) bool {
-        self.state_lock.lock();
-        defer self.state_lock.unlock();
-        return self.gamerules[5];
+        return self.cfg.load().gamerules[5];
     }
 
     pub fn gameruleList(self: *Server, out: []u8) []const u8 {
-        self.state_lock.lock();
-        defer self.state_lock.unlock();
+        const c = self.cfg.load();
         var ow: usize = 0;
         for (cmd_data.gamerules, 0..) |g, i| {
-            ow += (std.fmt.bufPrint(out[ow..], "{s} = {s}\n", .{ g.name, if (self.gamerules[i]) "true" else "false" }) catch break).len;
+            ow += (std.fmt.bufPrint(out[ow..], "{s} = {s}\n", .{ g.name, if (c.gamerules[i]) "true" else "false" }) catch break).len;
         }
         if (ow > 0) ow -= 1; // drop trailing newline
         return out[0..ow];
@@ -2617,8 +3017,9 @@ pub const Server = struct {
             // Break particles + survival-style drop handled by the caller
             // (drops need gamerule state, checked outside world_lock).
         }
-        view.applyBlock(pool, self.gpa, x, @intCast(y), z, id, meta) catch return .no_world;
+        const touched: u8 = view.applyBlock(pool, self.gpa, x, @intCast(y), z, id, meta) catch return .no_world;
         self.broadcastBlockChange(null, x, @intCast(y), z, id, meta) catch {};
+        self.resendTouchedNeighbors(pool, x, z, touched);
         var eb: [24]u8 = undefined;
         if (mode == .destroy) {
             if (packets.frameWorldEffect(2001, x, @intCast(y), z, @intCast(wire.toWire(cur.id)), &eb)) |f| {
@@ -2648,14 +3049,19 @@ pub const Server = struct {
 
     /// Summon a living entity (ticker broadcasts it like any other mob).
     /// Caller validates y in [0, 256); returns false without a world.
+    /// The mob is owned by its spawn cell's region from birth (no global
+    /// list to migrate later; a wander crossing adopts it elsewhere).
     pub fn summonMob(self: *Server, type_id: u8, x: f64, y: f64, z: f64, health: f32) bool {
         if (self.world == null) return false;
+        const kind = profile.game.mobs.fromWire(type_id) orelse return false;
         const id = self.eid_counter.fetchAdd(1, .acq_rel);
+        const rid = tick_mod.regionIdFor(0, x, z);
+        const reg = self.region_reg.getOrCreate(self.gpa, rid) catch return false;
         self.ent_lock.lock();
         defer self.ent_lock.unlock();
-        self.entities.append(self.gpa, .{
+        _ = reg.mobs.add(.{
             .id = id,
-            .kind = type_id,
+            .kind = kind,
             .x = x,
             .y = y,
             .z = z,
@@ -2708,8 +3114,8 @@ pub const Server = struct {
     /// /netstat console body: connection + entity + tick counters (we don't
     /// track per-packet bytes, so this reports what the server does know).
     pub fn netstatText(self: *Server, out: []u8) []const u8 {
+        const nmobs = self.mobCount();
         self.ent_lock.lock();
-        const nmobs = self.entities.items.len;
         const nitems = self.items.items.len;
         self.ent_lock.unlock();
         self.reg_lock.lock();
@@ -2737,19 +3143,27 @@ pub const Server = struct {
     pub fn setAutosave(self: *Server, on: bool) void {
         self.state_lock.lock();
         defer self.state_lock.unlock();
-        self.autosave = on;
+        {
+            var c = self.cfg.load();
+            c.autosave = on;
+            self.cfg.store(c);
+        }
     }
 
     pub fn getAutosave(self: *Server) bool {
         self.state_lock.lock();
         defer self.state_lock.unlock();
-        return self.autosave;
+        return self.cfg.load().autosave;
     }
 
     pub fn setIdleTimeout(self: *Server, mins: u32) void {
         self.state_lock.lock();
         defer self.state_lock.unlock();
-        self.idle_timeout_min = mins;
+        {
+            var c = self.cfg.load();
+            c.idle_timeout_min = mins;
+            self.cfg.store(c);
+        }
     }
 
     /// Personal spawn (`/spawnpoint`): empty name = sender handled by caller.
@@ -2772,8 +3186,12 @@ pub const Server = struct {
     /// non-forced online player.
     pub fn setWorldSpawn(self: *Server, x: i32, y: i32, z: i32) void {
         self.state_lock.lock();
-        self.world_spawn = .{ x, y, z };
-        self.world_spawn_set = true;
+        {
+            var c = self.cfg.load();
+            c.world_spawn = .{ x, y, z };
+            c.world_spawn_set = true;
+            self.cfg.store(c);
+        }
         self.state_lock.unlock();
         var batch: [256]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
@@ -3704,18 +4122,568 @@ pub const Server = struct {
 
     /// One server tick: advance clock, queue per-conn tick packets, flush,
     /// shut down timed-out sockets. Lock-free clock via atomics.
+    /// One furnace row snapshot for viewer sync (lit/unlit swaps ride
+    /// alongside in `furn_swaps`; see tickOnce).
+    const FurnSnap = struct {
+        x: i32,
+        y: u8,
+        z: i32,
+        burn: u32,
+        total: u32,
+        cook: u32,
+        in: ?item_mod.Stack = null,
+        fuel: ?item_mod.Stack = null,
+        out: ?item_mod.Stack = null,
+    };
+
+    /// Per-player environmental flags for the hazard tick (computed once
+    /// per tick from pure store reads, consumed per viewer).
+    const EnvFlag = struct { water: bool = false, lava: bool = false, suff: bool = false, cactus: bool = false };
+
+    /// Phase C: one tick-region's share of the viewer pass.
+    const RegionGroup = struct {
+        region: *tick_mod.Region,
+        /// Range into the dispatcher's `order` array (snap indices).
+        start: usize,
+        end: usize,
+        /// region.shed_events at group build (delta → region_shed_total).
+        shed_events_before: u64,
+    };
+
+    /// Phase C: a border crossing recorded during grouping (pushed to the
+    /// target inbox after the pass, with no locks held).
+    const RegionCrossing = struct {
+        eid: i32,
+        from_rx: i32,
+        from_rz: i32,
+        to: tick_mod.RegionId,
+        x: f64,
+        y: f64,
+        z: f64,
+    };
+
+    /// Phase C: per-worker context for the fork-join viewer pass. Every
+    /// slice is pre-ranged and read-only; outputs are per-worker and the
+    /// merge pass folds them in group order (deterministic for a given
+    /// grouping). Groups are disjoint across workers.
+    const RegionWorkerCtx = struct {
+        self: *Server,
+        io: std.Io,
+        snap: []RegistryEntry,
+        order: []const usize,
+        groups: []const RegionGroup,
+        /// Global group index of groups[0] (outputs are merge-indexed).
+        group_base: usize,
+        players: []entity.PlayerSnap,
+        mobs: []entity.MobSnap,
+        items: []entity.ItemSnap,
+        envs: []EnvFlag,
+        furn_snaps: []FurnSnap,
+        now_ms: i64,
+        age: i64,
+        cpu: ?usize,
+        out_deaths: []std.ArrayList(DeathInfo),
+        out_claims: []entity.ClaimSet,
+        out_rns: []u64,
+        out_sns: []u64,
+    };
+
+    /// Phase C follow-up: one viewer group, run to completion (times it,
+    /// runs its viewers with shed narrowing, records the sample, moves
+    /// outputs to the merge arrays). Shared by the fork-join worker and
+    /// the persistent-pool handler — one body, two thread lifetimes.
+    fn runViewerGroup(
+        self: *Server,
+        io: std.Io,
+        snap: []RegistryEntry,
+        order: []const usize,
+        g: RegionGroup,
+        gi: usize,
+        players: []entity.PlayerSnap,
+        mobs: []entity.MobSnap,
+        items: []entity.ItemSnap,
+        envs: []EnvFlag,
+        furn_snaps: []FurnSnap,
+        now_ms: i64,
+        age: i64,
+        out_deaths: []std.ArrayList(DeathInfo),
+        out_claims: []entity.ClaimSet,
+        out_rns: []u64,
+        out_sns: []u64,
+    ) void {
+        const t0 = std.Io.Timestamp.now(io, .awake);
+        var deaths = std.ArrayList(DeathInfo).empty;
+        defer deaths.deinit(self.gpa);
+        var claims = entity.ClaimSet{};
+        var rns: u64 = 0;
+        var sns: u64 = 0;
+        const shed = g.region.shed;
+        var vc = ViewerCtx{
+            .now_ms = now_ms,
+            .age = age,
+            .players = players,
+            .mobs = if (shed) mobs[0..0] else mobs,
+            .items = if (shed) items[0..0] else items,
+            .envs = envs,
+            .furn_snaps = if (shed) furn_snaps[0..0] else furn_snaps,
+            .deaths = &deaths,
+            .claims = &claims,
+            .reconcile_ns = &rns,
+            .send_ns = &sns,
+        };
+        for (order[g.start..g.end]) |si| {
+            self.tickViewerOne(&vc, snap[si]);
+        }
+        const dt = t0.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds;
+        g.region.recordSample(@intCast(@max(0, dt)));
+        // Move outputs to the merge arrays (the local is reset so the
+        // defer frees nothing — ownership passes to the merge pass,
+        // which frees each backing after folding it in).
+        out_deaths[gi] = deaths;
+        deaths = std.ArrayList(DeathInfo).empty;
+        out_claims[gi] = claims;
+        out_rns[gi] = rns;
+        out_sns[gi] = sns;
+    }
+
+    /// Phase C follow-up: one fork-join worker. Ticks its groups in order
+    /// (fallback when the persistent pool is unavailable; identical body).
+    /// Inbox drains live in the tick mob section (all drains under
+    /// ent_lock, once per tick) — workers never touch them.
+    fn runRegionWorker(w: *RegionWorkerCtx) void {
+        if (w.cpu) |c| affinity_mod.pinSelf(c);
+        for (w.groups, 0..) |g, k| {
+            runViewerGroup(
+                w.self,
+                w.io,
+                w.snap,
+                w.order,
+                g,
+                w.group_base + k,
+                w.players,
+                w.mobs,
+                w.items,
+                w.envs,
+                w.furn_snaps,
+                w.now_ms,
+                w.age,
+                w.out_deaths,
+                w.out_claims,
+                w.out_rns,
+                w.out_sns,
+            );
+        }
+    }
+
+    /// Phase C follow-up: shared dispatch for the persistent pool. The
+    /// pool owns stable worker identities (pinned once at spawn); each
+    /// generation covers all groups, partitioned contiguously via bounds
+    /// (same math as fork-join: neighbors share workers/cores).
+    const ViewerDispatch = struct {
+        self: *Server,
+        io: std.Io,
+        snap: []RegistryEntry,
+        order: []const usize,
+        groups: []const RegionGroup,
+        /// bounds[w]..bounds[w+1] is worker w's group range (n+1 entries).
+        bounds: []const usize,
+        players: []entity.PlayerSnap,
+        mobs: []entity.MobSnap,
+        items: []entity.ItemSnap,
+        envs: []EnvFlag,
+        furn_snaps: []FurnSnap,
+        now_ms: i64,
+        age: i64,
+        out_deaths: []std.ArrayList(DeathInfo),
+        out_claims: []entity.ClaimSet,
+        out_rns: []u64,
+        out_sns: []u64,
+    };
+
+    fn poolViewerHandler(ctx: *anyopaque, worker: usize, n_workers: usize) void {
+        const d: *const ViewerDispatch = @ptrCast(@alignCast(ctx));
+        _ = n_workers;
+        const start = d.bounds[worker];
+        const end = d.bounds[worker + 1];
+        var k = start;
+        while (k < end) : (k += 1) {
+            runViewerGroup(
+                d.self,
+                d.io,
+                d.snap,
+                d.order,
+                d.groups[k],
+                k,
+                d.players,
+                d.mobs,
+                d.items,
+                d.envs,
+                d.furn_snaps,
+                d.now_ms,
+                d.age,
+                d.out_deaths,
+                d.out_claims,
+                d.out_rns,
+                d.out_sns,
+            );
+        }
+    }
+
+    /// Phase C: worker count for the viewer pass (0 = auto = cpu count
+    /// capped at 8, matching the transport/gen worker convention).
+    fn resolveRegionThreads(self: *Server) usize {
+        if (self.region_threads == 1) return 1;
+        if (self.region_threads > 1) return @min(self.region_threads, tick_mod.max_workers);
+        return @max(1, @min(affinity_mod.cpuCount(), 8));
+    }
+
+    /// Phase C: record a player border crossing into the target region's
+    /// inbox (census + load signal; players live in conns, so nothing is
+    /// adopted). Never fails the tick (OOM drops the record).
+    fn pushTransfer(self: *Server, entity_id: u64, from_dim: u8, from_rx: i32, from_rz: i32, to: tick_mod.RegionId, x: f64, y: f64, z: f64) void {
+        const target = self.region_reg.getOrCreate(self.gpa, to) catch return;
+        target.inbox.push(.{
+            .entity_id = entity_id,
+            .from_dim = from_dim,
+            .from_rx = from_rx,
+            .from_rz = from_rz,
+            .x = x,
+            .y = y,
+            .z = z,
+        }) catch {};
+    }
+
+    /// Phase C follow-up: record a mob border crossing (full-state
+    /// transfer). The source copy stays put — next tick's drain adopts
+    /// into the target and deletes the source (delete-at-drain). Never
+    /// fails the tick (OOM drops the record; the still-present source
+    /// copy re-pushes next tick).
+    fn pushMobTransfer(self: *Server, t: tick_mod.Transfer) void {
+        const to = tick_mod.regionIdFor(0, t.x, t.z);
+        const target = self.region_reg.getOrCreate(self.gpa, to) catch return;
+        target.inbox.push(t) catch {};
+    }
+
+    /// Total live mobs across regions. Takes ent_lock itself (nests the
+    /// registry lock — legal per the Registry lock-order rule); for use
+    /// where ent_lock is NOT already held (stats line).
+    fn mobCount(self: *Server) usize {
+        self.ent_lock.lock();
+        defer self.ent_lock.unlock();
+        return self.region_reg.totalMobs();
+    }
+
+    /// Total mob-store bytes across regions. Caller must hold ent_lock
+    /// (used inside accountMemory's ent section).
+    fn mobBytesLocked(self: *Server) usize {
+        return self.region_reg.totalMobBytes();
+    }
+
+    /// Free all live regions + the viewer pool. Production path is
+    /// deinit(); tests that tick play conns (or a world that spawns mobs)
+    /// defer this next to their registry cleanup.
+    pub fn deinitRegions(self: *Server) void {
+        if (self.region_pool) |p| {
+            p.destroy();
+            self.region_pool = null;
+        }
+        if (self.region_reg.count() > 0) self.region_reg.deinit(self.gpa);
+    }
+
+    /// Phase C: grouped viewers for one tick (built by buildRegionGroups).
+    const GroupBuild = struct {
+        order: [256]usize = undefined,
+        groups: [256]RegionGroup = undefined,
+        n_groups: usize = 0,
+        n_ordered: usize = 0,
+        crossings: [256]RegionCrossing = undefined,
+        n_cross: usize = 0,
+    };
+
+    /// Phase C: file snap viewers into region groups (pass 1: classify
+    /// under one conn lock at a time; pass 2: compact into contiguous
+    /// ranges). Non-play conns tick inline through `legacy_vc` (login /
+    /// idle timeouts). The registry probe holds no conn lock (leaf).
+    ///
+    /// Invariant: every grouped snap index appears in exactly one
+    /// group's [start,end) range (ranges are contiguous and disjoint),
+    /// so no viewer ticks twice or zero times. Interleaved regions are
+    /// why pass 2 exists (extending ranges in place overlaps them).
+    fn buildRegionGroups(self: *Server, snap: []RegistryEntry, legacy_vc: *ViewerCtx, out: *GroupBuild) void {
+        var entry_group: [256]usize = undefined;
+        var group_counts: [256]usize = undefined;
+        var grouped: [256]bool = [_]bool{false} ** 256;
+        out.n_groups = 0;
+        out.n_cross = 0;
+        for (snap, 0..) |e, si| {
+            e.conn.lock.lock();
+            const is_play = e.conn.state == .play;
+            const px = e.conn.pos_x;
+            const py = e.conn.pos_y;
+            const pz = e.conn.pos_z;
+            const eid = e.conn.eid;
+            const prev = e.conn.last_region;
+            var cur: ?struct { rx: i32, rz: i32 } = null;
+            if (is_play) {
+                const rid = tick_mod.regionIdFor(0, px, pz);
+                cur = .{ .rx = rid.rx, .rz = rid.rz };
+                e.conn.last_region = .{ .rx = rid.rx, .rz = rid.rz };
+            }
+            e.conn.lock.unlock();
+            if (!is_play) {
+                self.tickViewerOne(legacy_vc, e);
+                continue;
+            }
+            const cr = cur.?;
+            if (prev) |pr| {
+                if ((pr.rx != cr.rx or pr.rz != cr.rz) and out.n_cross < out.crossings.len) {
+                    out.crossings[out.n_cross] = .{
+                        .eid = eid,
+                        .from_rx = pr.rx,
+                        .from_rz = pr.rz,
+                        .to = .{ .dim = 0, .rx = cr.rx, .rz = cr.rz },
+                        .x = px,
+                        .y = py,
+                        .z = pz,
+                    };
+                    out.n_cross += 1;
+                }
+            }
+            // OOM or group overflow must not drop the viewer: tick
+            // inline through the same body instead.
+            const reg = self.region_reg.getOrCreate(self.gpa, .{ .dim = 0, .rx = cr.rx, .rz = cr.rz }) catch {
+                self.tickViewerOne(legacy_vc, e);
+                continue;
+            };
+            var gi: usize = 0;
+            while (gi < out.n_groups) : (gi += 1) {
+                if (out.groups[gi].region == reg) break;
+            }
+            if (gi == out.n_groups) {
+                if (out.n_groups >= out.groups.len) {
+                    self.tickViewerOne(legacy_vc, e);
+                    continue;
+                }
+                out.groups[out.n_groups] = .{
+                    .region = reg,
+                    .start = 0,
+                    .end = 0,
+                    .shed_events_before = reg.shed_events,
+                };
+                group_counts[out.n_groups] = 0;
+                out.n_groups += 1;
+            }
+            entry_group[si] = gi;
+            group_counts[gi] += 1;
+            grouped[si] = true;
+        }
+        // Pass 2: compact into contiguous ranges (group order, snap
+        // order within a group — deterministic for the grouping).
+        var start: usize = 0;
+        for (out.groups[0..out.n_groups], group_counts[0..out.n_groups]) |*g, cnt| {
+            g.start = start;
+            g.end = start + cnt;
+            start = g.end;
+        }
+        out.n_ordered = start;
+        var filled: [256]usize = [_]usize{0} ** 256;
+        for (snap, 0..) |_, si| {
+            if (!grouped[si]) continue;
+            const gi = entry_group[si];
+            out.order[out.groups[gi].start + filled[gi]] = si;
+            filled[gi] += 1;
+        }
+    }
+
+    /// Phase C: per-viewer tick inputs. Slices are pre-ranged by the
+    /// dispatcher; a degraded (shed) region is handed narrowed slices
+    /// (players only, no furnace rows), so this body needs no shed
+    /// branches — identical code, smaller work. Accumulators are
+    /// per-worker; the merge pass folds them in deterministic order.
+    const ViewerCtx = struct {
+        now_ms: i64,
+        age: i64,
+        players: []entity.PlayerSnap,
+        mobs: []entity.MobSnap,
+        items: []entity.ItemSnap,
+        envs: []EnvFlag,
+        furn_snaps: []FurnSnap,
+        deaths: *std.ArrayList(DeathInfo),
+        claims: *entity.ClaimSet,
+        reconcile_ns: *u64,
+        send_ns: *u64,
+    };
+
+    /// Phase C: one viewer's tick body (visibility reconcile + output
+    /// drain). No locks on entry; takes the viewer's own conn.lock for
+    /// the queued-output section, releases it before the transport
+    /// flush (one output path, same as the legacy loop). Parallel-safe:
+    /// every mutable byte touched belongs to this viewer except the ctx
+    /// accumulators (per-worker deaths/claims/timings). Shared reads
+    /// (snapshots, seqlock config, atomics) are all lock-free.
+    fn tickViewerOne(self: *Server, vc: *ViewerCtx, e: RegistryEntry) void {
+        const PresentCtx = struct {
+            viewer: *Conn,
+            range_blocks: f64,
+        };
+        const present = struct {
+            fn f(ctx: *anyopaque, x: f64, z: f64) bool {
+                const p: *PresentCtx = @ptrCast(@alignCast(ctx));
+                const dx = x - p.viewer.pos_x;
+                const dz = z - p.viewer.pos_z;
+                if (@abs(dx) > p.range_blocks or @abs(dz) > p.range_blocks) return false;
+                const cx = @as(i32, @intFromFloat(@floor(x / 16.0)));
+                const cz = @as(i32, @intFromFloat(@floor(z / 16.0)));
+                return p.viewer.sent.contains(Conn.sentKey(cx, cz));
+            }
+        }.f;
+
+        e.conn.lock.lock();
+        // Connections that never reach play: login timeout (anti-slowloris).
+        // Login state gets a kick packet (0x00 exists there); handshaking /
+        // status have no disconnect packet, so they are just dropped.
+        if (e.conn.state != .play) {
+            const stale = vc.now_ms - e.conn.connected_at_ms > login_timeout_ms;
+            const is_login = e.conn.state == .login;
+            if (stale and !e.conn.dead) {
+                if (is_login) {
+                    var db: [128]u8 = undefined;
+                    const id: i32 = @intFromEnum(ids.LoginClient.disconnect);
+                    var payload: [120]u8 = undefined;
+                    var w = codec.PacketWriter.init(&payload);
+                    w.writeString("{\"text\":\"Login timed out\"}") catch {};
+                    if (codec.framePacket(id, w.written(), &db)) |f| {
+                        e.conn.queueFramed(f) catch {};
+                    } else |_| {}
+                }
+                e.conn.dead = true;
+                e.conn.close_after_flush = true;
+            }
+            const drop = e.conn.dead;
+            e.conn.lock.unlock();
+            // One output path (blocking: to the socket; async: the worker).
+            flushEntry(e, self.io);
+            if (drop) closeEntry(e, self.io);
+            return;
+        }
+        // Idle kick (`/setidletimeout`): play conns silent past the mark
+        // get the jar-hardcoded screen. last_active_ms refreshes per frame.
+        self.state_lock.lock();
+        const idle_min = self.cfg.load().idle_timeout_min;
+        self.state_lock.unlock();
+        if (idle_min > 0 and !e.conn.dead and e.conn.last_active_ms > 0 and
+            vc.now_ms - e.conn.last_active_ms > @as(i64, idle_min) * 60000)
+        {
+            var db: [128]u8 = undefined;
+            var payload: [96]u8 = undefined;
+            var w = codec.PacketWriter.init(&payload);
+            w.writeString("{\"text\":\"You have been idle for too long!\"}") catch {};
+            if (codec.framePacket(@intFromEnum(ids.PlayClient.disconnect), w.written(), &db)) |f| {
+                e.conn.queueFramed(f) catch {};
+            } else |_| {}
+            e.conn.dead = true;
+            e.conn.close_after_flush = true;
+            e.conn.lock.unlock();
+            // One output path (blocking: to the socket; async: the worker).
+            flushEntry(e, self.io);
+            closeEntry(e, self.io);
+            return;
+        }
+        const tod = self.time_of_day.load(.acquire);
+        const action = e.conn.queueTick(vc.now_ms, vc.age, tod) catch {
+            e.conn.lock.unlock();
+            return;
+        };
+        const timed_out = action == .timeout;
+        if (!timed_out) {
+            // Hunger + hazards before visibility (death gates pickup).
+            var died_now = false;
+            if (hungerTick(e.conn, self.config.difficulty)) died_now = true;
+            if (!died_now) {
+                for (vc.players, 0..) |p, i| {
+                    if (p.eid != e.conn.eid or i >= vc.envs.len) continue;
+                    if (envTick(e.conn, vc.envs[i].water, vc.envs[i].lava, vc.envs[i].suff, vc.envs[i].cactus)) died_now = true;
+                    break;
+                }
+            }
+            if (died_now) {
+                const dd = if (self.keepInv()) null else collectDeathDrops(e.conn);
+                vc.deaths.append(self.gpa, .{
+                    .conn = e.conn,
+                    .eid = e.conn.eid,
+                    .dd = dd,
+                    .x = e.conn.pos_x,
+                    .y = e.conn.pos_y,
+                    .z = e.conn.pos_z,
+                }) catch {};
+            }
+            // Furnace window sync (open window 2 at a snapped furnace).
+            if (e.conn.open_win) |ow| {
+                if (ow.id == 2) {
+                    for (vc.furn_snaps) |fs| {
+                        if (fs.x != ow.x or fs.y != ow.y or fs.z != ow.z) continue;
+                        // 39 slots: 0-2 furnace, 3-38 alias inv 9..44.
+                        var all: [39]?item_mod.Stack = [_]?item_mod.Stack{null} ** 39;
+                        all[0] = fs.in;
+                        all[1] = fs.fuel;
+                        all[2] = fs.out;
+                        for (9..45) |i| all[i - 6] = e.conn.inv[i];
+                        const wf = packets.frameWindowItemsAlloc(e.conn.allocator, 2, &all) catch null;
+                        if (wf) |f| {
+                            defer e.conn.allocator.free(f);
+                            e.conn.queueFramed(f) catch {};
+                        }
+                        var pb: [16]u8 = undefined;
+                        const props = [_]struct { p: i16, v: i16 }{
+                            .{ .p = 0, .v = @intCast(@min(fs.cook, 32767)) },
+                            .{ .p = 1, .v = @intCast(@min(fs.burn, 32767)) },
+                            .{ .p = 2, .v = @intCast(@min(fs.total, 32767)) },
+                        };
+                        for (props) |pr| {
+                            if (packets.frameProgressBar(2, pr.p, pr.v, &pb)) |f| {
+                                e.conn.queueFramed(f) catch {};
+                            } else |_| {}
+                        }
+                        break;
+                    }
+                }
+            }
+            var pctx = PresentCtx{ .viewer = e.conn, .range_blocks = @as(f64, @floatFromInt(self.view_distance)) * 16.0 + 16.0 };
+            const r0 = std.Io.Timestamp.now(self.io, .awake);
+            entity.reconcileViewer(e.conn, conn_sink.bind(e.conn), vc.players, vc.mobs, vc.items, vc.claims, present, &pctx) catch {};
+            const r1 = std.Io.Timestamp.now(self.io, .awake);
+            vc.reconcile_ns.* += @intCast(@max(0, r0.durationTo(r1).nanoseconds));
+        }
+        e.conn.lock.unlock();
+        // Tick-aligned flush (Phase B): the tick drains every conn's
+        // outbox and hands the bytes to the transport in one batch
+        // (blocking: one write; async: one queued send). This is the
+        // "flush" the acceptance criteria measure; the entity
+        // reconcile above is counted separately (it is O(players^2)
+        // and belongs to Phase C's region work).
+        const f0 = std.Io.Timestamp.now(self.io, .awake);
+        flushEntry(e, self.io);
+        const f1 = std.Io.Timestamp.now(self.io, .awake);
+        vc.send_ns.* += @intCast(@max(0, f0.durationTo(f1).nanoseconds));
+        if (timed_out) closeEntry(e, self.io);
+    }
+
     pub fn tickOnce(self: *Server, now_ms: i64) void {
         const age = self.world_age.fetchAdd(20, .acq_rel) + 20;
         // doDaylightCycle gates the clock (world age always advances).
         self.state_lock.lock();
-        const cycle = self.gamerules[8];
+        const cycle = self.cfg.load().gamerules[8];
         if (self.debug_start_ms != null) self.debug_ticks += 1;
         self.state_lock.unlock();
         if (cycle) {
             const tod = @mod(self.time_of_day.load(.acquire) + 20, @as(i64, 24000));
             self.time_of_day.store(tod, .release);
         }
+        // Phase C: publish the barrier payload (region workers read
+        // age/time lock-free; the fork-join itself is the barrier).
+        self.region_clock.publish(age, self.time_of_day.load(.acquire));
         self.tickWeather();
+        self.tickLightning();
         self.tickEffects();
 
         var batch: [256]RegistryEntry = undefined;
@@ -3744,13 +4712,52 @@ pub const Server = struct {
 
         // Wander mobs + snapshot (demo pig auto-spawns when a world is present;
         // death respawns it after pig_cooldown ticks).
+        //
+        // Region-owned mobs, delete-at-drain protocol (Phase C follow-up):
+        // drain+adopt first (last tick's crossings land, adopted mob is in
+        // this tick's snapshot — zero gap), snapshot merged across regions,
+        // then wander per region (crossings push full-state transfers and
+        // KEEP the source copy; next tick's drain adopts + deletes). A mob
+        // killed between push and drain is dropped, never resurrected; an
+        // adopt OOM keeps the source copy and retries next tick.
+        // Single ent_lock section throughout (registry nests innermost).
         var mobs: [256]entity.MobSnap = undefined;
         var n_mobs: usize = 0;
         self.ent_lock.lock();
+        // Live regions (stable pointers; heap-falls-back past 256 cells).
+        var rstack: [256]*tick_mod.Region = undefined;
+        const n_live = self.region_reg.count();
+        var rheap: []*tick_mod.Region = &.{};
+        if (n_live > rstack.len) {
+            rheap = self.gpa.alloc(*tick_mod.Region, n_live) catch &.{};
+        }
+        var regs: []*tick_mod.Region = if (rheap.len == n_live) rheap else rstack[0..];
+        const n_regs = self.region_reg.allRegions(regs);
+        defer if (rheap.len > 0) self.gpa.free(rheap);
+        // 1. Drain every inbox: mob transfers adopt (delete-at-drain),
+        //    player transfers bump the census.
+        for (regs[0..n_regs]) |reg| {
+            const msgs = reg.inbox.drain() catch continue;
+            defer self.gpa.free(msgs);
+            for (msgs) |m| {
+                if (!m.is_mob) {
+                    reg.census += 1;
+                    continue;
+                }
+                const eid: i32 = @intCast(m.entity_id);
+                const src_id = tick_mod.RegionId{ .dim = m.from_dim, .rx = m.from_rx, .rz = m.from_rz };
+                const src = self.region_reg.lookup(src_id) orelse continue;
+                const si = src.mobs.indexOfId(eid) orelse continue; // killed mid-flight: drop
+                reg.adoptMob(m) catch continue; // OOM: source copy kept, retried next tick
+                src.mobs.removeAt(si);
+            }
+        }
         if (self.world != null) {
             var pigs: usize = 0;
-            for (self.entities.items) |m| {
-                if (m.kind == entity.MOB_PIG) pigs += 1;
+            for (regs[0..n_regs]) |reg| {
+                for (reg.mobs.kinds.items) |k| {
+                    if (k == entity.MOB_PIG) pigs += 1;
+                }
             }
             var want_pig = false;
             if (pigs == 0) {
@@ -3766,25 +4773,72 @@ pub const Server = struct {
             }
             if (want_pig) {
                 const id = self.eid_counter.fetchAdd(1, .acq_rel);
-                self.entities.append(self.gpa, .{
-                    .id = id,
-                    .kind = entity.MOB_PIG,
-                    .x = @as(f64, @floatFromInt(self.config.spawn_x)) + 2.5,
-                    .y = @as(f64, @floatFromInt(self.config.spawn_y)),
-                    .z = @as(f64, @floatFromInt(self.config.spawn_z)) + 2.5,
-                    .yaw = 0,
-                    .health = 10.0,
-                    .home_x = @as(f64, @floatFromInt(self.config.spawn_x)) + 2.5,
-                    .home_z = @as(f64, @floatFromInt(self.config.spawn_z)) + 2.5,
-                    .patrol_r = 4.0,
-                }) catch {};
+                // Owned by its spawn cell's region from birth.
+                const srid = tick_mod.regionIdFor(0, @as(f64, @floatFromInt(self.config.spawn_x)) + 2.5, @as(f64, @floatFromInt(self.config.spawn_z)) + 2.5);
+                const srcreg = self.region_reg.getOrCreate(self.gpa, srid) catch null;
+                if (srcreg) |sr| {
+                    _ = sr.mobs.add(.{
+                        .id = id,
+                        .kind = entity.MOB_PIG,
+                        .x = @as(f64, @floatFromInt(self.config.spawn_x)) + 2.5,
+                        .y = @as(f64, @floatFromInt(self.config.spawn_y)),
+                        .z = @as(f64, @floatFromInt(self.config.spawn_z)) + 2.5,
+                        .yaw = 0,
+                        .health = 10.0,
+                        .home_x = @as(f64, @floatFromInt(self.config.spawn_x)) + 2.5,
+                        .home_z = @as(f64, @floatFromInt(self.config.spawn_z)) + 2.5,
+                        .patrol_r = 4.0,
+                    }) catch {};
+                }
             }
         }
-        for (self.entities.items) |*m| m.wanderStep(0.5);
-        for (self.entities.items) |m| {
-            if (n_mobs >= mobs.len) break;
-            mobs[n_mobs] = .{ .id = m.id, .kind = m.kind, .x = m.x, .y = m.y, .z = m.z, .yaw = m.yaw, .health = m.health };
-            n_mobs += 1;
+        // 2. Snapshot merged across regions (cap 256, pre-existing).
+        for (regs[0..n_regs]) |reg| {
+            for (0..reg.mobs.len()) |si| {
+                if (n_mobs >= mobs.len) break;
+                mobs[n_mobs] = .{
+                    .id = reg.mobs.ids.items[si],
+                    .kind = reg.mobs.kinds.items[si],
+                    .x = reg.mobs.px.items[si],
+                    .y = reg.mobs.py.items[si],
+                    .z = reg.mobs.pz.items[si],
+                    .yaw = reg.mobs.yaw.items[si],
+                    .health = reg.mobs.health.items[si],
+                };
+                n_mobs += 1;
+            }
+        }
+        // 3. Wander per region; crossings push full-state transfers (the
+        // source copy stays — next tick's drain adopts + deletes). A mob
+        // moves 0.5 blocks/tick against 512-block cells: at most one
+        // crossing per mob per tick, so the 256-entry record never fills
+        // from wander alone.
+        var mob_cross: [256]tick_mod.Transfer = undefined;
+        var n_mob_cross: usize = 0;
+        for (regs[0..n_regs]) |reg| {
+            reg.mobs.tick(0.5);
+            for (0..reg.mobs.len()) |i| {
+                const rid = tick_mod.regionIdFor(0, reg.mobs.px.items[i], reg.mobs.pz.items[i]);
+                if ((rid.dim != reg.id.dim or rid.rx != reg.id.rx or rid.rz != reg.id.rz) and n_mob_cross < mob_cross.len) {
+                    mob_cross[n_mob_cross] = .{
+                        .entity_id = @intCast(reg.mobs.ids.items[i]),
+                        .from_dim = reg.id.dim,
+                        .from_rx = reg.id.rx,
+                        .from_rz = reg.id.rz,
+                        .x = reg.mobs.px.items[i],
+                        .y = reg.mobs.py.items[i],
+                        .z = reg.mobs.pz.items[i],
+                        .is_mob = true,
+                        .kind = reg.mobs.kinds.items[i],
+                        .yaw = reg.mobs.yaw.items[i],
+                        .health = reg.mobs.health.items[i],
+                        .home_x = reg.mobs.home_x.items[i],
+                        .home_z = reg.mobs.home_z.items[i],
+                        .patrol_r = reg.mobs.patrol_r.items[i],
+                    };
+                    n_mob_cross += 1;
+                }
+            }
         }
         // Age item entities (ticks are 20tps units, +20 per 1Hz tick), tick
         // down pickup delays, merge stacks (vanilla xk merge), and mark the
@@ -3841,21 +4895,16 @@ pub const Server = struct {
             n_items += 1;
         }
         self.ent_lock.unlock();
+        // Mob handoffs ride the target inbox (recorded above, no locks
+        // held here). Full-state transfers; the source copy stays until
+        // next tick's drain adopts + deletes (delete-at-drain).
+        for (mob_cross[0..n_mob_cross]) |c| {
+            self.pushMobTransfer(c);
+        }
 
         // Furnaces: 20-tick quanta under furn_lock; snapshot progress + slots
         // for viewer sync, record lit/unlit swaps for the world pass.
         // (NBT duped per tick, freed after the reconcile pass like items.)
-        const FurnSnap = struct {
-            x: i32,
-            y: u8,
-            z: i32,
-            burn: u32,
-            total: u32,
-            cook: u32,
-            in: ?item_mod.Stack = null,
-            fuel: ?item_mod.Stack = null,
-            out: ?item_mod.Stack = null,
-        };
         var furn_snaps: [256]FurnSnap = undefined;
         var n_furn: usize = 0;
         var furn_swaps: [256]struct { x: i32, y: u8, z: i32, lit: bool } = undefined;
@@ -3898,31 +4947,67 @@ pub const Server = struct {
         }
         self.furn_lock.unlock();
 
-        const PresentCtx = struct {
-            viewer: *Conn,
-            range_blocks: f64,
-        };
-        const present = struct {
-            fn f(ctx: *anyopaque, x: f64, z: f64) bool {
-                const p: *PresentCtx = @ptrCast(@alignCast(ctx));
-                const dx = x - p.viewer.pos_x;
-                const dz = z - p.viewer.pos_z;
-                if (@abs(dx) > p.range_blocks or @abs(dz) > p.range_blocks) return false;
-                const cx = @as(i32, @intFromFloat(@floor(x / 16.0)));
-                const cz = @as(i32, @intFromFloat(@floor(z / 16.0)));
-                return p.viewer.sent.contains(Conn.sentKey(cx, cz));
+        // K1 redstone tick: drain scheduled entries (button release,
+        // repeater eval, ore fade, torch recheck) + poll pressure plates.
+        // World work under world_lock; broadcasts after (furnace pattern).
+        // Plate detection needs entity positions: players/mobs/item snaps
+        // are already copied above (no locks held here).
+        if (self.world != null and (self.rs_sched.n > 0 or self.rs_plates.n > 0)) {
+            var rs_changes: redstone_mod.ChangeList = .{};
+            var rs_sounds: redstone_mod.SoundList = .{};
+            var rs_actions: redstone_mod.ActionList = .{};
+            self.world_lock.lock();
+            const now_rs = self.rs_tick;
+            if (self.world) |pool| self.loadRedstone(pool, now_rs);
+            if (self.world) |pool| {
+                var w = Server.RsWorld{ .pool = pool, .alloc = self.gpa, .changes = &rs_changes };
+                var p_ents: [256]redstone_mod.Ent = undefined;
+                var m_ents: [256]redstone_mod.Ent = undefined;
+                var i_ents: [256]redstone_mod.Ent = undefined;
+                for (players[0..n_players], 0..) |p, i| {
+                    if (i >= p_ents.len) break;
+                    p_ents[i] = .{ .x = p.x, .y = p.y, .z = p.z };
+                }
+                for (mobs[0..n_mobs], 0..) |m, i| {
+                    if (i >= m_ents.len) break;
+                    m_ents[i] = .{ .x = m.x, .y = m.y, .z = m.z };
+                }
+                for (item_snaps[0..n_items], 0..) |it, i| {
+                    if (i >= i_ents.len) break;
+                    i_ents[i] = .{ .x = it.x, .y = it.y, .z = it.z };
+                }
+                redstone_mod.tick(
+                    w.rsView(),
+                    &self.rs_sched,
+                    &self.rs_burn,
+                    &self.rs_plates,
+                    &rs_changes,
+                    &rs_sounds,
+                    now_rs,
+                    p_ents[0..@min(n_players, p_ents.len)],
+                    m_ents[0..@min(n_mobs, m_ents.len)],
+                    i_ents[0..@min(n_items, i_ents.len)],
+                    &rs_actions,
+                );
             }
-        }.f;
+            self.world_lock.unlock();
+            if (self.world) |pool| {
+                self.flushRsBatch(pool, rs_changes, rs_sounds, rs_actions);
+            }
+        }
 
         var claims = entity.ClaimSet{};
         // Environmental hazards from player snaps (no conn locks here;
         // world_lock is a leaf). Eyes block decides drown/suffocate, feet
         // block adds lava.
-        const EnvFlag = struct { water: bool = false, lava: bool = false, suff: bool = false, cactus: bool = false };
         var envs: [256]EnvFlag = undefined;
         for (envs[0..@min(envs.len, n_players)]) |*f| f.* = .{};
         if (self.world) |pool| {
-            self.world_lock.lock();
+            // Pure reads (no read-modify-write), so the world lock is NOT
+            // held here: the store is internally consistent (a put
+            // replaces the whole chunk value), and holding the world lock
+            // across a cold-cache disk read stalled every chunk-serving
+            // thread behind the tick.
             for (players[0..n_players], 0..) |p, i| {
                 if (i >= envs.len) break;
                 const ex: i32 = @intFromFloat(@floor(p.x));
@@ -3933,147 +5018,180 @@ pub const Server = struct {
                     envs[i].water = b.id == game_ids.flowing_water or b.id == game_ids.water;
                     envs[i].suff = view.isOpaqueCube(b.id);
                     if (b.id == game_ids.flowing_lava or b.id == game_ids.lava) envs[i].lava = true;
-                    if (b.id == game_ids.cactus) envs[i].cactus = true;
                 }
                 if (view.peekBlock(pool, self.gpa, ex, feet, ez) catch null) |b| {
                     if (b.id == game_ids.flowing_lava or b.id == game_ids.lava) envs[i].lava = true;
-                    if (b.id == game_ids.cactus) envs[i].cactus = true;
                 }
+                // Cactus contact is AABB overlap, not cell identity: brushing
+                // past a neighboring cactus hurts (vanilla collision box).
+                envs[i].cactus = self.touchesCactus(pool, p.x, p.y, p.z);
             }
-            self.world_lock.unlock();
         }
         var deaths: std.ArrayList(DeathInfo) = .empty;
-        for (snap) |e| {
-            e.conn.lock.lock();
-            // Connections that never reach play: login timeout (anti-slowloris).
-            // Login state gets a kick packet (0x00 exists there); handshaking /
-            // status have no disconnect packet, so they are just dropped.
-            if (e.conn.state != .play) {
-                const stale = now_ms - e.conn.connected_at_ms > login_timeout_ms;
-                const is_login = e.conn.state == .login;
-                if (stale and !e.conn.dead) {
-                    if (is_login) {
-                        var db: [128]u8 = undefined;
-                        const id: i32 = @intFromEnum(ids.LoginClient.disconnect);
-                        var payload: [120]u8 = undefined;
-                        var w = codec.PacketWriter.init(&payload);
-                        w.writeString("{\"text\":\"Login timed out\"}") catch {};
-                        if (codec.framePacket(id, w.written(), &db)) |f| {
-                            e.conn.queueFramed(f) catch {};
-                        } else |_| {}
-                    }
-                    e.conn.dead = true;
-                    e.conn.close_after_flush = true;
-                }
-                const pending = e.conn.takeOutput() catch {
-                    e.conn.lock.unlock();
-                    continue;
-                };
-                const drop = e.conn.dead;
-                e.conn.lock.unlock();
-                if (pending.len > 0) writeFramed(e, self.io, pending);
-                e.conn.allocator.free(pending);
-                if (drop) e.stream.shutdown(self.io, .both) catch {};
-                continue;
-            }
-            // Idle kick (`/setidletimeout`): play conns silent past the mark
-            // get the jar-hardcoded screen. last_active_ms refreshes per frame.
-            self.state_lock.lock();
-            const idle_min = self.idle_timeout_min;
-            self.state_lock.unlock();
-            if (idle_min > 0 and !e.conn.dead and e.conn.last_active_ms > 0 and
-                now_ms - e.conn.last_active_ms > @as(i64, idle_min) * 60000)
-            {
-                var db: [128]u8 = undefined;
-                var payload: [96]u8 = undefined;
-                var w = codec.PacketWriter.init(&payload);
-                w.writeString("{\"text\":\"You have been idle for too long!\"}") catch {};
-                if (codec.framePacket(@intFromEnum(ids.PlayClient.disconnect), w.written(), &db)) |f| {
-                    e.conn.queueFramed(f) catch {};
-                } else |_| {}
-                e.conn.dead = true;
-                e.conn.close_after_flush = true;
-                const pending = e.conn.takeOutput() catch {
-                    e.conn.lock.unlock();
-                    continue;
-                };
-                e.conn.lock.unlock();
-                if (pending.len > 0) writeFramed(e, self.io, pending);
-                e.conn.allocator.free(pending);
-                e.stream.shutdown(self.io, .both) catch {};
-                continue;
-            }
-            const tod = self.time_of_day.load(.acquire);
-            const action = e.conn.queueTick(now_ms, age, tod) catch {
-                e.conn.lock.unlock();
-                continue;
+        // Phase B: the per-viewer tick phase (reconcile + output drain) is
+        // what "tick flush" means in the acceptance criteria: the time the
+        // tick spends pushing the accumulated output to every connection.
+        const flush_t0 = std.Io.Timestamp.now(self.io, .awake);
+        var reconcile_ns: u64 = 0;
+        var send_ns: u64 = 0;
+        // Phase C: region dispatch. Play viewers file into region groups
+        // (one region = one tick unit, never split mid-tick); groups run
+        // fork-join with the join as the global barrier; the merge folds
+        // worker outputs in group order (deterministic for a given
+        // grouping). Non-play conns run inline first (login/idle
+        // timeouts; rare).
+        {
+            var legacy_vc = ViewerCtx{
+                .now_ms = now_ms,
+                .age = age,
+                .players = players[0..n_players],
+                .mobs = mobs[0..n_mobs],
+                .items = item_snaps[0..n_items],
+                .envs = envs[0..],
+                .furn_snaps = furn_snaps[0..n_furn],
+                .deaths = &deaths,
+                .claims = &claims,
+                .reconcile_ns = &reconcile_ns,
+                .send_ns = &send_ns,
             };
-            const timed_out = action == .timeout;
-            if (!timed_out) {
-                // Hunger + hazards before visibility (death gates pickup).
-                var died_now = false;
-                if (hungerTick(e.conn, self.config.difficulty)) died_now = true;
-                if (!died_now) {
-                    for (players[0..n_players], 0..) |p, i| {
-                        if (p.eid != e.conn.eid or i >= envs.len) continue;
-                        if (envTick(e.conn, envs[i].water, envs[i].lava, envs[i].suff, envs[i].cactus)) died_now = true;
-                        break;
+            var build = GroupBuild{};
+            self.buildRegionGroups(snap, &legacy_vc, &build);
+            // Crossings ride the target inbox (recorded above, pushed with
+            // no locks held — the registry lock is a leaf).
+            for (build.crossings[0..build.n_cross]) |c| {
+                self.pushTransfer(@intCast(c.eid), 0, c.from_rx, c.from_rz, c.to, c.x, c.y, c.z);
+            }
+            // Run phase: one worker per group range (sequential when a
+            // single thread is configured — same body, group order, with
+            // the breaker and census live either way).
+            if (build.n_groups > 0) {
+                const want = self.resolveRegionThreads();
+                const n_workers = @min(@min(want, build.n_groups), tick_mod.max_workers);
+                var cpus: [tick_mod.max_workers]usize = undefined;
+                if (n_workers >= 2) {
+                    if (!self.region_topo_done) {
+                        self.region_topo = affinity_mod.detect(self.io);
+                        self.region_topo_done = true;
                     }
+                    affinity_mod.assignRegions(&self.region_topo, n_workers, &cpus);
                 }
-                if (died_now) {
-                    const dd = if (self.keepInv()) null else collectDeathDrops(e.conn);
-                    deaths.append(self.gpa, .{
-                        .conn = e.conn,
-                        .eid = e.conn.eid,
-                        .dd = dd,
-                        .x = e.conn.pos_x,
-                        .y = e.conn.pos_y,
-                        .z = e.conn.pos_z,
-                    }) catch {};
+                var out_deaths: [256]std.ArrayList(DeathInfo) = undefined;
+                var out_claims: [256]entity.ClaimSet = undefined;
+                var out_rns: [256]u64 = undefined;
+                var out_sns: [256]u64 = undefined;
+                // Phase C follow-up: persistent pool first (stable workers,
+                // pinned once); fork-join fallback when creation fails or
+                // off Linux (same body and merge either way).
+                var disp = ViewerDispatch{
+                    .self = self,
+                    .io = self.io,
+                    .snap = snap,
+                    .order = build.order[0..build.n_ordered],
+                    .groups = build.groups[0..build.n_groups],
+                    .bounds = &.{},
+                    .players = players[0..n_players],
+                    .mobs = mobs[0..n_mobs],
+                    .items = item_snaps[0..n_items],
+                    .envs = envs[0..],
+                    .furn_snaps = furn_snaps[0..n_furn],
+                    .now_ms = now_ms,
+                    .age = age,
+                    .out_deaths = out_deaths[0..build.n_groups],
+                    .out_claims = out_claims[0..build.n_groups],
+                    .out_rns = out_rns[0..build.n_groups],
+                    .out_sns = out_sns[0..build.n_groups],
+                };
+                var bounds: [tick_mod.max_workers + 1]usize = undefined;
+                var pool: ?*pool_mod.Pool = null;
+                if (n_workers >= 2) {
+                    if (self.region_pool == null) {
+                        self.region_pool = pool_mod.Pool.create(self.gpa, n_workers, cpus[0..n_workers]) catch null;
+                    }
+                    pool = self.region_pool;
                 }
-                // Furnace window sync (open window 2 at a snapped furnace).
-                if (e.conn.open_win) |ow| {
-                    if (ow.id == 2) {
-                        for (furn_snaps[0..n_furn]) |fs| {
-                            if (fs.x != ow.x or fs.y != ow.y or fs.z != ow.z) continue;
-                            // 39 slots: 0-2 furnace, 3-38 alias inv 9..44.
-                            var all: [39]?item_mod.Stack = [_]?item_mod.Stack{null} ** 39;
-                            all[0] = fs.in;
-                            all[1] = fs.fuel;
-                            all[2] = fs.out;
-                            for (9..45) |i| all[i - 6] = e.conn.inv[i];
-                            const wf = packets.frameWindowItemsAlloc(e.conn.allocator, 2, &all) catch null;
-                            if (wf) |f| {
-                                defer e.conn.allocator.free(f);
-                                e.conn.queueFramed(f) catch {};
-                            }
-                            var pb: [16]u8 = undefined;
-                            const props = [_]struct { p: i16, v: i16 }{
-                                .{ .p = 0, .v = @intCast(@min(fs.cook, 32767)) },
-                                .{ .p = 1, .v = @intCast(@min(fs.burn, 32767)) },
-                                .{ .p = 2, .v = @intCast(@min(fs.total, 32767)) },
-                            };
-                            for (props) |pr| {
-                                if (packets.frameProgressBar(2, pr.p, pr.v, &pb)) |f| {
-                                    e.conn.queueFramed(f) catch {};
-                                } else |_| {}
-                            }
-                            break;
+                if (pool) |pl| {
+                    // Partition groups contiguously across the pool's
+                    // stable workers (same math as fork-join).
+                    const pn = pl.n;
+                    var off: usize = 0;
+                    var w: usize = 0;
+                    while (w < pn) : (w += 1) {
+                        bounds[w] = off;
+                        off += (build.n_groups - off) / (pn - w);
+                    }
+                    bounds[pn] = off;
+                    disp.bounds = bounds[0 .. pn + 1];
+                    pl.run(&disp, poolViewerHandler);
+                } else {
+                    var wctx: [tick_mod.max_workers]RegionWorkerCtx = undefined;
+                    var wthreads: [tick_mod.max_workers]std.Thread = undefined;
+                    var spawned: usize = 0;
+                    var spawned_threads: usize = 0;
+                    var sequential = n_workers <= 1;
+                    var off: usize = 0;
+                    // Contiguous group ranges: neighboring regions share
+                    // workers (pinned to neighboring cores / shared L3).
+                    while (spawned < n_workers) : (spawned += 1) {
+                        const len = (build.n_groups - off) / (n_workers - spawned);
+                        wctx[spawned] = .{
+                            .self = self,
+                            .io = self.io,
+                            .snap = snap,
+                            .order = build.order[0..build.n_ordered],
+                            .groups = build.groups[off .. off + len],
+                            .group_base = off,
+                            .players = players[0..n_players],
+                            .mobs = mobs[0..n_mobs],
+                            .items = item_snaps[0..n_items],
+                            .envs = envs[0..],
+                            .furn_snaps = furn_snaps[0..n_furn],
+                            .now_ms = now_ms,
+                            .age = age,
+                            .cpu = if (n_workers >= 2) cpus[spawned] else null,
+                            .out_deaths = out_deaths[0..build.n_groups],
+                            .out_claims = out_claims[0..build.n_groups],
+                            .out_rns = out_rns[0..build.n_groups],
+                            .out_sns = out_sns[0..build.n_groups],
+                        };
+                        off += len;
+                        if (sequential) {
+                            runRegionWorker(&wctx[spawned]);
+                        } else if (std.Thread.spawn(.{}, runRegionWorker, .{&wctx[spawned]})) |t| {
+                            wthreads[spawned_threads] = t;
+                            spawned_threads += 1;
+                        } else |_| {
+                            // No thread for this range (or any later one):
+                            // run it — and the rest — inline. Still correct.
+                            runRegionWorker(&wctx[spawned]);
+                            sequential = true;
                         }
                     }
+                    for (wthreads[0..spawned_threads]) |t| t.join();
                 }
-                var pctx = PresentCtx{ .viewer = e.conn, .range_blocks = @as(f64, @floatFromInt(self.view_distance)) * 16.0 + 16.0 };
-                entity.reconcileViewer(e.conn, players[0..n_players], mobs[0..n_mobs], item_snaps[0..n_items], &claims, present, &pctx) catch {};
+                // Merge in group order (deterministic for the grouping).
+                // Shared by the pool and fork-join paths.
+                for (build.groups[0..build.n_groups], 0..) |g, gi| {
+                    for (out_deaths[gi].items) |di| deaths.append(self.gpa, di) catch {};
+                    out_deaths[gi].deinit(self.gpa);
+                    for (out_claims[gi].ids[0..out_claims[gi].n], out_claims[gi].collectors[0..out_claims[gi].n]) |id, who| {
+                        _ = claims.add(id, who);
+                    }
+                    reconcile_ns += out_rns[gi];
+                    send_ns += out_sns[gi];
+                    self.region_shed_total += g.region.shed_events - g.shed_events_before;
+                }
             }
-            const pending = e.conn.takeOutput() catch {
-                e.conn.lock.unlock();
-                continue;
-            };
-            const had_output = pending.len > 0;
-            e.conn.lock.unlock();
-            if (had_output) writeFramed(e, self.io, pending);
-            e.conn.allocator.free(pending);
-            if (timed_out) e.stream.shutdown(self.io, .both) catch {};
+        }
+        {
+            // The "tick flush" number the acceptance criteria measure is
+            // the output push (drain + send per connection); the entity
+            // reconcile is counted separately (it is O(players^2) and
+            // belongs to Phase C's region work).
+            const dt = flush_t0.durationTo(std.Io.Timestamp.now(self.io, .awake)).nanoseconds;
+            _ = dt;
+            self.pushFlushSample(send_ns);
+            self.reconcile_ns_last = reconcile_ns;
+            self.send_ns_last = send_ns;
         }
         // Apply pickup claims + despawns: remove under ent_lock (freeing owned
         // NBT), then broadcast Collect (claims) + Destroy to trackers. The
@@ -4106,12 +5224,13 @@ pub const Server = struct {
         // Guarded by peek: a concurrently broken furnace stays broken.
         if (self.world != null and n_swaps > 0) {
             var applied: [256]bool = [_]bool{false} ** 256;
+            var touched: [256]u8 = [_]u8{0} ** 256;
             self.world_lock.lock();
             for (furn_swaps[0..n_swaps], 0..) |sw, i| {
                 if (self.world) |pool| {
                     const cur = view.peekBlock(pool, self.gpa, sw.x, sw.y, sw.z) catch null;
                     if (cur) |c| if (c.id == game_ids.furnace or c.id == game_ids.lit_furnace) {
-                        view.applyBlock(pool, self.gpa, sw.x, sw.y, sw.z, if (sw.lit) game_ids.lit_furnace else game_ids.furnace, 0) catch {};
+                        touched[i] = view.applyBlock(pool, self.gpa, sw.x, sw.y, sw.z, if (sw.lit) game_ids.lit_furnace else game_ids.furnace, 0) catch 0;
                         applied[i] = true;
                     };
                 }
@@ -4120,6 +5239,9 @@ pub const Server = struct {
             for (furn_swaps[0..n_swaps], 0..) |sw, i| {
                 if (!applied[i]) continue;
                 self.broadcastBlockChange(null, sw.x, sw.y, sw.z, if (sw.lit) game_ids.lit_furnace else game_ids.furnace, 0) catch {};
+                if (self.world) |pool| {
+                    self.resendTouchedNeighbors(pool, sw.x, sw.z, touched[i]);
+                }
             }
         }
         for (furn_snaps[0..n_furn]) |s| {
@@ -4146,6 +5268,7 @@ pub const Server = struct {
         self.tick_counter += 1;
         if (self.world != null and self.getAutosave() and self.tick_counter % autosave_ticks == 0) {
             _ = self.saveAllPlayers();
+            self.saveRedstone();
         }
     }
 
@@ -4155,6 +5278,17 @@ pub const Server = struct {
     /// Material approximation of per-block `stepSound`: wood, grass
     /// (leaves use grass in vanilla), gravel, sand, glass (ice breaks
     /// like glass), cloth, snow, stone default.
+    fn isLiquid(id: game_ids.Id) bool {
+        return id == .water or id == .flowing_water or id == .lava or id == .flowing_lava;
+    }
+
+    /// Place/break voice: liquids splash (vanilla bucket/fluid behavior),
+    /// everything else digs by material.
+    fn placeSound(id: game_ids.Id) struct { name: []const u8, pitch: f32 } {
+        if (isLiquid(id)) return .{ .name = "liquid.splash", .pitch = 1.0 };
+        return .{ .name = stepSound(id), .pitch = 0.8 };
+    }
+
     fn stepSound(id: game_ids.Id) []const u8 {
         return switch (id) {
             .grass, .tallgrass, .deadbush, .vine, .leaves, .leaves2, .sapling, .yellow_flower, .red_flower, .brown_mushroom, .red_mushroom, .reeds_block, .cactus, .waterlily => "dig.grass",
@@ -4171,13 +5305,14 @@ pub const Server = struct {
     /// S29 sound to every play conn within vanilla earshot (16 blocks).
     /// Block place/break feedback (silent before: only /playsound made
     /// noise). Volume 1.0, pitch 0.8 like vanilla's break/place calls.
-    pub fn broadcastSound(self: *Server, sound: []const u8, x: f64, y: f64, z: f64, volume: f32, pitch: f32) void {
+    pub fn broadcastSound(self: *Server, exclude: ?*Conn, sound: []const u8, x: f64, y: f64, z: f64, volume: f32, pitch: f32) void {
         var sb: [512]u8 = undefined;
         const f = packets.frameSoundEffect(sound, x, y, z, volume, pitch, &sb) catch return;
         var batch: [256]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         for (snap) |e| {
+            if (exclude != null and e.conn == exclude.?) continue;
             e.conn.lock.lock();
             const play = e.conn.state == .play and !e.conn.dead;
             const dx = x - e.conn.pos_x;
@@ -4186,6 +5321,27 @@ pub const Server = struct {
             const near = dx * dx + dy * dy + dz * dz <= 256.0;
             if (play and near) e.conn.queueFramed(f) catch {};
             e.conn.lock.unlock();
+        }
+    }
+
+    /// S24 Block Action to every conn tracking the chunk (vanilla
+    /// PlayerManager block events: no per-player exclusion). Drives the
+    /// vanilla client's own piston animation + derived final blocks.
+    pub fn broadcastBlockAction(self: *Server, x: i32, y: u16, z: i32, byte1: u8, byte2: u8, id: game_ids.Id) void {
+        var fb: [24]u8 = undefined;
+        const f = packets.frameBlockAction(x, y, z, byte1, byte2, wire.toWire(id), &fb) catch return;
+        const key = Conn.sentKey(@divFloor(x, 16), @divFloor(z, 16));
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        for (snap) |e| {
+            e.conn.lock.lock();
+            const has = e.conn.sent.contains(key);
+            if (has) {
+                e.conn.queueFramed(f) catch {};
+            }
+            e.conn.lock.unlock();
+            flushEntry(e, self.io);
         }
     }
 
@@ -4199,11 +5355,53 @@ pub const Server = struct {
         for (snap) |e| {
             if (exclude != null and e.conn == exclude.?) continue;
             e.conn.lock.lock();
-            if (e.conn.sent.contains(key)) {
+            const has = e.conn.sent.contains(key);
+            if (has) {
                 e.conn.queueFramed(f) catch {};
             }
             e.conn.lock.unlock();
             flushEntry(e, self.io);
+        }
+    }
+
+    /// Resend neighbor columns dirtied by an edit-path light bleed
+    /// (applyBlock touched mask: bits 0-3 W,E,N,S; 4-7 NW,NE,SW,SE) to
+    /// every viewer tracking them. The 0x35 for the edited cell lets
+    /// nearby clients relight locally, but trackers of a touched neighbor
+    /// that never got a 0x35 keep stale nibbles until a resend — this is
+    /// that resend. Unload-first single-column burst (never re-send a live
+    /// groundUp column). No locks held (same discipline as the other
+    /// broadcast paths).
+    pub fn resendTouchedNeighbors(self: *Server, pool: *shard_mod.ShardPool, x: i32, z: i32, mask: u8) void {
+        if (mask == 0) return;
+        const cx = @divFloor(x, 16);
+        const cz = @divFloor(z, 16);
+        const offs = [_]struct { dx: i32, dz: i32 }{
+            .{ .dx = -1, .dz = 0 },
+            .{ .dx = 1, .dz = 0 },
+            .{ .dx = 0, .dz = -1 },
+            .{ .dx = 0, .dz = 1 },
+            .{ .dx = -1, .dz = -1 },
+            .{ .dx = 1, .dz = -1 },
+            .{ .dx = -1, .dz = 1 },
+            .{ .dx = 1, .dz = 1 },
+        };
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        for (offs, 0..) |o, i| {
+            if (mask & (@as(u8, 1) << @intCast(i)) == 0) continue;
+            const ncx = cx + o.dx;
+            const ncz = cz + o.dz;
+            for (snap) |e| {
+                e.conn.lock.lock();
+                const has = e.conn.sent.contains(Conn.sentKey(ncx, ncz));
+                if (has and e.conn.state == .play and !e.conn.dead) {
+                    view.resendColumn(e.conn, conn_sink.bind(e.conn), self.chunkSource(pool), 0, ncx, ncz, true) catch {};
+                }
+                e.conn.lock.unlock();
+                flushEntry(e, self.io);
+            }
         }
     }
 
@@ -4316,6 +5514,72 @@ pub const Server = struct {
         return died;
     }
 
+    /// Cactus contact via AABB overlap (vanilla BlockCactus collision box,
+    /// 1/16 XZ inset, full block height). The 3x3 block neighborhood around
+    /// the player at feet/feet+1 spans at most 4 chunks; each is decoded
+    /// once (the old feet/eyes identity check decoded the same chunk twice
+    /// and missed every brush-past). Pure pool reads, no world_lock (same
+    /// discipline as the eyes/feet checks in the tick env scan).
+    fn touchesCactus(self: *Server, pool: *shard_mod.ShardPool, px: f64, py: f64, pz: f64) bool {
+        const ex: i32 = @intFromFloat(@floor(px));
+        const ez: i32 = @intFromFloat(@floor(pz));
+        const feet: i32 = @intFromFloat(@floor(py));
+        var chunks: [4]struct { cx: i32, cz: i32 } = undefined;
+        var n_chunks: usize = 0;
+        for ([_]i32{ -1, 0, 1 }) |dx| {
+            for ([_]i32{ -1, 0, 1 }) |dz| {
+                const cx = @divFloor(ex + dx, 16);
+                const cz = @divFloor(ez + dz, 16);
+                var seen = false;
+                for (chunks[0..n_chunks]) |c| {
+                    if (c.cx == cx and c.cz == cz) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (seen) continue;
+                if (n_chunks >= chunks.len) continue; // unreachable (≤4), fail closed
+                chunks[n_chunks] = .{ .cx = cx, .cz = cz };
+                n_chunks += 1;
+                const raw = pool.get(self.gpa, store_mod.encodeKey(0, cx, cz)) catch continue;
+                if (raw == null) continue;
+                const ch = chunk_mod.Chunk.decode(self.gpa, raw.?) catch {
+                    self.gpa.free(raw.?);
+                    continue;
+                };
+                var hit = false;
+                var ddx: i32 = -1;
+                while (ddx <= 1 and !hit) : (ddx += 1) {
+                    var ddz: i32 = -1;
+                    while (ddz <= 1 and !hit) : (ddz += 1) {
+                        const bx = ex + ddx;
+                        const bz = ez + ddz;
+                        if (@divFloor(bx, 16) != cx or @divFloor(bz, 16) != cz) continue;
+                        var dy: i32 = 0;
+                        while (dy <= 1 and !hit) : (dy += 1) {
+                            const by = feet + dy;
+                            if (by < 0 or by > 255) continue;
+                            const yu: u8 = @intCast(by);
+                            const si: usize = @as(usize, yu) >> 4;
+                            const s = ch.sections[si] orelse continue;
+                            const li: usize = chunk_mod.Section.index(
+                                @intCast(@as(u4, @truncate(@as(u32, @bitCast(bx & 15))))),
+                                @truncate(yu & 15),
+                                @intCast(@as(u4, @truncate(@as(u32, @bitCast(bz & 15))))),
+                            );
+                            if (s.blocks[li] != game_ids.cactus) continue;
+                            if (interaction_mod.cactusOverlapsPlayer(bx, by, bz, px, py, pz)) hit = true;
+                        }
+                    }
+                }
+                ch.destroy(self.gpa);
+                self.gpa.free(raw.?);
+                if (hit) return true;
+            }
+        }
+        return false;
+    }
+
     /// Drown/lava/fire/suffocation/cactus for one tick (vanilla Entity
     /// rules, 1Hz-quantized; see deviations). Caller holds conn.lock.
     /// Returns true on death.
@@ -4347,7 +5611,8 @@ pub const Server = struct {
         }
         if (conn.cactus_cd > 0) conn.cactus_cd -= 1;
         if (!died and cactus and conn.config.gamemode != 1 and conn.cactus_cd == 0) {
-            conn.cactus_cd = 10; // ~0.5s between hits (no hurt-resistance yet)
+            conn.cactus_cd = 1; // 1Hz tick: hit every touching tick (~1/s;
+            // vanilla hurt-resistance gates to ~1/0.5s, quantized here)
             died = applyPlayerDamage(conn, 1.0);
         }
         return died;
@@ -4405,12 +5670,11 @@ pub const Server = struct {
             }
             const o = offs[oi];
             oi += 1;
-            self.ent_lock.lock();
             // NBT duped into server ownership (victim row keeps none).
+            // spawnItemLive owns locking + instant visibility.
             const owned_nbt: ?[]const u8 = if (st.nbt) |bytes| self.gpa.dupe(u8, bytes) catch null else null;
             const stored = item_mod.Stack{ .id = st.id, .count = st.count, .damage = st.damage, .nbt = owned_nbt };
-            _ = self.spawnItem(stored, x + o[0], y + 0.1, z + o[2], 10);
-            self.ent_lock.unlock();
+            self.spawnItemLive(stored, x + o[0], y + 0.1, z + o[2], 10);
             if (st.nbt) |n| self.gpa.free(n);
             maybe.* = null;
         }
@@ -4512,8 +5776,9 @@ pub const Server = struct {
     /// merged into a neighbor, appended, or freed on cap-hit). Merge-on-spawn
     /// mirrors the tick merge (same id/damage/NBT, centers within 1 block,
     /// combined count within max stack; survivor keeps max delay).
-    /// Caller MUST hold ent_lock. Returns false when the cap dropped it.
-    fn spawnItem(self: *Server, stack: item_mod.Stack, x: f64, y: f64, z: f64, delay: u32) bool {
+    /// Caller MUST hold ent_lock. Returns the new entity id, or null when
+    /// the stack merged into an existing entity or the cap dropped it.
+    fn spawnItem(self: *Server, stack: item_mod.Stack, x: f64, y: f64, z: f64, delay: u32) ?i32 {
         for (self.items.items) |*it| {
             const dx = it.x - x;
             const dz = it.z - z;
@@ -4524,12 +5789,12 @@ pub const Server = struct {
             it.delay = @max(it.delay, delay);
             var s: ?item_mod.Stack = stack;
             item_mod.freeStack(self.gpa, &s);
-            return true;
+            return null;
         }
         if (self.items.items.len >= Server.max_items) {
             var s: ?item_mod.Stack = stack;
             item_mod.freeStack(self.gpa, &s);
-            return false;
+            return null;
         }
         const id = self.eid_counter.fetchAdd(1, .acq_rel);
         self.items.append(self.gpa, .{
@@ -4542,9 +5807,71 @@ pub const Server = struct {
         }) catch {
             var s: ?item_mod.Stack = stack;
             item_mod.freeStack(self.gpa, &s);
-            return false;
+            return null;
         };
-        return true;
+        return id;
+    }
+
+    /// Spawn + immediately broadcast one item entity to every in-range
+    /// viewer with the chunk loaded (serve thread; caller holds no locks).
+    /// Cuts break→visible from ~1 tick to ~instant; pickup still happens
+    /// on the tick through the tracked-gate invariant (the spawn was
+    /// really queued before any pickup can run, so Collect-after-Spawn
+    /// ordering holds and no ghost entities appear). Viewers that join
+    /// or load the chunk later get the normal tick spawn instead.
+    /// Lock order per step (never nested): ent, then reg-snapshot, then
+    /// one viewer conn lock at a time. No opposite order exists: the tick
+    /// never holds ent_lock while taking conn locks, and no broadcast
+    /// takes ent_lock.
+    fn broadcastItemSpawn(self: *Server, id: i32, item_id: game_ids.Id, count: i8, damage: i16, nbt: ?[]const u8, x: f64, y: f64, z: f64) void {
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        const range = @as(f64, @floatFromInt(self.view_distance)) * 16.0 + 16.0;
+        const cx: i32 = @intFromFloat(@floor(x / 16.0));
+        const cz: i32 = @intFromFloat(@floor(z / 16.0));
+        for (snap) |e| {
+            if (e.conn.state != .play or e.conn.is_dead) continue;
+            e.conn.lock.lock();
+            const dx = x - e.conn.pos_x;
+            const dz = z - e.conn.pos_z;
+            const in_range = @abs(dx) <= range and @abs(dz) <= range;
+            const loaded = e.conn.sent.contains(Conn.sentKey(cx, cz));
+            var queued = false;
+            if (in_range and loaded and !e.conn.tracked.contains(id)) {
+                const stack = item_mod.Stack{ .id = item_id, .count = count, .damage = damage, .nbt = nbt };
+                var spawn = sink_mod.ItemSpawn{ .eid = id, .stack = stack, .x = x, .y = y, .z = z };
+                conn_sink.bind(e.conn).spawnItem(&spawn) catch {};
+                e.conn.tracked.put(id, .{ .x = x, .y = y, .z = z, .yaw = 0, .pitch = 0 }) catch {};
+                queued = true;
+            }
+            e.conn.lock.unlock();
+            // One output path: flush only viewers we queued to (untracked
+            // conns — and socket-less test conns — stay untouched).
+            if (queued) flushEntry(e, self.io);
+        }
+    }
+
+    /// Serve-thread item spawn with instant visibility (see
+    /// broadcastItemSpawn). Consumes `stack` exactly like spawnItem.
+    fn spawnItemLive(self: *Server, stack: item_mod.Stack, x: f64, y: f64, z: f64, delay: u32) void {
+        self.ent_lock.lock();
+        const id = self.spawnItem(stack, x, y, z, delay);
+        var nbt: ?[]u8 = null;
+        var item_id: game_ids.Id = undefined;
+        var count: i8 = 0;
+        var damage: i16 = 0;
+        if (id != null) {
+            const it = self.items.items[self.items.items.len - 1];
+            item_id = it.stack.id;
+            count = it.stack.count;
+            damage = it.stack.damage;
+            if (it.stack.nbt) |n| nbt = self.gpa.dupe(u8, n) catch null;
+        }
+        self.ent_lock.unlock();
+        const eid = id orelse return; // merged or capped: nothing new to show
+        defer if (nbt) |n| self.gpa.free(n);
+        self.broadcastItemSpawn(eid, item_id, count, damage, nbt, x, y, z);
     }
 
     /// Roll + spawn vanilla drops for a survival break. Caller holds world_lock
@@ -4557,8 +5884,8 @@ pub const Server = struct {
         self.rand_lock.lock();
         if (self.drop_rand == null) self.drop_rand = java_random.JavaRandom.init(self.drop_seed);
         var rng = self.drop_rand.?;
-        var rolls: [2]drops_mod.DropRoll = undefined;
-        const n_rolls = drops_mod.rollDrops(old_id, old_meta, &rng, &rolls);
+        var rolls: [2]profile.game.drops_data.DropRoll = undefined;
+        const n_rolls = profile.game.drops_data.rollDrops(old_id, old_meta, &rng, &rolls);
         // Materialize per-single chance + offsets while holding rand_lock so
         // the stream stays a single total order across serve threads.
         // Bounded: the table yields at most 8 singles per break (lapis).
@@ -4594,9 +5921,7 @@ pub const Server = struct {
                 const o = offs[oi];
                 oi += 1;
                 const stack = item_mod.Stack{ .id = r.item_id, .count = 1, .damage = r.damage, .nbt = null };
-                self.ent_lock.lock();
-                _ = self.spawnItem(stack, @as(f64, @floatFromInt(x)) + o[0], ry, @as(f64, @floatFromInt(z)) + o[2], 10);
-                self.ent_lock.unlock();
+                self.spawnItemLive(stack, @as(f64, @floatFromInt(x)) + o[0], ry, @as(f64, @floatFromInt(z)) + o[2], 10);
             }
         }
     }
@@ -4609,9 +5934,9 @@ pub const Server = struct {
         const sx = conn.pos_x + fx * 0.5;
         const sy = conn.pos_y + 1.32;
         const sz = conn.pos_z + fz * 0.5;
-        self.ent_lock.lock();
-        const ok = self.spawnItem(q.stack, sx, sy, sz, 40);
-        self.ent_lock.unlock();
+        // Live broadcast: the dropper sees the entity immediately; the tick
+        // still owns pickup (tracked-gate) and merge/despawn.
+        self.spawnItemLive(q.stack, sx, sy, sz, 40);
         conn.lock.lock();
         const cur = conn.inv[@intCast(q.slot)];
         const f = packets.frameSetSlotAlloc(conn.allocator, 0, q.slot, cur) catch null;
@@ -4620,13 +5945,15 @@ pub const Server = struct {
             conn.queueFramed(fr) catch {};
         }
         conn.lock.unlock();
-        _ = ok; // spawnItem always consumes (cap-hit frees); nothing to do
+        // spawnItemLive always consumes (merge/append/cap-hit frees); nothing to do
     }
 
     /// Right-click routing: crafting table (58) + not sneaking opens window 1.
     /// Caller holds world_lock (pool peek). Returns true when the click became
     /// a UI open (serve loop must skip placement + broadcast for the event).
-    fn tryOpenTable(self: *Server, conn: *Conn, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, b: *BlockEvent) bool {
+    /// `sneaking` is the clicker's sneak state (sneak + held block places
+    /// against the table instead); the serve loop reads it once per event.
+    fn tryOpenTable(self: *Server, conn: *Conn, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, b: *BlockEvent, sneaking: bool) bool {
         _ = self;
         var cx = b.x;
         var cy: i32 = b.y;
@@ -4644,10 +5971,7 @@ pub const Server = struct {
         if (cy < 0 or cy > 255) return false;
         const clicked = view.peekBlock(pool, allocator, cx, @intCast(cy), cz) catch null;
         if (clicked == null or clicked.?.id != game_ids.crafting_table) return false;
-        conn.lock.lock();
-        const sneak = conn.sneaking;
-        conn.lock.unlock();
-        if (sneak) return false; // sneak+click places against the table
+        if (sneaking) return false; // sneak+held-block places against the table
         // Open UI (leaf conn lock; world_lock held by caller: world->conn).
         conn.lock.lock();
         conn.openTableUI(cx, @intCast(cy), cz);
@@ -4658,7 +5982,7 @@ pub const Server = struct {
     /// Right-click routing: furnace (61/62) + not sneaking opens window 2.
     /// Ensures server state, then queues 0x2D + full 0x30. Same locking as
     /// tryOpenTable. Returns true when the click became a UI open.
-    fn tryOpenFurnace(self: *Server, conn: *Conn, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, b: *BlockEvent) bool {
+    fn tryOpenFurnace(self: *Server, conn: *Conn, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, b: *BlockEvent, sneaking: bool) bool {
         var cx = b.x;
         var cy: i32 = b.y;
         var cz = b.z;
@@ -4674,10 +5998,7 @@ pub const Server = struct {
         if (cy < 0 or cy > 255) return false;
         const clicked = view.peekBlock(pool, allocator, cx, @intCast(cy), cz) catch null;
         if (clicked == null or (clicked.?.id != game_ids.furnace and clicked.?.id != game_ids.lit_furnace)) return false;
-        conn.lock.lock();
-        const sneak = conn.sneaking;
-        conn.lock.unlock();
-        if (sneak) return false;
+        if (sneaking) return false;
         self.furn_lock.lock();
         self.ensureFurnace(cx, @intCast(cy), cz);
         const f = self.findFurnace(cx, @intCast(cy), cz).?;
@@ -4714,6 +6035,190 @@ pub const Server = struct {
         return true;
     }
 
+    /// LSM-backed redstone world adapter (caller holds world_lock).
+    /// Holes read as air and reject writes (no store, no broadcast).
+    const RsWorld = struct {
+        pool: *shard_mod.ShardPool,
+        alloc: std.mem.Allocator,
+        changes: *redstone_mod.ChangeList,
+
+        pub fn get(self: *@This(), x: i32, y: i32, z: i32) ?redstone_mod.Block {
+            if (y < 0 or y > 255) return null;
+            const pb = view.peekBlock(self.pool, self.alloc, x, @intCast(y), z) catch return null;
+            const b = pb orelse return null;
+            return .{ .id = b.id, .meta = b.meta };
+        }
+
+        /// Raw write: no change recording — the staged commit owns ChangeList
+        /// entries for sim paths, and the piston/door helpers append their
+        /// own (so a cell is never double-recorded).
+        pub fn set(self: *@This(), x: i32, y: i32, z: i32, id: game_ids.Id, meta: u4) void {
+            if (y < 0 or y > 255) return;
+            if ((view.peekBlock(self.pool, self.alloc, x, @intCast(y), z) catch null) == null) return;
+            _ = view.applyBlock(self.pool, self.alloc, x, @intCast(y), z, id, meta) catch 0;
+        }
+
+        /// Raw pop-write + its change record (single place for pop semantics).
+        pub fn pop(self: *@This(), x: i32, y: i32, z: i32, old_id: game_ids.Id, old_meta: u4) void {
+            if (y < 0 or y > 255) return;
+            if ((view.peekBlock(self.pool, self.alloc, x, @intCast(y), z) catch null) == null) return;
+            self.changes.append(.{ .x = x, .y = y, .z = z, .id = game_ids.air, .meta = 0, .old_id = old_id, .old_meta = old_meta, .popped = true });
+            _ = view.applyBlock(self.pool, self.alloc, x, @intCast(y), z, game_ids.air, 0) catch 0;
+        }
+
+        /// Typed redstone boundary: profile data travels with the adapter.
+        pub fn rsView(self: *@This()) redstone_mod.WorldView {
+            return redstone_mod.WorldView.init(self, &profile.game.blocks, &profile.rules.redstone);
+        }
+    };
+
+    /// K1 right-click routing: lever/button/door/trapdoor/gate/repeater delay
+    /// cycle/redstone-ore lighting. Caller holds world_lock; takes no other
+    /// lock. Returns true when the click was consumed (skip placement).
+    /// `b` carries the TARGET cell + clicked face (BlockEvent shape); the
+    /// clicked block is target - face offset.
+    fn tryInteract(
+        self: *Server,
+        pool: *shard_mod.ShardPool,
+        allocator: std.mem.Allocator,
+        b: *BlockEvent,
+        now: i64,
+        changes: *redstone_mod.ChangeList,
+        sounds: *redstone_mod.SoundList,
+    ) bool {
+        var cx = b.x;
+        var cy: i32 = b.y;
+        var cz = b.z;
+        switch (b.face) {
+            0 => cy += 1,
+            1 => cy -= 1,
+            2 => cz += 1,
+            3 => cz -= 1,
+            4 => cx += 1,
+            5 => cx -= 1,
+            else => return false,
+        }
+        if (cy < 0 or cy > 255) return false;
+        const clicked = view.peekBlock(pool, allocator, cx, @intCast(cy), cz) catch null;
+        if (clicked == null or !redstone_mod.isInteractable(&profile.game.blocks, clicked.?.id)) {
+            return false;
+        }
+        self.loadRedstone(pool, now);
+        var w = Server.RsWorld{ .pool = pool, .alloc = allocator, .changes = changes };
+        redstone_mod.interact(w.rsView(), &self.rs_sched, &self.rs_burn, changes, sounds, cx, cy, cz, now);
+        return true;
+    }
+
+    /// Post-edit redstone hook: recompute + fan-out after a place/break.
+    /// Caller holds world_lock.
+    fn redstoneOnEdit(
+        self: *Server,
+        pool: *shard_mod.ShardPool,
+        allocator: std.mem.Allocator,
+        x: i32,
+        y: u8,
+        z: i32,
+        now: i64,
+        changes: *redstone_mod.ChangeList,
+        sounds: *redstone_mod.SoundList,
+    ) void {
+        self.loadRedstone(pool, now);
+        var w = Server.RsWorld{ .pool = pool, .alloc = allocator, .changes = changes };
+        redstone_mod.onEdit(w.rsView(), &self.rs_sched, &self.rs_burn, changes, sounds, x, y, z, now);
+    }
+
+    /// Flush one accumulated redstone change: broadcast + sounds + pop drops.
+    /// No locks held (furnace-swap pattern: world work done, then broadcast).
+    fn flushRsChange(
+        self: *Server,
+        pool: *shard_mod.ShardPool,
+        allocator: std.mem.Allocator,
+        gamemode: u8,
+        c: redstone_mod.Change,
+    ) void {
+        if (!c.silent) {
+            self.broadcastBlockChange(null, c.x, @intCast(c.y), c.z, c.id, c.meta) catch {};
+        }
+        if (c.popped and c.old_id != game_ids.air) {
+            const sx: f64 = @as(f64, @floatFromInt(c.x)) + 0.5;
+            const sy: f64 = @as(f64, @floatFromInt(c.y)) + 0.5;
+            const sz: f64 = @as(f64, @floatFromInt(c.z)) + 0.5;
+            self.broadcastSound(null, Server.stepSound(c.old_id), sx, sy, sz, 1.0, 0.8);
+            if (Server.shouldDropBreak(gamemode, c.old_id, self.tileDrops())) {
+                self.spawnBreakDrops(pool, allocator, c.x, @intCast(c.y), c.z, c.old_id, c.old_meta);
+            }
+        }
+    }
+
+    /// Flush one accumulated redstone sound event.
+    fn flushRsSound(self: *Server, s: redstone_mod.SoundEv) void {
+        const v = redstone_mod.SoundList.voice(s.kind);
+        self.broadcastSound(
+            null,
+            v.name,
+            @as(f64, @floatFromInt(s.x)) + 0.5,
+            @as(f64, @floatFromInt(s.y)) + 0.5,
+            @as(f64, @floatFromInt(s.z)) + 0.5,
+            v.volume,
+            v.pitch,
+        );
+    }
+
+    /// Door halves: placing a door also sets the upper half (air above
+    /// only). Records into `changes` for broadcast.
+    fn rsPlaceDoorUpper(
+        pool: *shard_mod.ShardPool,
+        allocator: std.mem.Allocator,
+        x: i32,
+        y: u8,
+        z: i32,
+        id: game_ids.Id,
+        lower_meta: u4,
+        changes: *redstone_mod.ChangeList,
+    ) void {
+        if (redstone_mod.upperHalfFor(&profile.game.blocks, id) == null) return;
+        if (y >= 255) return;
+        // Vanilla `ach.placeDoorBlock`: upper = 8 | hinge bit.
+        var w = Server.RsWorld{ .pool = pool, .alloc = allocator, .changes = changes };
+        const um: u4 = redstone_mod.doorUpperMeta(w.rsView(), x, y, z, @truncate(lower_meta & 3), id);
+        const ay: u8 = y + 1;
+        const above = view.peekBlock(pool, allocator, x, ay, z) catch null;
+        if (above) |a| {
+            if (a.id == game_ids.air) {
+                w.set(x, @as(i32, y) + 1, z, id, um);
+                changes.append(.{ .x = x, .y = @as(i32, y) + 1, .z = z, .id = id, .meta = um, .old_id = a.id, .old_meta = a.meta });
+            }
+        }
+    }
+
+    /// Breaking one door half clears the partner (no extra drop — the main
+    /// half drops via the normal break path).
+    fn rsBreakDoorPartner(
+        pool: *shard_mod.ShardPool,
+        allocator: std.mem.Allocator,
+        x: i32,
+        y: u8,
+        z: i32,
+        old_id: game_ids.Id,
+        old_meta: u4,
+        changes: *redstone_mod.ChangeList,
+    ) void {
+        if (old_id != game_ids.wooden_door_block and old_id != game_ids.iron_door_block) return;
+        var w = Server.RsWorld{ .pool = pool, .alloc = allocator, .changes = changes };
+        if (redstone_mod.doorIsUpper(old_meta)) {
+            if (y == 0) return;
+            const below = view.peekBlock(pool, allocator, x, y - 1, z) catch null;
+            if (below) |bl| {
+                if (bl.id == old_id and !redstone_mod.doorIsUpper(bl.meta)) w.pop(x, @as(i32, y) - 1, z, bl.id, bl.meta);
+            }
+        } else {
+            const above = view.peekBlock(pool, allocator, x, y + 1, z) catch null;
+            if (above) |a| {
+                if (a.id == old_id and redstone_mod.doorIsUpper(a.meta)) w.pop(x, @as(i32, y) + 1, z, a.id, a.meta);
+            }
+        }
+    }
+
     /// Window-2 click (slots 0-2 furnace, 3-38 alias inv 9-44). Runs on the
     /// serve thread with conn.lock held, taking furn_lock nested inside.
     /// (Safe: furn is never held while acquiring conn anywhere, and the
@@ -4732,12 +6237,7 @@ pub const Server = struct {
             0 => {
                 if (fc.button != 0 and fc.button != 1) return;
                 if (fc.slot == 2) {
-                    // take output (cursor must be empty; no consume — the
-                    // tick already consumed the input)
-                    const out = f.output orelse return;
-                    if (conn.cursor != null) return;
-                    conn.cursor = out;
-                    f.output = null;
+                    if (!container_mod.takeOutput(&conn.cursor, &f.output)) return;
                     const sf = packets.frameSetSlotAlloc(conn.allocator, 2, 2, null) catch return;
                     defer conn.allocator.free(sf);
                     conn.queueFramed(sf) catch {};
@@ -4747,7 +6247,7 @@ pub const Server = struct {
                     return;
                 }
                 const cell: *?item_mod.Stack = if (fc.slot == 0) &f.input else if (fc.slot == 1) &f.fuel else if (fc.slot >= 3 and fc.slot <= 38) &conn.inv[@as(usize, @intCast(fc.slot)) - 3 + 9] else return;
-                if (!(conn.clickPickupImplCell(cell, fc.button) catch return)) return;
+                if (!(container_mod.pickup(conn.allocator, cell, &conn.cursor, fc.button) catch return)) return;
                 const sf = packets.frameSetSlotAlloc(conn.allocator, 2, fc.slot, cell.*) catch return;
                 defer conn.allocator.free(sf);
                 conn.queueFramed(sf) catch {};
@@ -4756,114 +6256,25 @@ pub const Server = struct {
                 conn.queueFramed(cf) catch {};
             },
             1 => {
-                // shift-click: output/input/fuel -> player inv; player inv ->
+                // Shift-click: output/input/fuel -> player inv; player inv ->
                 // smeltable to input, fuel to fuel, else hotbar<->main.
                 if (fc.button != 0 and fc.button != 1) return;
                 var changed = false;
                 if (fc.slot == 2 or fc.slot == 0 or fc.slot == 1) {
-                    // move whole furnace stack into inv 9..44 (merge, then fill)
                     const cell: *?item_mod.Stack = if (fc.slot == 2) &f.output else if (fc.slot == 0) &f.input else &f.fuel;
-                    if (cell.* != null) {
-                        var i: usize = 9;
-                        while (i <= 44) : (i += 1) {
-                            const dst = conn.inv[i] orelse continue;
-                            const src = cell.* orelse break;
-                            if (!item_mod.canMerge(dst, src)) continue;
-                            const room: i16 = @as(i16, item_mod.maxStackSize(dst.id)) - dst.count;
-                            if (room <= 0) continue;
-                            const n: i16 = @min(room, @as(i16, src.count));
-                            if (n <= 0) continue;
-                            conn.inv[i].?.count += @as(i8, @intCast(n));
-                            cell.*.?.count -= @as(i8, @intCast(n));
-                            changed = true;
-                            if (cell.*.?.count <= 0) {
-                                item_mod.freeStack(conn.allocator, cell);
-                                break;
-                            }
-                        }
-                        if (cell.* != null) {
-                            var j: usize = 9;
-                            while (j <= 44) : (j += 1) {
-                                if (conn.inv[j] != null) continue;
-                                conn.inv[j] = cell.*;
-                                cell.* = null;
-                                changed = true;
-                                break;
-                            }
-                        }
-                    }
+                    changed = container_mod.quickMove(conn.allocator, cell, &conn.inv, 9, 44, null);
                 } else if (fc.slot >= 3 and fc.slot <= 38) {
                     const islot: usize = @as(usize, @intCast(fc.slot)) - 3 + 9;
                     const st = conn.inv[islot] orelse return;
                     if (smelting_mod.findResult(st.id, st.damage) != null) {
-                        // smeltable -> input slot (merge, else fill if empty)
-                        if (f.input) |dst| {
-                            if (item_mod.canMerge(dst, st)) {
-                                const room: i16 = @as(i16, item_mod.maxStackSize(dst.id)) - dst.count;
-                                const n: i16 = @min(room, @as(i16, st.count));
-                                if (n > 0) {
-                                    f.input.?.count += @as(i8, @intCast(n));
-                                    conn.inv[islot].?.count -= @as(i8, @intCast(n));
-                                    changed = true;
-                                    if (conn.inv[islot].?.count <= 0) item_mod.freeStack(conn.allocator, &conn.inv[islot]);
-                                }
-                            }
-                        } else {
-                            f.input = conn.inv[islot];
-                            conn.inv[islot] = null;
-                            changed = true;
-                        }
+                        changed = container_mod.mergeInto(conn.allocator, &conn.inv[islot], &f.input);
                     } else if (smelting_mod.burnTime(st.id) > 0) {
-                        // fuel -> fuel slot (merge, else fill)
-                        if (f.fuel) |dst| {
-                            if (item_mod.canMerge(dst, st)) {
-                                const room: i16 = @as(i16, item_mod.maxStackSize(dst.id)) - dst.count;
-                                const n: i16 = @min(room, @as(i16, st.count));
-                                if (n > 0) {
-                                    f.fuel.?.count += @as(i8, @intCast(n));
-                                    conn.inv[islot].?.count -= @as(i8, @intCast(n));
-                                    changed = true;
-                                    if (conn.inv[islot].?.count <= 0) item_mod.freeStack(conn.allocator, &conn.inv[islot]);
-                                }
-                            }
-                        } else {
-                            f.fuel = conn.inv[islot];
-                            conn.inv[islot] = null;
-                            changed = true;
-                        }
+                        changed = container_mod.mergeInto(conn.allocator, &conn.inv[islot], &f.fuel);
                     } else {
-                        // hotbar<->main within the player range
                         const in_hotbar = islot >= 36;
                         const lo: usize = if (in_hotbar) 9 else 36;
                         const hi: usize = if (in_hotbar) 35 else 44;
-                        var i: usize = lo;
-                        while (i <= hi) : (i += 1) {
-                            if (i == islot) continue;
-                            const dst = conn.inv[i] orelse continue;
-                            const s = conn.inv[islot] orelse break;
-                            if (!item_mod.canMerge(dst, s)) continue;
-                            const room: i16 = @as(i16, item_mod.maxStackSize(dst.id)) - dst.count;
-                            if (room <= 0) continue;
-                            const n: i16 = @min(room, @as(i16, s.count));
-                            if (n <= 0) continue;
-                            conn.inv[i].?.count += @as(i8, @intCast(n));
-                            conn.inv[islot].?.count -= @as(i8, @intCast(n));
-                            changed = true;
-                            if (conn.inv[islot].?.count <= 0) {
-                                item_mod.freeStack(conn.allocator, &conn.inv[islot]);
-                                break;
-                            }
-                        }
-                        if (conn.inv[islot] != null) {
-                            var j: usize = lo;
-                            while (j <= hi) : (j += 1) {
-                                if (j == islot or conn.inv[j] != null) continue;
-                                conn.inv[j] = conn.inv[islot];
-                                conn.inv[islot] = null;
-                                changed = true;
-                                break;
-                            }
-                        }
+                        changed = container_mod.quickMove(conn.allocator, &conn.inv[islot], &conn.inv, lo, hi, islot);
                     }
                 } else return;
                 if (!changed) return;
@@ -4883,9 +6294,7 @@ pub const Server = struct {
                 const h: usize = 36 + @as(usize, @intCast(fc.button));
                 if (fc.slot >= 0 and fc.slot <= 1) {
                     const cell: *?item_mod.Stack = if (fc.slot == 0) &f.input else &f.fuel;
-                    const t = cell.*;
-                    cell.* = conn.inv[h];
-                    conn.inv[h] = t;
+                    if (!container_mod.swap(cell, &conn.inv[h])) return;
                     const sfa = packets.frameSetSlotAlloc(conn.allocator, 2, fc.slot, cell.*) catch return;
                     defer conn.allocator.free(sfa);
                     conn.queueFramed(sfa) catch {};
@@ -4894,10 +6303,7 @@ pub const Server = struct {
                     conn.queueFramed(sfb) catch {};
                 } else if (fc.slot >= 3 and fc.slot <= 38) {
                     const islot: usize = @as(usize, @intCast(fc.slot)) - 3 + 9;
-                    if (islot == h) return;
-                    const t = conn.inv[islot];
-                    conn.inv[islot] = conn.inv[h];
-                    conn.inv[h] = t;
+                    if (!container_mod.swap(&conn.inv[islot], &conn.inv[h])) return;
                     const sfa = packets.frameSetSlotAlloc(conn.allocator, 2, fc.slot, conn.inv[islot]) catch return;
                     defer conn.allocator.free(sfa);
                     conn.queueFramed(sfa) catch {};
@@ -4911,9 +6317,319 @@ pub const Server = struct {
         _ = fc.action;
     }
 
+    /// Next enchanting seed from the shared drop rand (leaf rand_lock only).
+    fn nextEnchantSeed(self: *Server) i32 {
+        self.rand_lock.lock();
+        defer self.rand_lock.unlock();
+        if (self.drop_rand == null) self.drop_rand = java_random.JavaRandom.init(self.drop_seed);
+        return self.drop_rand.?.nextInt();
+    }
+
+    /// Count bookshelves around an enchanting table (vanilla air-gap rule).
+    /// Pure pool reads; safe without world_lock (same discipline as the tick
+    /// environment reads). Holes count as non-air.
+    fn countShelves(
+        self: *Server,
+        pool: *shard_mod.ShardPool,
+        allocator: std.mem.Allocator,
+        tx: i32,
+        ty: u8,
+        tz: i32,
+    ) u8 {
+        _ = self;
+        const S = struct {
+            var p: *shard_mod.ShardPool = undefined;
+            var a: std.mem.Allocator = undefined;
+            fn get(x: i32, y: i32, z: i32) ?game_ids.Id {
+                if (y < 0 or y > 255) return null;
+                const pb = view.peekBlock(p, a, x, @intCast(y), z) catch return null;
+                const b = pb orelse return null;
+                return b.id;
+            }
+        };
+        S.p = pool;
+        S.a = allocator;
+        return enchanting_mod.countBookshelves(tx, ty, tz, &S.get);
+    }
+
+    /// Recompute the three offer levels for the open enchant UI.
+    /// Caller holds conn.lock. Uses the conn's seed + current item.
+    fn recomputeEnchantLevels(
+        self: *Server,
+        pool: *shard_mod.ShardPool,
+        allocator: std.mem.Allocator,
+        conn: *Conn,
+        tx: i32,
+        ty: u8,
+        tz: i32,
+    ) void {
+        const shelves = Server.countShelves(self, pool, allocator, tx, ty, tz);
+        const st = conn.enchant_item;
+        if (st == null) {
+            conn.enchant_levels = .{ 0, 0, 0 };
+            return;
+        }
+        var has_ench = false;
+        if (st.?.nbt) |raw| {
+            var have: [8]u8 = undefined;
+            if (parseEnchIds(raw, &have) > 0) has_ench = true;
+        }
+        if (!enchanting_mod.isEnchantableId(st.?.id, has_ench)) {
+            conn.enchant_levels = .{ 0, 0, 0 };
+            return;
+        }
+        if (st.?.count != 1) {
+            conn.enchant_levels = .{ 0, 0, 0 };
+            return;
+        }
+        const ench = profile.game.enchanting_data.enchantabilityForId(st.?.id);
+        var rng = java_random.JavaRandom.init(conn.enchant_seed);
+        conn.enchant_levels = enchanting_mod.calcLevels(&rng, shelves, ench);
+    }
+
+    /// Sync the open enchant window: full 0x30 + three 0x31 levels.
+    /// Caller holds conn.lock.
+    fn syncEnchantWindow(self: *Server, conn: *Conn) void {
+        _ = self;
+        conn.queueEnchantWindow();
+        conn.sendEnchantLevels();
+    }
+
+    /// Right-click routing: enchanting table (116) + not sneaking opens
+    /// window 4. Same locking as tryOpenTable/Furnace. Returns true when the
+    /// click became a UI open.
+    fn tryOpenEnchant(self: *Server, conn: *Conn, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, b: *BlockEvent, sneaking: bool) bool {
+        var cx = b.x;
+        var cy: i32 = b.y;
+        var cz = b.z;
+        switch (b.face) {
+            0 => cy += 1,
+            1 => cy -= 1,
+            2 => cz += 1,
+            3 => cz -= 1,
+            4 => cx += 1,
+            5 => cx -= 1,
+            else => return false,
+        }
+        if (cy < 0 or cy > 255) return false;
+        const clicked = view.peekBlock(pool, allocator, cx, @intCast(cy), cz) catch null;
+        if (clicked == null or clicked.?.id != game_ids.enchanting_table) return false;
+        if (sneaking) return false;
+        const seed = self.nextEnchantSeed();
+        conn.lock.lock();
+        conn.openEnchantUI(cx, @intCast(cy), cz, seed);
+        self.recomputeEnchantLevels(pool, allocator, conn, cx, @intCast(cy), cz);
+        // Levels are 0 with no item, but sync anyway for the client glue.
+        self.syncEnchantWindow(conn);
+        conn.lock.unlock();
+        return true;
+    }
+
+    /// Window-4 click (slots 0 = item, 1-36 alias inv 9-44). Runs on the
+    /// serve thread with conn.lock held; pool reads need no world_lock.
+    /// Mode-0 enforces the single-item slot limit (vanilla Slot limit 1);
+    /// shift/number-key moves take/place exactly one.
+    fn applyEnchantClick(self: *Server, conn: *Conn, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, ec: EnchantClick) void {
+        conn.lock.lock();
+        defer conn.lock.unlock();
+        const ow = conn.open_win orelse return;
+        if (ow.id != 4) return;
+        switch (ec.mode) {
+            0 => {
+                if (ec.button != 0 and ec.button != 1) return;
+                if (ec.slot == 0) {
+                    // Single-item slot: place one / pick up / swap single.
+                    if (conn.enchant_item == null and conn.cursor == null) return;
+                    if (conn.enchant_item == null) {
+                        // Place from cursor: move exactly one.
+                        const c = conn.cursor.?; // checked above
+                        if (c.count <= 0) return;
+                        const one = item_mod.Stack{
+                            .id = c.id,
+                            .count = 1,
+                            .damage = c.damage,
+                            .nbt = if (c.nbt) |n| conn.allocator.dupe(u8, n) catch return else null,
+                        };
+                        conn.enchant_item = one;
+                        conn.cursor.?.count -= 1;
+                        if (conn.cursor.?.count <= 0) item_mod.freeStack(conn.allocator, &conn.cursor);
+                    } else if (conn.cursor == null) {
+                        // Pick up the single item.
+                        conn.cursor = conn.enchant_item;
+                        conn.enchant_item = null;
+                    } else {
+                        // Both sides: swap only when the enchant slot holds
+                        // one and the cursor holds one (never merge beyond 1).
+                        const e = conn.enchant_item.?;
+                        const c = conn.cursor.?;
+                        if (e.count != 1 or c.count != 1) return;
+                        // NBT-merge would break conservation; swap ownership.
+                        const t = conn.enchant_item;
+                        conn.enchant_item = conn.cursor;
+                        conn.cursor = t;
+                    }
+                    self.recomputeEnchantLevels(pool, allocator, conn, ow.x, ow.y, ow.z);
+                    self.syncEnchantWindow(conn);
+                    const cf = packets.frameSetSlotAlloc(conn.allocator, -1, -1, conn.cursor) catch return;
+                    defer conn.allocator.free(cf);
+                    conn.queueFramed(cf) catch {};
+                } else if (ec.slot >= 1 and ec.slot <= 36) {
+                    const islot: usize = @as(usize, @intCast(ec.slot)) - 1 + 9;
+                    if (!(container_mod.pickup(conn.allocator, &conn.inv[islot], &conn.cursor, ec.button) catch return)) return;
+                    const sf = packets.frameSetSlotAlloc(conn.allocator, 4, ec.slot, conn.inv[islot]) catch return;
+                    defer conn.allocator.free(sf);
+                    conn.queueFramed(sf) catch {};
+                    const cf = packets.frameSetSlotAlloc(conn.allocator, -1, -1, conn.cursor) catch return;
+                    defer conn.allocator.free(cf);
+                    conn.queueFramed(cf) catch {};
+                } else return;
+            },
+            1 => {
+                // Shift-click: enchant slot -> player inv; player inv ->
+                // enchant slot (exactly one, when empty and enchantable).
+                if (ec.button != 0 and ec.button != 1) return;
+                if (ec.slot == 0) {
+                    const st = conn.enchant_item orelse return;
+                    // Merge into player range 9..44, then first empty.
+                    var src: ?item_mod.Stack = st;
+                    const moved = container_mod.quickMove(conn.allocator, &src, &conn.inv, 9, 44, null);
+                    if (!moved) return;
+                    // quickMove took ownership on success (src nulled) or
+                    // left it; either way clear the enchant slot on move.
+                    if (src == null) {
+                        item_mod.freeStack(conn.allocator, &conn.enchant_item);
+                        conn.enchant_item = null;
+                    } else {
+                        // Partial move should not happen for count-1, but
+                        // keep the remainder rather than duplicating.
+                        item_mod.freeStack(conn.allocator, &conn.enchant_item);
+                        conn.enchant_item = src;
+                        return;
+                    }
+                    self.recomputeEnchantLevels(pool, allocator, conn, ow.x, ow.y, ow.z);
+                    self.syncEnchantWindow(conn);
+                } else if (ec.slot >= 1 and ec.slot <= 36) {
+                    const islot: usize = @as(usize, @intCast(ec.slot)) - 1 + 9;
+                    const st = conn.inv[islot] orelse return;
+                    if (conn.enchant_item != null) return;
+                    if (st.count <= 0) return;
+                    // Take exactly one (vanilla transferStackInSlot takes 1).
+                    const one = item_mod.Stack{
+                        .id = st.id,
+                        .count = 1,
+                        .damage = st.damage,
+                        .nbt = if (st.nbt) |n| conn.allocator.dupe(u8, n) catch return else null,
+                    };
+                    conn.enchant_item = one;
+                    conn.inv[islot].?.count -= 1;
+                    if (conn.inv[islot].?.count <= 0) item_mod.freeStack(conn.allocator, &conn.inv[islot]);
+                    self.recomputeEnchantLevels(pool, allocator, conn, ow.x, ow.y, ow.z);
+                    self.syncEnchantWindow(conn);
+                } else return;
+            },
+            2 => {
+                // Number-key swap with hotbar (button 0..8). Cursor must be
+                // empty (vanilla rule). Enchant slot swaps single-for-single.
+                if (ec.button < 0 or ec.button > 8) return;
+                if (conn.cursor != null) return;
+                const h: usize = 36 + @as(usize, @intCast(ec.button));
+                if (ec.slot == 0) {
+                    const t = conn.enchant_item;
+                    // Hotbar stacks larger than 1 cannot enter the 1-slot.
+                    if (conn.inv[h]) |hh| {
+                        if (hh.count != 1) return;
+                    }
+                    conn.enchant_item = conn.inv[h];
+                    conn.inv[h] = t;
+                    self.recomputeEnchantLevels(pool, allocator, conn, ow.x, ow.y, ow.z);
+                    self.syncEnchantWindow(conn);
+                } else if (ec.slot >= 1 and ec.slot <= 36) {
+                    const islot: usize = @as(usize, @intCast(ec.slot)) - 1 + 9;
+                    if (!container_mod.swap(&conn.inv[islot], &conn.inv[h])) return;
+                    self.syncEnchantWindow(conn);
+                }
+            },
+            else => {},
+        }
+        _ = ec.action;
+    }
+
+    /// Serverbound 0x11: apply one of the three offers (1.7.10: full level
+    /// cost, no lapis). Validates window 4, slot 0..2, level > 0, XP, and a
+    /// still-enchantable single item; rolls the weighted draw with
+    /// seed+slot; merges NBT; converts books; deducts levels; reseeds and
+    /// resyncs. Fail-closed: any mismatch resyncs, never enchants.
+    fn applyEnchant(self: *Server, conn: *Conn, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, ev: EnchantEvent) void {
+        conn.lock.lock();
+        defer conn.lock.unlock();
+        const ow = conn.open_win orelse return;
+        if (ow.id != 4) return;
+        if (ev.window != 4) return;
+        if (ev.slot > 2) return;
+        const need = conn.enchant_levels[ev.slot];
+        if (need <= 0) return;
+        const st = conn.enchant_item orelse return;
+        if (st.count != 1) return;
+        var has_ench = false;
+        if (st.nbt) |raw| {
+            var have: [8]u8 = undefined;
+            if (parseEnchIds(raw, &have) > 0) has_ench = true;
+        }
+        if (!enchanting_mod.isEnchantableId(st.id, has_ench)) return;
+        const creative = conn.config.gamemode == 1;
+        if (!creative and conn.xp_level < need) {
+            // Insufficient levels: resync offers (vanilla leaves the UI up
+            // with the same requirements; the client shows its own text).
+            self.syncEnchantWindow(conn);
+            return;
+        }
+        // Roll the weighted draw with seed+slot (vanilla func_178148_a).
+        var rng = java_random.JavaRandom.init(conn.enchant_seed +% @as(i32, ev.slot));
+        var picks: [8]enchanting_mod.EnchPick = undefined;
+        const n = enchanting_mod.buildList(&rng, st.id, need, &picks);
+        if (n == 0) return; // fizzle: level fell outside every range
+        // Merge NBT (existing must be ench-free here, but keep the merge
+        // path for custom-name preservation). Chain through an owned
+        // buffer: each pick merges the previous result.
+        var nb: [2048]u8 = undefined;
+        var cur_owned: ?[]u8 = if (st.nbt) |nbt_bytes| conn.allocator.dupe(u8, nbt_bytes) catch return else null;
+        defer if (cur_owned) |b| conn.allocator.free(b);
+        for (picks[0..n]) |p| {
+            const cur_const: ?[]const u8 = if (cur_owned) |b| @as([]const u8, b) else null;
+            const merged = buildEnchNbt(cur_const, p.id, p.level, &nb) orelse return;
+            const duped = conn.allocator.dupe(u8, merged) catch return;
+            if (cur_owned) |b| conn.allocator.free(b);
+            cur_owned = duped;
+        }
+        const final_nbt = cur_owned orelse return;
+        cur_owned = null; // ownership moves into the enchant slot below
+        // Consume XP (creative free) + convert books + install the item.
+        if (!creative) {
+            conn.xp_level -= need;
+            if (conn.xp_level < 0) {
+                conn.xp_level = 0;
+                conn.xp_bar = 0;
+                conn.xp_total = 0;
+            }
+            queueExperience(conn);
+        }
+        item_mod.freeStack(conn.allocator, &conn.enchant_item);
+        var new_id = st.id;
+        if (new_id == game_ids.book) new_id = game_ids.enchanted_book;
+        conn.enchant_item = .{ .id = new_id, .count = 1, .damage = st.damage, .nbt = final_nbt };
+        // Reseed (vanilla regenerates the seed after each enchant) and
+        // recompute offers for the (now enchanted) item — which clears them.
+        conn.enchant_seed = self.nextEnchantSeed();
+        self.recomputeEnchantLevels(pool, allocator, conn, ow.x, ow.y, ow.z);
+        self.syncEnchantWindow(conn);
+        // The enchanted item is still in the table; the client shows it.
+        // XP bar sync rides on queueExperience above.
+    }
+
     /// Break-driven close: every conn with a window open AT this block gets
-    /// 0x2E; crafting grids drop as entities (furnace contents are dropped
-    /// by the break handler itself via removeFurnace). Caller holds world_lock.
+    /// 0x2E; crafting grids and enchant items drop as entities (furnace
+    /// contents are dropped by the break handler itself via removeFurnace).
+    /// Caller holds world_lock.
     fn closeWindowsAt(self: *Server, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, x: i32, y: u8, z: i32) void {
         _ = pool;
         _ = allocator;
@@ -4933,6 +6649,9 @@ pub const Server = struct {
             var stacks: [9]?item_mod.Stack = [_]?item_mod.Stack{null} ** 9;
             if (ow.id == 1) stacks = e.conn.takeTableGrid();
             if (ow.id == 2) e.conn.open_win = null;
+            if (ow.id == 4) {
+                if (e.conn.takeEnchantItem()) |owned| stacks[0] = owned;
+            }
             const px = e.conn.pos_x;
             const py = e.conn.pos_y;
             const pz = e.conn.pos_z;
@@ -4943,19 +6662,17 @@ pub const Server = struct {
             for (stacks[0..]) |*st| {
                 const s = st.* orelse continue;
                 st.* = null;
-                self.ent_lock.lock();
-                _ = self.spawnItem(s, px + 0.5, py + 1.0, pz + 0.5, 10);
-                self.ent_lock.unlock();
+                self.spawnItemLive(s, px + 0.5, py + 1.0, pz + 0.5, 10);
             }
             flushEntry(e, self.io);
         }
     }
 
-    /// Client-initiated close (0x0D): drop the crafting grid in front of the
-    /// player. Furnace closes drop nothing (contents persist server-side).
-    /// No 0x2E ack — the client already closed locally (vanilla flow).
+    /// Client-initiated close (0x0D): drop the crafting grid / enchant item in
+    /// front of the player. Furnace closes drop nothing (contents persist
+    /// server-side). No 0x2E ack — the client already closed locally.
     fn spawnTableClose(self: *Server, conn: *Conn, tc: TableClose) void {
-        if (tc.window != 1) return;
+        if (tc.window != 1 and tc.window != 4) return;
         var stacks = tc.stacks;
         conn.lock.lock();
         const px = conn.pos_x;
@@ -4968,9 +6685,7 @@ pub const Server = struct {
         for (stacks[0..]) |*st| {
             const s = st.* orelse continue;
             st.* = null;
-            self.ent_lock.lock();
-            _ = self.spawnItem(s, px + fx * 0.5 + 0.5, py + 1.32, pz + fz * 0.5 + 0.5, 10);
-            self.ent_lock.unlock();
+            self.spawnItemLive(s, px + fx * 0.5 + 0.5, py + 1.32, pz + fz * 0.5 + 0.5, 10);
         }
     }
 
@@ -4998,26 +6713,29 @@ pub const Server = struct {
     /// 30s timer); players get Update Health 0 + death screen, and walk
     /// back via Client Status 0 (conn.zig resets + heals there).
     fn resolveAttack(self: *Server, attacker: *Conn, ev: AttackEvent) void {
-        // --- mobs (ticker-owned list) ---
+        // --- mobs (region-owned; ent_lock throughout, registry nests
+        // innermost per the Registry lock-order rule) ---
         var mob_hit = false;
         var mob_dead_id: ?i32 = null;
         var mob_hp: f32 = 0;
         self.ent_lock.lock();
-        var mi: usize = 0;
-        while (mi < self.entities.items.len) : (mi += 1) {
-            if (self.entities.items[mi].id != ev.target_eid) continue;
-            const m = &self.entities.items[mi];
-            if (!attackInReach(ev.ax, ev.ay, ev.az, m.x, m.y + 0.5, m.z)) break;
-            mob_hit = true;
-            m.health -= ev.dmg;
-            if (m.health <= 0) {
-                const dead = self.entities.swapRemove(mi);
-                mob_dead_id = dead.id;
-                if (dead.kind == entity.MOB_PIG) self.pig_cooldown = 30;
-            } else {
-                mob_hp = m.health;
+        if (self.region_reg.findMob(ev.target_eid)) |found| {
+            const mx = found.region.mobs.px.items[found.index];
+            const my = found.region.mobs.py.items[found.index];
+            const mz = found.region.mobs.pz.items[found.index];
+            if (attackInReach(ev.ax, ev.ay, ev.az, mx, my + 0.5, mz)) {
+                mob_hit = true;
+                found.region.mobs.health.items[found.index] -= ev.dmg;
+                if (found.region.mobs.health.items[found.index] <= 0) {
+                    const dead_id = found.region.mobs.ids.items[found.index];
+                    const dead_kind = found.region.mobs.kinds.items[found.index];
+                    found.region.mobs.removeAt(found.index);
+                    mob_dead_id = dead_id;
+                    if (dead_kind == entity.MOB_PIG) self.pig_cooldown = 30;
+                } else {
+                    mob_hp = found.region.mobs.health.items[found.index];
+                }
             }
-            break;
         }
         self.ent_lock.unlock();
         if (mob_dead_id) |id| {
@@ -5082,10 +6800,253 @@ pub const Server = struct {
     fn tickerLoop(self: *Server) void {
         while (true) {
             const one_s = std.Io.Clock.Duration{ .raw = std.Io.Duration.fromSeconds(1), .clock = .awake };
-            std.Io.Timeout.sleep(.{ .duration = one_s }, self.io) catch return;
+            std.Io.Timeout.sleep(.{ .duration = one_s }, self.io) catch {
+                // EINTR from a shutdown signal (or any sleep failure):
+                // run the same pipeline as /stop instead of dying silently.
+                if (shutdown_mod.isRequested()) self.finishStop();
+                continue;
+            };
+            if (shutdown_mod.isRequested()) self.finishStop();
             const now = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
+            const t0 = std.Io.Timestamp.now(self.io, .awake);
             self.tickOnce(now);
+            const dt = t0.durationTo(std.Io.Timestamp.now(self.io, .awake)).nanoseconds;
+            self.pushTickSample(if (dt < 0) 0 else @intCast(dt));
+            self.maybePrintStats();
         }
+    }
+
+    /// 10Hz redstone driver (vanilla repeater delays are 2-8 game ticks, i.e.
+    /// 100-400ms — the 1Hz ticker alone would stretch them to ~1s). Advances
+    /// the redstone clock by 2 game ticks per wakeup and drains due
+    /// scheduled entries (button releases, repeater evals, ore fades).
+    /// Pressure plates also poll here at 10Hz: the 1Hz tick alone left
+    /// release timing phase-dependent (up to ~1s of jitter on top of the
+    /// 20-tick minimum press). Snapshots are read-only (no inbox drain, no
+    /// wander, no item mutation — the 1Hz tick still owns those); the
+    /// world write itself stays under world_lock. The tickOnce pass doubles
+    /// as the idle backstop; popDue is idempotent across both.
+    fn redstoneLoop(self: *Server) void {
+        while (true) {
+            const quantum = std.Io.Clock.Duration{ .raw = std.Io.Duration.fromMilliseconds(100), .clock = .awake };
+            std.Io.Timeout.sleep(.{ .duration = quantum }, self.io) catch {
+                if (shutdown_mod.isRequested()) self.finishStop();
+                continue;
+            };
+            if (shutdown_mod.isRequested()) self.finishStop();
+            if (self.world == null) continue;
+            // Read-only entity snapshots for plate occupancy (no mutation,
+            // no nesting: conn locks one at a time, then ent_lock alone).
+            var p_ents: [256]redstone_mod.Ent = undefined;
+            var n_p: usize = 0;
+            {
+                var batch: [256]RegistryEntry = undefined;
+                const snap = self.snapshot(&batch);
+                for (snap) |e| {
+                    if (n_p >= p_ents.len) break;
+                    e.conn.lock.lock();
+                    const is_play = e.conn.state == .play;
+                    const px = e.conn.pos_x;
+                    const py = e.conn.pos_y;
+                    const pz = e.conn.pos_z;
+                    e.conn.lock.unlock();
+                    if (!is_play) continue;
+                    p_ents[n_p] = .{ .x = px, .y = py, .z = pz };
+                    n_p += 1;
+                }
+                releaseSnap(snap);
+            }
+            var m_ents: [256]redstone_mod.Ent = undefined;
+            var n_m: usize = 0;
+            var i_ents: [256]redstone_mod.Ent = undefined;
+            var n_i: usize = 0;
+            self.ent_lock.lock();
+            {
+                var rstack: [256]*tick_mod.Region = undefined;
+                const n_live = self.region_reg.count();
+                if (n_live <= rstack.len) {
+                    var regs: []*tick_mod.Region = rstack[0..];
+                    const n_regs = self.region_reg.allRegions(regs);
+                    for (regs[0..n_regs]) |reg| {
+                        for (0..reg.mobs.len()) |si| {
+                            if (n_m >= m_ents.len) break;
+                            m_ents[n_m] = .{ .x = reg.mobs.px.items[si], .y = reg.mobs.py.items[si], .z = reg.mobs.pz.items[si] };
+                            n_m += 1;
+                        }
+                    }
+                }
+                for (self.items.items) |it| {
+                    if (n_i >= i_ents.len) break;
+                    i_ents[n_i] = .{ .x = it.x, .y = it.y, .z = it.z };
+                    n_i += 1;
+                }
+            }
+            self.ent_lock.unlock();
+            self.world_lock.lock();
+            self.rs_tick += 2;
+            var rs_changes: redstone_mod.ChangeList = .{};
+            var rs_sounds: redstone_mod.SoundList = .{};
+            var rs_actions: redstone_mod.ActionList = .{};
+            if (self.world) |pool| {
+                var w = Server.RsWorld{ .pool = pool, .alloc = self.gpa, .changes = &rs_changes };
+                redstone_mod.drainScheduled(w.rsView(), &self.rs_sched, &self.rs_burn, &rs_changes, &rs_sounds, self.rs_tick, &rs_actions);
+                redstone_mod.pollPlates(w.rsView(), &self.rs_sched, &self.rs_burn, &self.rs_plates, &rs_changes, &rs_sounds, self.rs_tick, p_ents[0..n_p], m_ents[0..n_m], i_ents[0..n_i], false);
+            }
+            self.world_lock.unlock();
+            if (rs_changes.n > 0 or rs_sounds.n > 0 or rs_actions.n > 0) {
+                if (self.world) |pool| {
+                    self.flushRsBatch(pool, rs_changes, rs_sounds, rs_actions);
+                }
+            }
+        }
+    }
+
+    /// Flush one drained batch: block actions (S24, piston animation) first,
+    /// then silent-aware change flush + sounds.
+    fn flushRsBatch(self: *Server, pool: *shard_mod.ShardPool, rs_changes: redstone_mod.ChangeList, rs_sounds: redstone_mod.SoundList, rs_actions: redstone_mod.ActionList) void {
+        for (rs_actions.items[0..rs_actions.n]) |a| {
+            self.broadcastBlockAction(a.x, @intCast(a.y), a.z, a.event_id, a.facing, a.id);
+        }
+        for (rs_changes.items[0..rs_changes.n]) |c| {
+            self.flushRsChange(pool, self.gpa, 0, c);
+        }
+        for (rs_sounds.evs[0..rs_sounds.n]) |s| self.flushRsSound(s);
+    }
+
+    /// Record one tick duration (ns) in the rolling window.
+    fn pushTickSample(self: *Server, ns: u64) void {
+        self.tick_samples[self.tick_samples_idx] = ns;
+        self.tick_samples_idx = (self.tick_samples_idx + 1) % self.tick_samples.len;
+        if (self.tick_samples_n < self.tick_samples.len) self.tick_samples_n += 1;
+    }
+
+    /// Record one tick-flush duration (ns) in the rolling window.
+    fn pushFlushSample(self: *Server, ns: u64) void {
+        self.flush_samples[self.flush_samples_idx] = ns;
+        self.flush_samples_idx = (self.flush_samples_idx + 1) % self.flush_samples.len;
+        if (self.flush_samples_n < self.flush_samples.len) self.flush_samples_n += 1;
+    }
+
+    /// Percentile of the rolling window (0..100). `which` picks the
+    /// window (0 = tick, 1 = flush).
+    fn percentile(self: *const Server, which: u8, p: u8) u64 {
+        const win = if (which == 0) self.tick_samples[0..self.tick_samples_n] else self.flush_samples[0..self.flush_samples_n];
+        if (win.len == 0) return 0;
+        var sorted: [256]u64 = undefined;
+        const n = @min(win.len, sorted.len);
+        @memcpy(sorted[0..n], win[0..n]);
+        std.mem.sort(u64, sorted[0..n], {}, std.sort.asc(u64));
+        const idx = (n * @as(usize, p)) / 100;
+        return sorted[@min(idx, n - 1)];
+    }
+
+    /// Per-subsystem memory accounting (Phase D: the numbers the stats
+    /// line prints, so a leak shows up as a growing line).
+    pub fn accountMemory(self: *Server) memstat_mod.Accounting {
+        var acc = memstat_mod.Accounting{};
+        // Snapshot first: holding the registry lock while taking a conn
+        // lock would nest the two (ABBA deadlock with the tick path,
+        // which holds a conn lock and then snapshots the registry).
+        var batch: [256]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        for (snap) |e| {
+            e.conn.lock.lock();
+            acc.outboxes += e.conn.out.items.len * @sizeOf(u8);
+            // The sent-set: one hash-map slot per column already sent.
+            acc.sent_sets += e.conn.sent.count() * 32;
+            e.conn.lock.unlock();
+        }
+        self.ent_lock.lock();
+        acc.entities = self.mobBytesLocked() + self.items.items.len * @sizeOf(entity.ItemEnt);
+        self.ent_lock.unlock();
+        if (self.world) |pool| acc.store_ring = pool.ringBytes();
+        self.mem_accounting = acc;
+        self.rss_bytes = memstat_mod.rssBytes(self.io);
+        return acc;
+    }
+
+    /// The transport counters (blocking transport: zeros).
+    pub fn transport_stats(self: *Server) transport_mod.Stats {
+        if (comptime builtin.os.tag == .linux) {
+            if (self.uring_backend) |b| {
+                const backend: *uring_mod.Backend = @ptrCast(@alignCast(b));
+                return backend.statsSnapshot();
+            }
+        }
+        return .{};
+    }
+
+    /// Live connection count for the stats line. The async transport
+    /// tracks accepts/closes itself; the blocking transport has no
+    /// counters, so the registry size is used instead.
+    fn liveConnCount(self: *Server) u64 {
+        if (comptime builtin.os.tag == .linux) {
+            if (self.uring_backend != null) {
+                const ts = self.transport_stats();
+                return ts.conns_accepted -| ts.conns_closed;
+            }
+        }
+        self.reg_lock.lock();
+        defer self.reg_lock.unlock();
+        return self.registry.items.len;
+    }
+
+    /// The per-tick stats line (Phase D: memory accounting + tick timing).
+    pub fn statsLine(self: *Server, buf: []u8) []const u8 {
+        const acc = self.accountMemory();
+        // One buffer per formatted value: formatBytes writes into the
+        // caller's buffer, so sharing one buffer between the three args
+        // would alias them all to the last write (the "sent=64 BB" bug).
+        var outbox_buf: [32]u8 = undefined;
+        var sent_buf: [32]u8 = undefined;
+        var ents_buf: [32]u8 = undefined;
+        var ring_buf: [32]u8 = undefined;
+        const p50 = self.percentile(0, 50);
+        const p99 = self.percentile(0, 99);
+        const f50 = self.percentile(1, 50);
+        const f99 = self.percentile(1, 99);
+        var rss_buf: [32]u8 = undefined;
+        const rss = memstat_mod.formatBytes(self.rss_bytes, &rss_buf);
+        const ts = self.transport_stats();
+        return std.fmt.bufPrint(buf, "stats tick_p50={d}us tick_p99={d}us out_p50={d}us out_p99={d}us send={d}us reconcile={d}us players={d} mobs={d} items={d} ssts={d} rss={s} outbox={s} sent={s} ents={s} ring={s} conns={d} zc={d} copy={d} flushes={d} starved={d} armfail={d} regions={d} region_shed={d} sp={s}", .{
+            @divFloor(p50, 1_000),
+            @divFloor(p99, 1_000),
+            @divFloor(f50, 1_000),
+            @divFloor(f99, 1_000),
+            @divFloor(self.send_ns_last, 1_000),
+            @divFloor(self.reconcile_ns_last, 1_000),
+            self.play_count.load(.acquire),
+            self.mobCount(),
+            self.items.items.len,
+            if (self.world) |w| w.sstCount() else 0,
+            rss,
+            memstat_mod.formatBytes(acc.outboxes, &outbox_buf),
+            memstat_mod.formatBytes(acc.sent_sets, &sent_buf),
+            memstat_mod.formatBytes(acc.entities, &ents_buf),
+            memstat_mod.formatBytes(acc.store_ring, &ring_buf),
+            // Live transport connections (accepted minus closed), not the
+            // cumulative accept count: a growing number here next to a
+            // flat player count means connections are leaking.
+            self.liveConnCount(),
+            ts.sends_zc,
+            ts.sends_copy,
+            ts.flushes,
+            ts.buffer_starved,
+            ts.recv_arm_failures,
+            self.region_reg.count(),
+            self.region_shed_total,
+            self.storage_profile_name,
+        }) catch buf[0..0];
+    }
+
+    /// Print the stats line every 600 ticks (10 minutes) to avoid TUI interference.
+    fn maybePrintStats(self: *Server) void {
+        self.tick_counter += 1;
+        if (self.tick_counter % 600 != 0) return;
+        var buf: [1024]u8 = undefined;
+        const line = self.statsLine(&buf);
+        std.log.info("{s}", .{line});
     }
 
     /// Serve exactly one connection (status or login+bootstrap), no ticker.
@@ -5097,8 +7058,8 @@ pub const Server = struct {
         try serveConn(stream, self.io, allocator, self, self.eid_counter.fetchAdd(1, .acq_rel));
     }
 
-    /// Accept loop: one OS thread per connection (blocking I/O).
-    /// Tick-aligned flush + io_uring transport slot in here later.
+    /// Accept loop: one OS thread per connection (blocking I/O) or the
+    /// io_uring transport (one ring per worker thread).
     pub fn serveForever(self: *Server, allocator: std.mem.Allocator) !void {
         self.gpa = allocator;
         std.log.info("listening (proto v5 offline={})", .{!self.config.online_mode});
@@ -5109,8 +7070,48 @@ pub const Server = struct {
         };
         const tick_th = try std.Thread.spawn(.{}, T.tick, .{self});
         tick_th.detach();
+        // K1: 10Hz redstone scheduler drain (sub-second repeater delays;
+        // plates stay on the 1Hz ticker, which also backstops the queue).
+        const R = struct {
+            fn red(s: *Server) void {
+                s.redstoneLoop();
+            }
+        };
+        const rs_th = try std.Thread.spawn(.{}, R.red, .{self});
+        rs_th.detach();
+        // Phase B: pick the transport. `auto` resolves to the best backend
+        // for this OS; io_uring is used on Linux when the kernel supports
+        // it, otherwise the portable blocking transport runs.
+        const kind = transport_mod.resolve(self.transport_kind);
+        if (kind == .uring) {
+            if (self.serveForeverUring(allocator)) {
+                return;
+            }
+            std.log.warn("transport: io_uring unavailable, falling back to blocking", .{});
+        }
+        if (kind == .kqueue) {
+            if (comptime builtin.os.tag.isDarwin()) {
+                if (self.serveForeverKqueue(allocator)) return;
+                std.log.warn("transport: kqueue unavailable, falling back to blocking", .{});
+            } else {
+                std.log.warn("transport: kqueue is macOS/BSD only, falling back to blocking", .{});
+            }
+        }
+        if (kind == .iocp) {
+            if (comptime builtin.os.tag == .windows) {
+                if (self.serveForeverIocp(allocator)) return;
+                std.log.warn("transport: iocp unavailable, falling back to blocking", .{});
+            } else {
+                std.log.warn("transport: iocp is Windows only, falling back to blocking", .{});
+            }
+        }
         while (true) {
-            const stream = try self.net.accept(self.io);
+            // A shutdown signal interrupts the blocking accept (EINTR):
+            // run the /stop pipeline instead of returning without saving.
+            const stream = self.net.accept(self.io) catch |err| {
+                if (shutdown_mod.isRequested()) self.finishStop();
+                return err;
+            };
             const eid = self.eid_counter.fetchAdd(1, .acq_rel);
             const C = struct {
                 fn run(s: std.Io.net.Stream, io: std.Io, a: std.mem.Allocator, srv: *Server, id: i32) void {
@@ -5125,19 +7126,828 @@ pub const Server = struct {
         }
     }
 
+    /// Phase B: run the io_uring transport (one ring per worker thread,
+    /// multishot accept + multishot recv with provided buffers).
+    /// Returns false when the kernel/runtime cannot do io_uring (the
+    /// caller falls back to the blocking transport).
+    fn serveForeverUring(self: *Server, allocator: std.mem.Allocator) bool {
+        if (comptime builtin.os.tag == .linux) {
+            return self.serveForeverUringLinux(allocator);
+        } else {
+            return false;
+        }
+    }
+
+    /// The Linux io_uring backend (only compiled on Linux).
+    fn serveForeverUringLinux(self: *Server, allocator: std.mem.Allocator) bool {
+        if (!uring_mod.supported) return false;
+        if (!uring_mod.probe()) return false;
+        const handle = transport_mod.Handler{
+            .on_accept = Server.onTransportAccept,
+            .on_read = Server.onTransportRead,
+            .on_close = Server.onTransportClose,
+            .on_flush = Server.onTransportFlush,
+            .ctx = self,
+        };
+        const backend = allocator.create(uring_mod.Backend) catch return false;
+        backend.init(allocator, self.transport_opts, self.io, self.net.socket.handle, handle) catch {
+            allocator.destroy(backend);
+            return false;
+        };
+        if (backend.failed) {
+            backend.deinit();
+            allocator.destroy(backend);
+            return false;
+        }
+        self.uring_backend = @ptrCast(backend);
+        self.transport_handle = backend.handle();
+        std.log.info("transport: io_uring ({d} workers, {d} ring entries, zc>={d}B)", .{
+            self.transport_opts.workerCount(),
+            self.transport_opts.ring_entries,
+            self.transport_opts.send_zc_threshold,
+        });
+        backend.run() catch {};
+        return true;
+    }
+
+    /// Phase B: run the macOS kqueue transport.
+    fn serveForeverKqueue(self: *Server, allocator: std.mem.Allocator) bool {
+        if (comptime builtin.os.tag.isDarwin()) {
+            const handle = transport_mod.Handler{
+                .on_accept = Server.onTransportAccept,
+                .on_read = Server.onTransportRead,
+                .on_close = Server.onTransportClose,
+                .on_flush = Server.onTransportFlush,
+                .ctx = self,
+            };
+            const backend = allocator.create(kqueue_mod.Backend) catch return false;
+            backend.init(allocator, self.transport_opts, self.net.socket.handle, handle) catch {
+                allocator.destroy(backend);
+                return false;
+            };
+            self.transport_handle = backend.handle();
+            std.log.info("transport: kqueue ({d} workers)", .{self.transport_opts.workerCount()});
+            backend.run() catch {};
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /// Phase B: run the Windows IOCP transport.
+    fn serveForeverIocp(self: *Server, allocator: std.mem.Allocator) bool {
+        if (comptime builtin.os.tag == .windows) {
+            if (!iocp_mod.supported or !iocp_mod.probe()) return false;
+            const handle = transport_mod.Handler{
+                .on_accept = Server.onTransportAccept,
+                .on_read = Server.onTransportRead,
+                .on_close = Server.onTransportClose,
+                .on_flush = Server.onTransportFlush,
+                .ctx = self,
+            };
+            const backend = allocator.create(iocp_mod.Backend) catch return false;
+            backend.init(allocator, self.transport_opts, self.io, self.net.socket.handle, handle) catch {
+                allocator.destroy(backend);
+                return false;
+            };
+            if (backend.failed) {
+                backend.deinit();
+                allocator.destroy(backend);
+                return false;
+            }
+            self.transport_handle = backend.handle();
+            std.log.info("transport: iocp ({d} workers)", .{self.transport_opts.workerCount()});
+            backend.run() catch {};
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /// Phase B: a connection was accepted by the transport.
+    fn onTransportAccept(ctx: *anyopaque, conn_id: u32, fd: std.posix.fd_t) void {
+        const self: *Server = @ptrCast(@alignCast(ctx));
+        const allocator = self.gpa;
+        const eid = self.eid_counter.fetchAdd(1, .acq_rel);
+        const conn = allocator.create(Conn) catch return;
+        conn.* = Conn.init(allocator, self.io, self.config, eid);
+        conn.transport_id = conn_id;
+        conn.transport = self.transport_handle;
+        // Peer address (the blocking transport gets it from the stream).
+        // std.posix.getpeername is a compile error on Windows, so IOCP
+        // conns keep ip_len == 0 (IP bans do not match them — documented;
+        // name bans are unaffected).
+        if (comptime builtin.os.tag == .windows) {
+            conn.ip_len = 0;
+        } else {
+            conn.ip_len = transport_mod.peerAddress(fd, &conn.ip);
+        }
+        const state = allocator.create(SessionState) catch {
+            conn.deinit();
+            allocator.destroy(conn);
+            return;
+        };
+        state.* = .{};
+        self.async_lock.lock();
+        self.async_conns.put(allocator, conn_id, conn) catch {};
+        self.async_states.put(allocator, conn_id, state) catch {};
+        self.async_lock.unlock();
+        // Register in the player registry. The stream is a closed
+        // placeholder: the transport owns the socket, and every write
+        // path is transport aware (a stray write would hit EBADF, not
+        // some unrelated fd).
+        self.register(conn, Server.closedStream()) catch {
+            self.async_lock.lock();
+            _ = self.async_conns.remove(conn_id);
+            _ = self.async_states.remove(conn_id);
+            self.async_lock.unlock();
+            state.deinit(allocator);
+            allocator.destroy(state);
+            conn.deinit();
+            allocator.destroy(conn);
+        };
+    }
+
+    /// Phase B: inbound bytes for a connection.
+    fn onTransportRead(ctx: *anyopaque, conn_id: u32, bytes: []const u8) void {
+        const self: *Server = @ptrCast(@alignCast(ctx));
+        const allocator = self.gpa;
+        self.async_lock.lock();
+        const conn = self.async_conns.get(conn_id);
+        const state = self.async_states.get(conn_id);
+        self.async_lock.unlock();
+        const c = conn orelse return;
+        const st = state orelse return;
+        const res = sessionStep(self, c, allocator, st, bytes) catch {
+            self.kickTransportConn(conn_id);
+            return;
+        };
+        if (res.finished) {
+            self.kickTransportConn(conn_id);
+            return;
+        }
+        if (res.announce) {
+            self.announceJoin(c) catch {};
+        }
+        if (res.stop) {
+            // The reply is in the outbox; give the worker a moment to send
+            // it before the process exits.
+            const d = std.Io.Clock.Duration{ .raw = std.Io.Duration.fromNanoseconds(50 * std.time.ns_per_ms), .clock = .awake };
+            std.Io.Timeout.sleep(.{ .duration = d }, self.io) catch {};
+            self.finishStop();
+        }
+    }
+
+    /// Phase B: drain a connection's queued output for the transport.
+    fn onTransportFlush(ctx: *anyopaque, conn_id: u32) ?[]u8 {
+        const self: *Server = @ptrCast(@alignCast(ctx));
+        self.async_lock.lock();
+        const conn = self.async_conns.get(conn_id);
+        self.async_lock.unlock();
+        const c = conn orelse return null;
+        c.lock.lock();
+        const pending = c.takeOutput() catch {
+            c.lock.unlock();
+            return null;
+        };
+        const overflow = c.overflow;
+        c.lock.unlock();
+        if (overflow) {
+            // Slow consumer: the outbox grew past the cap. Drop it.
+            c.allocator.free(pending);
+            self.kickTransportConn(conn_id);
+            return null;
+        }
+        if (pending.len == 0) {
+            c.allocator.free(pending);
+            return null;
+        }
+        return pending;
+    }
+
+    /// Phase B: the connection is gone.
+    fn onTransportClose(ctx: *anyopaque, conn_id: u32) void {
+        const self: *Server = @ptrCast(@alignCast(ctx));
+        const allocator = self.gpa;
+        self.async_lock.lock();
+        const conn = self.async_conns.fetchRemove(conn_id);
+        const state = self.async_states.fetchRemove(conn_id);
+        self.async_lock.unlock();
+        if (conn) |c| {
+            // unregister() persists, removes from the registry and
+            // destroys the conn — do not free it twice.
+            self.unregister(c.value);
+        }
+        if (state) |s| {
+            s.value.deinit(allocator);
+            allocator.destroy(s.value);
+        }
+    }
+
+    /// Kick a connection owned by the async transport.
+    fn kickTransportConn(self: *Server, conn_id: u32) void {
+        if (self.transport_handle) |h| h.close_conn(h.ctx, conn_id);
+    }
+
+    /// A stream that is not a socket: the registry placeholder for
+    /// connections owned by an async transport (the transport holds the
+    /// real socket).
+    pub fn closedStream() std.Io.net.Stream {
+        // -1 is not a HANDLE (Windows): use the invalid-handle sentinel
+        // there (this function is only analyzed on targets whose async
+        // backend references it).
+        return .{ .socket = .{ .handle = if (comptime builtin.os.tag == .windows) std.os.windows.INVALID_HANDLE_VALUE else -1, .address = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } } } };
+    }
+
+    /// Stop the server: save the players, flush the store, exit.
+    pub fn finishStop(self: *Server) noreturn {
+        _ = self.saveAllPlayers();
+        self.saveRedstone();
+        if (self.world) |pool| pool.flushAll() catch {};
+        std.log.info("stop: saved players, flushed. bye.", .{});
+        // exit() skips the console thread's restore defer: without this an
+        // in-game /stop leaves the operator's terminal without echo.
+        console_tui.restoreTerminal();
+        std.process.exit(0);
+    }
+
     /// Bind on all interfaces (production entry).
     pub fn bindAny(io: std.Io, port: u16, config: Config) !Server {
         const addr = try std.Io.net.IpAddress.parse("0.0.0.0", port);
-        var srv = Server{ .net = try addr.listen(io, .{ .reuse_address = true }), .io = io, .config = config };
-        srv.world_spawn = .{ config.spawn_x, config.spawn_y, config.spawn_z };
+        // A deep accept backlog: a server-list ping or a login burst
+        // must not be refused while the transport is busy.
+        var srv = Server{ .net = try addr.listen(io, .{ .reuse_address = true, .kernel_backlog = 4096 }), .io = io, .config = config };
+        {
+            var c = srv.cfg.load();
+            c.world_spawn = .{ config.spawn_x, config.spawn_y, config.spawn_z };
+            srv.cfg.store(c);
+        }
         return srv;
     }
 };
+
+/// Per-connection protocol state (shared by every transport).
+///
+/// The blocking transport keeps it on the serve thread's stack; the
+/// io_uring transport keeps one per connection (the worker owns it).
+pub const SessionState = struct {
+    /// Actions queued by the frame handlers; applied to the world after
+    /// the frame batch is parsed.
+    events: std.ArrayList(Action) = .empty,
+    /// The join still has to be announced to the other players.
+    need_announce: bool = false,
+
+    pub fn deinit(self: *SessionState, allocator: std.mem.Allocator) void {
+        self.events.deinit(allocator);
+    }
+};
+
+/// The chunk a player currently stands in (used for the viewer lookups
+/// after the conn lock is released).
+pub const ChunkPos = struct { cx: i32, cz: i32 };
+
+/// Result of one protocol step.
+pub const StepResult = struct {
+    /// The connection is finished: close it after the queued bytes went
+    /// out (kick, timeout, protocol error).
+    finished: bool = false,
+    /// The join must be announced to the other players.
+    announce: bool = false,
+    /// The server was asked to stop (the reply is in the outbox).
+    stop: bool = false,
+};
+/// The part of a protocol step that runs with `conn.lock` held: feed the
+/// bytes, parse the frames, run the handlers and apply the login
+/// bootstrap. Split out so the lock can be released on every error path
+/// (a malformed frame used to leave the lock held, and the cleanup path
+/// then deadlocked on it).
+fn sessionLocked(
+    server: *Server,
+    conn: *Conn,
+    allocator: std.mem.Allocator,
+    state: *SessionState,
+    data: []const u8,
+    entered: *bool,
+    cc_now: *ChunkPos,
+) !void {
+    const events = &state.events;
+    // Feed the raw bytes through the conn's reassembly buffer (the conn
+    // parses the Length prefix itself, so the transport does not care
+    // where the bytes came from).
+    conn.feedData(data) catch {
+        conn.lock.unlock();
+        return error.FrameTooLarge;
+    };
+    while (try conn.poll()) |f| {
+        // Server list ping reads a live player count, not the copy taken
+        // at accept time. Refresh under conn.lock (held here); status
+        // pings are rare so the atomic load is free.
+        if (conn.state == .status and f.id == @as(i32, @intFromEnum(ids.StatusServer.request))) {
+            conn.config.online_count = @intCast(@min(server.play_count.load(.acquire), 255));
+        }
+        const action = try conn.handleFrame(f);
+        if (action == .entered_play) entered.* = true;
+        switch (action) {
+            .block_set, .interact, .arm_swing, .chat, .attack, .command, .tab_complete, .qdrop, .table_close, .furnace_click, .enchant_click, .enchant => try events.append(allocator, action),
+            else => {},
+        }
+    }
+    if (entered.*) {
+        entered.* = false;
+        const age = server.world_age.load(.acquire);
+        // Worldgen spawn: ensure land spawn before Join/SpawnPosition go out.
+        // Returning players skip the search: loadPlayer restores pos.
+        var fresh = true;
+        if (server.world) |pool| {
+            const loaded = server.loadPlayer(conn);
+            fresh = !loaded;
+            if (!loaded) {
+                if (server.gen) |gen| {
+                    const sp = v5serve.findSpawn(pool, gen, &server.world_lock, allocator, 24) catch null;
+                    if (sp) |p| {
+                        conn.config.spawn_x = @intFromFloat(@floor(p.x));
+                        conn.config.spawn_y = @intFromFloat(@floor(p.y));
+                        conn.config.spawn_z = @intFromFloat(@floor(p.z));
+                    }
+                }
+                // First login (or no save): land at spawn. (Returning
+                // players keep their saved pos from loadPlayer.)
+                conn.pos_x = @as(f64, @floatFromInt(conn.config.spawn_x)) + 0.5;
+                conn.pos_y = @as(f64, @floatFromInt(conn.config.spawn_y));
+                conn.pos_z = @as(f64, @floatFromInt(conn.config.spawn_z)) + 0.5;
+                conn.yaw = 0;
+                conn.pitch = 0;
+            }
+        }
+        // Landing safety: sync-fill a small disk around the login position
+        // before the chunk burst + PosLook go out. Holes (background gen
+        // pending) would leave a real client falling through the world on
+        // join; the server trusts client positions, so that fall would be
+        // adopted and persisted. Completing login on solid ground avoids
+        // the fall (the login grace below covers the remainder).
+        if (server.world) |pool| {
+            server.ensureLanding(pool, allocator, conn);
+            // Inside-block rescue: a saved pos can sit inside a block (world
+            // edited while away, stale pre-grace row, or spawn inside
+            // terrain). Nudge up to the first headroom so login completes in
+            // the open instead of suffocating on join.
+            {
+                const ex: i32 = @intFromFloat(@floor(conn.pos_x));
+                const ez: i32 = @intFromFloat(@floor(conn.pos_z));
+                const feet: i32 = @intFromFloat(@floor(conn.pos_y));
+                var need_rescue = false;
+                if (feet >= 0 and feet <= 255) {
+                    const fy: u8 = @intCast(feet);
+                    if (view.peekBlock(pool, allocator, ex, fy, ez) catch null) |b| {
+                        if (view.isOpaqueCube(b.id)) need_rescue = true;
+                    }
+                }
+                if (!need_rescue) {
+                    const ey_i: i32 = @intFromFloat(@floor(conn.pos_y + 1.62));
+                    if (ey_i >= 0 and ey_i <= 255) {
+                        const ey: u8 = @intCast(ey_i);
+                        if (view.peekBlock(pool, allocator, ex, ey, ez) catch null) |b| {
+                            if (view.isOpaqueCube(b.id)) need_rescue = true;
+                        }
+                    }
+                }
+                if (need_rescue) {
+                    var y = feet + 1;
+                    while (y <= feet + 16 and y <= 253) : (y += 1) {
+                        if (y < 0) continue;
+                        const fy: u8 = @intCast(y);
+                        const ey: u8 = @intCast(y + 1);
+                        const bf = view.peekBlock(pool, allocator, ex, fy, ez) catch null;
+                        const be = view.peekBlock(pool, allocator, ex, ey, ez) catch null;
+                        const f_ok = if (bf) |b| !view.isOpaqueCube(b.id) else false;
+                        const e_ok = if (be) |b| !view.isOpaqueCube(b.id) else false;
+                        if (f_ok and e_ok) {
+                            conn.pos_y = @floatFromInt(y);
+                            break;
+                        }
+                    }
+                }
+            }
+            // Hold pure falls below the login teleport until the client
+            // proves it is synced (exact PosLook echo), moves horizontally
+            // (it is live), or the grace times out.
+            conn.armLoginGrace();
+        }
+        // Server defaults: difficulty is world-level (always applied);
+        // fresh logins also inherit the default gamemode + world spawn
+        // (an explicit /setworldspawn wins over the gen search above).
+        // One lock-free config snapshot (Phase D seqlock).
+        const cfg = server.cfg.load();
+        const srv_diff = cfg.difficulty;
+        const srv_gm = cfg.default_gamemode;
+        const srv_spawn = cfg.world_spawn;
+        const srv_spawn_set = cfg.world_spawn_set;
+        conn.config.difficulty = srv_diff;
+        if (fresh) {
+            const was_forced = conn.spawn_forced;
+            conn.config.gamemode = srv_gm;
+            if (srv_spawn_set and !was_forced) {
+                conn.config.spawn_x = srv_spawn[0];
+                conn.config.spawn_y = srv_spawn[1];
+                conn.config.spawn_z = srv_spawn[2];
+                conn.pos_x = @as(f64, @floatFromInt(srv_spawn[0])) + 0.5;
+                conn.pos_y = @as(f64, @floatFromInt(srv_spawn[1]));
+                conn.pos_z = @as(f64, @floatFromInt(srv_spawn[2])) + 0.5;
+            }
+        }
+        // Ban/whitelist gate (jar-hardcoded screens). Runs before any
+        // join packets: rejected logins get a play disconnect + close.
+        var login_rejected = false;
+        if (server.loginRejected(conn.username[0..conn.username_len], conn.ip[0..conn.ip_len])) |rej| {
+            server.rejectLogin(conn, rej);
+            login_rejected = true;
+        }
+        if (!login_rejected) {
+            // Own this player row from here on: bump the save epoch so
+            // any older session's delayed save (quit/rejoin race, ghost
+            // autosave) is dropped instead of overwriting us.
+            conn.save_epoch = server.bumpSaveEpoch(conn.username[0..conn.username_len]);
+            // Duplicate login (vanilla `initializeConnection`): kick any
+            // OTHER fully-joined same-name conn. Without this, ghost
+            // sessions linger in the registry and `findInSnap` (first
+            // match) routes /gamemode, /tp, /tell, ... at the ghost —
+            // the live session keeps its old gamemode and saves it back
+            // on quit ("gamemode not saved"). Only announced targets:
+            // a racing newcomer isn't announced yet, so two simultaneous
+            // logins can't kick each other.
+            {
+                var batch: [256]RegistryEntry = undefined;
+                const snap = server.snapshot(&batch);
+                defer Server.releaseSnap(snap);
+                const nm = conn.username[0..conn.username_len];
+                for (snap) |e| {
+                    if (e.conn == conn) continue;
+                    // Try-lock only: we already hold THIS conn's lock, and taking
+                    // another conn's lock here would nest conn locks (two
+                    // simultaneous logins would ABBA deadlock each other). A busy
+                    // conn is skipped: the save epoch still keeps the newer
+                    // session's row authoritative.
+                    if (!e.conn.lock.tryLock()) continue;
+                    const dup = e.conn.state == .play and e.conn.announced and std.ascii.eqlIgnoreCase(e.conn.username[0..e.conn.username_len], nm);
+                    e.conn.lock.unlock();
+                    if (dup) server.kickEntry(e, "You logged in from another location!");
+                }
+            }
+            const tod = server.time_of_day.load(.acquire);
+            // JoinGame went out at bootstrap with the default gamemode (the
+            // row loads after); when the final gamemode differs, correct the
+            // client controller/UI the vanilla way (S2B reason 3, same as
+            // /gamemode) before the abilities refresh below. Without this a
+            // returning survival player keeps the creative JoinGame value
+            // while the server deals survival damage.
+            if (conn.config.gamemode != 1) {
+                var gb: [16]u8 = undefined;
+                if (packets.frameGameState(3, @floatFromInt(conn.config.gamemode), &gb)) |f| {
+                    conn.queueFramed(f) catch {};
+                } else |_| {}
+            }
+            try conn.queueJoinPackets(age, tod);
+            // Current XP (vanilla re-sends S1F on login).
+            var eb: [16]u8 = undefined;
+            const xtotal: i16 = @truncate(conn.xp_total);
+            if (packets.frameSetExperience(conn.xp_bar, @truncate(conn.xp_level), xtotal, &eb)) |xf| {
+                try conn.queueFramed(xf);
+            } else |_| {}
+            // Current weather (flag + strengths) so a login during rain
+            // shows rain instead of clear skies until the next change.
+            server.syncWeatherTo(conn);
+        }
+        // Login completion: inventory sync, chunks, PosLook last.
+        // (announceJoin runs after unlock — it takes conn.lock itself).
+        if (!login_rejected) {
+            if (server.world) |pool| {
+                // Persisted inventory (or empty for fresh players): full
+                // Window Items + cursor so the client starts in sync.
+                const wf = try packets.frameWindowItemsAlloc(allocator, 0, &conn.inv);
+                defer allocator.free(wf);
+                try conn.queueFramed(wf);
+                const cf = try packets.frameSetSlotAlloc(allocator, -1, -1, conn.cursor);
+                defer allocator.free(cf);
+                try conn.queueFramed(cf);
+                const cc = conn.playerChunk();
+                try view.completeLogin(conn, conn_sink.bind(conn), server.chunkSource(pool), 0, cc.cx, cc.cz, server.view_distance, true);
+            } else {
+                try conn.queuePlayerPosLook();
+            }
+            state.need_announce = true;
+        }
+    }
+    if (conn.chunks_dirty) {
+        // Movement / respawn follow-up (no-op without a world).
+        if (server.world) |pool| {
+            const radius: u8 = @min(conn.client_view orelse server.view_distance, server.view_distance);
+            try view.syncPlayerChunks(conn, conn_sink.bind(conn), server.chunkSource(pool), 0, radius, true);
+        } else {
+            conn.chunks_dirty = false;
+            conn.force_resync = false;
+        }
+    }
+    // Async gen follow-up: holes requested earlier may have landed on
+    // worker threads since. Gated on the pool sequence (idle = one atomic
+    // load) and rate-limited to 1Hz: the rescan re-reads the view disk,
+    // and a gen storm would otherwise redo 1k+ store reads every frame.
+    // Capped at 16 pool reads per tick (spiral order => nearest holes
+    // heal first) plus outbox backpressure: without the cap a serve
+    // thread stalls in store reads while generation is active and
+    // stops noticing disconnects (quit->save lands minutes late).
+    if (server.world) |pool| {
+        if (server.gen_pool) |gp| {
+            if (conn.baseline_sent and conn.out.items.len < 262144) {
+                const s = gp.sequence();
+                if (s != conn.last_gen_seq) {
+                    const now_ms = std.Io.Timestamp.now(server.io, .awake).toMilliseconds();
+                    if (now_ms - conn.last_gen_retry_ms >= 1000) {
+                        conn.last_gen_seq = s;
+                        conn.last_gen_retry_ms = now_ms;
+                        const radius: u8 = @min(conn.client_view orelse server.view_distance, server.view_distance);
+                        const cc = conn.playerChunk();
+                        try view.resyncDisk(conn, conn_sink.bind(conn), server.chunkSource(pool), 0, cc.cx, cc.cz, radius, true, 16);
+                    }
+                }
+            }
+        }
+    }
+    const pc = conn.playerChunk();
+    cc_now.* = .{ .cx = pc.cx, .cz = pc.cz };
+}
+
+/// One protocol step: feed inbound bytes, parse frames, run the handlers,
+/// apply the queued world actions and leave the answer in the conn's
+/// outbox.
+///
+/// Both transports run this exact function, so the protocol behaviour is
+/// identical no matter how the bytes travel (Phase B). The caller drains
+/// `conn.out` afterwards (that is the single output path).
+pub fn sessionStep(
+    server: *Server,
+    conn: *Conn,
+    allocator: std.mem.Allocator,
+    state: *SessionState,
+    data: []const u8,
+) !StepResult {
+    const events = &state.events;
+    var entered = false;
+    var stop_requested = false;
+    var cc_now: ChunkPos = .{ .cx = 0, .cz = 0 };
+    conn.lock.lock();
+    // The locked region is a separate function so that every error path
+    // releases the lock (a leaked lock deadlocks the cleanup path).
+    sessionLocked(server, conn, allocator, state, data, &entered, &cc_now) catch |err| {
+        conn.lock.unlock();
+        return err;
+    };
+    conn.lock.unlock();
+    // World mutation (single world lock) then viewer broadcast
+    // (one conn lock at a time — never nested).
+    if (events.items.len > 0) {
+        // Per-event light-bleed footprint (applyBlock touched-neighbor
+        // mask, parallel to events.items): read at broadcast time to
+        // resend refreshed neighbor columns to their trackers.
+        const touched = try allocator.alloc(u8, events.items.len);
+        defer allocator.free(touched);
+        @memset(touched, 0);
+        if (server.world) |pool| {
+            // K1 accumulators: propagation/door halves/pops (broadcast +
+            // sounds + pop drops flush after unlock, furnace pattern).
+            var rs_changes: redstone_mod.ChangeList = .{};
+            var rs_sounds: redstone_mod.SoundList = .{};
+            server.world_lock.lock();
+            const now_ticks = server.rs_tick;
+            for (events.items, 0..) |*ev, i| {
+                switch (ev.*) {
+                    .block_set => |*b| {
+                        // Right-click routing (not sneaking with a held
+                        // item): crafting table / furnace UIs open, K1
+                        // lever-door-repeater-ore clicks toggle instead
+                        // of placing.
+                        conn.lock.lock();
+                        const sneak = conn.sneaking;
+                        conn.lock.unlock();
+                        if (b.id != game_ids.air) {
+                            if (server.tryOpenTable(conn, pool, allocator, b, sneak)) {
+                                events.items[i] = .none;
+                                continue;
+                            }
+                            // Right-click on a furnace (not sneaking)
+                            // opens window 2 instead of placing.
+                            if (server.tryOpenFurnace(conn, pool, allocator, b, sneak)) {
+                                events.items[i] = .none;
+                                continue;
+                            }
+                            // Right-click on an enchanting table (not
+                            // sneaking) opens window 4 instead of placing.
+                            if (server.tryOpenEnchant(conn, pool, allocator, b, sneak)) {
+                                events.items[i] = .none;
+                                continue;
+                            }
+                            if (!sneak and server.tryInteract(pool, allocator, b, now_ticks, &rs_changes, &rs_sounds)) {
+                                events.items[i] = .none;
+                                continue;
+                            }
+                        }
+                        const old = view.peekBlock(pool, allocator, b.x, b.y, b.z) catch null;
+                        touched[i] = view.applyBlock(pool, allocator, b.x, b.y, b.z, b.id, b.meta) catch 0;
+                        // K1: plate registry follows place/break.
+                        if (b.id != game_ids.air and redstone_mod.isPlate(&profile.game.blocks, .{ .id = b.id, .meta = b.meta })) {
+                            server.rs_plates.add(b.x, b.y, b.z);
+                        }
+                        if (old) |o| {
+                            if (redstone_mod.isPlate(&profile.game.blocks, .{ .id = o.id, .meta = o.meta }) and (b.id == game_ids.air or !redstone_mod.isPlate(&profile.game.blocks, .{ .id = b.id, .meta = b.meta }))) {
+                                server.rs_plates.remove(b.x, b.y, b.z);
+                            }
+                        }
+                        // Door halves: placing a door also sets the upper
+                        // half (air above only); breaking one half clears
+                        // the partner (no extra drop — the main half
+                        // already dropped via spawnBreakDrops below).
+                        if (b.id != game_ids.air) {
+                            Server.rsPlaceDoorUpper(pool, allocator, b.x, b.y, b.z, b.id, b.meta, &rs_changes);
+                        } else if (old) |o| {
+                            Server.rsBreakDoorPartner(pool, allocator, b.x, b.y, b.z, o.id, o.meta, &rs_changes);
+                        }
+                        // K1: recompute + neighbor fan-out for the edit.
+                        server.redstoneOnEdit(pool, allocator, b.x, b.y, b.z, now_ticks, &rs_changes, &rs_sounds);
+                        // Block sounds (S29 to nearby viewers; volume
+                        // 1.0, pitch 0.8 like vanilla break/place).
+                        const sx: f64 = @as(f64, @floatFromInt(b.x)) + 0.5;
+                        const sy: f64 = @as(f64, @floatFromInt(b.y)) + 0.5;
+                        const sz: f64 = @as(f64, @floatFromInt(b.z)) + 0.5;
+                        if (b.id != game_ids.air) {
+                            const v = Server.placeSound(b.id);
+                            // Liquids splash for everyone (no client prediction);
+                            // solid-block sounds skip the placer (they predicted it).
+                            const excl: ?*Conn = if (Server.isLiquid(b.id)) null else conn;
+                            server.broadcastSound(excl, v.name, sx, sy, sz, 1.0, v.pitch);
+                        }
+                        // Survival break of a real block: vanilla drops.
+                        // (Creative breaks drop nothing; missing chunks
+                        // peek null and stay dropless.)
+                        if (b.id == game_ids.air) {
+                            if (old) |o| {
+                                if (o.id != game_ids.air) {
+                                    const v = Server.placeSound(o.id);
+                                    const excl: ?*Conn = if (Server.isLiquid(o.id)) null else conn;
+                                    server.broadcastSound(excl, v.name, sx, sy, sz, 1.0, v.pitch);
+                                }
+                                if (Server.shouldDropBreak(conn.config.gamemode, o.id, server.tileDrops())) {
+                                    server.spawnBreakDrops(pool, allocator, b.x, b.y, b.z, o.id, o.meta);
+                                }
+                                // Table break with viewers: drop their
+                                // grids + close the windows.
+                                if (o.id == game_ids.crafting_table) server.closeWindowsAt(pool, allocator, b.x, b.y, b.z);
+                                // Enchanting-table break: close viewer windows
+                                // and drop their held item (like table grids).
+                                if (o.id == game_ids.enchanting_table) server.closeWindowsAt(pool, allocator, b.x, b.y, b.z);
+                                // Furnace break: close viewer windows and
+                                // drop input/fuel/output as entities
+                                // (both modes, like table grids; the
+                                // block itself drops only in survival
+                                // via spawnBreakDrops above).
+                                if (o.id == game_ids.furnace or o.id == game_ids.lit_furnace) {
+                                    server.closeWindowsAt(pool, allocator, b.x, b.y, b.z);
+                                    var removed = server.removeFurnace(b.x, b.y, b.z);
+                                    const fstacks = [_]*?item_mod.Stack{ &removed.input, &removed.fuel, &removed.output };
+                                    for (fstacks) |st| {
+                                        const s = st.* orelse continue;
+                                        st.* = null;
+                                        server.spawnItemLive(s, @as(f64, @floatFromInt(b.x)) + 0.5, @as(f64, @floatFromInt(b.y)) + 0.5, @as(f64, @floatFromInt(b.z)) + 0.5, 10);
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    .interact => |*b| {
+                        // Empty-hand right-click: UI opens + K1 toggles
+                        // only (sneak is irrelevant with nothing held).
+                        if (server.tryOpenTable(conn, pool, allocator, b, false)) {
+                            events.items[i] = .none;
+                            continue;
+                        }
+                        if (server.tryOpenFurnace(conn, pool, allocator, b, false)) {
+                            events.items[i] = .none;
+                            continue;
+                        }
+                        if (server.tryOpenEnchant(conn, pool, allocator, b, false)) {
+                            events.items[i] = .none;
+                            continue;
+                        }
+                        _ = server.tryInteract(pool, allocator, b, now_ticks, &rs_changes, &rs_sounds);
+                        events.items[i] = .none;
+                    },
+                    else => {},
+                }
+            }
+            server.world_lock.unlock();
+            // K1 flush: propagation edits + interaction sounds/pops.
+            // (Primary edits broadcast in the event loop below.)
+            if (rs_changes.n > 0 or rs_sounds.n > 0) {
+                conn.lock.lock();
+                const gm = conn.config.gamemode;
+                conn.lock.unlock();
+                for (rs_changes.items[0..rs_changes.n]) |c| {
+                    server.flushRsChange(pool, allocator, gm, c);
+                }
+                for (rs_sounds.evs[0..rs_sounds.n]) |s| server.flushRsSound(s);
+            }
+        }
+        for (events.items, 0..) |ev, i| {
+            switch (ev) {
+                .block_set => |b| {
+                    // Vanilla echoes placements/breaks to the actor too
+                    // (PlayerManager marks every tracker; client prediction
+                    // meets server truth immediately).
+                    server.broadcastBlockChange(null, b.x, b.y, b.z, b.id, b.meta) catch {};
+                    // Neighbor columns rewritten by the edit bleed get a
+                    // targeted resend to their trackers (the 0x35 alone
+                    // leaves remote viewers with stale light nibbles).
+                    if (server.world) |pool| {
+                        server.resendTouchedNeighbors(pool, b.x, b.z, touched[i]);
+                    }
+                    // Survival break: vanilla 0.025 exhaustion per block.
+                    if (b.id == game_ids.air) {
+                        conn.lock.lock();
+                        if (conn.config.gamemode == 0 and !conn.is_dead) conn.addExhaustion(0.025);
+                        conn.lock.unlock();
+                    }
+                },
+                .qdrop => |q| server.spawnQDrop(conn, q),
+                .table_close => |t| server.spawnTableClose(conn, t),
+                .furnace_click => |f| server.applyFurnaceClick(conn, f),
+                .enchant_click => |ec| {
+                    if (server.world) |pool| server.applyEnchantClick(conn, pool, allocator, ec);
+                },
+                .enchant => |ee| {
+                    if (server.world) |pool| server.applyEnchant(conn, pool, allocator, ee);
+                },
+                .arm_swing => |a| server.broadcastArmSwing(conn, cc_now.cx, cc_now.cz, conn.eid, a) catch {},
+                .chat => |m| server.broadcastChat(conn.chat_buf[0..m.json_len]),
+                .attack => |a| server.resolveAttack(conn, a),
+                .tab_complete => |m| server.handleTabComplete(conn, conn.tab_buf[0..m.json_len]),
+                .command => |m| {
+                    const text = conn.chat_buf[0..m.json_len];
+                    server.handleCommand(conn, text);
+                    if (Server.isStopCommand(text)) {
+                        // The stopping reply stays in the conn's
+                        // outbox: the caller flushes it and then
+                        // persists + exits (the ticker/serve loops die
+                        // with us; the WAL makes the flush a
+                        // performance plea, not a durability
+                        // requirement).
+                        stop_requested = true;
+                    }
+                },
+                else => {},
+            }
+        }
+        events.clearRetainingCapacity();
+    }
+    // Instant pressure-plate press on movement (vanilla senses plate
+    // collisions from entity movement; releases ride the 1Hz recheck, the
+    // same cadence as vanilla's scheduled 20-tick update while pressed).
+    // press_only never releases, so a mover can't drop a plate another
+    // entity is holding down.
+    if (server.world) |pool| {
+        if (server.rs_plates.n > 0) {
+            conn.lock.lock();
+            const mover = redstone_mod.Ent{ .x = conn.pos_x, .y = conn.pos_y, .z = conn.pos_z };
+            const in_play = conn.state == .play and !conn.dead;
+            conn.lock.unlock();
+            if (in_play) {
+                var rs_changes: redstone_mod.ChangeList = .{};
+                var rs_sounds: redstone_mod.SoundList = .{};
+                server.world_lock.lock();
+                var w = Server.RsWorld{ .pool = pool, .alloc = allocator, .changes = &rs_changes };
+                redstone_mod.pollPlates(w.rsView(), &server.rs_sched, &server.rs_burn, &server.rs_plates, &rs_changes, &rs_sounds, server.rs_tick, &[1]redstone_mod.Ent{mover}, &.{}, &.{}, true);
+                server.world_lock.unlock();
+                for (rs_changes.items[0..rs_changes.n]) |c| server.flushRsChange(pool, allocator, conn.config.gamemode, c);
+                for (rs_sounds.evs[0..rs_sounds.n]) |sv| server.flushRsSound(sv);
+            }
+        }
+    }
+    // Landing resolved once per serve pass (water check + fall damage).
+    server.resolvePendingFall(conn);
+    // Login grace: re-snap clients that fell through undelivered ground.
+    server.maybeLoginResync(conn);
+    conn.lock.lock();
+    const finished = conn.close_after_flush or conn.dead;
+    const announce = state.need_announce;
+    state.need_announce = false;
+    conn.lock.unlock();
+    return .{ .finished = finished, .announce = announce, .stop = stop_requested };
+}
 
 /// Handle one connection: handshake/status/login + play bootstrap, then
 /// stay open consuming play packets until close or tick-timeout.
 /// Login completion sends join packets, the initial chunk burst (when the
 /// server has a world), then PosLook, then registers for server ticks.
+///
+/// This is the blocking transport's driver. The io_uring transport drives
+/// the very same `sessionStep` from its worker threads.
 pub fn serveConn(
     stream: std.Io.net.Stream,
     io: std.Io,
@@ -5160,357 +7970,41 @@ pub fn serveConn(
     var writer = stream.writer(io, &wbuf);
     const rin = &reader.interface;
     const wout = &writer.interface;
-    var entered = false;
-    var events: std.ArrayList(Action) = .empty;
-    defer events.deinit(allocator);
-    var need_announce = false;
+    var state = SessionState{};
+    defer state.deinit(allocator);
     while (true) {
-        // read one Length-prefixed frame (byte-wise length, then body)
-        var len: i32 = 0;
-        var shift: u32 = 0;
-        var header: [5]u8 = undefined;
-        var hlen: usize = 0;
-        while (true) {
-            const b = rin.takeByte() catch |err| switch (err) {
-                error.EndOfStream => return, // client closed
-                else => return err,
-            };
-            header[hlen] = b;
-            hlen += 1;
-            if (hlen > 5) return error.VarIntTooLarge;
-            len |= @as(i32, b & 0x7F) << @as(u5, @intCast(shift));
-            shift += 7;
-            if ((b & 0x80) == 0) break;
-        }
-        if (len < 0 or len > @import("conn.zig").max_frame_len) return error.FrameTooLarge;
-        const ulen: usize = @intCast(len);
-        conn.lock.lock();
-        // feed header+body through Conn reassembly (also exercises it)
-        conn.feedData(header[0..hlen]) catch {
-            conn.lock.unlock();
-            return error.FrameTooLarge;
-        };
-        var remaining = ulen;
+        // Read whatever the client sent (the conn does its own frame
+        // reassembly, so a partial frame is fine). `readVec` returns after
+        // one socket read: it never waits for the buffer to fill.
         var chunk: [4096]u8 = undefined;
-        while (remaining > 0) {
-            const n = @min(remaining, chunk.len);
-            rin.readSliceAll(chunk[0..n]) catch {
-                conn.lock.unlock();
-                return error.ReadFailed;
-            };
-            conn.feedData(chunk[0..n]) catch {
-                conn.lock.unlock();
-                return error.FrameTooLarge;
-            };
-            remaining -= n;
-        }
-        while (try conn.poll()) |f| {
-            // Server list ping reads a live player count, not the copy taken
-            // at accept time. Refresh under conn.lock (held here); status
-            // pings are rare so the atomic load is free.
-            if (conn.state == .status and f.id == @as(i32, @intFromEnum(ids.StatusServer.request))) {
-                conn.config.online_count = @intCast(@min(server.play_count.load(.acquire), 255));
-            }
-            const action = try conn.handleFrame(f);
-            if (action == .entered_play) entered = true;
-            switch (action) {
-                .block_set, .arm_swing, .chat, .attack, .command, .tab_complete, .qdrop, .table_close, .furnace_click => try events.append(allocator, action),
-                else => {},
-            }
-        }
-        if (entered) {
-            entered = false;
-            const age = server.world_age.load(.acquire);
-            // Worldgen spawn: ensure land spawn before Join/SpawnPosition go out.
-            // Returning players skip the search: loadPlayer restores pos.
-            var fresh = true;
-            if (server.world) |pool| {
-                const loaded = server.loadPlayer(conn);
-                fresh = !loaded;
-                if (!loaded) {
-                    if (server.gen) |gen| {
-                        const sp = v5serve.findSpawn(pool, gen, &server.world_lock, allocator, 24) catch null;
-                        if (sp) |p| {
-                            conn.config.spawn_x = @intFromFloat(@floor(p.x));
-                            conn.config.spawn_y = @intFromFloat(@floor(p.y));
-                            conn.config.spawn_z = @intFromFloat(@floor(p.z));
-                        }
-                    }
-                    // First login (or no save): land at spawn. (Returning
-                    // players keep their saved pos from loadPlayer.)
-                    conn.pos_x = @as(f64, @floatFromInt(conn.config.spawn_x)) + 0.5;
-                    conn.pos_y = @as(f64, @floatFromInt(conn.config.spawn_y));
-                    conn.pos_z = @as(f64, @floatFromInt(conn.config.spawn_z)) + 0.5;
-                    conn.yaw = 0;
-                    conn.pitch = 0;
-                }
-            }
-            // Server defaults: difficulty is world-level (always applied);
-            // fresh logins also inherit the default gamemode + world spawn
-            // (an explicit /setworldspawn wins over the gen search above).
-            server.state_lock.lock();
-            const srv_diff = server.difficulty;
-            const srv_gm = server.default_gamemode;
-            const srv_spawn = server.world_spawn;
-            const srv_spawn_set = server.world_spawn_set;
-            server.state_lock.unlock();
-            conn.config.difficulty = srv_diff;
-            if (fresh) {
-                const was_forced = conn.spawn_forced;
-                conn.config.gamemode = srv_gm;
-                if (srv_spawn_set and !was_forced) {
-                    conn.config.spawn_x = srv_spawn[0];
-                    conn.config.spawn_y = srv_spawn[1];
-                    conn.config.spawn_z = srv_spawn[2];
-                    conn.pos_x = @as(f64, @floatFromInt(srv_spawn[0])) + 0.5;
-                    conn.pos_y = @as(f64, @floatFromInt(srv_spawn[1]));
-                    conn.pos_z = @as(f64, @floatFromInt(srv_spawn[2])) + 0.5;
-                }
-            }
-            // Ban/whitelist gate (jar-hardcoded screens). Runs before any
-            // join packets: rejected logins get a play disconnect + close.
-            var login_rejected = false;
-            if (server.loginRejected(conn.username[0..conn.username_len], conn.ip[0..conn.ip_len])) |rej| {
-                server.rejectLogin(conn, rej);
-                login_rejected = true;
-            }
-            if (!login_rejected) {
-                // Own this player row from here on: bump the save epoch so
-                // any older session's delayed save (quit/rejoin race, ghost
-                // autosave) is dropped instead of overwriting us.
-                conn.save_epoch = server.bumpSaveEpoch(conn.username[0..conn.username_len]);
-                // Duplicate login (vanilla `initializeConnection`): kick any
-                // OTHER fully-joined same-name conn. Without this, ghost
-                // sessions linger in the registry and `findInSnap` (first
-                // match) routes /gamemode, /tp, /tell, ... at the ghost —
-                // the live session keeps its old gamemode and saves it back
-                // on quit ("gamemode not saved"). Only announced targets:
-                // a racing newcomer isn't announced yet, so two simultaneous
-                // logins can't kick each other.
-                {
-                    var batch: [256]RegistryEntry = undefined;
-                    const snap = server.snapshot(&batch);
-                    defer Server.releaseSnap(snap);
-                    const nm = conn.username[0..conn.username_len];
-                    for (snap) |e| {
-                        if (e.conn == conn) continue;
-                        e.conn.lock.lock();
-                        const dup = e.conn.state == .play and e.conn.announced and std.ascii.eqlIgnoreCase(e.conn.username[0..e.conn.username_len], nm);
-                        e.conn.lock.unlock();
-                        if (dup) server.kickEntry(e, "You logged in from another location!");
-                    }
-                }
-                const tod = server.time_of_day.load(.acquire);
-                try conn.queueJoinPackets(age, tod);
-                // Current XP (vanilla re-sends S1F on login).
-                var eb: [16]u8 = undefined;
-                const xtotal: i16 = @truncate(conn.xp_total);
-                if (packets.frameSetExperience(conn.xp_bar, @truncate(conn.xp_level), xtotal, &eb)) |xf| {
-                    try conn.queueFramed(xf);
-                } else |_| {}
-            }
-            // Login completion: inventory sync, chunks, PosLook last.
-            // (announceJoin runs after unlock — it takes conn.lock itself).
-            if (!login_rejected) {
-                if (server.world) |pool| {
-                    // Persisted inventory (or empty for fresh players): full
-                    // Window Items + cursor so the client starts in sync.
-                    const wf = try packets.frameWindowItemsAlloc(allocator, 0, &conn.inv);
-                    defer allocator.free(wf);
-                    try conn.queueFramed(wf);
-                    const cf = try packets.frameSetSlotAlloc(allocator, -1, -1, conn.cursor);
-                    defer allocator.free(cf);
-                    try conn.queueFramed(cf);
-                    const cc = conn.playerChunk();
-                    try view.completeLogin(conn, server.chunkSource(pool), 0, cc.cx, cc.cz, server.view_distance, true);
-                } else {
-                    try conn.queuePlayerPosLook();
-                }
-                need_announce = true;
-            }
-        }
-        if (conn.chunks_dirty) {
-            // Movement / respawn follow-up (no-op without a world).
-            if (server.world) |pool| {
-                const radius: u8 = @min(conn.client_view orelse server.view_distance, server.view_distance);
-                try view.syncPlayerChunks(conn, server.chunkSource(pool), 0, radius, true);
-            } else {
-                conn.chunks_dirty = false;
-                conn.force_resync = false;
-            }
-        }
-        // Async gen follow-up: holes requested earlier may have landed on
-        // worker threads since. Gated on the pool sequence (idle = one atomic
-        // load) and rate-limited to 1Hz: the rescan re-reads the view disk,
-        // and a gen storm would otherwise redo 1k+ store reads every frame.
-        // Capped at 16 pool reads per tick (spiral order => nearest holes
-        // heal first) plus outbox backpressure: without the cap a serve
-        // thread stalls in store reads while generation is active and
-        // stops noticing disconnects (quit->save lands minutes late).
-        if (server.world) |pool| {
-            if (server.gen_pool) |gp| {
-                if (conn.baseline_sent and conn.out.items.len < 262144) {
-                    const s = gp.sequence();
-                    if (s != conn.last_gen_seq) {
-                        const now_ms = std.Io.Timestamp.now(server.io, .awake).toMilliseconds();
-                        if (now_ms - conn.last_gen_retry_ms >= 1000) {
-                            conn.last_gen_seq = s;
-                            conn.last_gen_retry_ms = now_ms;
-                            const radius: u8 = @min(conn.client_view orelse server.view_distance, server.view_distance);
-                            const cc = conn.playerChunk();
-                            try view.resyncDisk(conn, server.chunkSource(pool), 0, cc.cx, cc.cz, radius, true, 16);
-                        }
-                    }
-                }
-            }
-        }
+        var bufs: [1][]u8 = .{&chunk};
+        const n = rin.readVec(&bufs) catch |err| switch (err) {
+            error.EndOfStream => return, // client closed
+            else => return err,
+        };
+        if (n == 0) return;
+        const res = try sessionStep(server, conn, allocator, &state, chunk[0..n]);
+        // Single output path: drain the outbox and write it.
+        conn.lock.lock();
         const pending = try conn.takeOutput();
-        const done = conn.close_after_flush or conn.dead;
-        const cc_now = conn.playerChunk();
         conn.lock.unlock();
-        // World mutation (single world lock) then viewer broadcast
-        // (one conn lock at a time — never nested).
-        if (events.items.len > 0) {
-            if (server.world) |pool| {
-                server.world_lock.lock();
-                for (events.items, 0..) |*ev, i| {
-                    switch (ev.*) {
-                        .block_set => |*b| {
-                            // Right-click on a crafting table (not sneaking)
-                            // opens the 3x3 UI instead of placing.
-                            if (b.id != game_ids.air) {
-                                if (server.tryOpenTable(conn, pool, allocator, b)) {
-                                    events.items[i] = .none;
-                                    continue;
-                                }
-                                // Right-click on a furnace (not sneaking)
-                                // opens window 2 instead of placing.
-                                if (server.tryOpenFurnace(conn, pool, allocator, b)) {
-                                    events.items[i] = .none;
-                                    continue;
-                                }
-                            }
-                            const old = view.peekBlock(pool, allocator, b.x, b.y, b.z) catch null;
-                            view.applyBlock(pool, allocator, b.x, b.y, b.z, b.id, b.meta) catch {};
-                            // Block sounds (S29 to nearby viewers; volume
-                            // 1.0, pitch 0.8 like vanilla break/place).
-                            const sx: f64 = @as(f64, @floatFromInt(b.x)) + 0.5;
-                            const sy: f64 = @as(f64, @floatFromInt(b.y)) + 0.5;
-                            const sz: f64 = @as(f64, @floatFromInt(b.z)) + 0.5;
-                            if (b.id != game_ids.air) {
-                                server.broadcastSound(Server.stepSound(b.id), sx, sy, sz, 1.0, 0.8);
-                            }
-                            // Survival break of a real block: vanilla drops.
-                            // (Creative breaks drop nothing; missing chunks
-                            // peek null and stay dropless.)
-                            if (b.id == game_ids.air) {
-                                if (old) |o| {
-                                    if (o.id != game_ids.air) {
-                                        server.broadcastSound(Server.stepSound(o.id), sx, sy, sz, 1.0, 0.8);
-                                    }
-                                    if (Server.shouldDropBreak(conn.config.gamemode, o.id, server.tileDrops())) {
-                                        server.spawnBreakDrops(pool, allocator, b.x, b.y, b.z, o.id, o.meta);
-                                    }
-                                    // Table break with viewers: drop their
-                                    // grids + close the windows.
-                                    if (o.id == game_ids.crafting_table) server.closeWindowsAt(pool, allocator, b.x, b.y, b.z);
-                                    // Furnace break: close viewer windows and
-                                    // drop input/fuel/output as entities
-                                    // (both modes, like table grids; the
-                                    // block itself drops only in survival
-                                    // via spawnBreakDrops above).
-                                    if (o.id == game_ids.furnace or o.id == game_ids.lit_furnace) {
-                                        server.closeWindowsAt(pool, allocator, b.x, b.y, b.z);
-                                        var removed = server.removeFurnace(b.x, b.y, b.z);
-                                        const fstacks = [_]*?item_mod.Stack{ &removed.input, &removed.fuel, &removed.output };
-                                        for (fstacks) |st| {
-                                            const s = st.* orelse continue;
-                                            st.* = null;
-                                            server.ent_lock.lock();
-                                            _ = server.spawnItem(s, @as(f64, @floatFromInt(b.x)) + 0.5, @as(f64, @floatFromInt(b.y)) + 0.5, @as(f64, @floatFromInt(b.z)) + 0.5, 10);
-                                            server.ent_lock.unlock();
-                                        }
-                                    }
-                                }
-                            }
-                        },
-                        else => {},
-                    }
-                }
-                server.world_lock.unlock();
-            }
-            for (events.items) |ev| {
-                switch (ev) {
-                    .block_set => |b| {
-                        server.broadcastBlockChange(conn, b.x, b.y, b.z, b.id, b.meta) catch {};
-                        // Survival break: vanilla 0.025 exhaustion per block.
-                        if (b.id == game_ids.air) {
-                            conn.lock.lock();
-                            if (conn.config.gamemode == 0 and !conn.is_dead) conn.addExhaustion(0.025);
-                            conn.lock.unlock();
-                        }
-                    },
-                    .qdrop => |q| server.spawnQDrop(conn, q),
-                    .table_close => |t| server.spawnTableClose(conn, t),
-                    .furnace_click => |f| server.applyFurnaceClick(conn, f),
-                    .arm_swing => |a| server.broadcastArmSwing(conn, cc_now.cx, cc_now.cz, conn.eid, a) catch {},
-                    .chat => |m| server.broadcastChat(conn.chat_buf[0..m.json_len]),
-                    .attack => |a| server.resolveAttack(conn, a),
-                    .tab_complete => |m| server.handleTabComplete(conn, conn.tab_buf[0..m.json_len]),
-                    .command => |m| {
-                        const text = conn.chat_buf[0..m.json_len];
-                        server.handleCommand(conn, text);
-                        if (Server.isStopCommand(text)) {
-                            // Flush the stopping reply first, then
-                            // persist + exit. (Ticker/serve loops die with us;
-                            // the WAL makes the flush a performance plea, not
-                            // a durability requirement.)
-                            conn.lock.lock();
-                            const tail = conn.takeOutput() catch &[_]u8{};
-                            const nm = conn.username[0..conn.username_len];
-                            var nm_copy: [16]u8 = undefined;
-                            @memcpy(nm_copy[0..nm.len], nm);
-                            const nm_len = nm.len;
-                            conn.lock.unlock();
-                            defer conn.allocator.free(tail);
-                            if (tail.len > 0) {
-                                conn.wlock.lock();
-                                defer conn.wlock.unlock();
-                                wout.writeAll(tail) catch {};
-                                wout.flush() catch {};
-                            }
-                            _ = server.saveAllPlayers();
-                            if (server.world) |pool| pool.flushAll() catch {};
-                            std.log.info("in-game stop by {s}: saved players, flushed. bye.", .{nm_copy[0..nm_len]});
-                            std.process.exit(0);
-                        }
-                    },
-                    else => {},
-                }
-            }
-            events.clearRetainingCapacity();
-        }
-        // Landing resolved once per serve pass (water check + fall damage).
-        server.resolvePendingFall(conn);
         if (pending.len > 0) {
             conn.wlock.lock();
+            defer conn.wlock.unlock();
             wout.writeAll(pending) catch {
-                conn.wlock.unlock();
                 conn.allocator.free(pending);
                 return;
             };
             wout.flush() catch {
-                conn.wlock.unlock();
                 conn.allocator.free(pending);
                 return;
             };
-            conn.wlock.unlock();
         }
         conn.allocator.free(pending);
-        if (done) return;
-        if (need_announce) {
-            need_announce = false;
-            server.announceJoin(conn, stream) catch {};
+        if (res.stop) server.finishStop();
+        if (res.finished) return;
+        if (res.announce) {
+            server.announceJoin(conn) catch {};
         }
     }
 }
@@ -5592,6 +8086,7 @@ test "play_count tracks announces and unregisters for the list ping" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
     defer srv.registry.deinit(a);
     try std.testing.expectEqual(@as(u32, 0), srv.play_count.load(.acquire));
 
@@ -5637,12 +8132,12 @@ test "play_count tracks announces and unregisters for the list ping" {
     try srv.register(bob.conn, bob.srv_stream);
     // Registered but not announced: not counted yet.
     try std.testing.expectEqual(@as(u32, 0), srv.play_count.load(.acquire));
-    try srv.announceJoin(alice.conn, alice.srv_stream);
+    try srv.announceJoin(alice.conn);
     try std.testing.expectEqual(@as(u32, 1), srv.play_count.load(.acquire));
-    try srv.announceJoin(bob.conn, bob.srv_stream);
+    try srv.announceJoin(bob.conn);
     try std.testing.expectEqual(@as(u32, 2), srv.play_count.load(.acquire));
     // Re-announce is idempotent for the count.
-    try srv.announceJoin(bob.conn, bob.srv_stream);
+    try srv.announceJoin(bob.conn);
     try std.testing.expectEqual(@as(u32, 2), srv.play_count.load(.acquire));
     srv.unregister(bob.conn);
     try std.testing.expectEqual(@as(u32, 1), srv.play_count.load(.acquire));
@@ -5654,6 +8149,7 @@ test "registry join/leave broadcast + tickOnce keepalive over loopback" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
     defer srv.registry.deinit(a);
 
     // loopback pair without threads: connects complete via kernel backlog
@@ -5700,8 +8196,8 @@ test "registry join/leave broadcast + tickOnce keepalive over loopback" {
     try srv.register(bob.conn, bob.srv_stream);
     // announce both (each conn announces itself on login, like serveConn does).
     // Duplicates are harmless (idempotent player list); drain both copies.
-    try srv.announceJoin(alice.conn, alice.srv_stream);
-    try srv.announceJoin(bob.conn, bob.srv_stream);
+    try srv.announceJoin(alice.conn);
+    try srv.announceJoin(bob.conn);
     // Alice learns Bob; Bob learns Alice (persistent readers: fresh ones
     // would drop coalesced bytes buffered by a previous reader)
     var arb: [128]u8 = undefined;
@@ -5709,8 +8205,9 @@ test "registry join/leave broadcast + tickOnce keepalive over loopback" {
     var arr = alice.cli_stream.reader(io, &arb);
     var brb: [128]u8 = undefined;
     var brr = bob.cli_stream.reader(io, &brb);
-    // two join frames per side (one per announceJoin call)
-    for ([2]struct { r : *std.Io.net.Stream.Reader, want : []const u8 }{ .{ .r = &arr, .want = "Bob" }, .{ .r = &brr, .want = "Alice" } }) |side| {
+    // two join frames per side (one per announceJoin call), each followed
+    // by that player's yellow join chat
+    for ([2]struct { r: *std.Io.net.Stream.Reader, want: []const u8 }{ .{ .r = &arr, .want = "Bob" }, .{ .r = &brr, .want = "Alice" } }) |side| {
         var n: usize = 0;
         while (n < 2) : (n += 1) {
             const f = try readFrame(&side.r.interface, &afb);
@@ -5718,6 +8215,8 @@ test "registry join/leave broadcast + tickOnce keepalive over loopback" {
             var pr = codec.PacketReader.init(f.body);
             try std.testing.expectEqualStrings(side.want, try pr.readString());
             try std.testing.expect(try pr.readBool());
+            const c = try readFrame(&side.r.interface, &afb);
+            try std.testing.expectEqual(@as(i32, 0x02), c.id);
         }
     }
     // one server tick: both get TimeUpdate + KeepAlive on the wire
@@ -5728,7 +8227,7 @@ test "registry join/leave broadcast + tickOnce keepalive over loopback" {
         const k = try readFrame(&rr.interface, &afb);
         try std.testing.expectEqual(@as(i32, 0x00), k.id);
     }
-    // Bob leaves: Alice sees remove
+    // Bob leaves: Alice sees remove + yellow leave chat
     srv.unregister(bob.conn);
     {
         const f = try readFrame(&arr.interface, &afb);
@@ -5736,15 +8235,541 @@ test "registry join/leave broadcast + tickOnce keepalive over loopback" {
         var pr = codec.PacketReader.init(f.body);
         try std.testing.expectEqualStrings("Bob", try pr.readString());
         try std.testing.expect(!(try pr.readBool())); // online=false
+        const c = try readFrame(&arr.interface, &afb);
+        try std.testing.expectEqual(@as(i32, 0x02), c.id);
     }
     srv.unregister(alice.conn);
     try std.testing.expectEqual(@as(usize, 0), srv.registry.items.len);
+}
+
+test "K1 glue: piston extend/retract through the LSM pool + S24 action" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+        try pool.flushAll();
+    }
+    // Floor y=63; piston (facing east) at (8,64,8); stone at (9,64,8);
+    // lever on the block below the piston's WEST neighbor cell.
+    for ([_]i32{ 7, 8, 9, 10, 11 }) |x| _ = try view.applyBlock(pool, a, x, 63, 8, game_ids.stone, 0);
+    _ = try view.applyBlock(pool, a, 8, 64, 8, game_ids.piston, 5);
+    _ = try view.applyBlock(pool, a, 9, 64, 8, game_ids.stone, 0);
+    _ = try view.applyBlock(pool, a, 7, 64, 8, game_ids.lever, 5);
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    srv.world = pool;
+    var changes: redstone_mod.ChangeList = .{};
+    var sounds: redstone_mod.SoundList = .{};
+    var actions: redstone_mod.ActionList = .{};
+    // Toggle the lever ON -> the piston's west neighbor sees weak power ->
+    // updatePistonState schedules a piston_extend block event.
+    var evt = BlockEvent{ .x = 7, .y = 65, .z = 8, .id = game_ids.air, .meta = 0, .face = 1 };
+    srv.world_lock.lock();
+    const consumed = srv.tryInteract(pool, a, &evt, 0, &changes, &sounds);
+    srv.world_lock.unlock();
+    try std.testing.expect(consumed);
+    try std.testing.expectEqual(@as(u4, 13), (try view.peekBlock(pool, a, 7, 64, 8)).?.meta); // lever ON
+    // Drain the scheduled event (due at now+2).
+    srv.world_lock.lock();
+    var w = Server.RsWorld{ .pool = pool, .alloc = a, .changes = &changes };
+    redstone_mod.drainScheduled(w.rsView(), &srv.rs_sched, &srv.rs_burn, &changes, &sounds, 2, &actions);
+    srv.world_lock.unlock();
+    try std.testing.expectEqual(game_ids.piston_head, (try view.peekBlock(pool, a, 9, 64, 8)).?.id);
+    try std.testing.expectEqual(@as(u4, 5), (try view.peekBlock(pool, a, 9, 64, 8)).?.meta); // non-sticky head
+    try std.testing.expectEqual(game_ids.stone, (try view.peekBlock(pool, a, 10, 64, 8)).?.id); // pushed
+    try std.testing.expectEqual(@as(u4, 5 | 8), (try view.peekBlock(pool, a, 8, 64, 8)).?.meta); // extended
+    try std.testing.expectEqual(@as(usize, 1), actions.n); // exactly one S24
+    try std.testing.expectEqual(@as(u8, 0), actions.items[0].event_id);
+    try std.testing.expectEqual(@as(u8, 5), actions.items[0].facing);
+    try std.testing.expectEqual(game_ids.piston, actions.items[0].id);
+
+    // Lever OFF -> retract event; non-sticky leaves the pushed stone put.
+    var evt2 = BlockEvent{ .x = 7, .y = 65, .z = 8, .id = game_ids.air, .meta = 0, .face = 1 };
+    srv.world_lock.lock();
+    _ = srv.tryInteract(pool, a, &evt2, 4, &changes, &sounds);
+    var w2 = Server.RsWorld{ .pool = pool, .alloc = a, .changes = &changes };
+    var actions2: redstone_mod.ActionList = .{};
+    redstone_mod.drainScheduled(w2.rsView(), &srv.rs_sched, &srv.rs_burn, &changes, &sounds, 6, &actions2);
+    srv.world_lock.unlock();
+    try std.testing.expectEqual(game_ids.air, (try view.peekBlock(pool, a, 9, 64, 8)).?.id); // head gone
+    try std.testing.expectEqual(game_ids.stone, (try view.peekBlock(pool, a, 10, 64, 8)).?.id); // stone stays
+    try std.testing.expectEqual(@as(u4, 5), (try view.peekBlock(pool, a, 8, 64, 8)).?.meta); // retracted
+    try std.testing.expectEqual(@as(u8, 1), actions2.items[0].event_id);
+}
+
+test "K1 glue: sticky piston pulls its adjacent block on retract" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+        try pool.flushAll();
+    }
+    for ([_]i32{ 7, 8, 9, 10 }) |x| _ = try view.applyBlock(pool, a, x, 63, 8, game_ids.stone, 0);
+    _ = try view.applyBlock(pool, a, 8, 64, 8, game_ids.sticky_piston, 5);
+    _ = try view.applyBlock(pool, a, 9, 64, 8, game_ids.dirt, 0);
+    _ = try view.applyBlock(pool, a, 7, 64, 8, game_ids.lever, 5);
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    srv.world = pool;
+    var changes: redstone_mod.ChangeList = .{};
+    var sounds: redstone_mod.SoundList = .{};
+    var evt = BlockEvent{ .x = 7, .y = 65, .z = 8, .id = game_ids.air, .meta = 0, .face = 1 };
+    srv.world_lock.lock();
+    _ = srv.tryInteract(pool, a, &evt, 0, &changes, &sounds);
+    var w = Server.RsWorld{ .pool = pool, .alloc = a, .changes = &changes };
+    var actions: redstone_mod.ActionList = .{};
+    redstone_mod.drainScheduled(w.rsView(), &srv.rs_sched, &srv.rs_burn, &changes, &sounds, 2, &actions);
+    srv.world_lock.unlock();
+    // Extended: head at 9, dirt pushed to 10.
+    try std.testing.expectEqual(game_ids.piston_head, (try view.peekBlock(pool, a, 9, 64, 8)).?.id);
+    try std.testing.expectEqual(@as(u4, 5 | 8), (try view.peekBlock(pool, a, 9, 64, 8)).?.meta); // sticky head carries bit 3
+    try std.testing.expectEqual(game_ids.dirt, (try view.peekBlock(pool, a, 10, 64, 8)).?.id);
+    // Retract: the dirt comes back into the head cell.
+    var evt2 = BlockEvent{ .x = 7, .y = 65, .z = 8, .id = game_ids.air, .meta = 0, .face = 1 };
+    srv.world_lock.lock();
+    _ = srv.tryInteract(pool, a, &evt2, 4, &changes, &sounds);
+    var w2 = Server.RsWorld{ .pool = pool, .alloc = a, .changes = &changes };
+    var actions2: redstone_mod.ActionList = .{};
+    redstone_mod.drainScheduled(w2.rsView(), &srv.rs_sched, &srv.rs_burn, &changes, &sounds, 6, &actions2);
+    srv.world_lock.unlock();
+    try std.testing.expectEqual(game_ids.dirt, (try view.peekBlock(pool, a, 9, 64, 8)).?.id);
+    try std.testing.expectEqual(game_ids.air, (try view.peekBlock(pool, a, 10, 64, 8)).?.id);
+    try std.testing.expectEqual(@as(u4, 5), (try view.peekBlock(pool, a, 8, 64, 8)).?.meta);
+}
+
+test "K1 glue: breaking an extended piston pops its head" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+        try pool.flushAll();
+    }
+    for ([_]i32{ 8, 9 }) |x| _ = try view.applyBlock(pool, a, x, 63, 8, game_ids.stone, 0);
+    _ = try view.applyBlock(pool, a, 8, 64, 8, game_ids.piston, 5 | 8); // extended east
+    _ = try view.applyBlock(pool, a, 9, 64, 8, game_ids.piston_head, 5);
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    srv.world = pool;
+    var changes: redstone_mod.ChangeList = .{};
+    var sounds: redstone_mod.SoundList = .{};
+    // Breaking the base: the block_set air path applies the air first, then
+    // calls redstoneOnEdit (sessionStep order).
+    _ = try view.applyBlock(pool, a, 8, 64, 8, game_ids.air, 0);
+    srv.world_lock.lock();
+    srv.redstoneOnEdit(pool, a, 8, 64, 8, 0, &changes, &sounds);
+    srv.world_lock.unlock();
+    try std.testing.expectEqual(game_ids.air, (try view.peekBlock(pool, a, 9, 64, 8)).?.id);
+    var popped_head = false;
+    for (changes.items[0..changes.n]) |c| {
+        if (c.popped and c.old_id == game_ids.piston_head) popped_head = true;
+    }
+    try std.testing.expect(popped_head);
+}
+
+test "K1 glue: lever interact powers wire + lamp through the LSM pool" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+        try pool.flushAll();
+    }
+    // stone floor y=63, lever/wire/wire/lamp at y=64 (chunk 0,0).
+    for ([_]i32{ 8, 9, 10, 11 }) |x| _ = try view.applyBlock(pool, a, x, 63, 8, game_ids.stone, 0);
+    _ = try view.applyBlock(pool, a, 8, 64, 8, game_ids.lever, 5);
+    _ = try view.applyBlock(pool, a, 9, 64, 8, game_ids.redstone_wire, 0);
+    _ = try view.applyBlock(pool, a, 10, 64, 8, game_ids.redstone_wire, 0);
+    _ = try view.applyBlock(pool, a, 11, 64, 8, game_ids.redstone_lamp, 0);
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    srv.world = pool;
+    var changes: redstone_mod.ChangeList = .{};
+    var sounds: redstone_mod.SoundList = .{};
+    // Right-click the lever top (target = clicked + face).
+    var evt = BlockEvent{ .x = 8, .y = 65, .z = 8, .id = game_ids.air, .meta = 0, .face = 1 };
+    srv.world_lock.lock();
+    const consumed = srv.tryInteract(pool, a, &evt, 0, &changes, &sounds);
+    srv.world_lock.unlock();
+    try std.testing.expect(consumed);
+    try std.testing.expectEqual(@as(u4, 13), (try view.peekBlock(pool, a, 8, 64, 8)).?.meta);
+    try std.testing.expectEqual(@as(u4, 15), (try view.peekBlock(pool, a, 9, 64, 8)).?.meta);
+    try std.testing.expectEqual(@as(u4, 14), (try view.peekBlock(pool, a, 10, 64, 8)).?.meta);
+    try std.testing.expectEqual(game_ids.lit_redstone_lamp, (try view.peekBlock(pool, a, 11, 64, 8)).?.id);
+    try std.testing.expectEqual(@as(usize, 1), sounds.n);
+    // Toggle off: wire dies, lamp unlights.
+    var evt2 = BlockEvent{ .x = 8, .y = 65, .z = 8, .id = game_ids.air, .meta = 0, .face = 1 };
+    srv.world_lock.lock();
+    defer srv.world_lock.unlock();
+    try std.testing.expect(srv.tryInteract(pool, a, &evt2, 20, &changes, &sounds));
+    try std.testing.expectEqual(@as(u4, 5), (try view.peekBlock(pool, a, 8, 64, 8)).?.meta);
+    try std.testing.expectEqual(@as(u4, 0), (try view.peekBlock(pool, a, 9, 64, 8)).?.meta);
+    try std.testing.expectEqual(game_ids.redstone_lamp, (try view.peekBlock(pool, a, 11, 64, 8)).?.id);
+}
+
+test "K1 glue: door halves place/break together" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+        try pool.flushAll();
+    }
+    _ = try view.applyBlock(pool, a, 8, 63, 8, game_ids.stone, 0);
+    _ = try view.applyBlock(pool, a, 8, 64, 8, game_ids.wooden_door_block, 2);
+    var changes: redstone_mod.ChangeList = .{};
+    Server.rsPlaceDoorUpper(pool, a, 8, 64, 8, game_ids.wooden_door_block, 2, &changes);
+    try std.testing.expectEqual(@as(u4, 8), (try view.peekBlock(pool, a, 8, 65, 8)).?.meta);
+    // Breaking the lower half clears the upper (partner recorded, no drop).
+    _ = try view.applyBlock(pool, a, 8, 64, 8, game_ids.air, 0);
+    Server.rsBreakDoorPartner(pool, a, 8, 64, 8, game_ids.wooden_door_block, 2, &changes);
+    try std.testing.expectEqual(game_ids.air, (try view.peekBlock(pool, a, 8, 65, 8)).?.id);
+    try std.testing.expect(changes.n >= 2);
+    // Non-door blocks are ignored.
+    const n_before = changes.n;
+    Server.rsBreakDoorPartner(pool, a, 8, 64, 8, game_ids.stone, 0, &changes);
+    Server.rsPlaceDoorUpper(pool, a, 8, 64, 8, game_ids.stone, 0, &changes);
+    try std.testing.expectEqual(n_before, changes.n);
+}
+
+test "Phase C: grouping covers each viewer exactly once (interleaved regions)" {
+    // Regression test for the in-place range-extension bug (interleaved
+    // regions overlapped ranges and ticked viewers twice): pass 2 must
+    // compact into contiguous, disjoint ranges covering every viewer.
+    const a = std.heap.page_allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    // Interleaved: A(0,0) B(3,0) A(0,0) B(3,0) + one non-play conn.
+    var conns: [5]*Conn = undefined;
+    const xs = [_]f64{ 8.5, 2000.5, 24.5, 2016.5, 8.5 };
+    for (&conns, 0..) |*slot, i| {
+        const c = try a.create(Conn);
+        c.* = Conn.init(a, io, .{}, 1);
+        if (i < 4) c.state = .play;
+        c.pos_x = xs[i];
+        c.pos_z = 8.5;
+        slot.* = c;
+    }
+    defer for (conns) |c| {
+        c.deinit();
+        a.destroy(c);
+    };
+    var snap: [5]RegistryEntry = undefined;
+    for (&snap, conns) |*e, c| e.* = .{ .conn = c, .stream = undefined };
+    var deaths = std.ArrayList(Server.DeathInfo).empty;
+    defer deaths.deinit(a);
+    var claims = entity.ClaimSet{};
+    var rns: u64 = 0;
+    var sns: u64 = 0;
+    var players: [0]entity.PlayerSnap = .{};
+    var mobs: [0]entity.MobSnap = .{};
+    var items: [0]entity.ItemSnap = .{};
+    var envs: [0]Server.EnvFlag = .{};
+    var furn: [0]Server.FurnSnap = .{};
+    var vc = Server.ViewerCtx{
+        .now_ms = 1000,
+        .age = 20,
+        .players = &players,
+        .mobs = &mobs,
+        .items = &items,
+        .envs = &envs,
+        .furn_snaps = &furn,
+        .deaths = &deaths,
+        .claims = &claims,
+        .reconcile_ns = &rns,
+        .send_ns = &sns,
+    };
+    var build = Server.GroupBuild{};
+    srv.buildRegionGroups(&snap, &vc, &build);
+    // Two regions (non-play conn ticks inline, never grouped).
+    try std.testing.expectEqual(@as(usize, 2), build.n_groups);
+    // Every grouped index appears exactly once across all ranges.
+    var seen: [5]u32 = [_]u32{0} ** 5;
+    for (build.groups[0..build.n_groups]) |g| {
+        // Ranges are non-empty and inside the order array.
+        try std.testing.expect(g.end > g.start);
+        try std.testing.expect(g.end <= build.n_ordered);
+        for (build.order[g.start..g.end]) |si| {
+            try std.testing.expect(si < 4); // play viewers only
+            seen[si] += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), build.n_ordered);
+    for (seen[0..4]) |n| try std.testing.expectEqual(@as(u32, 1), n);
+    // First-seen order: group 0 is region (0,0) with viewers {0,2} in
+    // snap order, group 1 is region (3,0) with {1,3}.
+    try std.testing.expectEqual(@as(i32, 0), build.groups[0].region.id.rx);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 0, 2 }, build.order[build.groups[0].start..build.groups[0].end]);
+    try std.testing.expectEqual(@as(i32, 3), build.groups[1].region.id.rx);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 3 }, build.order[build.groups[1].start..build.groups[1].end]);
+}
+
+test "Phase C follow-up: mob crossing adopts into target, source empties, never gaps or dups" {
+    // Deterministic crossing: mob just inside region (0,0), homed so
+    // wanderStep carries it over the x=512 border in one tick (0.5
+    // blocks/tick toward waypoint (home+r, home)).
+    const a = std.heap.page_allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    srv.region_threads = 1; // sequential: deterministic single-threaded tick
+    srv.ent_lock.lock();
+    const src = try srv.region_reg.getOrCreate(a, .{ .dim = 0, .rx = 0, .rz = 0 });
+    _ = try src.mobs.add(.{ .id = 77, .kind = .pig, .x = 511.8, .y = 64, .z = 8.5, .yaw = 0, .health = 10, .home_x = 511.8, .home_z = 8.5, .patrol_r = 4 });
+    srv.ent_lock.unlock();
+    // Tick 1: wander crosses, transfer pushed, source copy kept.
+    srv.tickOnce(1000);
+    srv.ent_lock.lock();
+    try std.testing.expectEqual(@as(usize, 1), srv.region_reg.totalMobs());
+    try std.testing.expect(src.mobs.indexOfId(77) != null);
+    srv.ent_lock.unlock();
+    const dst = try srv.region_reg.getOrCreate(a, .{ .dim = 0, .rx = 1, .rz = 0 });
+    try std.testing.expect(!dst.inbox.isEmpty());
+    // Tick 2: drain adopts into target + deletes source (delete-at-drain).
+    srv.tickOnce(2000);
+    srv.ent_lock.lock();
+    try std.testing.expectEqual(@as(usize, 1), srv.region_reg.totalMobs());
+    try std.testing.expect(src.mobs.indexOfId(77) == null);
+    try std.testing.expect(dst.mobs.indexOfId(77) != null);
+    try std.testing.expectEqual(@as(usize, 1), dst.mobs.len());
+    srv.ent_lock.unlock();
+    try std.testing.expect(dst.inbox.isEmpty());
+    // Tick 3: settled (owned by target, inside its cell) — no re-push,
+    // no dup, still exactly one copy.
+    srv.tickOnce(3000);
+    srv.ent_lock.lock();
+    try std.testing.expectEqual(@as(usize, 1), srv.region_reg.totalMobs());
+    try std.testing.expect(dst.mobs.indexOfId(77) != null);
+    srv.ent_lock.unlock();
+}
+
+test "Phase C: region dispatch ticks viewers + handoff on crossing" {
+    // Page allocator throughout: region workers share it (the test
+    // allocator is not for concurrent use).
+    const a = std.heap.page_allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    srv.region_threads = 8; // force the parallel path (spawn fallback keeps it correct)
+    var port: u16 = 37981;
+    var listener: std.Io.net.Server = while (true) {
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+        break addr.listen(io, .{}) catch |err| switch (err) {
+            error.AddressInUse => {
+                port += 1;
+                if (port > 38010) return err;
+                continue;
+            },
+            else => return err,
+        };
+    };
+    defer listener.deinit(io);
+    const mk = struct {
+        fn run(l: *std.Io.net.Server, p: u16, name: []const u8, x: f64, z: f64) !struct {
+            conn: *Conn,
+            srv_stream: std.Io.net.Stream,
+            cli_stream: std.Io.net.Stream,
+        } {
+            const addr = try std.Io.net.IpAddress.parse("127.0.0.1", p);
+            var cli = try addr.connect(io, .{ .mode = .stream });
+            errdefer cli.close(io);
+            const sv = try l.accept(io);
+            const c = try a.create(Conn);
+            errdefer a.destroy(c);
+            c.* = Conn.init(a, io, .{}, 1);
+            c.state = .play;
+            @memcpy(c.username[0..name.len], name);
+            c.username_len = name.len;
+            c.pos_x = x;
+            c.pos_z = z;
+            c.last_echo_ms = 1000; // keepalive anchored (no kick during the test)
+            // Each viewer sees its own chunk (reconcile has range to work with).
+            const cc = c.playerChunk();
+            try c.sent.put(Conn.sentKey(cc.cx, cc.cz), {});
+            return .{ .conn = c, .srv_stream = sv, .cli_stream = cli };
+        }
+    };
+    // Alice near origin (region 0,0), Bob 2000 blocks east (region 3,0).
+    var alice = try mk.run(&listener, port, "Alice", 8.5, 8.5);
+    defer alice.cli_stream.close(io);
+    defer alice.srv_stream.close(io);
+    defer a.destroy(alice.conn);
+    var bob = try mk.run(&listener, port, "Bob", 2000.5, 8.5);
+    defer bob.cli_stream.close(io);
+    defer bob.srv_stream.close(io);
+    defer a.destroy(bob.conn);
+    try srv.register(alice.conn, alice.srv_stream);
+    try srv.register(bob.conn, bob.srv_stream);
+    srv.tickOnce(1000);
+    // Two populated regions, stamped on both conns, no crossings yet.
+    try std.testing.expectEqual(@as(usize, 2), srv.region_reg.count());
+    try std.testing.expect(alice.conn.last_region != null);
+    try std.testing.expectEqual(@as(i32, 0), alice.conn.last_region.?.rx);
+    try std.testing.expectEqual(@as(i32, 3), bob.conn.last_region.?.rx);
+    // Bob teleports into Alice's region: the next tick pushes a Transfer
+    // 3,0 -> 0,0; the following tick's mob section drains it and the
+    // target census observes it (drains run once per tick, before wander).
+    bob.conn.lock.lock();
+    bob.conn.pos_x = 10.5;
+    bob.conn.pos_z = 10.5;
+    bob.conn.last_echo_ms = 2000;
+    bob.conn.lock.unlock();
+    alice.conn.lock.lock();
+    alice.conn.last_echo_ms = 2000;
+    alice.conn.lock.unlock();
+    srv.tickOnce(2000);
+    try std.testing.expectEqual(@as(i32, 0), bob.conn.last_region.?.rx);
+    alice.conn.lock.lock();
+    alice.conn.last_echo_ms = 3000;
+    alice.conn.lock.unlock();
+    bob.conn.lock.lock();
+    bob.conn.last_echo_ms = 3000;
+    bob.conn.lock.unlock();
+    srv.tickOnce(3000);
+    const home = try srv.region_reg.getOrCreate(a, .{ .dim = 0, .rx = 0, .rz = 0 });
+    try std.testing.expectEqual(@as(u64, 1), home.census);
+    // region_threads=8 took the persistent-pool path (not fork-join).
+    try std.testing.expect(srv.region_pool != null);
+    // Stats line carries the region counters (breaker quiet: no sheds).
+    var buf: [1024]u8 = undefined;
+    const line = srv.statsLine(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, line, "regions=2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "region_shed=0") != null);
+    try std.testing.expectEqual(@as(u64, 0), srv.region_shed_total);
+}
+
+test "Phase C: thread resolution, transfer inbox, tick clock" {
+    const a = std.heap.page_allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    // 0 = auto (cpus, max 8); 1 = sequential; explicit honored, capped.
+    const auto = srv.resolveRegionThreads();
+    try std.testing.expect(auto >= 1 and auto <= 8);
+    srv.region_threads = 1;
+    try std.testing.expectEqual(@as(usize, 1), srv.resolveRegionThreads());
+    srv.region_threads = 4;
+    try std.testing.expectEqual(@as(usize, 4), srv.resolveRegionThreads());
+    srv.region_threads = 1000;
+    try std.testing.expectEqual(@as(usize, tick_mod.max_workers), srv.resolveRegionThreads());
+    srv.region_threads = 0;
+    // A crossing lands in the target inbox; the next tick's mob section
+    // drains it and feeds the census (drains run once per tick, up front).
+    srv.pushTransfer(7, 0, 0, 0, .{ .dim = 0, .rx = 5, .rz = -3 }, 1.0, 2.0, 3.0);
+    const r = try srv.region_reg.getOrCreate(a, .{ .dim = 0, .rx = 5, .rz = -3 });
+    try std.testing.expect(!r.inbox.isEmpty());
+    srv.tickOnce(1000);
+    try std.testing.expect(r.inbox.isEmpty());
+    try std.testing.expectEqual(@as(u64, 1), r.census);
+    const msgs = try r.inbox.drain();
+    defer a.free(msgs);
+    try std.testing.expectEqual(@as(usize, 0), msgs.len);
+    // Barrier payload publishes monotonically (tickOnce above already
+    // published at least once).
+    const g0 = srv.region_clock.load().generation;
+    srv.region_clock.publish(20, 6020);
+    const rd = srv.region_clock.load();
+    try std.testing.expectEqual(@as(i64, 20), rd.age);
+    try std.testing.expect(rd.generation > g0);
+    srv.region_clock.publish(40, 6040);
+    try std.testing.expect(srv.region_clock.load().generation > rd.generation);
+}
+
+test "statsLine renders per-subsystem memory independently (no buffer aliasing)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    const conn = try a.create(Conn);
+    conn.* = Conn.init(a, io, .{}, 1);
+    // Queue 4 bytes so the outbox is nonzero while sent-sets stay empty:
+    // with the old shared-buffer bug all three fields rendered the last
+    // write ("outbox=0 B sent=0 B ents=0 B").
+    try conn.queueFramed(&[_]u8{ 1, 2, 3, 4 });
+    try srv.registry.append(a, .{ .conn = conn, .stream = Server.closedStream() });
+    var buf: [1024]u8 = undefined;
+    const line = srv.statsLine(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, line, "outbox=4 B") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "sent=0 B") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "ents=0 B") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "ring=0 B") != null);
+    // Live conns (blocking transport has no counters: registry size).
+    try std.testing.expect(std.mem.indexOf(u8, line, "conns=1") != null);
+    conn.deinit();
+    a.destroy(conn);
+}
+
+test "K1 tick: scheduled button release fires through tickOnce" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+        try pool.flushAll();
+    }
+    _ = try view.applyBlock(pool, a, 8, 63, 8, game_ids.stone, 0);
+    _ = try view.applyBlock(pool, a, 9, 63, 8, game_ids.stone, 0);
+    // Pressed stone button + live wire.
+    _ = try view.applyBlock(pool, a, 8, 64, 8, game_ids.stone_button, 13);
+    _ = try view.applyBlock(pool, a, 9, 64, 8, game_ids.redstone_wire, 15);
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    defer srv.items.deinit(a);
+    srv.world = pool;
+    srv.rs_sched.schedule(8, 64, 8, 1020, .button_release);
+    srv.rs_tick = 1020;
+    srv.tickOnce(0);
+    try std.testing.expectEqual(@as(u4, 5), (try view.peekBlock(pool, a, 8, 64, 8)).?.meta);
+    // Wire fades a single step per update (vanilla single-step settle).
+    try std.testing.expectEqual(@as(u4, 14), (try view.peekBlock(pool, a, 9, 64, 8)).?.meta);
 }
 
 test "broadcastBlockChange/ArmSwing target sent-set viewers only" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
     defer srv.registry.deinit(a);
 
     var port: u16 = 37971;
@@ -5789,7 +8814,7 @@ test "broadcastBlockChange/ArmSwing target sent-set viewers only" {
     try srv.register(alice.conn, alice.srv_stream);
     try srv.register(bob.conn, bob.srv_stream);
     // register is silent; one announceJoin drives the join broadcast both ways.
-    try srv.announceJoin(alice.conn, alice.srv_stream);
+    try srv.announceJoin(alice.conn);
     // (One persistent reader per stream: fresh readers would drop coalesced bytes.)
     var arb: [128]u8 = undefined;
     var afb: [128]u8 = undefined;
@@ -5800,8 +8825,13 @@ test "broadcastBlockChange/ArmSwing target sent-set viewers only" {
     {
         const f = try readFrame(&arr.interface, &afb);
         try std.testing.expectEqual(@as(i32, 0x38), f.id);
+        const jc = try readFrame(&arr.interface, &afb);
+        try std.testing.expectEqual(@as(i32, 0x02), jc.id);
+        try std.testing.expect(std.mem.indexOf(u8, jc.body, "joined the game") != null);
         const g = try readFrame(&brr.interface, &bfb);
         try std.testing.expectEqual(@as(i32, 0x38), g.id);
+        const kc = try readFrame(&brr.interface, &bfb);
+        try std.testing.expectEqual(@as(i32, 0x02), kc.id);
     }
     // block change at (3,65,4) -> chunk (0,0): only alice
     try srv.broadcastBlockChange(null, 3, 65, 4, game_ids.bedrock, 0);
@@ -5872,7 +8902,10 @@ test "hunger: exhaustion drain, regen, starvation gates" {
     c.food_timer = 60;
     try std.testing.expect(Server.hungerTick(&c, 3));
     try std.testing.expect(c.is_dead); // hard: killing blow
-    { const o = try c.takeOutput(); defer a.free(o); }
+    {
+        const o = try c.takeOutput();
+        defer a.free(o);
+    }
 }
 
 test "env: drown countdown, lava+fire, suffocate; fall resolution" {
@@ -5904,29 +8937,33 @@ test "env: drown countdown, lava+fire, suffocate; fall resolution" {
     // suffocate: 4 per tick
     try std.testing.expect(!Server.envTick(&c, false, false, true, false));
     try std.testing.expectApproxEqAbs(@as(f32, 9.0), c.health, 1e-6);
-    // cactus: 1.0 per touch, throttled to ~1/0.5s (10-tick cooldown)
+    // cactus: 1.0 per touching tick (1Hz model hits ~1/s; vanilla
+    // hurt-resistance gates to ~1/0.5s, quantized to whole ticks here)
     try std.testing.expect(!Server.envTick(&c, false, false, false, true));
     try std.testing.expectApproxEqAbs(@as(f32, 8.0), c.health, 1e-6);
     try std.testing.expect(!Server.envTick(&c, false, false, false, true));
-    try std.testing.expectApproxEqAbs(@as(f32, 8.0), c.health, 1e-6); // cooldown: no double-hit
+    try std.testing.expectApproxEqAbs(@as(f32, 7.0), c.health, 1e-6); // next tick hits again
     // creative is immune to cactus
     c.config.gamemode = 1;
     c.cactus_cd = 0;
     try std.testing.expect(!Server.envTick(&c, false, false, false, true));
-    try std.testing.expectApproxEqAbs(@as(f32, 8.0), c.health, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 7.0), c.health, 1e-6);
     c.config.gamemode = 0;
     // fall: ceil(dist-3) without a world (no water to save us)
     c.pending_fall = .{ .dist = 5.5, .x = 0, .y = 64, .z = 0 };
     var srv = Server{ .net = undefined, .io = std.testing.io, .config = .{}, .gpa = a };
     defer srv.registry.deinit(a);
     srv.resolvePendingFall(&c);
-    try std.testing.expectApproxEqAbs(@as(f32, 5.0), c.health, 1e-6); // 8-3
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), c.health, 1e-6); // 7-3
     try std.testing.expect(c.pending_fall == null);
     // short falls are free
     c.pending_fall = .{ .dist = 3.0, .x = 0, .y = 64, .z = 0 };
     srv.resolvePendingFall(&c);
-    try std.testing.expectApproxEqAbs(@as(f32, 5.0), c.health, 1e-6);
-    { const o = try c.takeOutput(); defer a.free(o); }
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), c.health, 1e-6);
+    {
+        const o = try c.takeOutput();
+        defer a.free(o);
+    }
 }
 
 test "dig-drop gate: survival+adventure drop, creative/gamerule/air do not" {
@@ -5937,16 +8974,188 @@ test "dig-drop gate: survival+adventure drop, creative/gamerule/air do not" {
     try std.testing.expect(!Server.shouldDropBreak(0, .air, true));
 }
 
+test "live drop spawn: instant 0x0E/0x1C, no tick re-spawn, tick pickup grants" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    var port: u16 = 38001;
+    var listener: std.Io.net.Server = while (true) {
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+        break addr.listen(io, .{}) catch |err| switch (err) {
+            error.AddressInUse => {
+                port += 1;
+                if (port > 38100) return err;
+                continue;
+            },
+            else => return err,
+        };
+    };
+    defer listener.deinit(io);
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    var cli = try addr.connect(io, .{ .mode = .stream });
+    defer cli.close(io);
+    const sv = try listener.accept(io);
+    defer sv.close(io);
+    const c = try a.create(Conn);
+    defer {
+        c.deinit();
+        a.destroy(c);
+    }
+    c.* = Conn.init(a, io, .{ .gamemode = 0 }, 7);
+    c.state = .play;
+    c.pos_x = 8.5;
+    c.pos_y = 65.0;
+    c.pos_z = 8.5;
+    try c.sent.put(Conn.sentKey(0, 0), {});
+    try srv.register(c, sv);
+    var crb: [128]u8 = undefined;
+    var cfb: [2048]u8 = undefined;
+    var cread = cli.reader(io, &crb);
+    // Serve-thread spawn: visible immediately, no tick wait.
+    srv.spawnItemLive(.{ .id = game_ids.dirt, .count = 1, .damage = 0, .nbt = null }, 8.5, 65.1, 8.5, 10);
+    const eid = blk: {
+        srv.ent_lock.lock();
+        defer srv.ent_lock.unlock();
+        try std.testing.expectEqual(@as(usize, 1), srv.items.items.len);
+        break :blk srv.items.items[0].id;
+    };
+    try std.testing.expect(c.tracked.contains(eid));
+    {
+        const f0 = try readFrame(&cread.interface, &cfb);
+        try std.testing.expectEqual(@as(i32, 0x0E), f0.id);
+        const f1 = try readFrame(&cread.interface, &cfb);
+        try std.testing.expectEqual(@as(i32, 0x1C), f1.id);
+    }
+    // Tick reconcile before the delay expires: tracked already, so no
+    // re-spawn (and no pickup while can_pickup is false).
+    {
+        var claims = entity.ClaimSet{};
+        const snap = [_]entity.ItemSnap{.{
+            .id = eid,
+            .x = 8.5,
+            .y = 65.1,
+            .z = 8.5,
+            .item_id = game_ids.dirt,
+            .count = 1,
+            .damage = 0,
+            .can_pickup = false,
+        }};
+        const Always = struct {
+            fn f(_: *anyopaque, _: f64, _: f64) bool {
+                return true;
+            }
+        }.f;
+        var ctx: u8 = 0;
+        try entity.reconcileViewer(c, conn_sink.bind(c), &[_]entity.PlayerSnap{}, &[_]entity.MobSnap{}, &snap, &claims, Always, &ctx);
+        try std.testing.expect(!claims.contains(eid));
+        try std.testing.expect(c.tracked.contains(eid));
+        c.lock.lock();
+        const out = try c.takeOutput();
+        c.lock.unlock();
+        defer a.free(out);
+        try std.testing.expectEqual(@as(usize, 0), out.len);
+    }
+    // Delay expired + standing on it: single grant (slot + collect +
+    // destroy), tracked cleared, no duplicate spawn.
+    {
+        var claims = entity.ClaimSet{};
+        const snap = [_]entity.ItemSnap{.{
+            .id = eid,
+            .x = 8.5,
+            .y = 65.1,
+            .z = 8.5,
+            .item_id = game_ids.dirt,
+            .count = 1,
+            .damage = 0,
+            .can_pickup = true,
+        }};
+        const Always = struct {
+            fn f(_: *anyopaque, _: f64, _: f64) bool {
+                return true;
+            }
+        }.f;
+        var ctx: u8 = 0;
+        try entity.reconcileViewer(c, conn_sink.bind(c), &[_]entity.PlayerSnap{}, &[_]entity.MobSnap{}, &snap, &claims, Always, &ctx);
+        try std.testing.expect(claims.contains(eid));
+        try std.testing.expect(!c.tracked.contains(eid));
+        try std.testing.expect(c.inv[9] != null);
+        try std.testing.expectEqual(game_ids.dirt, c.inv[9].?.id);
+        c.lock.lock();
+        const out = try c.takeOutput();
+        c.lock.unlock();
+        defer a.free(out);
+        // grant (Set Slot) + Collect + Destroy, in that order, and nothing
+        // else (in particular no duplicate 0x0E spawn).
+        var off: usize = 0;
+        var seen = [_]i32{ -1, -1, -1 };
+        var si: usize = 0;
+        while (off < out.len and si < 3) : (si += 1) {
+            var rr = codec.PacketReader.init(out[off..]);
+            const h = try codec.decodeFrame(&rr);
+            seen[si] = h.id;
+            off += @as(usize, @intCast(codec.PacketWriter.varIntLen(h.length))) + @as(usize, @intCast(h.length));
+        }
+        try std.testing.expectEqual(@as(usize, 3), si);
+        try std.testing.expectEqual(out.len, off);
+        try std.testing.expectEqualSlices(i32, &[_]i32{ 0x2F, 0x0D, 0x13 }, &seen);
+    }
+    // No server-side residue: the tick's removeItemById would free the
+    // claimed entity; the test owns cleanup instead (same discipline).
+    srv.ent_lock.lock();
+    while (srv.items.items.len > 0) {
+        const dead = srv.items.swapRemove(0);
+        var s: ?item_mod.Stack = dead.stack;
+        item_mod.freeStack(a, &s);
+    }
+    srv.items.deinit(a);
+    srv.ent_lock.unlock();
+}
+
+test "login landing disk: ensureLanding fills the 5x5 around the player" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    var gen = try v5gen.Gen.init(a, 42, false, false);
+    defer gen.deinit();
+    srv.gen = &gen;
+    const c = try a.create(Conn);
+    defer {
+        c.deinit();
+        a.destroy(c);
+    }
+    c.* = Conn.init(a, io, .{}, 7);
+    c.pos_x = 0.5;
+    c.pos_y = 69.0;
+    c.pos_z = 0.5;
+    c.lock.lock();
+    srv.ensureLanding(pool, a, c);
+    c.lock.unlock();
+    // All 25 landing columns exist now (sync fill; no workers in this path).
+    var dx: i32 = -2;
+    while (dx <= 2) : (dx += 1) {
+        var dz: i32 = -2;
+        while (dz <= 2) : (dz += 1) {
+            const raw = try pool.get(a, store_mod.encodeKey(0, dx, dz));
+            if (raw) |r| a.free(r);
+            try std.testing.expect(raw != null);
+        }
+    }
+}
+
 test "resolveAttack: mob damage/death/destroy, PvP, reach, pig respawn timer" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
     defer srv.registry.deinit(a);
-    defer {
-        srv.ent_lock.lock();
-        srv.entities.deinit(a);
-        srv.ent_lock.unlock();
-    }
     var port: u16 = 37971;
     var listener: std.Io.net.Server = while (true) {
         const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
@@ -5995,13 +9204,17 @@ test "resolveAttack: mob damage/death/destroy, PvP, reach, pig respawn timer" {
     var brr = bob.cli_stream.reader(io, &brb);
     // Pig id 50 at (10,64,10), hp 10; alice tracks it.
     srv.ent_lock.lock();
-    try srv.entities.append(a, .{ .id = 50, .kind = entity.MOB_PIG, .x = 10, .y = 64, .z = 10, .yaw = 0, .health = 10.0, .home_x = 10, .home_z = 10, .patrol_r = 4 });
+    const pig_reg = try srv.region_reg.getOrCreate(a, .{ .dim = 0, .rx = 0, .rz = 0 });
+    _ = try pig_reg.mobs.add(.{ .id = 50, .kind = entity.MOB_PIG, .x = 10, .y = 64, .z = 10, .yaw = 0, .health = 10.0, .home_x = 10, .home_z = 10, .patrol_r = 4 });
     srv.ent_lock.unlock();
     try alice.conn.tracked.put(50, .{ .x = 0, .y = 0, .z = 0, .yaw = 0, .pitch = 0 });
     // Non-lethal hit: 10 -> 7, metadata to trackers.
     srv.resolveAttack(alice.conn, .{ .target_eid = 50, .dmg = 3, .ax = 10, .ay = 64, .az = 10 });
     srv.ent_lock.lock();
-    try std.testing.expectApproxEqAbs(@as(f32, 7.0), srv.entities.items[0].health, 1e-6);
+    {
+        const f50 = srv.region_reg.findMob(50).?;
+        try std.testing.expectApproxEqAbs(@as(f32, 7.0), f50.region.mobs.health.items[f50.index], 1e-6);
+    }
     srv.ent_lock.unlock();
     {
         const f = try readFrame(&arr.interface, &afb);
@@ -6018,12 +9231,15 @@ test "resolveAttack: mob damage/death/destroy, PvP, reach, pig respawn timer" {
     // Out of reach: no damage.
     srv.resolveAttack(alice.conn, .{ .target_eid = 50, .dmg = 3, .ax = 900, .ay = 64, .az = 900 });
     srv.ent_lock.lock();
-    try std.testing.expectApproxEqAbs(@as(f32, 7.0), srv.entities.items[0].health, 1e-6);
+    {
+        const f50 = srv.region_reg.findMob(50).?;
+        try std.testing.expectApproxEqAbs(@as(f32, 7.0), f50.region.mobs.health.items[f50.index], 1e-6);
+    }
     srv.ent_lock.unlock();
     // Lethal hit: destroy broadcast, mob removed, respawn timer armed.
     srv.resolveAttack(alice.conn, .{ .target_eid = 50, .dmg = 10, .ax = 10, .ay = 64, .az = 10 });
     srv.ent_lock.lock();
-    try std.testing.expectEqual(@as(usize, 0), srv.entities.items.len);
+    try std.testing.expectEqual(@as(usize, 0), srv.region_reg.totalMobs());
     try std.testing.expectEqual(@as(u32, 30), srv.pig_cooldown);
     srv.ent_lock.unlock();
     {
@@ -6079,19 +9295,23 @@ test "resolveAttack: mob damage/death/destroy, PvP, reach, pig respawn timer" {
     }
     srv.ent_lock.lock();
     defer srv.ent_lock.unlock();
-    try std.testing.expectEqual(@as(usize, 1), srv.entities.items.len);
-    try std.testing.expectEqual(@as(i32, 90), srv.entities.items[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), srv.region_reg.totalMobs());
+    var found_pig = false;
+    var rbuf: [8]*tick_mod.Region = undefined;
+    for (rbuf[0..srv.region_reg.allRegions(&rbuf)]) |rg| {
+        for (rg.mobs.kinds.items) |k| {
+            if (k == entity.MOB_PIG) found_pig = true;
+        }
+    }
+    try std.testing.expect(found_pig);
 }
 
-test "tickOnce spawns/tracks/despawns players + mobs" {    const a = std.testing.allocator;
+test "tickOnce spawns/tracks/despawns players + mobs" {
+    const a = std.testing.allocator;
     const io = std.testing.io;
     var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
     defer srv.registry.deinit(a);
-    defer {
-        srv.ent_lock.lock();
-        srv.entities.deinit(a);
-        srv.ent_lock.unlock();
-    }
     var port: u16 = 37971;
     var listener: std.Io.net.Server = while (true) {
         const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
@@ -6139,7 +9359,8 @@ test "tickOnce spawns/tracks/despawns players + mobs" {    const a = std.testing
         srv.ent_lock.lock();
         defer srv.ent_lock.unlock();
         pig_id = srv.eid_counter.fetchAdd(1, .acq_rel);
-        try srv.entities.append(a, .{
+        const pig_reg = try srv.region_reg.getOrCreate(a, .{ .dim = 0, .rx = 0, .rz = 0 });
+        _ = try pig_reg.mobs.add(.{
             .id = pig_id,
             .kind = entity.MOB_PIG,
             .x = 10.5,
@@ -6166,7 +9387,7 @@ test "tickOnce spawns/tracks/despawns players + mobs" {    const a = std.testing
             saw_spawn = true;
             var pr = codec.PacketReader.init(f.body);
             try std.testing.expectEqual(pig_id, try pr.readVarInt());
-            try std.testing.expectEqual(@as(u8, entity.MOB_PIG), try pr.readByte());
+            try std.testing.expectEqual(@as(u8, profile.game.mobs.wire(entity.MOB_PIG)), try pr.readByte());
             break;
         }
         try std.testing.expect(f.id == 0x03 or f.id == 0x00);
@@ -6193,7 +9414,8 @@ test "tickOnce spawns/tracks/despawns players + mobs" {    const a = std.testing
     alice.conn.last_echo_ms = 99900;
     {
         srv.ent_lock.lock();
-        srv.entities.items[0].x = 500.0;
+        const fpig = srv.region_reg.findMob(pig_id).?;
+        fpig.region.mobs.px.items[fpig.index] = 500.0;
         srv.ent_lock.unlock();
     }
     srv.tickOnce(99999);
@@ -6219,6 +9441,7 @@ test "broadcastChat reaches all play conns; login timeout kicks stale logins" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
     defer srv.registry.deinit(a);
     var port: u16 = 37981;
     var listener: std.Io.net.Server = while (true) {
@@ -6306,6 +9529,7 @@ test "player save/load roundtrip via pool (pos/health/inv/NBT)" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
     defer srv.registry.deinit(a);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6384,10 +9608,68 @@ test "player save/load roundtrip via pool (pos/health/inv/NBT)" {
     c2.deinit();
 }
 
+test "weather: flags, strength fade, expiry, login sync frames" {
+    // S2B(1/2) flips the client flag; S2B(7/8) carry the rendered
+    // strengths (flags alone leave the sky clear on 1.7.10).
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    srv.setWeather(.rain, 200);
+    try std.testing.expect(srv.raining and !srv.thundering);
+    try std.testing.expectEqual(@as(u32, 200), srv.rain_time);
+    try std.testing.expectEqual(@as(f32, 0), srv.rain_strength);
+    srv.tickWeather();
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), srv.rain_strength, 1e-6);
+    var i: usize = 0;
+    while (i < 4) : (i += 1) srv.tickWeather();
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), srv.rain_strength, 1e-6);
+    try std.testing.expect(srv.raining); // 200 - 5*20 = 100 left
+    while (srv.raining) srv.tickWeather();
+    try std.testing.expect(!srv.raining);
+    try std.testing.expect(srv.rain_strength < 1.0); // fades out past expiry
+    // Thunder sets both flags + strengths.
+    srv.setWeather(.thunder, 40);
+    try std.testing.expect(srv.raining and srv.thundering);
+    srv.tickWeather();
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), srv.thunder_strength, 1e-6);
+    // Login sync queues 1/2 + 7 + 8 for the joiner.
+    const c = try a.create(Conn);
+    defer {
+        c.deinit();
+        a.destroy(c);
+    }
+    c.* = Conn.init(a, io, .{}, 7);
+    srv.syncWeatherTo(c);
+    c.lock.lock();
+    const raw = try c.takeOutput();
+    c.lock.unlock();
+    defer a.free(raw);
+    var reasons: [8]u8 = undefined;
+    var n: usize = 0;
+    var r = codec.PacketReader.init(raw);
+    while (r.remaining() > 0) {
+        const h = try codec.decodeFrame(&r);
+        const blen: usize = @as(usize, @intCast(h.length - @as(i32, @intCast(codec.PacketWriter.varIntLen(h.id)))));
+        if (h.id == 0x2B) {
+            var pr = codec.PacketReader.init(r.buffer[r.index..]);
+            reasons[n] = try pr.readByte();
+            n += 1;
+        }
+        r.index += blen;
+    }
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqual(@as(u8, 1), reasons[0]);
+    try std.testing.expectEqual(@as(u8, 7), reasons[1]);
+    try std.testing.expectEqual(@as(u8, 8), reasons[2]);
+}
+
 test "commands help/list/save-all/unknown (+ console null-sender)" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
     defer srv.registry.deinit(a);
     defer if (srv.perms) |*db| db.deinit();
     const mk = struct {
@@ -6535,6 +9817,7 @@ test "permissions gate commands: op/deop/grant/deny/show/clear/reload" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
     defer srv.registry.deinit(a);
     defer if (srv.perms) |*db| db.deinit();
     var tmp = std.testing.tmpDir(.{});
@@ -6774,6 +10057,7 @@ test "tab-complete: single-token candidates carry the slash" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
     defer srv.registry.deinit(a);
     defer if (srv.perms) |*db| db.deinit();
     const mk = struct {
@@ -6828,11 +10112,11 @@ test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
     defer srv.registry.deinit(a);
     defer if (srv.perms) |*db| db.deinit();
     defer {
         srv.ent_lock.lock();
-        srv.entities.deinit(a);
         srv.items.deinit(a);
         srv.ent_lock.unlock();
     }
@@ -7252,11 +10536,11 @@ test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
     _ = srv.registry.pop();
 }
 
-
 test "furnace: take output moves stack to cursor + syncs" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
     defer srv.registry.deinit(a);
     defer srv.furnaces.deinit(a);
     var conn = Conn.init(a, io, .{}, 7);

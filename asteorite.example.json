@@ -11,5 +11,7 @@
   "rcon_port": 25575,
   "motd": "Asteorite",
   "max_players": 20,
-  "brand": "vanilla"
+  "brand": "vanilla",
+  "storage_profile": "auto",
+  "region_threads": 0
 }

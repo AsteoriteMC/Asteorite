@@ -7,7 +7,8 @@
 //! - Container item: only lava bucket leaves one (empty bucket 325).
 
 const std = @import("std");
-const data = @import("smelting_data.zig");
+const profile = @import("../version.zig");
+const data = profile.game.smelting_data;
 const ids = @import("../ids.zig");
 
 pub const WILD: i16 = 32767;

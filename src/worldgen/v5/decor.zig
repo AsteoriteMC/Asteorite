@@ -1457,6 +1457,13 @@ pub fn seedForChunk(rand: *java_random.JavaRandom, world_seed: i64, cx: i32, cz:
 /// `heights` is a MUTABLE scratch (sx*sz): recomputed after lakes/dungeons
 /// (vanilla decorate reads post-lake heights), then reused by every phase.
 /// `biome_id` is the chunk's biome (at center+8, voronoi).
+/// `win_bio` is the per-column voronoi biome over the populate window
+/// (base+8..base+23, row-major `dx*16+dz`): the snow/ice tail gates each
+/// column on its own biome (vanilla `World.r`/`World.e` check the column's
+/// biome temperature < 0.15), NOT on the chunk-center biome. Gating the
+/// whole window on one biome freezes ocean/beach columns whenever any
+/// frozen biome sits in the window — an 8-wide ice square spilling across
+/// the border (vanilla leaves those columns water).
 /// `flower_noise` is the plains tulip-patch octave (seed 2345, 1 octave).
 /// Writes outside `view` are dropped by View bounds checks.
 ///
@@ -1473,6 +1480,7 @@ pub fn populateOne(
     base_x: i32, // chunk base world x (cx*16)
     base_z: i32,
     biome_id: i32,
+    win_bio: [256]i32,
 ) !void {
     const b: i32 = if (biome_id >= 128) biome_id - 128 else biome_id;
     const p = decorParams(b);
@@ -1716,14 +1724,16 @@ pub fn populateOne(
             try minable(view, rand, nx, ny, nz, ids.monster_egg, 8, ids.stone);
         }
     }
-    // Snow + ice (behavioral port of the populate tail: frozen biomes only,
-    // window base+8..base+23; light checks skipped — populate runs before
-    // lighting, same as vanilla).
-    if (isFrozenBiome(b)) {
+    // Snow + ice (behavioral port of the populate tail: per-column frozen
+    // check, matching vanilla `World.r`/`World.e` which gate each column on
+    // its own biome temperature < 0.15; light checks skipped — populate runs
+    // before lighting, same as vanilla).
+    {
         var dx: i32 = 0;
         while (dx < 16) : (dx += 1) {
             var dz: i32 = 0;
             while (dz < 16) : (dz += 1) {
+                if (!isFrozenBiome(win_bio[@as(usize, @intCast(dx * 16 + dz))])) continue;
                 const wx: i32 = base_x + 8 + dx;
                 const wz: i32 = base_z + 8 + dz;
                 const top = heightAt(view, heights, wx, wz);
@@ -1817,6 +1827,13 @@ pub fn decorateCenter(
     defer flower_noise.deinit();
     const run_heights = try scratch.alloc(i32, view.sx * view.sz);
     defer scratch.free(run_heights);
+    // Per-column voronoi for the snow/ice tail (one fetch for the whole
+    // 48x48 view; each run slices its 16x16 populate window). The tail
+    // gates every column on its own biome (vanilla `World.r`/`World.e`);
+    // a single center biome per window would freeze warm columns.
+    const bio48 = try scratch.alloc(i32, view.sx * view.sz);
+    defer scratch.free(bio48);
+    try chain.getInts(scratch, root_voronoi, view.ox, view.oz, view.sx, view.sz, bio48);
     // Fixed order: 8 neighbors (sorted dz,dx) then center last.
     var order: [9]struct { dx: i32, dz: i32 } = undefined;
     var k: usize = 0;
@@ -1837,11 +1854,66 @@ pub fn decorateCenter(
         @memcpy(work_metas, base_metas);
         seedForChunk(&rand, world_seed, nx, nz);
         const biome = try biomeAt(chain, root_voronoi, scratch, nx * 16 + 8, nz * 16 + 8);
-        try populateOne(&work, run_heights, &rand, &flower_noise, nx * 16, nz * 16, biome);
+        // Populate window [nx*16+8, nx*16+23]^2 in view-local coords;
+        // out-of-view cells fall back to the center biome (their writes
+        // are dropped by View bounds checks anyway).
+        var win_bio: [256]i32 = undefined;
+        const lx0: i32 = nx * 16 + 8 - view.ox;
+        const lz0: i32 = nz * 16 + 8 - view.oz;
+        var wdx: usize = 0;
+        while (wdx < 16) : (wdx += 1) {
+            var wdz: usize = 0;
+            while (wdz < 16) : (wdz += 1) {
+                const lx: i32 = lx0 + @as(i32, @intCast(wdx));
+                const lz: i32 = lz0 + @as(i32, @intCast(wdz));
+                win_bio[wdx * 16 + wdz] = if (lx >= 0 and lz >= 0 and lx < @as(i32, @intCast(view.sx)) and lz < @as(i32, @intCast(view.sz)))
+                    bio48[@as(usize, @intCast(lx)) * view.sz + @as(usize, @intCast(lz))]
+                else
+                    biome;
+            }
+        }
+        try populateOne(&work, run_heights, &rand, &flower_noise, nx * 16, nz * 16, biome, win_bio);
         var ii: usize = 0;
         while (ii < n) : (ii += 1) {
             if (work_blocks[ii] != base_blocks[ii]) view.blocks[ii] = work_blocks[ii];
             if (work_metas[ii] != base_metas[ii]) view.metas[ii] = work_metas[ii];
+        }
+    }
+    // Post-merge floater sweep: a later run's lake can undercut an earlier
+    // run's flora (see sweepFloaters). Center chunk only; neighbors sweep
+    // themselves in their own decorateCenter runs.
+    sweepFloaters(view, cx, cz);
+}
+
+/// Post-merge floater sweep for soil-gated plants (counterpart to gen's
+/// snow sweep): the 3x3 merge can undercut one run's flora when a later
+/// run's lake carves water/air below it (vanilla runs on one live world,
+/// so this never floats). Only removes what vanilla placement gates
+/// forbid — every soil set below mirrors the scatter gate exactly, so
+/// legitimate placements are never touched. Sweeps the center chunk only
+/// (each chunk's own decorateCenter run sweeps itself).
+pub fn sweepFloaters(view: *View, cx: i32, cz: i32) void {
+    var lx: i32 = 0;
+    while (lx < 16) : (lx += 1) {
+        var lz: i32 = 0;
+        while (lz < 16) : (lz += 1) {
+            const wx = cx * 16 + lx;
+            const wz = cz * 16 + lz;
+            var y: i32 = 1;
+            while (y < 256) : (y += 1) {
+                const id = view.get(wx, y, wz);
+                const keep = switch (id) {
+                    .tallgrass, .yellow_flower, .red_flower => isSoilGrass(view.get(wx, y - 1, wz)),
+                    .deadbush => isSoilDeadbush(view.get(wx, y - 1, wz)),
+                    .brown_mushroom, .red_mushroom => isSoilOpaque(view.get(wx, y - 1, wz)),
+                    .waterlily => isWaterLike(view.get(wx, y - 1, wz)),
+                    .pumpkin => view.get(wx, y - 1, wz) == ids.grass,
+                    .reeds_block => reedCanStay(view, wx, y, wz),
+                    .cactus => cactusCanStay(view, wx, y, wz),
+                    else => true,
+                };
+                if (!keep) view.set(wx, y, wz, ids.air, 0);
+            }
         }
     }
 }
@@ -1879,7 +1951,7 @@ test "populateOne matches JVM (seed 42 chunk 0,0 forest)" {
     var rand = java_random.JavaRandom.init(0);
     seedForChunk(&rand, 42, 0, 0);
     // Forest biome id 4.
-    try populateOne(&view, heights, &rand, &fnoise, 0, 0, 4);
+    try populateOne(&view, heights, &rand, &fnoise, 0, 0, 4, [_]i32{4} ** 256);
     var crc: i64 = 0;
     var counts: [256]usize = [_]usize{0} ** 256;
     var wx: i32 = 0;
@@ -1940,7 +2012,7 @@ test "populateOne plains matches JVM (seed 42, no trees)" {
     var rand = java_random.JavaRandom.init(0);
     seedForChunk(&rand, 42, 0, 0);
     // Plains biome id 1 (x=-999, no trees, but nextInt10 still drawn).
-    try populateOne(&view, heights, &rand, &fnoise2, 0, 0, 1);
+    try populateOne(&view, heights, &rand, &fnoise2, 0, 0, 1, [_]i32{1} ** 256);
     var crc: i64 = 0;
     var counts: [256]usize = [_]usize{0} ** 256;
     var wx: i32 = 0;
@@ -1970,5 +2042,138 @@ test "populateOne plains matches JVM (seed 42, no trees)" {
     try std.testing.expectEqual(@as(usize, 4), counts[@intFromEnum(ids.lapis_ore)]);
     try std.testing.expectEqual(@as(usize, 36), counts[@intFromEnum(ids.tallgrass)]);
     try std.testing.expectEqual(@as(usize, 14), counts[@intFromEnum(ids.redstone_ore)]);
+}
+
+test "sweepFloaters removes only support-less plants" {
+    const alloc = std.testing.allocator;
+    const S: usize = 16;
+    const blocks = try alloc.alloc(ids.Id, S * 256 * S);
+    defer alloc.free(blocks);
+    const metas = try alloc.alloc(u8, S * 256 * S);
+    defer alloc.free(metas);
+    @memset(blocks, ids.stone);
+    @memset(metas, 0);
+    var view = View{ .blocks = blocks, .metas = metas, .ox = 0, .oz = 0, .sx = S, .sz = S };
+    const at = struct {
+        fn f(v: *View, x: i32, y: i32, z: i32, below: ids.Id, plant: ids.Id) void {
+            v.set(x, y - 1, z, below, 0);
+            v.set(x, y, z, plant, 0);
+        }
+    }.f;
+    at(&view, 0, 70, 0, .water, .tallgrass); // floating -> air
+    at(&view, 1, 70, 0, .dirt, .tallgrass); // kept
+    at(&view, 2, 70, 0, .air, .yellow_flower); // floating -> air
+    at(&view, 3, 70, 0, .sand, .deadbush); // kept
+    at(&view, 4, 70, 0, .grass, .red_mushroom); // kept (solid soil)
+    at(&view, 5, 70, 0, .grass, .pumpkin); // kept
+    at(&view, 6, 70, 0, .stone, .pumpkin); // no grass below -> air
+    at(&view, 7, 70, 0, .water, .waterlily); // kept
+    at(&view, 8, 70, 0, .dirt, .waterlily); // sinks -> air
+    at(&view, 9, 70, 0, .dirt, .reeds_block); // no adjacent water -> air
+    at(&view, 10, 70, 0, .grass, .cactus); // wrong soil -> air
+    view.set(11, 70, 1, ids.water, 0); // adjacent water for the kept reed
+    at(&view, 11, 70, 0, .dirt, .reeds_block); // kept
+    view.set(12, 70, 2, ids.sand, 0);
+    view.set(11, 71, 2, ids.air, 0);
+    view.set(13, 71, 2, ids.air, 0);
+    view.set(12, 71, 1, ids.air, 0);
+    view.set(12, 71, 3, ids.air, 0);
+    view.set(12, 71, 2, ids.cactus, 0); // kept (sand + air neighbors)
+
+    sweepFloaters(&view, 0, 0);
+
+    try std.testing.expectEqual(ids.air, view.get(0, 70, 0));
+    try std.testing.expectEqual(ids.tallgrass, view.get(1, 70, 0));
+    try std.testing.expectEqual(ids.air, view.get(2, 70, 0));
+    try std.testing.expectEqual(ids.deadbush, view.get(3, 70, 0));
+    try std.testing.expectEqual(ids.red_mushroom, view.get(4, 70, 0));
+    try std.testing.expectEqual(ids.pumpkin, view.get(5, 70, 0));
+    try std.testing.expectEqual(ids.air, view.get(6, 70, 0));
+    try std.testing.expectEqual(ids.waterlily, view.get(7, 70, 0));
+    try std.testing.expectEqual(ids.air, view.get(8, 70, 0));
+    try std.testing.expectEqual(ids.air, view.get(9, 70, 0));
+    try std.testing.expectEqual(ids.air, view.get(10, 70, 0));
+    try std.testing.expectEqual(ids.reeds_block, view.get(11, 70, 0));
+    try std.testing.expectEqual(ids.cactus, view.get(12, 71, 2));
+}
+
+test "snow/ice tail gates per column, not per window" {
+    // Regression: the old code gated the whole 16x16 populate window on
+    // the chunk-center biome, freezing ocean/beach water into an ice
+    // square whenever a frozen biome sat in the window (vanilla checks
+    // each column's own biome temperature < 0.15 via World.r/World.e).
+    const alloc = std.testing.allocator;
+    const S: usize = 48;
+    const blocks = try alloc.alloc(ids.Id, S * 256 * S);
+    defer alloc.free(blocks);
+    const metas = try alloc.alloc(u8, S * 256 * S);
+    defer alloc.free(metas);
+    @memset(blocks, ids.air);
+    @memset(metas, 0);
+    // Ocean world: stone to 70 everywhere; water at 71 on the west half
+    // of the window, bare stone at 71 on the east half.
+    for (0..S) |x| {
+        for (0..S) |z| {
+            for (0..71) |y| blocks[(x * S + z) * 256 + y] = ids.stone;
+        }
+    }
+    // Window for base (0,0) is wx 8..23, wz 8..23 (view ox=-16,oz=-16).
+    var dx: i32 = 0;
+    while (dx < 16) : (dx += 1) {
+        var dz: i32 = 0;
+        while (dz < 16) : (dz += 1) {
+            const wx = 8 + dx;
+            const wz = 8 + dz;
+            const lx: usize = @intCast(wx + 16);
+            const lz: usize = @intCast(wz + 16);
+            if (dx < 8) {
+                blocks[(lx * S + lz) * 256 + 71] = ids.water;
+            } else {
+                blocks[(lx * S + lz) * 256 + 71] = ids.stone;
+            }
+        }
+    }
+    var view = View{ .blocks = blocks, .metas = metas, .ox = -16, .oz = -16, .sx = S, .sz = S };
+    const heights = try alloc.alloc(i32, S * S);
+    defer alloc.free(heights);
+    computeHeights(&view, heights);
+    var frand = java_random.JavaRandom.init(2345);
+    var fnoise = try noise_mod.SimplexOctaves.init(alloc, &frand, 1);
+    defer fnoise.deinit();
+    var rand = java_random.JavaRandom.init(0);
+    seedForChunk(&rand, 42, 0, 0);
+    // Window biomes: west half ocean (0, warm), east half ice plains
+    // (12, frozen). Center biome is frozen on purpose: the old
+    // whole-window gate would freeze the western water too.
+    var win_bio: [256]i32 = undefined;
+    var i: usize = 0;
+    while (i < 256) : (i += 1) {
+        win_bio[i] = if (i / 16 < 8) 0 else 12;
+    }
+    try populateOne(&view, heights, &rand, &fnoise, 0, 0, 12, win_bio);
+    // Warm columns: water untouched, no snow anywhere above.
+    dx = 0;
+    while (dx < 8) : (dx += 1) {
+        var dz: i32 = 0;
+        while (dz < 16) : (dz += 1) {
+            const wx = 8 + dx;
+            const wz = 8 + dz;
+            try std.testing.expectEqual(ids.water, view.get(wx, 71, wz));
+            try std.testing.expectEqual(ids.air, view.get(wx, 72, wz));
+        }
+    }
+    // Frozen stone columns: snow_layer on top (proves the tail ran).
+    var snow_n: usize = 0;
+    dx = 8;
+    while (dx < 16) : (dx += 1) {
+        var dz: i32 = 0;
+        while (dz < 16) : (dz += 1) {
+            const wx = 8 + dx;
+            const wz = 8 + dz;
+            if (view.get(wx, 72, wz) == ids.snow_layer) snow_n += 1;
+            try std.testing.expect(view.get(wx, 71, wz) != ids.ice);
+        }
+    }
+    try std.testing.expect(snow_n > 100);
 }
 

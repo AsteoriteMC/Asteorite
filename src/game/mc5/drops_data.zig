@@ -19,15 +19,10 @@
 //! draws, then per-entity position offsets drawn by the spawner).
 
 const std = @import("std");
-const JavaRandom = @import("../worldgen/rng/java_random.zig").JavaRandom;
-const ids = @import("../ids.zig");
-
-/// One drop roll: spawn `singles` separate single-item entities of this stack.
-pub const DropRoll = struct {
-    item_id: ids.Id,
-    damage: i16,
-    singles: u8,
-};
+const JavaRandom = @import("../../worldgen/rng/java_random.zig").JavaRandom;
+const ids = @import("../../ids.zig");
+const drop_mod = @import("../drops.zig");
+pub const DropRoll = drop_mod.DropRoll;
 
 /// Roll drops for a broken block. Writes up to 2 rolls (leaves need two:
 /// sapling + apple) into `out`, returns the count. `meta` is the low nibble
@@ -129,6 +124,39 @@ pub fn rollDrops(block_id: ids.Id, meta: u4, rand: *JavaRandom, out: *[2]DropRol
         },
         // Glass, ice, bedrock: nothing (quantityDropped 0 / unbreakable).
         ids.bedrock, ids.glass, ids.ice => {},
+        // Piston head + moving block have no item form (`apq` getItemDropped
+        // is null; they exist only as block states).
+        ids.piston_head, ids.piston_extension => {},
+        // Redstone wire drops dust (the block has no item form).
+        ids.redstone_wire => {
+            out[0] = .{ .item_id = ids.redstone, .damage = 0, .singles = 1 };
+            n = 1;
+        },
+        // Repeaters/comparators drop their items (lit or not).
+        ids.unpowered_repeater, ids.powered_repeater => {
+            out[0] = .{ .item_id = ids.repeater, .damage = 0, .singles = 1 };
+            n = 1;
+        },
+        ids.unpowered_comparator, ids.powered_comparator => {
+            out[0] = .{ .item_id = ids.comparator, .damage = 0, .singles = 1 };
+            n = 1;
+        },
+        // Doors drop their items (either half; the partner half drops
+        // nothing — serve removes it directly).
+        ids.wooden_door_block => {
+            out[0] = .{ .item_id = ids.wooden_door_item, .damage = 0, .singles = 1 };
+            n = 1;
+        },
+        ids.iron_door_block => {
+            out[0] = .{ .item_id = ids.iron_door_item, .damage = 0, .singles = 1 };
+            n = 1;
+        },
+        // Anvil: the damage state rides in bits 2-3 (`BlockAnvil` drops
+        // damageValue >> 2); the facing bits are not preserved.
+        ids.anvil => {
+            out[0] = .{ .item_id = ids.anvil, .damage = @as(i16, meta >> 2), .singles = 1 };
+            n = 1;
+        },
         else => {
             out[0] = .{ .item_id = block_id, .damage = if (preservesMeta(block_id)) meta else 0, .singles = 1 };
             n = 1;
@@ -171,6 +199,18 @@ test "fixed drops: stone/cobble/ores/clay/glass" {
     // double slab -> 2 singles
     try std.testing.expectEqual(@as(usize, 1), rollDrops(ids.double_stone_slab, 0, &rng, &out));
     try std.testing.expectEqual(DropRoll{ .item_id = ids.stone_slab, .damage = 0, .singles = 2 }, out[0]);
+    // K1 redstone arms: wire -> dust; repeaters/comparators -> items;
+    // doors (either half) -> door items.
+    try std.testing.expectEqual(@as(usize, 1), rollDrops(ids.redstone_wire, 7, &rng, &out));
+    try std.testing.expectEqual(DropRoll{ .item_id = ids.redstone, .damage = 0, .singles = 1 }, out[0]);
+    try std.testing.expectEqual(@as(usize, 1), rollDrops(ids.powered_repeater, 3, &rng, &out));
+    try std.testing.expectEqual(ids.repeater, out[0].item_id);
+    try std.testing.expectEqual(@as(usize, 1), rollDrops(ids.powered_comparator, 3, &rng, &out));
+    try std.testing.expectEqual(ids.comparator, out[0].item_id);
+    try std.testing.expectEqual(@as(usize, 1), rollDrops(ids.wooden_door_block, 8, &rng, &out));
+    try std.testing.expectEqual(ids.wooden_door_item, out[0].item_id);
+    try std.testing.expectEqual(@as(usize, 1), rollDrops(ids.iron_door_block, 0, &rng, &out));
+    try std.testing.expectEqual(ids.iron_door_item, out[0].item_id);
     // default: self-drop; wool keeps color
     try std.testing.expectEqual(@as(usize, 1), rollDrops(ids.dirt, 0, &rng, &out));
     try std.testing.expectEqual(DropRoll{ .item_id = ids.dirt, .damage = 0, .singles = 1 }, out[0]);

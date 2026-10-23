@@ -1,12 +1,58 @@
 const std = @import("std");
 
+const McSpec = struct {
+    name: []const u8,
+    protocol: u16,
+    implemented: bool = true,
+};
+
+/// One entry per version in the support ladder. Unknown values fail in the
+/// build script; known-but-unimplemented values fail with a specific message.
+const mc_profiles = [_]McSpec{
+    .{ .name = "1.7.10", .protocol = 5 },
+    .{ .name = "1.8.9", .protocol = 47, .implemented = false },
+    .{ .name = "1.12.2", .protocol = 340, .implemented = false },
+    .{ .name = "1.13.2", .protocol = 404, .implemented = false },
+    .{ .name = "1.16.5", .protocol = 754, .implemented = false },
+    .{ .name = "1.20.4", .protocol = 765, .implemented = false },
+    .{ .name = "1.21.x", .protocol = 767, .implemented = false },
+};
+
+fn resolveMc(name: []const u8) ?McSpec {
+    for (mc_profiles) |spec| {
+        if (std.mem.eql(u8, spec.name, name)) return spec;
+    }
+    return null;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const mc_name = b.option([]const u8, "mc", "Minecraft version profile") orelse "1.7.10";
+    const mc = resolveMc(mc_name) orelse {
+        std.debug.print(
+            "error: unsupported -Dmc value '{s}' (implemented profile: 1.7.10)\n",
+            .{mc_name},
+        );
+        std.process.exit(1);
+    };
+    if (!mc.implemented) {
+        std.debug.print("error: profile -Dmc={s} is not implemented yet\n", .{mc.name});
+        std.process.exit(1);
+    }
+
+    const opts = b.addOptions();
+    opts.addOption(u16, "mc_protocol", mc.protocol);
+    opts.addOption([]const u8, "mc_name", mc.name);
+    const build_options = opts.createModule();
+
     const mod = b.addModule("asteorite", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .imports = &.{
+            .{ .name = "build_options", .module = build_options },
+        },
     });
 
     const exe = b.addExecutable(.{
@@ -139,6 +185,19 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(player_dump_tool);
 
+    const bench_tool = b.addExecutable(.{
+        .name = "bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "asteorite", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(bench_tool);
+
     const run_step = b.step("run", "Run asteorite server (stub)");
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -187,6 +246,12 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| player_dump_cmd.addArgs(args);
     player_dump_step.dependOn(&player_dump_cmd.step);
 
+    const bench_step = b.step("bench", "Run micro-benchmarks (tick, SIMD, codec)");
+    const bench_cmd = b.addRunArtifact(bench_tool);
+    bench_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| bench_cmd.addArgs(args);
+    bench_step.dependOn(&bench_cmd.step);
+
     const mod_tests = b.addTest(.{ .root_module = mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
@@ -216,6 +281,34 @@ pub fn build(b: *std.Build) void {
     const player_dump_tests = b.addTest(.{ .root_module = player_dump_tool.root_module });
     const run_player_dump_tests = b.addRunArtifact(player_dump_tests);
 
+    // C0 import-boundary gate. Kept as a named step so it can run on its own
+    // even while a larger WIP module is temporarily uncompilable.
+    const import_gate_mod = b.createModule(.{
+        .root_source_file = b.path("src/import_gate.zig"),
+        .target = target,
+    });
+    const import_gate_tests = b.addTest(.{ .root_module = import_gate_mod });
+    const run_import_gate_tests = b.addRunArtifact(import_gate_tests);
+    run_import_gate_tests.setCwd(b.path("."));
+    const check_imports_step = b.step("check-imports", "Reject direct protocol imports in shared core modules");
+    check_imports_step.dependOn(&run_import_gate_tests.step);
+
+    // C9 exploit/core regression suite. Deliberately standalone: it imports
+    // only modules that are not coupled to net/server/redstone, so it can run
+    // while those areas are being worked on. `--fuzz` applies to this step too.
+    const exploit_mod = b.createModule(.{
+        .root_source_file = b.path("src/exploit_tests.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "build_options", .module = build_options },
+        },
+    });
+    const exploit_tests = b.addTest(.{ .root_module = exploit_mod });
+    const run_exploit_tests = b.addRunArtifact(exploit_tests);
+    run_exploit_tests.setCwd(b.path("."));
+    const test_exploit_step = b.step("test-exploit", "Run C9 exploit/core regression suite and fuzz seeds");
+    test_exploit_step.dependOn(&run_exploit_tests.step);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
@@ -227,4 +320,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_check_tests.step);
     test_step.dependOn(&run_player_import_tests.step);
     test_step.dependOn(&run_player_dump_tests.step);
+    test_step.dependOn(&run_import_gate_tests.step);
+    test_step.dependOn(&run_exploit_tests.step);
 }

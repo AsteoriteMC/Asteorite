@@ -18,7 +18,7 @@
 //! `"modinfo":null`.
 
 const std = @import("std");
-const ids = @import("../proto/v5/ids.zig");
+const version = @import("../version.zig");
 
 /// Which server software the status handshake advertises.
 pub const Brand = enum {
@@ -58,8 +58,8 @@ pub const StatusPayload = struct {
     online_players: u8,
     brand: Brand = .vanilla,
     mods: []const ModEntry = &.{},
-    version_name: []const u8 = "1.7.10",
-    protocol: i32 = ids.protocol_version_1_7_10,
+    version_name: []const u8 = version.meta.name,
+    protocol: i32 = version.meta.protocol,
 };
 
 /// Serialize to a freshly allocated JSON string (caller frees).
@@ -76,7 +76,7 @@ pub fn writeJson(alloc: std.mem.Allocator, p: StatusPayload) ![]u8 {
         text: []const u8,
     };
     const WireModInfo = struct {
-        @"type": []const u8,
+        type: []const u8,
         modList: []const ModEntry,
     };
     const Wire = struct {
@@ -89,7 +89,7 @@ pub fn writeJson(alloc: std.mem.Allocator, p: StatusPayload) ![]u8 {
         .description = .{ .text = p.motd },
         .players = .{ .max = p.max_players, .online = p.online_players },
         .version = .{ .name = p.version_name, .protocol = p.protocol },
-        .modinfo = if (p.brand == .forge) .{ .@"type" = "FML", .modList = p.mods } else null,
+        .modinfo = if (p.brand == .forge) .{ .type = "FML", .modList = p.mods } else null,
     };
     return std.json.Stringify.valueAlloc(alloc, wire, .{ .emit_null_optional_fields = false });
 }
@@ -101,6 +101,12 @@ test "vanilla status is the exact 1.7.10 shape" {
     try std.testing.expectEqualStrings(
         \\{"description":{"text":"Asteorite"},"players":{"max":20,"online":3},"version":{"name":"1.7.10","protocol":5}}
     , js);
+}
+
+test "status version defaults come from the selected profile" {
+    const p = StatusPayload{ .motd = "x", .max_players = 1, .online_players = 0 };
+    try std.testing.expectEqualStrings(version.meta.name, p.version_name);
+    try std.testing.expectEqual(version.meta.protocol, p.protocol);
 }
 
 test "fabric status matches vanilla bytes (no 1.7.10 marker)" {

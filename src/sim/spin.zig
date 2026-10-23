@@ -11,9 +11,23 @@ pub const SpinLock = struct {
     state: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn lock(self: *SpinLock) void {
+        var spins: usize = 0;
         while (self.state.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
             std.atomic.spinLoopHint();
+            spins += 1;
+            // A long wait means the holder is doing real work (or is
+            // stuck): yield the CPU instead of burning it.
+            if (spins % 1024 == 0) std.Thread.yield() catch {};
         }
+    }
+
+    /// Try to take the lock without waiting. False when it is held.
+    ///
+    /// Used where taking another connection's lock would nest locks
+    /// (ABBA deadlock: two threads holding one conn's lock and waiting
+    /// for the other's). The caller treats "not acquired" as "skip".
+    pub fn tryLock(self: *SpinLock) bool {
+        return self.state.cmpxchgWeak(false, true, .acquire, .monotonic) == null;
     }
 
     pub fn unlock(self: *SpinLock) void {

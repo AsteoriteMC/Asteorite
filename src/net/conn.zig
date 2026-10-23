@@ -14,6 +14,9 @@ const packets = @import("../proto/v5/packets.zig");
 const slot_mod = @import("../proto/v5/slot.zig");
 const item_mod = @import("../item.zig");
 const recipes_mod = @import("../sim/recipes.zig");
+const container_mod = @import("../sim/container.zig");
+const interaction_mod = @import("../sim/interaction.zig");
+const movement_mod = @import("../sim/movement.zig");
 const uuid_mod = @import("uuid.zig");
 const cfb8 = @import("cfb8.zig");
 const rsa_mod = @import("rsa.zig");
@@ -21,6 +24,10 @@ const mojang = @import("mojang.zig");
 const spin = @import("../sim/spin.zig");
 const game_ids = @import("../ids.zig");
 const status_mod = @import("status.zig");
+const redstone_mod = @import("../sim/redstone.zig");
+const profile = @import("../version.zig");
+const arena_mod = @import("../sim/arena.zig");
+const transport_mod = @import("transport.zig");
 
 /// Server-driven tick intervals.
 pub const keepalive_interval_ms: i64 = 15000;
@@ -50,6 +57,10 @@ pub const Config = struct {
     /// Borrowed RSA keypair; required when online_mode is true.
     rsa: ?*const rsa_mod.RsaKeyPair = null,
     auth_url: []const u8 = "https://sessionserver.mojang.com/session/minecraft/hasJoined",
+    /// Phase B: per-connection cap on queued output bytes. A slow
+    /// consumer that lets its outbox grow past this is kicked (the queue
+    /// is unbounded otherwise, and chunk bulks are megabytes).
+    out_cap_bytes: usize = 4 * 1024 * 1024,
 };
 
 /// Block mutation request (break = id 0). Serve loop applies to the world
@@ -74,6 +85,15 @@ pub const QDropEvent = struct { stack: item_mod.Stack, slot: i16 };
 /// Furnace click (window 2): resolved by the serve thread (furnace state is
 /// server-owned under furn_lock). Click validation happened in handleFrame.
 pub const FurnaceClick = struct { slot: i16, button: i8, action: i16, mode: i8 };
+
+/// Enchanting-table click (window 4): same wire shape as FurnaceClick, but
+/// resolved by the enchanting path (conn-owned item + bookshelf recount).
+/// Kept as a distinct type so window-2 and window-4 clicks cannot be
+/// confused at the call site.
+pub const EnchantClick = struct { slot: i16, button: i8, action: i16, mode: i8 };
+
+/// Serverbound 0x11 enchant item (window 4, slot 0/1/2 offer).
+pub const EnchantEvent = struct { window: u8, slot: u8 };
 
 /// Crafting-table close: OWNED grid stacks (result slot is virtual and
 /// vanishes) for the serve loop to drop as entities + 0x2E the window.
@@ -110,6 +130,11 @@ pub const Action = union(enum) {
     disconnect_queued,
     /// Mutate one block then broadcast 0x23 to chunk viewers (not sender).
     block_set: BlockEvent,
+    /// Empty-hand (or interactable) right-click: serve resolves the clicked
+    /// block first (crafting table / furnace / K1 lever-door-repeater-ore);
+    /// only unhandled clicks with a held item fall through to placement.
+    /// Coordinates are the TARGET cell (clicked + face), like block_set.
+    interact: BlockEvent,
     /// Validated melee attack: resolved by the tick thread against mobs +
     /// players (carries attacker snapshot so no locks are needed later).
     attack: AttackEvent,
@@ -117,6 +142,11 @@ pub const Action = union(enum) {
     qdrop: QDropEvent,
     /// Furnace click (window 2): serve loop mutates server state + syncs.
     furnace_click: FurnaceClick,
+    /// Enchanting-table click (window 4): serve loop mutates the conn-owned
+    /// enchant item + recomputes levels + syncs.
+    enchant_click: EnchantClick,
+    /// Serverbound 0x11 enchant item: apply one of the three offers.
+    enchant: EnchantEvent,
     /// Crafting-table close (0x0D or table break): grid contents drop as
     /// entities in front of the player; serve loop sends 0x2E + spawns.
     table_close: TableClose,
@@ -183,6 +213,12 @@ pub const Conn = struct {
     /// Window 1 (crafting table): slot 0 = result, 1-9 = 3x3 grid.
     /// Owned stacks (NBT duped). open_win records the table block pos.
     table: [10]?item_mod.Stack = [_]?item_mod.Stack{null} ** 10,
+    /// Window 4 (enchanting table): single item slot (1.7.10 has no lapis).
+    /// Owned stack; levels/seed drive the K3 engine. open_win id 4 records
+    /// the table pos, like the table/furnace paths.
+    enchant_item: ?item_mod.Stack = null,
+    enchant_levels: [3]i32 = .{ 0, 0, 0 },
+    enchant_seed: i32 = 0,
     open_win: ?struct { id: u8, x: i32, y: u8, z: i32 } = null,
     sneaking: bool = false,
     /// Survival state. Damage resolution lives in the tick thread
@@ -201,8 +237,8 @@ pub const Conn = struct {
     food_timer: u32 = 0,
     air: i16 = 300,
     fire_ticks: u32 = 0,
-    /// Cactus hurt throttle (ticks remaining; vanilla hits ~1/0.5s while
-    /// in contact, without this envTick's per-tick damage is 20dps).
+    /// Cactus hurt throttle (1Hz ticks remaining; vanilla hurt-resistance
+    /// gates to ~1/0.5s, quantized here to one hit per touching tick).
     cactus_cd: u8 = 0,
     /// Save-epoch assigned at login (see Server.bumpSaveEpoch): a stale
     /// session's delayed save is dropped once a newer login owns the row.
@@ -220,6 +256,13 @@ pub const Conn = struct {
     /// Scratch for one validated outbound chat line (JSON).
     chat_buf: [1024]u8 = [_]u8{0} ** 1024,
     last_chat_ms: ?i64 = null,
+    /// Burst allowance inside the chat cooldown window. The cooldown is
+    /// measured at receive time, but a multithreaded server can stall reads
+    /// (chunk-bulk writes, world_lock contention, SST flushes) and then
+    /// read two legit chats back-to-back — that must not kick. Vanilla is
+    /// similarly lenient (threshold counter, not a single gap). Kick only
+    /// when the burst exceeds this many chats inside one window.
+    chat_burst: u8 = 0,
     /// Scratch for one serverbound 0x14 tab-complete request (raw text).
     tab_buf: [1024]u8 = [_]u8{0} ** 1024,
     /// Peer address ("127.0.0.1"-style; filled by the serve thread from the
@@ -249,6 +292,20 @@ pub const Conn = struct {
     yaw: f32 = 0,
     pitch: f32 = 0,
     on_ground: bool = false,
+    /// Login grace: the last teleported-to position (login PosLook /
+    /// respawn). While the grace is armed (deadline in `login_grace_ms`,
+    /// 0 = inactive), pure falls below it are held server-side: a real
+    /// client that falls through not-yet-streamed ground during the login
+    /// burst would otherwise be adopted at the fallen position (and that
+    /// wrong position persisted). Cleared by the exact PosLook echo, by
+    /// any horizontal move (the client is live), or by timeout; the serve
+    /// loop re-snaps the client once ground is confirmed present.
+    login_x: f64 = 8.5,
+    login_y: f64 = 64.0,
+    login_z: f64 = 8.5,
+    login_grace_ms: i64 = 0,
+    login_fell: bool = false,
+    login_resynced: bool = false,
     /// Columns already sent groundUp (groundUp re-send leaks client memory,
     /// so each column goes out at most once until unloaded). Key: x<<32|z.
     sent: std.AutoHashMap(i64, void),
@@ -260,6 +317,11 @@ pub const Conn = struct {
     bulk_comp: []u8 = &[_]u8{},
     bulk_work: []u8 = &[_]u8{},
     sent_center: ?struct { cx: i32, cz: i32 } = null,
+    /// Phase C: tick-region (32x32 chunks) the player was in on the last
+    /// server tick. Compared every tick: a change pushes a Transfer into
+    /// the target region's inbox (cross-region handoff). Null until the
+    /// first tick (spawn, not a crossing — no Transfer).
+    last_region: ?struct { rx: i32, rz: i32 } = null,
     /// Set once the login burst went out; movement before that is ignored.
     baseline_sent: bool = false,
     /// Set by movement/respawn handlers; serveConn drains via view.sync.
@@ -305,6 +367,19 @@ pub const Conn = struct {
     /// `undefined`, so returning a slice into `read` would alias poisoned
     /// memory). Valid until the next poll/feedData.
     frame: std.ArrayList(u8) = .empty,
+    /// Phase B: transport-assigned connection id (0 = blocking transport,
+    /// which does not use ids). The server uses it to route flush and
+    /// close requests to the owning transport worker.
+    transport_id: u32 = 0,
+    /// Phase B: the async transport that owns this connection (null =
+    /// blocking transport, which writes to the socket itself).
+    transport: ?transport_mod.Handle = null,
+    /// Phase B: the queued output grew past `config.out_cap_bytes`.
+    /// The server kicks the connection (slow-consumer protection).
+    overflow: bool = false,
+    /// Phase D: scratch arena for the decrypt/encrypt copies. Reset after
+    /// every use, so the steady-state allocation rate is zero.
+    scratch: arena_mod.Arena = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Config, eid: i32) Conn {
         return .{
@@ -318,6 +393,7 @@ pub const Conn = struct {
             .sent = std.AutoHashMap(i64, void).init(allocator),
             .tracked = std.AutoHashMap(i32, Tracked).init(allocator),
             .connected_at_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds(),
+            .scratch = arena_mod.Arena.init(allocator, 4096),
         };
     }
 
@@ -327,11 +403,13 @@ pub const Conn = struct {
         self.frame.deinit(self.allocator);
         self.sent.deinit();
         self.tracked.deinit();
+        self.scratch.deinit();
         if (self.bulk_raw.len > 0) self.allocator.free(self.bulk_raw);
         if (self.bulk_comp.len > 0) self.allocator.free(self.bulk_comp);
         if (self.bulk_work.len > 0) self.allocator.free(self.bulk_work);
         for (&self.inv) |*s| item_mod.freeStack(self.allocator, s);
         for (&self.table) |*s| item_mod.freeStack(self.allocator, s);
+        item_mod.freeStack(self.allocator, &self.enchant_item);
         item_mod.freeStack(self.allocator, &self.cursor);
     }
 
@@ -343,9 +421,12 @@ pub const Conn = struct {
     pub fn feedData(self: *Conn, data: []const u8) !void {
         if (self.dec) |*d| {
             // AES-CFB8 is a stream cipher: decrypt arrival-ordered bytes.
-            // (Heap copy per feed; P-next uses per-conn arena slices.)
-            const tmp = try self.allocator.dupe(u8, data);
-            defer self.allocator.free(tmp);
+            // The scratch arena (Phase D) replaces the per-feed heap dupe:
+            // the copy is a bump allocation and the arena is reset right
+            // after the bytes land in the (owning) read buffer.
+            const tmp = try self.scratch.alloc(data.len);
+            defer self.scratch.reset();
+            @memcpy(tmp, data);
             d.decrypt(tmp);
             try self.read.appendSlice(self.allocator, tmp);
         } else {
@@ -381,13 +462,19 @@ pub const Conn = struct {
 
     fn queueRaw(self: *Conn, framed: []const u8) !void {
         if (self.enc) |*e| {
-            const tmp = try self.allocator.dupe(u8, framed);
-            defer self.allocator.free(tmp);
+            // Scratch arena instead of a per-frame heap dupe (Phase D).
+            const tmp = try self.scratch.alloc(framed.len);
+            defer self.scratch.reset();
+            @memcpy(tmp, framed);
             e.encrypt(tmp);
             try self.out.appendSlice(self.allocator, tmp);
         } else {
             try self.out.appendSlice(self.allocator, framed);
         }
+        // Phase B: backpressure. The outbox is unbounded otherwise, and
+        // chunk bulks are megabytes: a slow consumer would eat the heap.
+        // The server kicks the connection once the cap is hit.
+        if (self.out.items.len > self.config.out_cap_bytes) self.overflow = true;
     }
 
     pub fn handleFrame(self: *Conn, frame: Frame) !Action {
@@ -662,6 +749,9 @@ pub const Conn = struct {
                     self.pitch,
                     false,
                 );
+                // Falling through the respawn burst is the same hazard as
+                // the login fall: hold pure falls until the client syncs.
+                self.armLoginGrace();
                 self.force_resync = true;
                 self.chunks_dirty = true;
                 if (self.is_dead) {
@@ -693,7 +783,7 @@ pub const Conn = struct {
         }
         if (frame.id == @as(i32, @intFromEnum(ids.PlayServer.player_block_placement))) {
             const p = try packets.parsePlacement(frame.body);
-            return self.onPlace(p.x, p.y, p.z, p.direction);
+            return self.onPlace(p.x, p.y, p.z, p.direction, @bitCast(p.cursor_y));
         }
         if (frame.id == @as(i32, @intFromEnum(ids.PlayServer.held_item_change))) {
             const slot = try packets.parseHeldSlot(frame.body);
@@ -715,6 +805,13 @@ pub const Conn = struct {
         }
         if (frame.id == @as(i32, @intFromEnum(ids.PlayServer.creative_inventory_action))) {
             const c = try packets.parseCreativeSlot(frame.body);
+            // Vanilla only processes these in creative; in survival the
+            // client never sends them, so a stale/replayed 0x10 must not
+            // mutate (or resurrect) the survival inventory.
+            if (self.config.gamemode != 1) {
+                if (c.slot >= 1 and c.slot < 45) self.sendSlot(c.slot);
+                return .none;
+            }
             // Vanilla rejects the output slot (slot 0); grid edits recompute.
             if (c.slot >= 1 and c.slot < 45) {
                 const idx: usize = @intCast(c.slot);
@@ -732,8 +829,13 @@ pub const Conn = struct {
             const now = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
             if (self.last_chat_ms) |last| {
                 if (now - last < chat_cooldown_ms) {
-                    return try self.disconnect("{\"text\":\"Kicked for spamming\"}");
-                }
+                    // Same-window repeat: tolerate stall-bunched pairs, kick
+                    // sustained floods (vanilla uses a threshold counter too).
+                    self.chat_burst += 1;
+                    if (self.chat_burst > 3) {
+                        return try self.disconnect("{\"text\":\"Kicked for spamming\"}");
+                    }
+                } else self.chat_burst = 0;
             }
             // Commands ride the chat packet (vanilla behavior): "/" prefix
             // routes to server.handleCommand instead of broadcast. Raw bytes
@@ -764,10 +866,24 @@ pub const Conn = struct {
         }
         if (frame.id == @as(i32, @intFromEnum(ids.PlayServer.click_window))) {
             const u = try packets.parseClickWindow(frame.body);
+            // Window 4 clicks resolve on the serve thread (bookshelf recount
+            // needs the world); window 2 the same. Both share the click
+            // validation shape, but map to distinct actions.
+            if (u.window == 4) {
+                if (try self.onClickWindowEnchant(u.window, u.slot, u.button, u.action, u.mode)) |ec| {
+                    return .{ .enchant_click = ec };
+                }
+                return .none;
+            }
             if (try self.onClickWindow(u.window, u.slot, u.button, u.action, u.mode)) |fc| {
                 return .{ .furnace_click = fc };
             }
             return .none;
+        }
+        if (frame.id == @as(i32, @intFromEnum(ids.PlayServer.enchant_item))) {
+            if (self.is_dead) return .none;
+            const e = packets.parseEnchantItem(frame.body) catch return .none;
+            return .{ .enchant = .{ .window = e.window, .slot = e.slot } };
         }
         if (frame.id == @as(i32, @intFromEnum(ids.PlayServer.close_window))) {
             const w = try packets.parseCloseWindow(frame.body);
@@ -776,6 +892,12 @@ pub const Conn = struct {
                 if (w == ow.id and ow.id == 2) {
                     self.open_win = null;
                     return .{ .table_close = .{ .window = 2, .stacks = [_]?item_mod.Stack{null} ** 9 } };
+                }
+                if (w == ow.id and ow.id == 4) {
+                    const owned = self.takeEnchantItem();
+                    var stacks = [_]?item_mod.Stack{null} ** 9;
+                    stacks[0] = owned;
+                    return .{ .table_close = .{ .window = 4, .stacks = stacks } };
                 }
             }
             return .none;
@@ -797,12 +919,18 @@ pub const Conn = struct {
         return .{ .attack = .{ .target_eid = target, .dmg = dmg, .ax = self.pos_x, .ay = self.pos_y, .az = self.pos_z } };
     }
 
-    /// Reach check from eyes (feet + 1.62) to block center; 6.0 generous.
+    /// Reach check from the profile eye point to the block center.
     fn inReach(self: *const Conn, x: i32, y: u8, z: i32) bool {
-        const dx = @as(f64, @floatFromInt(x)) + 0.5 - self.pos_x;
-        const dy = @as(f64, @floatFromInt(y)) + 0.5 - (self.pos_y + 1.62);
-        const dz = @as(f64, @floatFromInt(z)) + 0.5 - self.pos_z;
-        return dx * dx + dy * dy + dz * dz < 36.0;
+        const r = profile.rules.interaction;
+        return interaction_mod.inReach(
+            self.pos_x,
+            self.pos_y + r.eye_height,
+            self.pos_z,
+            x,
+            y,
+            z,
+            r.reach,
+        );
     }
 
     /// Send one Set Slot (0x2F) update. Heap frame (NBT can be large);
@@ -817,11 +945,15 @@ pub const Conn = struct {
         self.queueRaw(f) catch {};
     }
 
-    /// Full window refresh after desync (action-number mismatch).
+    /// Full window refresh after desync (action-number mismatch). Includes
+    /// the cursor: without it the client keeps a stale held stack (ghost
+    /// item) while the server sees empty, and the next click duplicates
+    /// then vanishes.
     fn sendWindow(self: *Conn) void {
         const f = packets.frameWindowItemsAlloc(self.allocator, 0, &self.inv) catch return;
         defer self.allocator.free(f);
         self.queueRaw(f) catch {};
+        self.sendCursor();
     }
 
     /// Serverbound 0x0E click window. Window 0 = player inventory (2x2 grid
@@ -841,6 +973,7 @@ pub const Conn = struct {
                 self.click_seen = true;
             } else if (action != self.click_seq) {
                 self.queueTableWindow();
+                self.sendCursor();
                 return null;
             }
             self.click_seq = action +% 1;
@@ -891,7 +1024,13 @@ pub const Conn = struct {
         switch (mode) {
             0 => {
                 if (button != 0 and button != 1) return null;
-                if (!(try self.clickPickupImplCell(&self.inv[s], button))) return null;
+                if (!(try self.clickPickupImplCell(&self.inv[s], button))) {
+                    // No-op (empty-empty) or full-merge: echo the current
+                    // slot + cursor so a predicting client snaps back.
+                    self.sendSlot(@intCast(s));
+                    self.sendCursor();
+                    return null;
+                }
                 self.sendSlot(@intCast(s));
                 self.sendCursor();
                 if (s >= 1 and s <= 4) {
@@ -923,55 +1062,7 @@ pub const Conn = struct {
     /// Returns true when anything moved (caller syncs slot + cursor then).
     /// Operates on any resolved cell (window-0 inv or table slot).
     pub fn clickPickupImplCell(self: *Conn, cell: *?item_mod.Stack, button: i8) !bool {
-        if (cell.* == null and self.cursor == null) return false;
-        if (cell.* == null) {
-            // Place from cursor.
-            if (button == 0) {
-                cell.* = self.cursor.?;
-                self.cursor = null;
-            } else {
-                const c = self.cursor.?;
-                cell.* = .{ .id = c.id, .count = 1, .damage = c.damage, .nbt = if (c.nbt) |n| try self.allocator.dupe(u8, n) else null };
-                self.cursor.?.count -= 1;
-                if (self.cursor.?.count <= 0) item_mod.freeStack(self.allocator, &self.cursor);
-            }
-            return true;
-        }
-        if (self.cursor == null) {
-            // Pick up from slot.
-            if (button == 0) {
-                self.cursor = cell.*;
-                cell.* = null;
-            } else {
-                const st = cell.*.?;
-                const take: i8 = @divTrunc(st.count + 1, 2); // ceil half
-                self.cursor = .{ .id = st.id, .count = take, .damage = st.damage, .nbt = if (st.nbt) |n| try self.allocator.dupe(u8, n) else null };
-                cell.*.?.count -= take;
-                if (cell.*.?.count <= 0) item_mod.freeStack(self.allocator, cell);
-            }
-            return true;
-        }
-        // Both sides occupied.
-        const dst = cell.*.?;
-        const src = self.cursor.?;
-        const limit = item_mod.maxStackSize(dst.id);
-        if (item_mod.canMerge(dst, src) and dst.count < limit) {
-            const space: i16 = @as(i16, limit) - dst.count;
-            var n: i16 = if (button == 0) @min(space, src.count) else 1;
-            if (space <= 0 or n <= 0) return false;
-            if (n > src.count) n = src.count;
-            cell.*.?.count += @as(i8, @intCast(n));
-            self.cursor.?.count -= @as(i8, @intCast(n));
-            if (self.cursor.?.count <= 0) item_mod.freeStack(self.allocator, &self.cursor);
-            return true;
-        }
-        if (!item_mod.canMerge(dst, src)) {
-            const t = cell.*;
-            cell.* = self.cursor.?;
-            self.cursor = t;
-            return true;
-        }
-        return false;
+        return container_mod.pickup(self.allocator, cell, &self.cursor, button);
     }
 
     /// Mode 1: shift-click moves the slot stack into the opposite region
@@ -984,53 +1075,29 @@ pub const Conn = struct {
         const in_hotbar = s >= 36;
         const dst_lo: usize = if (in_hotbar) 9 else 36;
         const dst_hi: usize = if (in_hotbar) 35 else 44;
-        var moved = false;
-        // 1. merge into compatible non-full dest stacks.
-        var i: usize = dst_lo;
-        while (i <= dst_hi) : (i += 1) {
-            if (i == s) continue;
-            const src = self.inv[s] orelse break;
-            const dst = self.inv[i] orelse continue;
-            if (!item_mod.canMerge(dst, src)) continue;
-            const room: i16 = @as(i16, item_mod.maxStackSize(dst.id)) - dst.count;
-            if (room <= 0) continue;
-            const n: i16 = @min(room, @as(i16, src.count));
-            if (n <= 0) continue;
-            self.inv[i].?.count += @as(i8, @intCast(n));
-            self.inv[s].?.count -= @as(i8, @intCast(n));
-            moved = true;
-            if (self.inv[s].?.count <= 0) {
-                item_mod.freeStack(self.allocator, &self.inv[s]);
-                break;
-            }
+        if (container_mod.quickMove(self.allocator, &self.inv[s], &self.inv, dst_lo, dst_hi, s)) {
+            self.sendWindow();
         }
-        // 2. remainder goes whole into the first empty dest slot.
-        if (self.inv[s] != null) {
-            i = dst_lo;
-            while (i <= dst_hi) : (i += 1) {
-                if (i == s) continue;
-                if (self.inv[i] != null) continue;
-                self.inv[i] = self.inv[s];
-                self.inv[s] = null;
-                moved = true;
-                break;
-            }
-        }
-        if (moved) self.sendWindow();
     }
 
     /// Mode 2: number-key swap with hotbar slot `button` (0..8).
-    /// Ignored while dragging (cursor non-empty), like vanilla.
+    /// Ignored while dragging (cursor non-empty), like vanilla — but the
+    /// predicting client still swapped locally, so echo both slots.
     fn clickNumberKey(self: *Conn, s: usize, button: i8) void {
         if (button < 0 or button > 8) return;
-        if (self.cursor != null) return;
+        if (self.cursor != null) {
+            self.sendSlot(@intCast(s));
+            self.sendCursor();
+            return;
+        }
         const h: usize = 36 + @as(usize, @intCast(button));
-        if (s == h) return;
-        const t = self.inv[s];
-        self.inv[s] = self.inv[h];
-        self.inv[h] = t;
-        self.sendSlot(@intCast(s));
-        self.sendSlot(@intCast(h));
+        if (container_mod.swap(&self.inv[s], &self.inv[h])) {
+            self.sendSlot(@intCast(s));
+            self.sendSlot(@intCast(h));
+        } else {
+            self.sendSlot(@intCast(s));
+            self.sendSlot(@intCast(h));
+        }
     }
 
     // ---------- crafting (2x2 player grid + window-1 table) ----------
@@ -1085,17 +1152,8 @@ pub const Conn = struct {
     /// result moves to cursor, one unit consumed per grid cell.
     /// `grid` borrows inv[1..5] or table[1..10]; `is_table` picks refresh.
     fn takeResult(self: *Conn, window: i8, grid: []?item_mod.Stack, result: *?item_mod.Stack, is_table: bool) !bool {
-        const res = result.* orelse return false;
-        if (self.cursor != null) return false;
-        self.cursor = res;
-        result.* = null;
-        for (grid, 0..) |*cell, i| {
-            if (cell.*) |_| {
-                cell.*.?.count -= 1;
-                if (cell.*.?.count <= 0) item_mod.freeStack(self.allocator, cell);
-                self.sendSlotWin(window, @intCast(1 + i));
-            }
-        }
+        if (!container_mod.takeResult(self.allocator, &self.cursor, result, grid)) return false;
+        for (grid, 0..) |_, i| self.sendSlotWin(window, @intCast(1 + i));
         if (is_table) self.refreshTable() else self.refreshCrafting();
         self.sendSlotWin(window, 0);
         self.sendSlotWin(-1, -1); // cursor lives on window -1 (vanilla rule)
@@ -1109,33 +1167,8 @@ pub const Conn = struct {
         while (true) {
             if (is_table) self.refreshTable() else self.refreshCrafting();
             const res = result.* orelse break;
-            // grant into player range (merge first, then empty)
-            var placed = false;
-            var i: usize = 9;
-            while (i <= 44) : (i += 1) {
-                const dst = self.inv[i] orelse continue;
-                if (!item_mod.canMerge(dst, res)) continue;
-                if (@as(u16, @intCast(dst.count)) + @as(u16, @intCast(res.count)) > item_mod.maxStackSize(dst.id)) continue;
-                self.inv[i].?.count += res.count;
-                placed = true;
-                break;
-            }
-            if (!placed) {
-                i = 9;
-                while (i <= 44) : (i += 1) {
-                    if (self.inv[i] != null) continue;
-                    self.inv[i] = try item_mod.cloneStack(self.allocator, res);
-                    placed = true;
-                    break;
-                }
-            }
-            if (!placed) break;
-            for (grid) |*cell| {
-                if (cell.*) |_| {
-                    cell.*.?.count -= 1;
-                    if (cell.*.?.count <= 0) item_mod.freeStack(self.allocator, cell);
-                }
-            }
+            if (!(try container_mod.insertWhole(self.allocator, &self.inv, 9, 44, res))) break;
+            container_mod.consumeGrid(self.allocator, grid);
             made = true;
         }
         if (made) {
@@ -1169,6 +1202,82 @@ pub const Conn = struct {
             self.queueRaw(f) catch {};
         } else |_| {}
         self.queueTableWindow();
+    }
+
+    /// Open the enchanting-table UI (window id 4, type 4, 1 item slot).
+    /// 1.7.10 has no lapis slot: the window carries the single item plus
+    /// the 36-slot player alias. `seed` is the per-session enchanting seed
+    /// (regenerated after each successful enchant); levels start at 0 and
+    /// are recomputed by the server once the item lands.
+    pub fn openEnchantUI(self: *Conn, x: i32, y: u8, z: i32, seed: i32) void {
+        self.open_win = .{ .id = 4, .x = x, .y = y, .z = z };
+        item_mod.freeStack(self.allocator, &self.enchant_item);
+        self.enchant_item = null;
+        self.enchant_levels = .{ 0, 0, 0 };
+        self.enchant_seed = seed;
+        var ob: [128]u8 = undefined;
+        if (packets.frameOpenWindow(4, 4, "Enchant", 1, &ob)) |f| {
+            self.queueRaw(f) catch {};
+        } else |_| {}
+        self.queueEnchantWindow();
+        self.sendEnchantLevels();
+    }
+
+    /// Assemble + queue a full Window Items 0x30 for the enchanting window
+    /// (slot 0 = item, 1-36 alias inv 9-44). Mirrors the furnace 39-slot
+    /// shape (3 + 36); enchanting is 1 + 36 = 37.
+    pub fn queueEnchantWindow(self: *Conn) void {
+        var all: [37]?item_mod.Stack = [_]?item_mod.Stack{null} ** 37;
+        all[0] = self.enchant_item;
+        for (9..45) |i| all[i - 8] = self.inv[i];
+        const f = packets.frameWindowItemsAlloc(self.allocator, 4, &all) catch return;
+        defer self.allocator.free(f);
+        self.queueRaw(f) catch {};
+    }
+
+    /// Queue the three S31 window-property levels for the open enchant UI.
+    pub fn sendEnchantLevels(self: *Conn) void {
+        if (self.open_win == null or self.open_win.?.id != 4) return;
+        var pb: [16]u8 = undefined;
+        for (0..3) |i| {
+            const v: i16 = @intCast(@max(0, @min(30, self.enchant_levels[i])));
+            if (packets.frameProgressBar(4, @intCast(i), v, &pb)) |f| {
+                self.queueRaw(f) catch {};
+            } else |_| {}
+        }
+    }
+
+    /// Move the enchant item out (ownership transfer) + clear levels + close.
+    /// Serve loop drops the stack as an entity, like the table grid.
+    pub fn takeEnchantItem(self: *Conn) ?item_mod.Stack {
+        const out = self.enchant_item;
+        self.enchant_item = null;
+        self.enchant_levels = .{ 0, 0, 0 };
+        self.open_win = null;
+        return out;
+    }
+
+    /// Serverbound 0x0E validation for window 4. The serve thread owns the
+    /// mutation (bookshelf recount needs the world), so validated clicks
+    /// return an event instead of mutating here. Mirrors the window-2 gate:
+    /// desync -> full refresh, never a kick.
+    fn onClickWindowEnchant(self: *Conn, window: i8, slot: i16, button: i8, action: i16, mode: i8) !?EnchantClick {
+        if (self.is_dead) return null;
+        if (window != 4) return null;
+        if (self.open_win == null or self.open_win.?.id != 4) {
+            self.sendWindow();
+            return null;
+        }
+        if (!self.click_seen) {
+            self.click_seen = true;
+        } else if (action != self.click_seq) {
+            self.queueEnchantWindow();
+            self.sendCursor();
+            return null;
+        }
+        self.click_seq = action +% 1;
+        if (slot == -999 or slot < 0 or slot > 36) return null;
+        return EnchantClick{ .slot = slot, .button = button, .action = action, .mode = mode };
     }
 
     /// Move the table grid out (ownership transfer), clear table + result +
@@ -1256,36 +1365,7 @@ pub const Conn = struct {
     /// Shift-click helper: move a source cell into player range 9..44
     /// (merge first, then first empty). Returns true when anything moved.
     fn quickMoveCellToInv(self: *Conn, src: *?item_mod.Stack) bool {
-        if (src.* == null) return false;
-        var moved = false;
-        var i: usize = 9;
-        while (i <= 44) : (i += 1) {
-            const dst = self.inv[i] orelse continue;
-            const s = src.* orelse break;
-            if (!item_mod.canMerge(dst, s)) continue;
-            const room: i16 = @as(i16, item_mod.maxStackSize(dst.id)) - dst.count;
-            if (room <= 0) continue;
-            const n: i16 = @min(room, @as(i16, s.count));
-            if (n <= 0) continue;
-            self.inv[i].?.count += @as(i8, @intCast(n));
-            src.*.?.count -= @as(i8, @intCast(n));
-            moved = true;
-            if (src.*.?.count <= 0) {
-                item_mod.freeStack(self.allocator, src);
-                break;
-            }
-        }
-        if (src.* != null) {
-            i = 9;
-            while (i <= 44) : (i += 1) {
-                if (self.inv[i] != null) continue;
-                self.inv[i] = src.*;
-                src.* = null;
-                moved = true;
-                break;
-            }
-        }
-        return moved;
+        return container_mod.quickMove(self.allocator, src, &self.inv, 9, 44, null);
     }
 
     fn sendCursor(self: *Conn) void {
@@ -1352,30 +1432,44 @@ pub const Conn = struct {
     }
 
     /// Face offsets: 0=-Y,1=+Y,2=-Z,3=+Z,4=-X,5=+X. 255/-1 = no placement.
-    fn onPlace(self: *Conn, x: i32, y: u8, z: i32, direction: i8) Action {
+    /// Empty-hand clicks still route (interact) so levers/doors/buttons work
+    /// bare-handed; held redstone-family items map to their blocks (dust ->
+    /// wire, repeater/comparator/door items) with facing-aware metas.
+    fn onPlace(self: *Conn, x: i32, y: u8, z: i32, direction: i8, cursor_y: u8) Action {
         if (self.is_dead) return .none;
         if (direction < 0 or direction > 5) return .none;
         if (!self.inReach(x, y, z)) return .none;
-        const held = self.inv[36 + self.selected] orelse return .none;
+        const held = self.inv[36 + self.selected];
+        const target = interaction_mod.targetCell(x, y, z, direction) orelse return .none;
+        const tx = target.x;
+        const ty = target.y;
+        const tz = target.z;
+        const h = held orelse return .{ .interact = .{ .x = tx, .y = @intCast(ty), .z = tz, .id = game_ids.air, .meta = 0, .face = direction } };
         // Canonical ids are always < 4096, so the old wire range check is
         // vacuous; unknown wires never reach here (slot parse maps them to empty).
-        // target cell adjacent on the clicked face
-        var tx = x;
-        var ty: i32 = y;
-        var tz = z;
-        switch (direction) {
-            0 => ty -= 1,
-            1 => ty += 1,
-            2 => tz -= 1,
-            3 => tz += 1,
-            4 => tx -= 1,
-            5 => tx += 1,
-            else => unreachable,
-        }
-        if (ty < 0 or ty > 255) return .none;
-        // creative damage value doubles as block metadata (low nibble)
-        const m: u4 = @truncate(@as(u16, @bitCast(held.damage)) & 0x0F);
-        return .{ .block_set = .{ .x = tx, .y = @intCast(ty), .z = tz, .id = held.id, .meta = m, .face = direction } };
+        const bid = profile.game.placeBlockForHeld(h.id) orelse h.id;
+        // Vanilla canPlaceBlockOnSide rejects floor/ceiling (sides 0/1)
+        // for buttons and trapdoors: no placement, no interact (jar).
+        if (redstone_mod.isButton(&profile.game.blocks, .{ .id = bid, .meta = 0 }) and (direction == 0 or direction == 1)) return .none;
+        if (profile.game.blocks.get(bid).orientation == .trapdoor and (direction == 0 or direction == 1)) return .none;
+        // Redstone-family placement is facing-aware; everything else keeps
+        // the legacy creative damage-nibble behavior. The anvil rule needs
+        // the held damage (bits 2-3 carry the damage state), so it rides
+        // along (ignored by every other orientation).
+        const held_dmg: u4 = @truncate(@as(u16, @bitCast(h.damage)) & 0x0F);
+        const m: u4 = redstone_mod.orientOnPlace(
+            &profile.game.blocks,
+            bid,
+            direction,
+            self.yaw,
+            cursor_y,
+            .{ self.pos_x, self.pos_y, self.pos_z },
+            tx,
+            ty,
+            tz,
+            held_dmg,
+        ) orelse held_dmg;
+        return .{ .block_set = .{ .x = tx, .y = @intCast(ty), .z = tz, .id = bid, .meta = m, .face = direction } };
     }
 
     fn markChunkDirty(self: *Conn) void {
@@ -1440,7 +1534,52 @@ pub const Conn = struct {
         return .none;
     }
 
+    /// Arm the login grace at the current (teleported-to) position (login
+    /// PosLook / respawn): pure falls below it are held server-side until
+    /// the echo, a horizontal move, or the timeout. See setPos.
+    pub fn armLoginGrace(self: *Conn) void {
+        self.login_x = self.pos_x;
+        self.login_y = self.pos_y;
+        self.login_z = self.pos_z;
+        self.login_fell = false;
+        self.login_resynced = false;
+        self.login_grace_ms = std.Io.Timestamp.now(self.io, .awake).toMilliseconds() + 10_000;
+    }
+
     fn setPos(self: *Conn, x: f64, y: f64, z: f64, yaw: f32, pitch: f32, on_ground: bool) void {
+        // Login grace: hold pure falls below the login teleport until the
+        // client proves it is synced (exact PosLook echo), moves
+        // horizontally (it is live), or the grace times out. A real client
+        // that falls through not-yet-streamed ground during the login burst
+        // would otherwise be adopted at the fallen position — joining in
+        // the ground despite having left on the ground — and that wrong
+        // position persisted on the next save.
+        if (self.login_grace_ms != 0) {
+            const now = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
+            if (now > self.login_grace_ms) {
+                self.login_grace_ms = 0;
+            } else if (x == self.login_x and y == self.login_y and z == self.login_z) {
+                self.login_grace_ms = 0; // exact teleport echo: synced
+            } else {
+                const gdx = x - self.login_x;
+                const gdz = z - self.login_z;
+                if (gdx * gdx + gdz * gdz > 1e-6) {
+                    self.login_grace_ms = 0; // playing, not falling
+                } else if (y < self.login_y - 1.0) {
+                    // Load-fall held: the client runs physics before its
+                    // burst arrives and falls through not-yet-streamed
+                    // ground (the sent-set only proves the bytes left, not
+                    // that the client processed them). Look still updates
+                    // so the client feels live; fall/landing bookkeeping
+                    // is skipped — no phantom fall damage, and the fallen
+                    // position is never adopted/persisted.
+                    self.login_fell = true;
+                    self.yaw = yaw;
+                    self.pitch = pitch;
+                    return;
+                }
+            }
+        }
         if (self.state == .play and !self.is_dead and self.baseline_sent) {
             const dx = x - self.pos_x;
             const dz = z - self.pos_z;
@@ -1448,8 +1587,9 @@ pub const Conn = struct {
             // while grounded, sprint 0.1 / walk 0.01. Airborne moves are free
             // (swim 0.015 needs a water check — documented J2 gap).
             if (on_ground and self.on_ground) {
-                const hd = @sqrt(dx * dx + dz * dz);
-                if (hd > 0.01) self.addExhaustion(@as(f32, @floatCast(hd)) * @as(f32, if (self.sprinting) 0.1 else 0.01));
+                const hd = movement_mod.horizontalDistance(dx, dz);
+                const cost = movement_mod.moveExhaustion(hd, self.sprinting, profile.rules.movement);
+                if (cost != 0) self.addExhaustion(cost);
             }
         }
         self.groundTransition(y - self.pos_y, on_ground);
@@ -1466,23 +1606,27 @@ pub const Conn = struct {
     /// is a jump). dy is the vertical delta (0 for flying-only frames).
     fn groundTransition(self: *Conn, dy: f64, on_ground: bool) void {
         if (self.state != .play or self.is_dead or !self.baseline_sent) return;
-        if (self.on_ground and !on_ground and dy > 0) {
-            // Vanilla `yz.bj()` via the flying handler; step-ups keep the
-            // client grounded, so they don't charge.
-            self.addExhaustion(@as(f32, if (self.sprinting) 0.8 else 0.2));
+        const tr = movement_mod.groundTransition(
+            self.on_ground,
+            on_ground,
+            dy,
+            self.sprinting,
+            self.fall_acc,
+            profile.rules.movement,
+        );
+        // Vanilla `yz.bj()` via the flying handler; step-ups keep the client
+        // grounded, so they don't charge.
+        if (tr.jump_exhaustion != 0) self.addExhaustion(tr.jump_exhaustion);
+        self.fall_acc = tr.fall_acc;
+        if (tr.landing) |dist| {
+            self.pending_fall = .{ .dist = dist, .x = self.pos_x, .y = self.pos_y, .z = self.pos_z };
         }
-        if (!on_ground and dy < 0) self.fall_acc += @floatCast(-dy);
-        if (!self.on_ground and on_ground) {
-            if (self.fall_acc > 0) self.pending_fall = .{ .dist = self.fall_acc, .x = self.pos_x, .y = self.pos_y, .z = self.pos_z };
-            self.fall_acc = 0;
-        }
-        if (on_ground) self.fall_acc = 0;
     }
 
     /// Vanilla `yz.a(float)`: creative (disableDamage) is exempt; cap 40.
     pub fn addExhaustion(self: *Conn, amount: f32) void {
         if (self.config.gamemode == 1) return;
-        self.exhaustion = @min(self.exhaustion + amount, 40.0);
+        self.exhaustion = movement_mod.addExhaustion(self.exhaustion, amount, profile.rules.movement);
     }
 
     /// Chunk coords of the player's current position (for resend-on-move).
@@ -1500,6 +1644,28 @@ pub const Conn = struct {
         return out;
     }
 };
+
+test "Phase B: the outbox cap marks the conn for a backpressure kick" {
+    const a = std.testing.allocator;
+    var c = Conn.init(a, std.testing.io, .{ .out_cap_bytes = 1024 }, 1);
+    defer c.deinit();
+    // Fill the outbox past the cap.
+    var payload: [200]u8 = undefined;
+    var framed: [256]u8 = undefined;
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        const f = try codec.framePacket(0x02, &payload, &framed);
+        try c.queueFramed(f);
+    }
+    try std.testing.expect(c.overflow);
+    try std.testing.expect(c.out.items.len > 1024);
+    // Under the cap: no overflow.
+    var c2 = Conn.init(a, std.testing.io, .{ .out_cap_bytes = 1 << 20 }, 2);
+    defer c2.deinit();
+    const f2 = try codec.framePacket(0x02, payload[0..10], &framed);
+    try c2.queueFramed(f2);
+    try std.testing.expect(!c2.overflow);
+}
 
 test "status flow with split feeds" {
     const a = std.testing.allocator;
@@ -1649,17 +1815,17 @@ test "offline login -> play bootstrap" {
     try std.testing.expectEqual(@as(i32, 0x08), h3.id);
 }
 
-test "player position tracked (stance consumed), chunk computed" {
+test "player position tracked (feet, not eye height), chunk computed" {
     const a = std.testing.allocator;
     var c = Conn.init(a, std.testing.io, .{}, 1);
     defer c.deinit();
     c.state = .play;
-    // serverbound 0x06 position+look with stance 66.5
+    // serverbound 0x06 position+look: x, FEET 65.0, stance 66.62, z
     var pb: [48]u8 = undefined;
     var w = codec.PacketWriter.init(&pb);
     try w.writeDouble(100.7);
-    try w.writeDouble(66.5); // stance
-    try w.writeDouble(65.0);
+    try w.writeDouble(65.0); // feet
+    try w.writeDouble(66.62); // stance (eye)
     try w.writeDouble(-40.2);
     try w.writeFloat(90.0);
     try w.writeFloat(0.0);
@@ -1697,10 +1863,16 @@ test "chat formats, rate-limits, and validates" {
     const act = try feed(&c, "hi <there>");
     try std.testing.expect(act.? == .chat);
     try std.testing.expectEqualStrings("{\"text\":\"<Bo> hi <there>\"}", c.chat_buf[0..act.?.chat.json_len]);
-    // immediate second message: spam kick (simulated recent chat => deterministic)
+    // immediate second message: tolerated (stall-bunched pairs must not
+    // kick); sustained floods still kick (burst cap 3 per window)
     c.last_chat_ms = std.Io.Timestamp.now(std.testing.io, .awake).toMilliseconds();
     const act2 = try feed(&c, "again");
-    try std.testing.expectEqual(Action.disconnect_queued, act2.?);
+    try std.testing.expect(act2.? == .chat);
+    // hammer inside the window: 4th rapid repeat kicks
+    _ = try feed(&c, "m3");
+    _ = try feed(&c, "m4");
+    const act5 = try feed(&c, "m5");
+    try std.testing.expectEqual(Action.disconnect_queued, act5.?);
     try std.testing.expect(c.close_after_flush);
 }
 
@@ -1890,6 +2062,82 @@ test "dig/place/held/creative/arm behavior" {
     }
 }
 
+test "K1 placement: redstone mapping, facing metas, empty-hand interact" {
+    const a = std.testing.allocator;
+    var c = Conn.init(a, std.testing.io, .{ .gamemode = 1, .spawn_x = 8, .spawn_y = 64, .spawn_z = 8 }, 7);
+    defer c.deinit();
+    c.state = .play;
+    // Redstone dust in hotbar slot 0 -> places wire (not dust-as-block).
+    c.inv[36] = .{ .id = game_ids.redstone, .count = 64, .damage = 0, .nbt = null };
+    c.selected = 0;
+    {
+        const act = c.onPlace(8, 64, 8, 1, 8);
+        const b = act.block_set;
+        try std.testing.expectEqual(game_ids.redstone_wire, b.id);
+        try std.testing.expectEqual(@as(i32, 8), b.x);
+    }
+    // Repeater item -> unpowered repeater with yaw facing (yaw 0 = south = 2).
+    c.inv[36] = .{ .id = game_ids.repeater, .count = 1, .damage = 0, .nbt = null };
+    c.yaw = 0;
+    {
+        const act = c.onPlace(8, 64, 8, 1, 8);
+        try std.testing.expectEqual(game_ids.unpowered_repeater, act.block_set.id);
+        try std.testing.expectEqual(@as(u4, 2), act.block_set.meta);
+    }
+    // Lever places with wall meta from the clicked face (face 2 -> 4).
+    c.inv[36] = .{ .id = game_ids.lever, .count = 1, .damage = 0, .nbt = null };
+    {
+        const act = c.onPlace(8, 64, 8, 2, 8);
+        try std.testing.expectEqual(game_ids.lever, act.block_set.id);
+        try std.testing.expectEqual(@as(u4, 4), act.block_set.meta);
+    }
+    // Stone keeps the legacy damage-nibble meta.
+    c.inv[36] = .{ .id = game_ids.stone, .count = 1, .damage = 7, .nbt = null };
+    {
+        const act = c.onPlace(8, 64, 8, 1, 8);
+        try std.testing.expectEqual(game_ids.stone, act.block_set.id);
+        try std.testing.expectEqual(@as(u4, 7), act.block_set.meta);
+    }
+    // Buttons are wall-only (vanilla canPlaceBlockOnSide): floor/ceiling
+    // clicks with a held button are dropped, walls place with facing metas.
+    c.inv[36] = .{ .id = game_ids.stone_button, .count = 1, .damage = 0, .nbt = null };
+    {
+        try std.testing.expect(c.onPlace(8, 64, 8, 1, 8) == .none);
+        try std.testing.expect(c.onPlace(8, 64, 8, 0, 8) == .none);
+        const act = c.onPlace(8, 64, 8, 2, 8);
+        try std.testing.expectEqual(game_ids.stone_button, act.block_set.id);
+        try std.testing.expectEqual(@as(u4, 4), act.block_set.meta);
+    }
+    // Torch on ceiling mounts upward (meta 0, vanilla `aoc` table).
+    c.inv[36] = .{ .id = game_ids.redstone_torch, .count = 1, .damage = 0, .nbt = null };
+    {
+        const act = c.onPlace(8, 64, 8, 0, 8);
+        try std.testing.expectEqual(game_ids.redstone_torch, act.block_set.id);
+        try std.testing.expectEqual(@as(u4, 0), act.block_set.meta);
+    }
+    // Trapdoor: wall-only (face 0/1 rejected), meta = side-2, upper half
+    // bit from cursor height.
+    c.inv[36] = .{ .id = game_ids.trapdoor, .count = 1, .damage = 0, .nbt = null };
+    {
+        try std.testing.expect(c.onPlace(8, 64, 8, 0, 8) == .none);
+        try std.testing.expect(c.onPlace(8, 64, 8, 1, 8) == .none);
+        const lo = c.onPlace(8, 64, 8, 3, 2);
+        try std.testing.expectEqual(game_ids.trapdoor, lo.block_set.id);
+        try std.testing.expectEqual(@as(u4, 1), lo.block_set.meta);
+        const hi = c.onPlace(8, 64, 8, 3, 12);
+        try std.testing.expectEqual(@as(u4, 1 | 8), hi.block_set.meta);
+    }
+    // Empty hand -> interact event (target cell + face, id air).
+    c.inv[36] = null;
+    {
+        const act = c.onPlace(8, 64, 8, 1, 8);
+        try std.testing.expect(act == .interact);
+        try std.testing.expectEqual(@as(i32, 8), act.interact.x);
+        try std.testing.expectEqual(@as(u8, 65), act.interact.y);
+        try std.testing.expectEqual(game_ids.air, act.interact.id);
+    }
+}
+
 test "use entity: attack validation, damage table, dead gates, respawn" {
     const a = std.testing.allocator;
     var c = Conn.init(a, std.testing.io, .{ .gamemode = 0, .spawn_x = 8, .spawn_y = 64, .spawn_z = 8 }, 7);
@@ -2032,7 +2280,10 @@ test "crafting table: 3x3 take, shift-craft, close drops grid" {
         var owned: ?item_mod.Stack = c.cursor;
         item_mod.freeStack(a, &owned);
         c.cursor = null;
-        { const o = try c.takeOutput(); defer a.free(o); }
+        {
+            const o = try c.takeOutput();
+            defer a.free(o);
+        }
     }
     // shift-craft sticks x64: grid col0 rows0-2... use 3-high column? sticks need 2x1; fill col0
     c.table[1] = .{ .id = game_ids.planks, .count = 64, .damage = 0, .nbt = null };
@@ -2053,7 +2304,10 @@ test "crafting table: 3x3 take, shift-craft, close drops grid" {
             total += st.count;
         };
         try std.testing.expectEqual(@as(i32, 256), total);
-        { const o = try c.takeOutput(); defer a.free(o); }
+        {
+            const o = try c.takeOutput();
+            defer a.free(o);
+        }
     }
     // close (0x0D) drops remaining grid stacks as entities
     c.table[6] = .{ .id = game_ids.stone, .count = 7, .damage = 0, .nbt = null };
@@ -2072,7 +2326,10 @@ test "crafting table: 3x3 take, shift-craft, close drops grid" {
         try std.testing.expect(c.open_win == null);
         var owned = tc.stacks;
         for (&owned) |*st| item_mod.freeStack(a, st);
-        { const o = try c.takeOutput(); defer a.free(o); }
+        {
+            const o = try c.takeOutput();
+            defer a.free(o);
+        }
     }
     // table shift-craft (craftAll path, window 1): sticks from 2x64 planks
     {
@@ -2095,7 +2352,10 @@ test "crafting table: 3x3 take, shift-craft, close drops grid" {
             total += st.count;
         };
         try std.testing.expectEqual(@as(i32, 256), total);
-        { const o = try c.takeOutput(); defer a.free(o); }
+        {
+            const o = try c.takeOutput();
+            defer a.free(o);
+        }
     }
 }
 
@@ -2199,7 +2459,10 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
         var owned: ?item_mod.Stack = c.cursor;
         item_mod.freeStack(a, &owned);
         c.cursor = null;
-        { const o = try c.takeOutput(); defer a.free(o); }
+        {
+            const o = try c.takeOutput();
+            defer a.free(o);
+        }
     }
     // 0b. Shift-click result crafts repeatedly into the pack.
     {
@@ -2222,7 +2485,10 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
         };
         try std.testing.expectEqual(@as(i32, 256), total);
         try std.testing.expect(c.inv[1] == null and c.inv[3] == null);
-        { const o = try c.takeOutput(); defer a.free(o); }
+        {
+            const o = try c.takeOutput();
+            defer a.free(o);
+        }
         c.click_seq = 1; // restore the action counter for the steps below
         for (9..45) |i| item_mod.freeStack(a, &c.inv[i]); // clear crafted stacks
     }
@@ -2249,7 +2515,10 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
         c.inv[0] = null;
         c.inv[1] = null;
         c.inv[3] = null;
-        { const o = try c.takeOutput(); defer a.free(o); }
+        {
+            const o = try c.takeOutput();
+            defer a.free(o);
+        }
     }
     // 0. Q-drop: status 4 drops one (slot decrements, event owns one),
     // status 3 drops the whole stack (slot empties).
@@ -2322,25 +2591,37 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
     try std.testing.expect((try click(&c, 11, 0, 2, 0)).? == .none);
     try std.testing.expectEqual(@as(i8, 64), c.inv[11].?.count);
     try std.testing.expect(c.cursor == null);
-    { const o = try c.takeOutput(); defer a.free(o); }
+    {
+        const o = try c.takeOutput();
+        defer a.free(o);
+    }
     // 3. right-click pickup half (ceil): 10 -> cursor 5, slot 5
     c.inv[12] = .{ .id = game_ids.stone, .count = 10, .damage = 0, .nbt = null };
     try std.testing.expect((try click(&c, 12, 1, 3, 0)).? == .none);
     try std.testing.expectEqual(@as(i8, 5), c.cursor.?.count);
     try std.testing.expectEqual(@as(i8, 5), c.inv[12].?.count);
-    { const o = try c.takeOutput(); defer a.free(o); }
+    {
+        const o = try c.takeOutput();
+        defer a.free(o);
+    }
     // 4. right-click place one: slot 13 empty -> 1, cursor 5 -> 4
     try std.testing.expect((try click(&c, 13, 1, 4, 0)).? == .none);
     try std.testing.expectEqual(@as(i8, 1), c.inv[13].?.count);
     try std.testing.expectEqual(@as(i8, 4), c.cursor.?.count);
-    { const o = try c.takeOutput(); defer a.free(o); }
+    {
+        const o = try c.takeOutput();
+        defer a.free(o);
+    }
     // 5. merge: slot has 60, cursor has 10 of same -> slot 64, cursor 6
     c.inv[14] = .{ .id = game_ids.stone, .count = 60, .damage = 0, .nbt = null };
     c.cursor = .{ .id = game_ids.stone, .count = 10, .damage = 0, .nbt = null };
     try std.testing.expect((try click(&c, 14, 0, 5, 0)).? == .none);
     try std.testing.expectEqual(@as(i8, 64), c.inv[14].?.count);
     try std.testing.expectEqual(@as(i8, 6), c.cursor.?.count);
-    { const o = try c.takeOutput(); defer a.free(o); }
+    {
+        const o = try c.takeOutput();
+        defer a.free(o);
+    }
     // 6. swap: cursor stone vs slot dirt
     c.inv[16] = .{ .id = game_ids.dirt, .count = 5, .damage = 0, .nbt = null };
     c.cursor = .{ .id = game_ids.stone, .count = 6, .damage = 0, .nbt = null };
@@ -2348,7 +2629,10 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
     try std.testing.expectEqual(game_ids.stone, c.inv[16].?.id);
     try std.testing.expectEqual(@as(i8, 6), c.inv[16].?.count);
     try std.testing.expectEqual(game_ids.dirt, c.cursor.?.id);
-    { const o = try c.takeOutput(); defer a.free(o); }
+    {
+        const o = try c.takeOutput();
+        defer a.free(o);
+    }
     // 7. shift-click merge: main slot 20 (dirt 32) into hotbar 36 (dirt 32)
     // exact fill: source empties, no remainder to place
     c.cursor = null;
@@ -2364,7 +2648,10 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
     try std.testing.expect((try click(&c, 24, 0, 8, 1)).? == .none);
     try std.testing.expect(c.inv[24] == null);
     try std.testing.expectEqual(@as(i8, 10), c.inv[38].?.count);
-    { const o = try c.takeOutput(); defer a.free(o); }
+    {
+        const o = try c.takeOutput();
+        defer a.free(o);
+    }
     // 8. number key: swap slot 21 with hotbar 0 (button 0); ignored w/ cursor
     c.inv[21] = .{ .id = game_ids.planks, .count = 1, .damage = 0, .nbt = null };
     c.inv[36] = .{ .id = game_ids.stone, .count = 64, .damage = 0, .nbt = null };
@@ -2375,7 +2662,10 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
     try std.testing.expect((try click(&c, 21, 1, 10, 2)).? == .none);
     try std.testing.expectEqual(game_ids.stone, c.inv[21].?.id); // unchanged
     c.cursor = null;
-    { const o = try c.takeOutput(); defer a.free(o); }
+    {
+        const o = try c.takeOutput();
+        defer a.free(o);
+    }
     // 9. desync: reused action number triggers full Window Items + ignore
     c.inv[22] = .{ .id = game_ids.bedrock, .count = 3, .damage = 0, .nbt = null };
     try std.testing.expect((try click(&c, 22, 0, 10, 0)).? == .none); // stale action
@@ -2398,12 +2688,18 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
     try std.testing.expect(c.inv[30] == null);
     try std.testing.expectEqualSlices(u8, &tag, c.cursor.?.nbt.?);
     try std.testing.expect(c.cursor.?.nbt.?.ptr == owned_tag.ptr); // moved, not copied
-    { const o = try c.takeOutput(); defer a.free(o); }
+    {
+        const o = try c.takeOutput();
+        defer a.free(o);
+    }
     // park it in an empty slot (place path keeps NBT too)
     try std.testing.expect((try click(&c, 31, 0, 12, 0)).? == .none);
     try std.testing.expect(c.cursor == null);
     try std.testing.expectEqualSlices(u8, &tag, c.inv[31].?.nbt.?);
-    { const o = try c.takeOutput(); defer a.free(o); }
+    {
+        const o = try c.takeOutput();
+        defer a.free(o);
+    }
     // two-stack split: fresh enchanted stack of 2, right-click takes half
     const tag2 = try a.dupe(u8, &tag);
     c.inv[32] = .{ .id = game_ids.diamond_sword, .count = 2, .damage = 0, .nbt = tag2 };
@@ -2412,7 +2708,125 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
     try std.testing.expectEqual(@as(i8, 1), c.inv[32].?.count);
     try std.testing.expectEqualSlices(u8, c.cursor.?.nbt.?, c.inv[32].?.nbt.?);
     try std.testing.expect(c.cursor.?.nbt.?.ptr != c.inv[32].?.nbt.?.ptr); // independent copies
-    { const o = try c.takeOutput(); defer a.free(o); }
+    {
+        const o = try c.takeOutput();
+        defer a.free(o);
+    }
+}
+
+test "enchant window: open, click validation, close, 0x11" {
+    const a = std.testing.allocator;
+    var c = Conn.init(a, std.testing.io, .{ .gamemode = 0, .spawn_x = 8, .spawn_y = 64, .spawn_z = 8 }, 7);
+    defer c.deinit();
+    c.state = .play;
+    const feed = struct {
+        fn run(conn: *Conn, id: i32, body: []const u8) !?Action {
+            var f: [128]u8 = undefined;
+            try conn.feedData(try codec.framePacket(id, body, &f));
+            const fr = (try conn.poll()).?;
+            return try conn.handleFrame(fr);
+        }
+    }.run;
+    // Open window 4 directly (server computes bookshelves/levels).
+    c.openEnchantUI(8, 64, 8, 1234);
+    try std.testing.expect(c.open_win != null);
+    try std.testing.expectEqual(@as(u8, 4), c.open_win.?.id);
+    try std.testing.expectEqual(@as(i32, 1234), c.enchant_seed);
+    try std.testing.expect(c.enchant_item == null);
+    // 0x0E click on window 4 validates the action number and returns an
+    // enchant_click for the serve thread (no direct mutation here).
+    {
+        var cb: [32]u8 = undefined;
+        var w = codec.PacketWriter.init(&cb);
+        try w.writeByte(4); // window 4
+        try w.writeShort(1); // player alias slot
+        try w.writeByte(0); // left
+        try w.writeShort(100); // action
+        try w.writeByte(0); // pickup
+        try w.writeShort(-1);
+        const act = (try feed(&c, 0x0E, w.written())).?;
+        try std.testing.expect(act == .enchant_click);
+        try std.testing.expectEqual(@as(i16, 1), act.enchant_click.slot);
+        // Replay with a stale action number resyncs instead of clicking.
+        var cb2: [32]u8 = undefined;
+        var w2 = codec.PacketWriter.init(&cb2);
+        try w2.writeByte(4);
+        try w2.writeShort(1);
+        try w2.writeByte(0);
+        try w2.writeShort(99); // stale
+        try w2.writeByte(0);
+        try w2.writeShort(-1);
+        try std.testing.expect((try feed(&c, 0x0E, w2.written())).? == .none);
+    }
+    // 0x11 enchant item parses window + slot.
+    {
+        var eb: [8]u8 = undefined;
+        var w = codec.PacketWriter.init(&eb);
+        try w.writeByte(4);
+        try w.writeByte(1);
+        const act = (try feed(&c, 0x11, w.written())).?;
+        try std.testing.expect(act == .enchant);
+        try std.testing.expectEqual(@as(u8, 4), act.enchant.window);
+        try std.testing.expectEqual(@as(u8, 1), act.enchant.slot);
+    }
+    // 0x0D close window 4 takes the item out for the serve loop to drop.
+    {
+        c.enchant_item = .{ .id = game_ids.diamond_sword, .count = 1, .damage = 0, .nbt = null };
+        var cb: [8]u8 = undefined;
+        var w = codec.PacketWriter.init(&cb);
+        try w.writeByte(4);
+        const act = (try feed(&c, 0x0D, w.written())).?;
+        try std.testing.expect(act == .table_close);
+        try std.testing.expectEqual(@as(u8, 4), act.table_close.window);
+        try std.testing.expectEqual(game_ids.diamond_sword, act.table_close.stacks[0].?.id);
+        try std.testing.expect(c.open_win == null);
+    }
+    {
+        const o = try c.takeOutput();
+        defer a.free(o);
+    }
+}
+
+test "login grace holds load-falls until echo, move, or timeout" {
+    const a = std.testing.allocator;
+    var c = Conn.init(a, std.testing.io, .{}, 7);
+    defer c.deinit();
+    c.state = .play;
+    c.baseline_sent = true;
+    c.pos_x = 0.5;
+    c.pos_y = 69.0;
+    c.pos_z = 0.5;
+    c.on_ground = true;
+    c.armLoginGrace();
+    try std.testing.expect(c.login_grace_ms != 0);
+    // Exact PosLook echo: synced, grace clears, position adopted.
+    c.setPos(0.5, 69.0, 0.5, 10.0, 0.0, true);
+    try std.testing.expect(c.login_grace_ms == 0);
+    try std.testing.expectApproxEqAbs(@as(f64, 10.0), c.yaw, 1e-6);
+    // Re-arm: a pure fall below login-1 is held (no save corruption,
+    // no phantom fall damage); look still updates. The serve loop
+    // re-snaps the client once the ground column is actually delivered.
+    c.armLoginGrace();
+    c.setPos(0.5, 67.5, 0.5, 20.0, 0.0, false);
+    try std.testing.expect(c.login_grace_ms != 0);
+    try std.testing.expect(c.login_fell);
+    try std.testing.expectApproxEqAbs(@as(f64, 69.0), c.pos_y, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f32, 20.0), c.yaw, 1e-6);
+    try std.testing.expect(c.pending_fall == null);
+    // Horizontal move means the client is live: grace clears, pos adopted.
+    c.setPos(2.5, 67.5, 0.5, 20.0, 0.0, false);
+    try std.testing.expect(c.login_grace_ms == 0);
+    try std.testing.expectApproxEqAbs(@as(f64, 67.5), c.pos_y, 1e-9);
+    // Re-arm: small vertical jitter above the threshold is adopted, not held.
+    c.armLoginGrace();
+    c.setPos(2.5, 67.2, 0.5, 0.0, 0.0, false);
+    try std.testing.expect(c.login_grace_ms != 0); // still armed (no echo/move/timeout)
+    try std.testing.expectApproxEqAbs(@as(f64, 67.2), c.pos_y, 1e-9);
+    // Timeout clears the grace.
+    c.login_grace_ms = std.Io.Timestamp.now(c.io, .awake).toMilliseconds() - 1;
+    c.setPos(2.5, 60.0, 0.5, 0.0, 0.0, false);
+    try std.testing.expect(c.login_grace_ms == 0);
+    try std.testing.expectApproxEqAbs(@as(f64, 60.0), c.pos_y, 1e-9);
 }
 
 test "join packets order + fields" {
@@ -2657,5 +3071,3 @@ test "online login full handshake (mock Mojang)" {
     try std.testing.expectEqualStrings("069a79f4-44e9-4726-a5be-f2a2fce1b293", try r2.readString());
     try std.testing.expectEqualStrings("Steve", try r2.readString());
 }
-
-

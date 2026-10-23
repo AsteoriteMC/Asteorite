@@ -70,10 +70,92 @@ Precedence is **built-in defaults < config file < CLI flags**.
 | `--motd <text>` | `Asteorite` | server list message |
 | `--max-players <n>` | 20 | server list player cap |
 | `--brand <name>` | `vanilla` | `vanilla`, `fabric`, or `forge` (`fml` accepted; see below) |
+| `--transport <kind>` | `auto` | `auto`, `uring`, `kqueue`, `iocp`, `blocking` (network backend) |
+| `--transport-workers <n>` | cpu count (max 8) | io_uring/kqueue worker threads (one ring per worker) |
+| `--region-threads <n>` | cpu count (max 8) | region tick threads (1 = sequential legacy path) |
+| `--storage-profile <p>` | `auto` | `auto`, `hdd`, `ssd`, `nvme` (SST sizing + io_uring SST reads) |
+| `--out-cap <bytes>` | 4 MiB | per-connection outbox cap; a slow consumer past it is dropped |
+| `--send-zc-threshold <bytes>` | 8192 | frames at/above this size go out zerocopy (`SEND_ZC`) |
+| `--tcp-nodelay` / `--no-tcp-nodelay` | on | `TCP_NODELAY` on accepted sockets |
+| `--sndbuf <bytes>` / `--rcvbuf <bytes>` | OS default | socket buffer sizes |
 | `-c, --config <path>` | `./asteorite.json` if present | JSON config file |
 | `-h, --help` | — | help |
 
 `--flag value` and `--flag=value` both work; `--` ends flag parsing.
+
+### Network transports
+
+`--transport` picks the network backend; `auto` resolves per OS
+(io_uring on Linux, kqueue on macOS/BSD, IOCP on Windows, blocking
+anywhere with `--transport blocking`).
+
+The **io_uring** backend (Linux) is the fast path: one ring per worker
+thread, multishot accept, multishot recv with registered buffer rings,
+and zerocopy sends for the big frames (chunk bulks). Measured on a
+20-core box with 500 idle + 100 moving clients: **600/600 joined, 0
+errors, output push p99 0.99 ms, RSS 15 MiB** (the blocking transport
+uses 212 MiB — the difference is the per-connection thread stacks).
+
+The blocking transport is the portable fallback (one thread per
+connection) and is also what `--transport blocking` selects.
+
+The **kqueue** backend (macOS/BSD) is implemented, lifecycle-reviewed
+(map-authority close, retained slots, flush wakeups so ticker output
+never stalls, working stop()), and compiles for the Darwin target —
+but this box is Linux, so it still has no runtime coverage. The
+**IOCP** backend (Windows, `src/net/iocp.zig`: one completion port,
+worker completion loops, blocking acceptor thread, same Handler
+contract) is in the same position: implemented, cross-compiled for
+`x86_64-windows`, pure parts unit-tested on every target, runtime
+needs Windows hardware. Two known v1 limits: IOCP conns carry no peer
+IP (`ip_len == 0`, so IP bans don't match them), and pre-existing
+`--transport blocking` remains the documented fallback on both
+(one thread per connection).
+
+### Storage profiles
+
+`--storage-profile` picks the LSM tuning; `auto` detects rotational
+storage on Linux (sysfs) and otherwise keeps today's defaults:
+
+- `hdd` — big SSTs (8 MiB flush), rare compactions (12 runs), batched WAL
+  syncs: seeks are the bottleneck, so move as few bytes as possible.
+- `ssd` — today's defaults (4 MiB flush, compact at 8 runs).
+- `nvme` — small SSTs (1 MiB flush), frequent small compactions (4 runs),
+  SST reads through io_uring (registered buffers + fixed files), parallel
+  cross-shard compaction. Measured `zig build bench` (ReleaseFast):
+  gets **572 µs → 85 µs (6.7×)** on 2 MB strides, 640/640 reads through
+  the ring with 0 fallbacks; compaction 22 ms per 4 MiB merged.
+
+The ring is best-effort: a kernel that refuses io_uring still serves,
+on plain pread (the stats line keeps working, `sp=` shows the profile).
+
+### Region threading
+
+`--region-threads` (default: cpu count, max 8; `1` = sequential legacy
+path) runs the per-viewer tick in Folia-style 32x32-chunk regions:
+viewers file into region groups, groups run on a persistent pool of
+stable workers (pinned once; a generation barrier replaces the join —
+time/weather publish through atomics only, never a world lock), and
+the merge folds worker outputs in group order (deterministic for a
+given grouping). Fork-join survives as the fallback (pool creation
+failure, non-Linux). Mobs are owned by regions: border crossings push
+full-state `Transfer`s, the next tick's drain adopts into the target
+and deletes the source (delete-at-drain: every snapshot holds exactly
+one copy, attacks never miss; a mid-flight kill drops the transfer).
+Player crossings still feed the per-region census + shed load signal.
+
+A per-region circuit breaker degrades hot regions only: 3 straight ticks
+with p99 over 15 ms sheds that region (players-only reconcile, no
+furnace-window resync) until 5 straight cool ticks recover it; entries
+show as `region_shed=` in the stats line. Measured `zig build bench`
+(ReleaseFast, 8 regions x 200 viewers x 2000 entities): **5.63×** over
+the sequential engine with identical checksums (pool matches fork-join
+there); on near-empty ticks the pool does **3.0µs vs fork-join's
+1317µs** — per-tick spawn costs ~150µs/worker here, which is why the
+pool exists. Workers pin to CCX-grouped cores (big cores first on
+big.LITTLE); pinning is advisory and never affects correctness. Item
+entities stay global (merge + magnet pickup are cross-region pair
+interactions — partitioning them needs a halo protocol).
 
 ### Config file
 
@@ -94,7 +176,11 @@ Every key is optional; anything the CLI sets wins over the file:
   "rcon_port": 25575,
   "motd": "Asteorite",
   "max_players": 20,
-  "brand": "vanilla"
+  "brand": "vanilla",
+  "transport": "auto",
+  "out_cap_bytes": 4194304,
+  "send_zc_threshold": 8192,
+  "storage_profile": "auto"
 }
 ```
 

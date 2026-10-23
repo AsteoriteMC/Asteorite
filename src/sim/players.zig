@@ -13,26 +13,32 @@
 //! for load (login path is single-threaded per conn). Durability comes
 //! from the WAL (kill -9 safe); `save-all`/stop/periodic flush SSTs.
 //!
-//! Format (versioned binary, "ZPLR"+3): fixed-size scalars big-endian,
-//! NBT stored verbatim (opaque, length-prefixed, -1 = none — same
-//! convention as the 1.7 slot wire format). Decode rejects truncated,
-//! overlong, version-skewed, and username-mismatched payloads.
+//! Format (versioned binary, magic "ZPLR" + u8 version): fixed-size scalars
+//! big-endian, NBT stored verbatim (opaque, length-prefixed, -1 = none — same
+//! convention as the 1.7 slot wire format). Slots store canonical `ids.Id`
+//! values (v5). Decode rejects truncated, overlong, version-skewed, and
+//! username-mismatched payloads.
 
 const std = @import("std");
 const store_mod = @import("../world/store.zig");
 const shard_mod = @import("../world/shard.zig");
 const item_mod = @import("../item.zig");
-const nbt_mod = @import("../world/nbt.zig");
 const ids = @import("../ids.zig");
-const wire = @import("../proto/v5/wire_ids.zig");
 
 pub const player_dim: u8 = 255;
 pub const magic = "ZPLR";
-/// v2 adds trailing gamemode (v1 rows decode with gamemode defaulting to 1).
-/// v4 appends xp (level/total/bar) + spawn_forced; v3 rows still decode
-/// (append-only, defaults apply).
-pub const version: u8 = 4;
+/// v1/v2 predate this parser and are rejected (reimport from player.dat).
+/// v3 introduced the current scalar layout but, due to the historical bug
+/// fixed in C1, still wrote 1.7.10 **wire** ids; v4 appended xp + spawn_forced
+/// on top of that. v3/v4 rows decode through an explicit `LegacySlotMap`.
+/// v5 is what `encode` writes and stores canonical `ids.Id` slots.
+pub const version: u8 = 5;
 pub const inv_size = 45;
+
+/// Migration map for v3/v4 rows: 1.7.10 wire id -> canonical id. Supplied by
+/// the import boundary (`world/import/player.zig`); the canonical core never
+/// imports a protocol table itself.
+pub const LegacySlotMap = *const fn (u16) ?ids.Id;
 
 pub const Data = struct {
     username_len: usize = 0,
@@ -153,7 +159,8 @@ fn writeSlot(out: []u8, i: usize, s: ?item_mod.Stack) usize {
     };
     out[j] = 1;
     j += 1;
-    std.mem.writeInt(u16, out[j..][0..2], wire.toWire(st.id), .big);
+    // v5 stores the canonical ids.Id; only pre-C1 v3/v4 rows held wire ids.
+    std.mem.writeInt(u16, out[j..][0..2], @intFromEnum(st.id), .big);
     j += 2;
     out[j] = @bitCast(st.count);
     j += 1;
@@ -174,6 +181,17 @@ fn writeSlot(out: []u8, i: usize, s: ?item_mod.Stack) usize {
 pub const LoadError = error{ CorruptPlayer, UsernameMismatch };
 
 pub fn decode(alloc: std.mem.Allocator, bytes: []const u8, expect_username: []const u8) (LoadError || std.mem.Allocator.Error)!Data {
+    return decodeInner(alloc, bytes, expect_username, null);
+}
+
+/// Decode a legacy v3/v4 row by mapping its 1.7.10 wire slot ids through
+/// `legacy`. v5 rows ignore `legacy` (their slots are already canonical);
+/// v3/v4 without a mapper are rejected rather than guessed.
+pub fn decodeLegacy(alloc: std.mem.Allocator, bytes: []const u8, expect_username: []const u8, legacy: LegacySlotMap) (LoadError || std.mem.Allocator.Error)!Data {
+    return decodeInner(alloc, bytes, expect_username, legacy);
+}
+
+fn decodeInner(alloc: std.mem.Allocator, bytes: []const u8, expect_username: []const u8, legacy: ?LegacySlotMap) (LoadError || std.mem.Allocator.Error)!Data {
     var d = Data{};
     errdefer freeData(alloc, &d);
     var r = bytes;
@@ -187,10 +205,11 @@ pub fn decode(alloc: std.mem.Allocator, bytes: []const u8, expect_username: []co
     }.run;
     if (!std.mem.eql(u8, try take(&r, 4), magic)) return error.CorruptPlayer;
     const ver = (try take(&r, 1))[0];
-    // v1/v2 stored wire ids; v3+ stores canonical ids. No migration path:
-    // reimport from Anvil/vanilla player.dat instead (same rule as ZC1).
-    // v3 rows decode with xp/spawn_forced defaulting (append-only v4).
-    if (ver != version and ver != 3) return error.CorruptPlayer;
+    // v5 stores canonical ids.Id. v3/v4 stored 1.7.10 wire ids and need the
+    // explicit migration map; v1/v2 predate this parser (reimport instead).
+    if (ver != version and ver != 3 and ver != 4) return error.CorruptPlayer;
+    const legacy_row = ver != version;
+    if (legacy_row and legacy == null) return error.CorruptPlayer;
     const ulen: usize = (try take(&r, 1))[0];
     if (ulen == 0 or ulen > 16) return error.CorruptPlayer;
     const uname = try take(&r, ulen);
@@ -215,8 +234,8 @@ pub fn decode(alloc: std.mem.Allocator, bytes: []const u8, expect_username: []co
     if (!std.math.isFinite(d.health) or d.health < 0 or d.health > 20) return error.CorruptPlayer;
     if (d.food < 0 or d.food > 20) return error.CorruptPlayer;
     if (!std.math.isFinite(d.saturation) or d.saturation < 0) return error.CorruptPlayer;
-    for (&d.inv) |*s| s.* = try readSlot(alloc, &r, take);
-    d.cursor = try readSlot(alloc, &r, take);
+    for (&d.inv) |*s| s.* = try readSlot(alloc, &r, take, if (legacy_row) legacy else null);
+    d.cursor = try readSlot(alloc, &r, take, if (legacy_row) legacy else null);
     d.gamemode = (try take(&r, 1))[0];
     if (d.gamemode > 1) return error.CorruptPlayer;
     if (ver >= 4) {
@@ -231,16 +250,22 @@ pub fn decode(alloc: std.mem.Allocator, bytes: []const u8, expect_username: []co
     return d;
 }
 
-fn readSlot(alloc: std.mem.Allocator, r: *[]const u8, take: fn (*[]const u8, usize) LoadError![]const u8) (LoadError || std.mem.Allocator.Error)!?item_mod.Stack {
+fn readSlot(alloc: std.mem.Allocator, r: *[]const u8, take: fn (*[]const u8, usize) LoadError![]const u8, legacy: ?LegacySlotMap) (LoadError || std.mem.Allocator.Error)!?item_mod.Stack {
     if ((try take(r, 1))[0] == 0) return null;
-    const wire_id = std.mem.readInt(u16, (try take(r, 2))[0..2], .big);
+    const raw_id = std.mem.readInt(u16, (try take(r, 2))[0..2], .big);
     const count: i8 = @bitCast((try take(r, 1))[0]);
     const damage = std.mem.readInt(i16, (try take(r, 2))[0..2], .big);
     const nlen = std.mem.readInt(i32, (try take(r, 4))[0..4], .big);
     if (nlen < -1) return error.CorruptPlayer;
     // id 0 is air: only legal as an empty slot, never as a stack.
-    // Anything else must map to the canonical registry.
-    const id = wire.fromWire(wire_id) orelse return error.CorruptPlayer;
+    // v5 payloads are canonical; v3/v4 payloads are wire ids and must be
+    // translated through the migration map (never guessed).
+    const id: ids.Id = if (legacy) |map|
+        map(raw_id) orelse return error.CorruptPlayer
+    else blk: {
+        if (@as(usize, raw_id) >= ids.COUNT) return error.CorruptPlayer;
+        break :blk @enumFromInt(raw_id);
+    };
     if (id == ids.air) return error.CorruptPlayer;
     if (nlen == -1) return .{ .id = id, .count = count, .damage = damage, .nbt = null };
     if (nlen > 1024 * 1024) return error.CorruptPlayer;
@@ -256,14 +281,25 @@ pub fn save(pool: *shard_mod.ShardPool, username: []const u8, d: *const Data) !v
     try pool.put(keyFor(username), enc);
 }
 
-/// Load one player's Data (owned NBT; free with freeData). Null = no save.
-/// UsernameMismatch is treated as absent (a hash hit on someone else's row —
-/// vanishingly unlikely, but never trust a key alone).
+/// Load one player's canonical Data (owned NBT; free with freeData).
+/// Null = no save. UsernameMismatch is treated as absent (a hash hit on
+/// someone else's row — vanishingly unlikely, but never trust a key alone).
 pub fn load(pool: *shard_mod.ShardPool, alloc: std.mem.Allocator, username: []const u8) !?Data {
+    return loadInner(pool, alloc, username, null);
+}
+
+/// Like `load`, but also accepts legacy v3/v4 rows by translating their wire
+/// slot ids through `legacy` (see `LegacySlotMap`). The runtime login path
+/// uses this so pre-C1 saves keep loading; v5 rows are unaffected.
+pub fn loadLegacy(pool: *shard_mod.ShardPool, alloc: std.mem.Allocator, username: []const u8, legacy: LegacySlotMap) !?Data {
+    return loadInner(pool, alloc, username, legacy);
+}
+
+fn loadInner(pool: *shard_mod.ShardPool, alloc: std.mem.Allocator, username: []const u8, legacy: ?LegacySlotMap) !?Data {
     const raw = try pool.get(alloc, keyFor(username));
     if (raw == null) return null;
     defer alloc.free(raw.?);
-    return decode(alloc, raw.?, username) catch |err| switch (err) {
+    return decodeInner(alloc, raw.?, username, legacy) catch |err| switch (err) {
         error.UsernameMismatch => null,
         else => |e| e,
     };
@@ -311,7 +347,15 @@ test "player roundtrip incl NBT, cursor, selected, spawn" {
     try std.testing.expect(back.inv[0] == null);
 }
 
-test "player v1/v2 rows are rejected (wire ids, not canonical)" {
+fn fakeLegacySlot(w: u16) ?ids.Id {
+    return switch (w) {
+        1 => .stone,
+        999 => .diamond_sword,
+        else => null,
+    };
+}
+
+test "player v1/v2 rows are rejected; v3/v4 need the legacy mapper" {
     const a = std.testing.allocator;
     var d = Data{};
     @memcpy(d.username[0.."Al".len], "Al");
@@ -319,7 +363,8 @@ test "player v1/v2 rows are rejected (wire ids, not canonical)" {
     d.gamemode = 0;
     const enc = try encode(a, &d);
     defer a.free(enc);
-    // Downgrade to v1 on the wire: version byte 1, drop trailing gamemode.
+    // Downgrade to v1 on the wire (and snip a tail byte so it cannot be
+    // mistaken for the current layout).
     const v1 = try a.alloc(u8, enc.len - 1);
     defer a.free(v1);
     @memcpy(v1, enc[0 .. enc.len - 1]);
@@ -342,8 +387,22 @@ test "player v1/v2 rows are rejected (wire ids, not canonical)" {
     } else |err| {
         try std.testing.expect(err == error.CorruptPlayer);
     }
+    // v3/v4 are pre-C1 wire-id rows: without the explicit legacy mapper the
+    // decoder rejects them instead of misreading wire ids as canonical.
+    for ([_]u8{ 3, 4 }) |legacy_ver| {
+        const row = try a.dupe(u8, enc);
+        defer a.free(row);
+        row[4] = legacy_ver;
+        var r = decode(a, row, "Al");
+        if (r) |*b| {
+            freeData(a, b);
+            try std.testing.expect(false);
+        } else |err| {
+            try std.testing.expect(err == error.CorruptPlayer);
+        }
+    }
     // garbage gamemode rejected (7 = neither survival nor creative).
-    // v4 layout tails with gamemode + xp_level/total/bar + spawn_forced.
+    // The tail is gamemode + xp_level/total/bar + spawn_forced.
     const bad = try a.dupe(u8, enc);
     defer a.free(bad);
     bad[bad.len - 14] = 7;
@@ -354,6 +413,45 @@ test "player v1/v2 rows are rejected (wire ids, not canonical)" {
     } else |err| {
         try std.testing.expect(err == error.CorruptPlayer);
     }
+}
+
+test "v4/v3 rows decode through the injected legacy mapper" {
+    const a = std.testing.allocator;
+    var d = Data{};
+    @memcpy(d.username[0.."Al".len], "Al");
+    d.username_len = 2;
+    d.inv[0] = .{ .id = .stone, .count = 64, .damage = 0, .nbt = null };
+    d.inv[36] = .{ .id = .diamond_sword, .count = 1, .damage = 0, .nbt = null };
+    const enc = try encode(a, &d);
+    defer a.free(enc);
+    const v4 = try a.dupe(u8, enc);
+    defer a.free(v4);
+    v4[4] = 4;
+    // Header before inv[0] is 4 magic + 1 version + 1 name length + 2 name
+    // + 24 pos + 8 rotation + 1 ground + 12 spawn + 4 health + 2 food
+    // + 4 saturation + 1 selected = 64 bytes. inv[0] is 1+2+1+2+4 = 10 bytes
+    // and slots 1..35 are one empty byte each, so inv[36]'s id is at 110.
+    std.mem.writeInt(u16, v4[65..][0..2], 1, .big); // stone wire
+    std.mem.writeInt(u16, v4[110..][0..2], 999, .big); // diamond_sword wire
+    var back = try decodeLegacy(a, v4, "Al", fakeLegacySlot);
+    defer freeData(a, &back);
+    try std.testing.expectEqual(ids.stone, back.inv[0].?.id);
+    try std.testing.expectEqual(@as(i8, 64), back.inv[0].?.count);
+    try std.testing.expectEqual(ids.diamond_sword, back.inv[36].?.id);
+    // v3 rows (no xp tail) default xp/spawn_forced instead of requiring it.
+    const v3 = try a.dupe(u8, v4[0 .. v4.len - 13]);
+    defer a.free(v3);
+    v3[4] = 3;
+    var back3 = try decodeLegacy(a, v3, "Al", fakeLegacySlot);
+    defer freeData(a, &back3);
+    try std.testing.expectEqual(ids.stone, back3.inv[0].?.id);
+    try std.testing.expectEqual(@as(i32, 0), back3.xp_level);
+    try std.testing.expect(!back3.spawn_forced);
+    // Unmapped wire ids are rejected, not stored as canonical guesses.
+    const bad = try a.dupe(u8, v4);
+    defer a.free(bad);
+    std.mem.writeInt(u16, bad[65..][0..2], 176, .big);
+    try std.testing.expectError(error.CorruptPlayer, decodeLegacy(a, bad, "Al", fakeLegacySlot));
 }
 
 test "player decode rejects corrupt/truncated/mismatched" {
@@ -434,335 +532,3 @@ test "player keys stable + distinct" {
     const k3 = keyFor("steve");
     try std.testing.expect(!std.mem.eql(u8, &k1, &k3));
 }
-
-// ---------------------------------------------------------------------------
-// Vanilla 1.7.10 player.dat import (Anvil home-world migration).
-// ---------------------------------------------------------------------------
-// Field mapping verified against CFR 0.152 decompiles of the official
-// 1.7.10 server jar (see notes): Entity.a/b (sa: Pos/Rotation 3d+2f,
-// FallDistance f, Fire/Air short, OnGround bool, Dimension int,
-// PortalCooldown int, UUIDMost/Least long), EntityLivingBase.a/b (sv:
-// HealF float preferred, else Health float-or-short), FoodStats.a/b (zr:
-// lowercase foodLevel int, foodTickTimer int, foodSaturationLevel float,
-// foodExhaustionLevel float), EntityPlayer.a/b (yz: Inventory list of
-// compounds Slot byte 0-35 main / 100-103 armor, SelectedItemSlot int,
-// SpawnX/Y/Z int + SpawnForced, XpLevel/XpTotal, EnderItems),
-// EntityPlayerMP.a/b (mw: playerGameType int), ItemStack.a (add:
-// id short, Count byte, Damage short, optional tag compound).
-//
-// Dropped on the floor (documented): Motion, FallDistance, Fire, Air,
-// PortalCooldown, Invulnerable, UUID, Score, XP, food timers/exhaustion,
-// EnderItems (no ender chest yet), crafting grid (vanilla doesn't save
-// it either), cursor (vanilla saves none). Out-of-range gamemodes clamp
-// to survival; only gamemode 0/1 exist here.
-
-pub const ImportStats = struct {
-    /// Inventory entries whose Slot byte maps nowhere (vanilla only emits
-    /// 0-35/100-103, but be liberal on read).
-    unknown_slots: usize = 0,
-    /// Entries dropped for bad id (<=0) or Count (<=0).
-    dropped_stacks: usize = 0,
-    /// True when no SpawnX/Y/Z trio was present (spawn falls back to pos).
-    defaulted_spawn: bool = true,
-    /// Player.dat Dimension (we always land the import in dim 0).
-    dimension: i32 = 0,
-};
-
-pub const VanillaError = nbt_mod.NbtError || std.mem.Allocator.Error || error{ BadUsername };
-
-fn validImportName(name: []const u8) bool {
-    // Mirrors conn.validPlayerName (kept local: players.zig must not import
-    // the whole connection stack for one charset check).
-    if (name.len == 0 or name.len > 16) return false;
-    for (name) |c| {
-        if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
-    }
-    return true;
-}
-
-/// Convert decompressed (gunzip already applied by the caller) vanilla
-/// 1.7.10 player.dat NBT into canonical Data. NBT `tag` compounds are
-/// preserved byte-for-byte (owned). Never fails a whole file on one bad
-/// scalar; structural corruption (truncation, bad tags) errors out.
-pub fn fromVanillaNbt(alloc: std.mem.Allocator, nbt: []const u8, username: []const u8) !struct { data: Data, stats: ImportStats } {
-    if (!validImportName(username)) return error.BadUsername;
-    var d = Data{};
-    var stats = ImportStats{};
-    errdefer freeData(alloc, &d);
-    d.username_len = username.len;
-    @memcpy(d.username[0..username.len], username);
-    var r = nbt_mod.Reader.init(nbt);
-    _ = try r.readRoot();
-    var have_healf = false;
-    var health_short: ?f32 = null;
-    var sx: ?i32 = null;
-    var sy: ?i32 = null;
-    var sz: ?i32 = null;
-    while (true) {
-        const t = try r.readTagType();
-        if (t == .end) break;
-        const name = try r.readString();
-        if (std.mem.eql(u8, name, "Pos")) {
-            if (t == .list) {
-                const elem = try r.readTagType();
-                const len = try r.readBE(i32);
-                if (elem == .double and len == 3) {
-                    d.pos_x = try r.readDouble();
-                    d.pos_y = try r.readDouble();
-                    d.pos_z = try r.readDouble();
-                } else {
-                    // Wrong shape: skip element-by-element.
-                    var i: i32 = 0;
-                    while (i < len) : (i += 1) try r.skipPayload(elem);
-                }
-            } else try r.skipPayload(t);
-        } else if (std.mem.eql(u8, name, "Rotation")) {
-            if (t == .list) {
-                const elem = try r.readTagType();
-                const len = try r.readBE(i32);
-                if (elem == .float and len == 2) {
-                    d.yaw = try r.readFloat();
-                    d.pitch = try r.readFloat();
-                } else {
-                    var i: i32 = 0;
-                    while (i < len) : (i += 1) try r.skipPayload(elem);
-                }
-            } else try r.skipPayload(t);
-        } else if (std.mem.eql(u8, name, "OnGround")) {
-            if (t == .byte) d.on_ground = (try r.readByte()) != 0 else try r.skipPayload(t);
-        } else if (std.mem.eql(u8, name, "Health")) {
-            // Legacy short-or-float form (HealF preferred; see below).
-            if (t == .float) {
-                health_short = try r.readFloat();
-            } else if (t == .short) {
-                health_short = @floatFromInt(try r.readBE(i16));
-            } else try r.skipPayload(t);
-        } else if (std.mem.eql(u8, name, "HealF")) {
-            if (t == .float) {
-                d.health = try r.readFloat();
-                have_healf = true;
-            } else try r.skipPayload(t);
-        } else if (std.mem.eql(u8, name, "foodLevel")) {
-            if (t == .int) {
-                const v = try r.readBE(i32);
-                d.food = @intCast(@max(0, @min(@as(i32, 20), v)));
-            } else try r.skipPayload(t);
-        } else if (std.mem.eql(u8, name, "foodSaturationLevel")) {
-            if (t == .float) {
-                d.saturation = @max(0.0, try r.readFloat());
-            } else try r.skipPayload(t);
-        } else if (std.mem.eql(u8, name, "playerGameType")) {
-            if (t == .int) {
-                d.gamemode = if ((try r.readBE(i32)) == 1) 1 else 0;
-            } else try r.skipPayload(t);
-        } else if (std.mem.eql(u8, name, "SpawnX")) {
-            if (t == .int) sx = try r.readBE(i32) else try r.skipPayload(t);
-        } else if (std.mem.eql(u8, name, "SpawnY")) {
-            if (t == .int) sy = try r.readBE(i32) else try r.skipPayload(t);
-        } else if (std.mem.eql(u8, name, "SpawnZ")) {
-            if (t == .int) sz = try r.readBE(i32) else try r.skipPayload(t);
-        } else if (std.mem.eql(u8, name, "SelectedItemSlot")) {
-            if (t == .int) {
-                const v = try r.readBE(i32);
-                d.selected = if (v >= 0 and v <= 8) @intCast(v) else 0;
-            } else try r.skipPayload(t);
-        } else if (std.mem.eql(u8, name, "Dimension")) {
-            if (t == .int) stats.dimension = try r.readBE(i32) else try r.skipPayload(t);
-        } else if (std.mem.eql(u8, name, "Inventory")) {
-            try readVanillaInventory(alloc, &r, t, &d, &stats);
-        } else {
-            try r.skipPayload(t);
-        }
-    }
-    if (!have_healf) {
-        if (health_short) |h| d.health = @min(@as(f32, 20.0), @max(0.0, h));
-    } else {
-        d.health = @min(@as(f32, 20.0), @max(0.0, d.health));
-    }
-    if (!std.math.isFinite(d.pos_x) or !std.math.isFinite(d.pos_y) or !std.math.isFinite(d.pos_z)) {
-        d.pos_x = 8.5;
-        d.pos_y = 64.0;
-        d.pos_z = 8.5;
-    }
-    if (sx != null and sy != null and sz != null) {
-        d.spawn_x = sx.?;
-        d.spawn_y = sy.?;
-        d.spawn_z = sz.?;
-        stats.defaulted_spawn = false;
-    } else {
-        d.spawn_x = @intFromFloat(@floor(d.pos_x));
-        d.spawn_y = @intFromFloat(@floor(d.pos_y));
-        d.spawn_z = @intFromFloat(@floor(d.pos_z));
-    }
-    return .{ .data = d, .stats = stats };
-}
-
-/// Player.dat Inventory list: compounds with Slot byte, id short, Count
-/// byte, Damage short, optional tag compound. Maps vanilla main 0-8 to
-/// hotbar window slots 36-44, main 9-35 to window 9-35, armor 100-103 to
-/// window 5-8. Anything else counts as an unknown slot.
-fn readVanillaInventory(alloc: std.mem.Allocator, r: *nbt_mod.Reader, outer: nbt_mod.TagType, d: *Data, stats: *ImportStats) !void {
-    if (outer != .list) {
-        try r.skipPayload(outer);
-        return;
-    }
-    const elem = try r.readTagType();
-    const len = try r.readBE(i32);
-    if (len < 0) return nbt_mod.NbtError.InvalidTag;
-    if (elem != .compound) {
-        var i: i32 = 0;
-        while (i < len) : (i += 1) try r.skipPayload(elem);
-        return;
-    }
-    var i: i32 = 0;
-    while (i < len) : (i += 1) {
-        // List elements are bare compounds (no name).
-        var id: i32 = 0;
-        var count: i8 = 0;
-        var damage: i16 = 0;
-        var slot: ?u8 = null;
-        var nbt: ?[]const u8 = null;
-        errdefer if (nbt) |n| alloc.free(n);
-        while (true) {
-            const t = try r.readTagType();
-            if (t == .end) break;
-            const fname = try r.readString();
-            if (std.mem.eql(u8, fname, "Slot")) {
-                if (t == .byte) slot = try r.readByte() else try r.skipPayload(t);
-            } else if (std.mem.eql(u8, fname, "id")) {
-                if (t == .short) id = try r.readBE(i16) else try r.skipPayload(t);
-            } else if (std.mem.eql(u8, fname, "Count")) {
-                if (t == .byte) count = @bitCast(try r.readByte()) else try r.skipPayload(t);
-            } else if (std.mem.eql(u8, fname, "Damage")) {
-                if (t == .short) damage = try r.readBE(i16) else try r.skipPayload(t);
-            } else if (std.mem.eql(u8, fname, "tag")) {
-                if (t == .compound) {
-                    nbt = try alloc.dupe(u8, try r.readRawCompound());
-                } else try r.skipPayload(t);
-            } else {
-                try r.skipPayload(t);
-            }
-        }
-        const s = slot orelse {
-            stats.dropped_stacks += 1;
-            continue;
-        };
-        if (id <= 0 or count <= 0) {
-            stats.dropped_stacks += 1;
-            continue;
-        }
-        // Vanilla wire id -> canonical; unmapped ids are dropped, not stored.
-        const canon = wire.fromWire(@intCast(@max(id, 0))) orelse {
-            stats.dropped_stacks += 1;
-            continue;
-        };
-        const dst: ?usize = if (s < 9) @as(usize, 36 + s) else if (s < 36) @as(usize, s) else if (s >= 100 and s < 104) @as(usize, 5 + (s - 100)) else null;
-        const di = dst orelse {
-            stats.unknown_slots += 1;
-            continue;
-        };
-        // Duplicate slots in one file: last wins (vanilla overwrites too).
-        item_mod.freeStack(alloc, &d.inv[di]);
-        d.inv[di] = .{ .id = canon, .count = count, .damage = damage, .nbt = nbt };
-        nbt = null; // owned by the slot now
-    }
-}
-
-test "vanilla player.dat golden (official 1.7.10 server)" {
-    const a = std.testing.allocator;
-    const blob = @embedFile("testdata/vanilla_player.dat");
-    const plain = try nbt_mod.gunzipAlloc(a, blob);
-    defer a.free(plain);
-    const imp = try fromVanillaNbt(a, plain, "Steve");
-    var d = imp.data;
-    defer freeData(a, &d);
-    // Fixture provenance: official 1.7.10 server.jar (sha256 pinned in
-    // testdata/README), offline mode, gamemode=creative Steve: creative
-    // gave 64 dirt, renamed diamond sword via 0x10 with NBT, walked to
-    // +X, disconnected. See testdata/README for the exact session script.
-    // NOTE: vanilla ignored the teleport (moved-too-quickly guard), so the
-    // row holds the login spawn, not x=100.5.
-    try std.testing.expectApproxEqAbs(@as(f64, -116.5), d.pos_x, 1e-9);
-    try std.testing.expectApproxEqAbs(@as(f64, 69.0), d.pos_y, 1e-9);
-    try std.testing.expectApproxEqAbs(@as(f64, 250.5), d.pos_z, 1e-9);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), d.yaw, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), d.pitch, 1e-6);
-    try std.testing.expect(!d.on_ground);
-    try std.testing.expectEqual(@as(u8, 1), d.gamemode);
-    try std.testing.expectApproxEqAbs(@as(f32, 20.0), d.health, 1e-6);
-    try std.testing.expectEqual(@as(i16, 20), d.food);
-    try std.testing.expectApproxEqAbs(@as(f32, 5.0), d.saturation, 1e-6);
-    try std.testing.expectEqual(@as(u8, 0), d.selected);
-    // no SpawnX/Y/Z in the fixture (no bed): spawn falls back to pos.
-    try std.testing.expect(imp.stats.defaulted_spawn);
-    try std.testing.expectEqual(@as(i32, -117), d.spawn_x);
-    try std.testing.expectEqual(@as(i32, 69), d.spawn_y);
-    try std.testing.expectEqual(@as(i32, 250), d.spawn_z);
-    // stone in hotbar slot 0 -> window 36
-    try std.testing.expectEqual(ids.stone, d.inv[36].?.id);
-    try std.testing.expectEqual(@as(i8, 64), d.inv[36].?.count);
-    try std.testing.expectEqual(@as(i16, 0), d.inv[36].?.damage);
-    try std.testing.expect(d.inv[36].?.nbt == null);
-    // renamed sword keeps its tag bytes verbatim (NBT round-trips opaque)
-    const sword = d.inv[37].?;
-    try std.testing.expectEqual(ids.diamond_sword, sword.id);
-    try std.testing.expectEqual(@as(i8, 1), sword.count);
-    const want_tag = [_]u8{ 0x0A, 0x00, 0x07, 'd', 'i', 's', 'p', 'l', 'a', 'y', 0x08, 0x00, 0x04, 'N', 'a', 'm', 'e', 0x00, 0x02, 'H', 'i', 0x00, 0x00 };
-    try std.testing.expectEqualSlices(u8, &want_tag, sword.nbt.?);
-    try std.testing.expect(imp.stats.unknown_slots == 0);
-    try std.testing.expect(imp.stats.dropped_stacks == 0);
-    // ZPLR round-trips the import (the store path is format-agnostic).
-    const enc = try encode(a, &d);
-    defer a.free(enc);
-    var back = try decode(a, enc, "Steve");
-    defer freeData(a, &back);
-    try std.testing.expect(item_mod.stacksEqual(d.inv[37], back.inv[37]));
-    try std.testing.expect(back.inv[37].?.nbt.?[0..back.inv[37].?.nbt.?.len].ptr != sword.nbt.?.ptr);
-}
-
-test "vanilla spawn trio fallback + synthetic edge cases" {
-    const a = std.testing.allocator;
-    // Minimal synthetic root: Pos only, no spawn trio, no health/food keys.
-    // (Labeled synthetic: exercises fallback branches the golden file's
-    // full fixture doesn't hit.)
-    var buf: [256]u8 = undefined;
-    var w: usize = 0;
-    buf[w] = 10;
-    w += 1; // TAG_Compound root
-    buf[w] = 0;
-    buf[w + 1] = 0;
-    w += 2; // empty name
-    // Pos: list of 3 doubles (tag + u16 name + element type + count)
-    buf[w] = 9;
-    w += 1;
-    std.mem.writeInt(u16, buf[w..][0..2], 3, .big);
-    w += 2;
-    @memcpy(buf[w..][0..3], "Pos");
-    w += 3;
-    buf[w] = 6;
-    w += 1;
-    std.mem.writeInt(i32, buf[w..][0..4], 3, .big);
-    w += 4;
-    for ([_]f64{ 10.5, 65.0, -3.25 }) |v| {
-        std.mem.writeInt(u64, buf[w..][0..8], @bitCast(v), .big);
-        w += 8;
-    }
-    buf[w] = 0;
-    w += 1; // TAG_End
-    var imp = try fromVanillaNbt(a, buf[0..w], "Al");
-    defer freeData(a, &imp.data);
-    try std.testing.expectApproxEqAbs(@as(f64, 10.5), imp.data.pos_x, 1e-9);
-    try std.testing.expect(imp.stats.defaulted_spawn);
-    try std.testing.expectEqual(@as(i32, 10), imp.data.spawn_x);
-    try std.testing.expectEqual(@as(i32, 65), imp.data.spawn_y);
-    try std.testing.expectEqual(@as(i32, -4), imp.data.spawn_z);
-    // Bad username rejected before touching NBT.
-    var r_bad = fromVanillaNbt(a, buf[0..w], "has space");
-    if (r_bad) |*bad| {
-        freeData(a, &bad.data);
-        try std.testing.expect(false);
-    } else |err| {
-        try std.testing.expect(err == error.BadUsername);
-    }
-}
-

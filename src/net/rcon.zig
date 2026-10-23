@@ -28,6 +28,7 @@
 //!   the only thing that can hit it.
 
 const std = @import("std");
+const console_tui = @import("../console_tui.zig");
 
 pub const AUTH: i32 = 3;
 pub const AUTH_RESPONSE: i32 = 2;
@@ -167,8 +168,11 @@ pub fn handleConn(stream: std.Io.net.Stream, io: std.Io, server: *Server, passwo
             sendResponse(wout, p.id, reply) catch return;
             if (Server.isStopCommand(text)) {
                 _ = server.saveAllPlayers();
+                server.saveRedstone();
                 if (server.world) |pool| pool.flushAll() catch {};
                 std.log.info("rcon stop: saved players, flushed. bye.", .{});
+                // exit() skips the console thread's restore defer.
+                console_tui.restoreTerminal();
                 std.process.exit(0);
             }
         } else {

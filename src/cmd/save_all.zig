@@ -17,6 +17,7 @@ pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u
     srv.sendDirect(sender, "Saving...");
     srv.notifyAdmins(sender, &def, "Saving...");
     _ = srv.saveAllPlayers();
+    srv.saveRedstone();
     srv.flushWorld();
     const done = "Saved the world";
     srv.notifyAdmins(sender, &def, done);

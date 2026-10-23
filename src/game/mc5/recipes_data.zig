@@ -5,7 +5,7 @@
 //! Repair (2x same damageable) and the 5 NBT specials (map/book/armor-dye/
 //! fireworks) live in recipes.zig, not here.
 
-const ids = @import("../ids.zig");
+const ids = @import("../../ids.zig");
 
 pub const Cell = struct { id: ids.Id, dmg: i16 };
 pub const Output = struct { id: ids.Id, count: i8, dmg: i16 };
