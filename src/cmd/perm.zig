@@ -9,7 +9,7 @@ const cmd = @import("mod.zig");
 pub const def = cmd.define(.{
     .name = "perm",
     .node = "asteorite.command.perm",
-    .min_level = 4,
+    .min_level = .owner,
     .spec = &.{
         &[_]cmd.Slot{
             cmd.Slot{ .arg = .{ .choice = &.{ "grant", "deny", "clear", "show", "reload" } } },

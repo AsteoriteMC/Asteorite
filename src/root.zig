@@ -121,6 +121,8 @@ pub const arena = @import("sim/arena.zig");
 pub const slab = @import("sim/slab.zig");
 /// Seqlock for read-mostly shared state (Phase D lock-free reads).
 pub const seqlock = @import("sim/seqlock.zig");
+/// Sliding-window rate limiters (login attempts, block placement).
+pub const ratelimit = @import("sim/ratelimit.zig");
 /// SoA entity store + SIMD fast paths (Phase D prefetcher-friendly tick).
 pub const entity_store = @import("sim/entity_store.zig");
 /// Network transport abstraction (Phase B: io_uring / kqueue / IOCP / blocking).
@@ -209,6 +211,7 @@ test {
     _ = @import("sim/arena.zig");
     _ = @import("sim/slab.zig");
     _ = @import("sim/seqlock.zig");
+    _ = @import("sim/ratelimit.zig");
     _ = @import("sim/entity_store.zig");
     _ = @import("sim/packet_sink.zig");
     _ = @import("sim/packet_sink_test.zig");

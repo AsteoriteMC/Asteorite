@@ -111,6 +111,10 @@ pub fn main(init: std.process.Init) !void {
         if (parsed.tcp_nodelay) |v| eff.tcp_nodelay = v;
         if (parsed.sndbuf) |v| eff.sndbuf = v;
         if (parsed.rcvbuf) |v| eff.rcvbuf = v;
+        if (parsed.login_rate_window_ms) |v| eff.login_rate_window_ms = v;
+        if (parsed.login_rate_burst) |v| eff.login_rate_burst = v;
+        if (parsed.place_rate_window_ms) |v| eff.place_rate_window_ms = v;
+        if (parsed.place_rate_burst) |v| eff.place_rate_burst = v;
         config.validate(&eff) catch |err| {
             try w.print("serve: {s}\n", .{config.validateMessage(err)});
             try w.flush();
@@ -145,6 +149,9 @@ pub fn main(init: std.process.Init) !void {
         }
         var srv = try asteorite.server.Server.bindAny(io, port, cfg);
         defer srv.deinit();
+        // Seed the runtime command registry once, before any serving
+        // thread can take the serving path (lazy ensure covers the rest).
+        srv.ensureCommands();
         // OS shutdown signals (SIGINT/SIGTERM/SIGHUP/SIGQUIT, Windows
         // console events) set an atomic flag; the ticker loop turns it
         // into finishStop() (same save+flush+exit as /stop). Installed
@@ -164,6 +171,11 @@ pub fn main(init: std.process.Init) !void {
         };
         // The per-connection outbox cap travels with the conn config.
         srv.config.out_cap_bytes = eff.out_cap_bytes;
+        // Flood-gate budgets travel the same way (conn template + server).
+        srv.config.place_window_ms = eff.place_rate_window_ms;
+        srv.config.place_burst = eff.place_rate_burst;
+        srv.login_rate_window_ms = eff.login_rate_window_ms;
+        srv.login_rate_burst = eff.login_rate_burst;
         // Phase C: region tick threads (0 = auto).
         srv.region_threads = eff.region_threads;
         if (seed) |s| srv.drop_seed = s;

@@ -140,7 +140,7 @@ pub fn fromVanillaNbt(alloc: std.mem.Allocator, nbt: []const u8, username: []con
             } else try r.skipPayload(t);
         } else if (std.mem.eql(u8, name, "playerGameType")) {
             if (t == .int) {
-                d.gamemode = if ((try r.readBE(i32)) == 1) 1 else 0;
+                d.gamemode = if ((try r.readBE(i32)) == 1) .creative else .survival;
             } else try r.skipPayload(t);
         } else if (std.mem.eql(u8, name, "SpawnX")) {
             if (t == .int) sx = try r.readBE(i32) else try r.skipPayload(t);
@@ -275,7 +275,7 @@ test "vanilla player.dat golden (official 1.7.10 server)" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), d.yaw, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), d.pitch, 1e-6);
     try std.testing.expect(!d.on_ground);
-    try std.testing.expectEqual(@as(u8, 1), d.gamemode);
+    try std.testing.expect(d.gamemode == .creative);
     try std.testing.expectApproxEqAbs(@as(f32, 20.0), d.health, 1e-6);
     try std.testing.expectEqual(@as(i16, 20), d.food);
     try std.testing.expectApproxEqAbs(@as(f32, 5.0), d.saturation, 1e-6);

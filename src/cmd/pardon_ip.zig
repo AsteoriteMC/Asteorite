@@ -5,7 +5,7 @@ const cmd = @import("mod.zig");
 pub const def = cmd.define(.{
     .name = "pardon-ip",
     .node = "asteorite.command.pardon-ip",
-    .min_level = 3,
+    .min_level = .admin,
     .spec = &.{
         &[_]cmd.Slot{
             cmd.Slot{ .arg = .{ .word = {} }, .display = "<address>" },

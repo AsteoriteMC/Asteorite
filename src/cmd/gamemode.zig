@@ -1,11 +1,12 @@
 //! /gamemode — switch survival/creative/adventure (self or another player).
 
 const cmd = @import("mod.zig");
+const rules = @import("../game/rules.zig");
 
 pub const def = cmd.define(.{
     .name = "gamemode",
     .node = "asteorite.command.gamemode",
-    .min_level = 2,
+    .min_level = .gamemaster,
     .spec = &.{
         &[_]cmd.Slot{
             cmd.Slot{ .arg = .{ .word = {} }, .display = "<mode>" },
@@ -16,14 +17,14 @@ pub const def = cmd.define(.{
 });
 
 /// Vanilla mode parse: full names + single letters (case-insensitive),
-/// else integer 0..2 (parseIntBounded with min 0, max values-2).
-fn parseMode(s: []const u8) ?u8 {
-    if (std.ascii.eqlIgnoreCase(s, "survival") or std.ascii.eqlIgnoreCase(s, "s")) return 0;
-    if (std.ascii.eqlIgnoreCase(s, "creative") or std.ascii.eqlIgnoreCase(s, "c")) return 1;
-    if (std.ascii.eqlIgnoreCase(s, "adventure") or std.ascii.eqlIgnoreCase(s, "a")) return 2;
+/// else the wire value. Bounds track the enum (no hardcoded max).
+fn parseMode(s: []const u8) ?rules.GameMode {
+    if (std.ascii.eqlIgnoreCase(s, "survival") or std.ascii.eqlIgnoreCase(s, "s")) return .survival;
+    if (std.ascii.eqlIgnoreCase(s, "creative") or std.ascii.eqlIgnoreCase(s, "c")) return .creative;
+    if (std.ascii.eqlIgnoreCase(s, "adventure") or std.ascii.eqlIgnoreCase(s, "a")) return .adventure;
     const v = std.fmt.parseInt(i64, s, 10) catch return null;
-    if (v < 0 or v > 2) return null;
-    return @intCast(v);
+    if (v < 0 or v >= std.enums.values(rules.GameMode).len) return null;
+    return @enumFromInt(v);
 }
 
 pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u8 {
@@ -57,11 +58,11 @@ const std = @import("std");
 
 test "gamemode usage + parse" {
     try std.testing.expectEqualStrings("/gamemode <mode> [player]", def.usage());
-    try std.testing.expectEqual(@as(?u8, 0), parseMode("survival"));
-    try std.testing.expectEqual(@as(?u8, 0), parseMode("S"));
-    try std.testing.expectEqual(@as(?u8, 1), parseMode("c"));
-    try std.testing.expectEqual(@as(?u8, 2), parseMode("Adventure"));
-    try std.testing.expectEqual(@as(?u8, 2), parseMode("2"));
+    try std.testing.expectEqual(@as(?rules.GameMode, .survival), parseMode("survival"));
+    try std.testing.expectEqual(@as(?rules.GameMode, .survival), parseMode("S"));
+    try std.testing.expectEqual(@as(?rules.GameMode, .creative), parseMode("c"));
+    try std.testing.expectEqual(@as(?rules.GameMode, .adventure), parseMode("Adventure"));
+    try std.testing.expectEqual(@as(?rules.GameMode, .adventure), parseMode("2"));
     try std.testing.expect(parseMode("7") == null);
     try std.testing.expect(parseMode("nope") == null);
 }

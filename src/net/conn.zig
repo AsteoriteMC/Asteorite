@@ -28,6 +28,8 @@ const redstone_mod = @import("../sim/redstone.zig");
 const profile = @import("../version.zig");
 const arena_mod = @import("../sim/arena.zig");
 const transport_mod = @import("transport.zig");
+const rules_mod = @import("../game/rules.zig");
+const ratelimit_mod = @import("../sim/ratelimit.zig");
 
 /// Server-driven tick intervals.
 pub const keepalive_interval_ms: i64 = 15000;
@@ -47,8 +49,8 @@ pub const Config = struct {
     /// Forge adds the FML modinfo block; the mod list stays empty until the
     /// modding API registers mods.
     brand: status_mod.Brand = .vanilla,
-    gamemode: u8 = 1,
-    difficulty: u8 = 1,
+    gamemode: rules_mod.GameMode = .creative,
+    difficulty: rules_mod.Difficulty = .easy,
     level_type: []const u8 = "default",
     spawn_x: i32 = 8,
     spawn_y: i32 = 64,
@@ -61,6 +63,12 @@ pub const Config = struct {
     /// consumer that lets its outbox grow past this is kicked (the queue
     /// is unbounded otherwise, and chunk bulks are megabytes).
     out_cap_bytes: usize = 4 * 1024 * 1024,
+    /// Block-place flood budget (creative spam = chunk rewrite storm into
+    /// the LSM). Server template value, copied to every conn at accept;
+    /// admin-tunable via config file / CLI. The window capacity in
+    /// sim/ratelimit.zig caps the burst.
+    place_window_ms: i64 = ratelimit_mod.default_place_window_ms,
+    place_burst: usize = ratelimit_mod.default_place_burst,
 };
 
 /// Block mutation request (break = id 0). Serve loop applies to the world
@@ -165,6 +173,8 @@ pub const Action = union(enum) {
 
 /// Minimum gap between chat packets (vanilla-style spam kick otherwise).
 pub const chat_cooldown_ms: i64 = 750;
+/// Chats allowed inside one cooldown window before the spam kick.
+pub const chat_burst_max: u8 = 3;
 
 /// Last state a viewer was sent (for entity delta encoding).
 pub const Tracked = struct {
@@ -263,6 +273,10 @@ pub const Conn = struct {
     /// similarly lenient (threshold counter, not a single gap). Kick only
     /// when the burst exceeds this many chats inside one window.
     chat_burst: u8 = 0,
+    /// Block-place flood gate state (sliding window; counts every
+    /// placement attempt, valid or not). Budget lives in Config so the
+    /// server template carries the admin-tuned values to every conn.
+    place_gate: ratelimit_mod.Window(ratelimit_mod.place_window_capacity) = .{},
     /// Scratch for one serverbound 0x14 tab-complete request (raw text).
     tab_buf: [1024]u8 = [_]u8{0} ** 1024,
     /// Peer address ("127.0.0.1"-style; filled by the serve thread from the
@@ -659,9 +673,9 @@ pub const Conn = struct {
         var jb: [512]u8 = undefined;
         try self.queueRaw(try packets.frameJoinGame(.{
             .eid = self.eid,
-            .gamemode = self.config.gamemode,
+            .gamemode = self.config.gamemode.wire(),
             .dimension = 0,
-            .difficulty = self.config.difficulty,
+            .difficulty = self.config.difficulty.wire(),
             .max_players = self.config.max_players,
             .level_type = self.config.level_type,
         }, &jb));
@@ -808,7 +822,7 @@ pub const Conn = struct {
             // Vanilla only processes these in creative; in survival the
             // client never sends them, so a stale/replayed 0x10 must not
             // mutate (or resurrect) the survival inventory.
-            if (self.config.gamemode != 1) {
+            if (!self.config.gamemode.isCreative()) {
                 if (c.slot >= 1 and c.slot < 45) self.sendSlot(c.slot);
                 return .none;
             }
@@ -832,7 +846,7 @@ pub const Conn = struct {
                     // Same-window repeat: tolerate stall-bunched pairs, kick
                     // sustained floods (vanilla uses a threshold counter too).
                     self.chat_burst += 1;
-                    if (self.chat_burst > 3) {
+                    if (self.chat_burst > chat_burst_max) {
                         return try self.disconnect("{\"text\":\"Kicked for spamming\"}");
                     }
                 } else self.chat_burst = 0;
@@ -1399,7 +1413,7 @@ pub const Conn = struct {
             self.inv[slot] = .{ .id = held.id, .count = held.count - 1, .damage = held.damage, .nbt = held.nbt };
             return .{ .qdrop = .{ .stack = one, .slot = @intCast(slot) } };
         }
-        const creative = self.config.gamemode == 1;
+        const creative = self.config.gamemode.isCreative();
         switch (status) {
             0 => { // start
                 if (!self.inReach(x, y, z)) return .none;
@@ -1437,6 +1451,13 @@ pub const Conn = struct {
     /// wire, repeater/comparator/door items) with facing-aware metas.
     fn onPlace(self: *Conn, x: i32, y: u8, z: i32, direction: i8, cursor_y: u8) Action {
         if (self.is_dead) return .none;
+        // Flood gate: burst-tolerant, disconnect on sustained flood (chat
+        // discipline). Queued directly — onPlace stays infallible so the
+        // hot path and its tests keep a plain Action.
+        const now_ms = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
+        if (!self.place_gate.allow(now_ms, self.config.place_window_ms, self.config.place_burst)) {
+            return self.disconnect("{\"text\":\"Kicked for spamming\"}") catch .none;
+        }
         if (direction < 0 or direction > 5) return .none;
         if (!self.inReach(x, y, z)) return .none;
         const held = self.inv[36 + self.selected];
@@ -1484,7 +1505,7 @@ pub const Conn = struct {
     /// Join packets: abilities, health, XP, own list entry, clock.
     /// Queued after JoinGame/Spawn, before chunk bulks (serveConn orders this).
     pub fn queueJoinPackets(self: *Conn, world_age: i64, time_of_day: i64) !void {
-        const creative = self.config.gamemode == 1;
+        const creative = self.config.gamemode.isCreative();
         var ab: [32]u8 = undefined;
         try self.queueRaw(try packets.framePlayerAbilities(packets.abilityFlags(creative), 0.05, 0.1, &ab));
         var hb: [32]u8 = undefined;
@@ -1625,7 +1646,7 @@ pub const Conn = struct {
 
     /// Vanilla `yz.a(float)`: creative (disableDamage) is exempt; cap 40.
     pub fn addExhaustion(self: *Conn, amount: f32) void {
-        if (self.config.gamemode == 1) return;
+        if (self.config.gamemode.isCreative()) return;
         self.exhaustion = movement_mod.addExhaustion(self.exhaustion, amount, profile.rules.movement);
     }
 
@@ -1934,7 +1955,7 @@ test "play keepalive recorded" {
 test "dig/place/held/creative/arm behavior" {
     const a = std.testing.allocator;
     // creative conn near origin: pos defaults to config spawn (8,64,8)
-    var c = Conn.init(a, std.testing.io, .{ .gamemode = 1, .spawn_x = 8, .spawn_y = 64, .spawn_z = 8 }, 7);
+    var c = Conn.init(a, std.testing.io, .{ .gamemode = .creative, .spawn_x = 8, .spawn_y = 64, .spawn_z = 8 }, 7);
     defer c.deinit();
     c.state = .play;
     const feed = struct {
@@ -1980,7 +2001,7 @@ test "dig/place/held/creative/arm behavior" {
     }
     // survival: finish without start is ignored; start->finish works
     {
-        var s = Conn.init(a, std.testing.io, .{ .gamemode = 0, .spawn_x = 8, .spawn_y = 64, .spawn_z = 8 }, 8);
+        var s = Conn.init(a, std.testing.io, .{ .gamemode = .survival, .spawn_x = 8, .spawn_y = 64, .spawn_z = 8 }, 8);
         defer s.deinit();
         s.state = .play;
         try std.testing.expect((try feed(&s, 0x07, digBody(2, 8, 64, 9, &db))).? == .none);
@@ -2064,7 +2085,7 @@ test "dig/place/held/creative/arm behavior" {
 
 test "K1 placement: redstone mapping, facing metas, empty-hand interact" {
     const a = std.testing.allocator;
-    var c = Conn.init(a, std.testing.io, .{ .gamemode = 1, .spawn_x = 8, .spawn_y = 64, .spawn_z = 8 }, 7);
+    var c = Conn.init(a, std.testing.io, .{ .gamemode = .creative, .spawn_x = 8, .spawn_y = 64, .spawn_z = 8 }, 7);
     defer c.deinit();
     c.state = .play;
     // Redstone dust in hotbar slot 0 -> places wire (not dust-as-block).
@@ -2138,9 +2159,26 @@ test "K1 placement: redstone mapping, facing metas, empty-hand interact" {
     }
 }
 
+test "place flood gate: burst admitted, sustained flood disconnects" {
+    const a = std.testing.allocator;
+    var c = Conn.init(a, std.testing.io, .{ .gamemode = .creative, .spawn_x = 8, .spawn_y = 64, .spawn_z = 8 }, 7);
+    defer c.deinit();
+    c.state = .play;
+    c.inv[36] = .{ .id = game_ids.stone, .count = 64, .damage = 0, .nbt = null };
+    // A full burst inside one window is admitted (block_set events).
+    var i: usize = 0;
+    while (i < c.config.place_burst) : (i += 1) {
+        try std.testing.expect(c.onPlace(8, 64, 8, 1, 8) == .block_set);
+    }
+    // The next placement in the same window disconnects with the spam
+    // screen and arms close-after-flush, like the chat throttle.
+    try std.testing.expect(c.onPlace(8, 64, 8, 1, 8) == .disconnect_queued);
+    try std.testing.expect(c.close_after_flush);
+}
+
 test "use entity: attack validation, damage table, dead gates, respawn" {
     const a = std.testing.allocator;
-    var c = Conn.init(a, std.testing.io, .{ .gamemode = 0, .spawn_x = 8, .spawn_y = 64, .spawn_z = 8 }, 7);
+    var c = Conn.init(a, std.testing.io, .{ .gamemode = .survival, .spawn_x = 8, .spawn_y = 64, .spawn_z = 8 }, 7);
     defer c.deinit();
     c.state = .play;
     @memcpy(c.username[0.."Al".len], "Al");
@@ -2239,7 +2277,7 @@ test "use entity: attack validation, damage table, dead gates, respawn" {
 
 test "crafting table: 3x3 take, shift-craft, close drops grid" {
     const a = std.testing.allocator;
-    var c = Conn.init(a, std.testing.io, .{ .gamemode = 0, .spawn_x = 8, .spawn_y = 64, .spawn_z = 8 }, 7);
+    var c = Conn.init(a, std.testing.io, .{ .gamemode = .survival, .spawn_x = 8, .spawn_y = 64, .spawn_z = 8 }, 7);
     defer c.deinit();
     c.state = .play;
     const feed = struct {
@@ -2361,7 +2399,7 @@ test "crafting table: 3x3 take, shift-craft, close drops grid" {
 
 test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
     const a = std.testing.allocator;
-    var c = Conn.init(a, std.testing.io, .{ .gamemode = 0, .spawn_x = 8, .spawn_y = 64, .spawn_z = 8 }, 7);
+    var c = Conn.init(a, std.testing.io, .{ .gamemode = .survival, .spawn_x = 8, .spawn_y = 64, .spawn_z = 8 }, 7);
     defer c.deinit();
     c.state = .play;
     @memcpy(c.username[0.."Bo".len], "Bo");
@@ -2389,7 +2427,7 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
     }.run;
     // 0. movement accounting: walk/jump/fall/sprint exhaustion + landing
     {
-        var m = Conn.init(a, std.testing.io, .{ .gamemode = 0, .spawn_x = 8, .spawn_y = 64, .spawn_z = 8 }, 7);
+        var m = Conn.init(a, std.testing.io, .{ .gamemode = .survival, .spawn_x = 8, .spawn_y = 64, .spawn_z = 8 }, 7);
         defer m.deinit();
         m.state = .play;
         m.baseline_sent = true;
@@ -2428,7 +2466,7 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
         m.addExhaustion(5.0);
         try std.testing.expectEqual(@as(f32, 40.0), m.exhaustion);
         // creative is exempt
-        m.config.gamemode = 1;
+        m.config.gamemode = .creative;
         m.exhaustion = 0;
         m.addExhaustion(3.0);
         try std.testing.expectEqual(@as(f32, 0), m.exhaustion);
@@ -2716,7 +2754,7 @@ test "click window: pickup/place/merge/swap/shift/number/desync/nbt" {
 
 test "enchant window: open, click validation, close, 0x11" {
     const a = std.testing.allocator;
-    var c = Conn.init(a, std.testing.io, .{ .gamemode = 0, .spawn_x = 8, .spawn_y = 64, .spawn_z = 8 }, 7);
+    var c = Conn.init(a, std.testing.io, .{ .gamemode = .survival, .spawn_x = 8, .spawn_y = 64, .spawn_z = 8 }, 7);
     defer c.deinit();
     c.state = .play;
     const feed = struct {
@@ -2831,7 +2869,7 @@ test "login grace holds load-falls until echo, move, or timeout" {
 
 test "join packets order + fields" {
     const a = std.testing.allocator;
-    var c = Conn.init(a, std.testing.io, .{ .gamemode = 1 }, 1);
+    var c = Conn.init(a, std.testing.io, .{ .gamemode = .creative }, 1);
     defer c.deinit();
     @memcpy(c.username[0.."Steve".len], "Steve");
     c.username_len = "Steve".len;

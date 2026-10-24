@@ -423,7 +423,7 @@ test "rcon loopback: auth, gating, dispatch, close rules" {
         try c.send(10, EXECCOMMAND, "/help");
         var rh = try c.recv();
         defer rh.free();
-        try std.testing.expect(std.mem.startsWith(u8, rh.payload(), "--- Showing help page 1 of 7 (/help <page>) ---"));
+        try std.testing.expect(std.mem.startsWith(u8, rh.payload(), "--- Showing help page 1 of 8 (/help <page>) ---"));
         c.close();
         th.join();
     }
@@ -440,9 +440,9 @@ test "rcon loopback: auth, gating, dispatch, close rules" {
         defer ro.free();
         try std.testing.expectEqualStrings("Opped MalloryR", ro.payload());
         srv.perm_lock.lock();
-        const lvl = if (srv.perms) |*db| db.levelFor("MalloryR") else 0;
+        const lvl = if (srv.perms) |*db| db.levelFor("MalloryR") else .all;
         srv.perm_lock.unlock();
-        try std.testing.expectEqual(@as(u8, 4), lvl);
+        try std.testing.expect(lvl == .owner);
         c.close();
         th.join();
     }

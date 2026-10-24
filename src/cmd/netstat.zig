@@ -5,7 +5,7 @@ const cmd = @import("mod.zig");
 pub const def = cmd.define(.{
     .name = "netstat",
     .node = "asteorite.command.netstat",
-    .min_level = 0,
+    .min_level = .all,
     .spec = &.{
         &[_]cmd.Slot{},
         &[_]cmd.Slot{cmd.Slot{ .arg = .{ .word = {} }, .display = "<hottest-read|hottest-write|most-read|most-write|netstat|packet-read|packet-write>" }},

@@ -40,10 +40,25 @@ pub const Value = spec_mod.Value;
 /// `spec` at comptime (or takes `usage_override` verbatim for the rare
 /// vanilla strings the generator can't spell). Help text, parsing, and
 /// tab-completion all read the same spec, so the three can never drift.
+/// Vanilla op ladder (0-4). Commands gate on rank, never on a raw int:
+/// comparisons go through `rank()` below.
+pub const OpLevel = enum(u8) {
+    all = 0,
+    moderator = 1,
+    gamemaster = 2,
+    admin = 3,
+    owner = 4,
+
+    /// Numeric rank for `>=` gates (Zig enums don't order-compare).
+    pub fn rank(self: OpLevel) u8 {
+        return @intFromEnum(self);
+    }
+};
+
 pub const Command = struct {
     name: []const u8,
     node: []const u8,
-    min_level: u8,
+    min_level: OpLevel,
     /// Rendered usage text (filled by define() from the spec). Fixed array
     /// so no comptime-var pointer ever escapes into the runtime value.
     usage_buf: [192]u8 = [_]u8{0} ** 192,
@@ -222,7 +237,7 @@ test "define rejects bad defs" {
     const d = comptime define(.{
         .name = "ping",
         .node = "asteorite.command.ping",
-        .min_level = 0,
+        .min_level = .all,
         .spec = &.{&[_]Slot{}},
     });
     try std.testing.expectEqualStrings("ping", d.name);
@@ -231,7 +246,7 @@ test "define rejects bad defs" {
     const t = comptime define(.{
         .name = "time",
         .node = "asteorite.command.time",
-        .min_level = 2,
+        .min_level = .gamemaster,
         .spec = &.{
             &[_]Slot{ Slot{ .arg = .{ .choice = &.{ "set", "add" } } }, Slot{ .arg = .{ .int_range = .{} }, .display = "<value>" } },
         },
@@ -240,7 +255,7 @@ test "define rejects bad defs" {
     const tp = comptime define(.{
         .name = "tp",
         .node = "asteorite.command.tp",
-        .min_level = 2,
+        .min_level = .gamemaster,
         .spec = &.{
             &[_]Slot{Slot{ .arg = .{ .player = {} } }},
             &[_]Slot{ Slot{ .arg = .{ .player = {} } }, Slot{ .arg = .{ .player = {} } } },

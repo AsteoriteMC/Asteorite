@@ -60,11 +60,132 @@ const LogQueue = struct {
     }
 };
 
-/// Fullscreen raw-mode console needs termios + poll + ioctl. Windows has
-/// none of these in std.posix (termios is void, poll is a compileError),
-/// so it always uses plain line mode. Linux and libc-backed POSIX targets
-/// (macOS, *BSD) get the full TUI.
+/// Fullscreen console: POSIX uses termios + poll + ioctl; Windows uses the
+/// Win32 Console API (see runWindows below). Both get the same fullscreen
+/// TUI with scrollback, history, colors, and a bottom input row. Only piped
+/// / redirected stdin falls back to plain line mode.
 const have_tty = builtin.os.tag != .windows;
+const is_windows = builtin.os.tag == .windows;
+
+const windows = std.os.windows;
+const WinHANDLE = windows.HANDLE;
+const WinBOOL = windows.BOOL;
+const WinDWORD = windows.DWORD;
+const WinWORD = windows.WORD;
+const WinWCHAR = windows.WCHAR;
+const WinSHORT = windows.SHORT;
+
+extern "kernel32" fn GetStdHandle(nStdHandle: WinDWORD) callconv(.winapi) ?WinHANDLE;
+extern "kernel32" fn GetConsoleMode(hConsoleHandle: WinHANDLE, lpMode: *WinDWORD) callconv(.winapi) WinBOOL;
+extern "kernel32" fn SetConsoleMode(hConsoleHandle: WinHANDLE, dwMode: WinDWORD) callconv(.winapi) WinBOOL;
+extern "kernel32" fn GetConsoleScreenBufferInfo(hConsoleOutput: WinHANDLE, lpConsoleScreenBufferInfo: *WinConsoleScreenBufferInfo) callconv(.winapi) WinBOOL;
+extern "kernel32" fn WaitForSingleObject(hHandle: WinHANDLE, dwMilliseconds: WinDWORD) callconv(.winapi) WinDWORD;
+extern "kernel32" fn GetNumberOfConsoleInputEvents(hConsoleInput: WinHANDLE, lpcNumberOfEvents: *WinDWORD) callconv(.winapi) WinBOOL;
+extern "kernel32" fn ReadConsoleInputW(hConsoleInput: WinHANDLE, lpBuffer: [*]WinInputRecord, nLength: WinDWORD, lpNumberOfEventsRead: *WinDWORD) callconv(.winapi) WinBOOL;
+
+const WIN_STD_INPUT_HANDLE: WinDWORD = @bitCast(@as(i32, -10));
+const WIN_STD_OUTPUT_HANDLE: WinDWORD = @bitCast(@as(i32, -11));
+const WIN_ENABLE_PROCESSED_INPUT: WinDWORD = 0x0001;
+const WIN_ENABLE_LINE_INPUT: WinDWORD = 0x0002;
+const WIN_ENABLE_ECHO_INPUT: WinDWORD = 0x0004;
+const WIN_ENABLE_WINDOW_INPUT: WinDWORD = 0x0008;
+const WIN_ENABLE_EXTENDED_FLAGS: WinDWORD = 0x0080;
+const WIN_ENABLE_PROCESSED_OUTPUT: WinDWORD = 0x0001;
+const WIN_ENABLE_WRAP_AT_EOL_OUTPUT: WinDWORD = 0x0002;
+const WIN_ENABLE_VIRTUAL_TERMINAL_PROCESSING: WinDWORD = 0x0004;
+const WIN_WAIT_OBJECT_0: WinDWORD = 0;
+const WIN_WAIT_TIMEOUT: WinDWORD = 258;
+const WIN_KEY_EVENT: WinWORD = 0x0001;
+const WIN_WINDOW_BUFFER_SIZE_EVENT: WinWORD = 0x0004;
+const WIN_VK_PRIOR: WinWORD = 0x21;
+const WIN_VK_NEXT: WinWORD = 0x22;
+const WIN_VK_END: WinWORD = 0x23;
+const WIN_VK_HOME: WinWORD = 0x24;
+const WIN_VK_LEFT: WinWORD = 0x25;
+const WIN_VK_UP: WinWORD = 0x26;
+const WIN_VK_RIGHT: WinWORD = 0x27;
+const WIN_VK_DOWN: WinWORD = 0x28;
+const WIN_VK_DELETE: WinWORD = 0x2E;
+const WIN_LEFT_ALT_PRESSED: WinDWORD = 0x0002;
+const WIN_RIGHT_ALT_PRESSED: WinDWORD = 0x0001;
+
+const WinCOORD = extern struct {
+    X: WinSHORT,
+    Y: WinSHORT,
+};
+const WinSMALL_RECT = extern struct {
+    Left: WinSHORT,
+    Top: WinSHORT,
+    Right: WinSHORT,
+    Bottom: WinSHORT,
+};
+const WinConsoleScreenBufferInfo = extern struct {
+    dwSize: WinCOORD,
+    dwCursorPosition: WinCOORD,
+    wAttributes: WinWORD,
+    srWindow: WinSMALL_RECT,
+    dwMaximumWindowSize: WinCOORD,
+};
+const WinKeyEventRecord = extern struct {
+    bKeyDown: WinBOOL,
+    wRepeatCount: WinWORD,
+    wVirtualKeyCode: WinWORD,
+    wVirtualScanCode: WinWORD,
+    UnicodeChar: WinWCHAR,
+    dwControlKeyState: WinDWORD,
+};
+const WinInputRecord = extern struct {
+    EventType: WinWORD,
+    Reserved: WinWORD,
+    KeyEvent: WinKeyEventRecord,
+};
+
+/// Console modes saved when the Windows TUI takes over. Kept in globals
+/// (not on Console) so ANY stop path can restore them even though
+/// std.process.exit() skips defers — same reason as saved_termios.
+var saved_win_in_handle: ?WinHANDLE = null;
+var saved_win_out_handle: ?WinHANDLE = null;
+var saved_win_in_mode: ?WinDWORD = null;
+var saved_win_out_mode: ?WinDWORD = null;
+
+fn winNoteModes(in_h: WinHANDLE, out_h: WinHANDLE, in_mode: WinDWORD, out_mode: WinDWORD) void {
+    if (comptime is_windows) {
+        saved_win_in_handle = in_h;
+        saved_win_out_handle = out_h;
+        saved_win_in_mode = in_mode;
+        saved_win_out_mode = out_mode;
+    }
+}
+
+fn winRestoreModes() void {
+    if (comptime is_windows) {
+        if (saved_win_in_handle) |h| {
+            if (saved_win_in_mode) |m| _ = SetConsoleMode(h, m);
+        }
+        if (saved_win_out_handle) |h| {
+            if (saved_win_out_mode) |m| _ = SetConsoleMode(h, m);
+        }
+        saved_win_in_handle = null;
+        saved_win_out_handle = null;
+        saved_win_in_mode = null;
+        saved_win_out_mode = null;
+    }
+}
+
+fn winRefreshTermSize(cols: *usize, rows: *usize) void {
+    if (comptime is_windows) {
+        const out_h = GetStdHandle(WIN_STD_OUTPUT_HANDLE) orelse return;
+        if (out_h == windows.INVALID_HANDLE_VALUE) return;
+        var info: WinConsoleScreenBufferInfo = undefined;
+        if (GetConsoleScreenBufferInfo(out_h, &info) == .FALSE) return;
+        const w: i32 = @as(i32, info.srWindow.Right) - @as(i32, info.srWindow.Left) + 1;
+        const h: i32 = @as(i32, info.srWindow.Bottom) - @as(i32, info.srWindow.Top) + 1;
+        if (w > 0 and h > 0) {
+            cols.* = @intCast(w);
+            rows.* = @intCast(h);
+        }
+    }
+}
 
 /// Seconds since epoch, for HH:MM:SS stamps (portable: the old
 /// linux.clock_gettime(CLOCK.REALTIME) is Linux-only; Io .real is the same
@@ -170,6 +291,9 @@ const TermSize = struct {
     rows: usize = 24,
 
     pub fn refresh(self: *TermSize) void {
+        if (comptime is_windows) {
+            winRefreshTermSize(&self.cols, &self.rows);
+        }
         if (comptime have_tty) {
             var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
             // Per-OS request code (Linux 0x5413 differs from macOS/*BSD);
@@ -518,9 +642,8 @@ pub const Console = struct {
     }
 
     pub fn run(self: *Console) !void {
-        if (comptime builtin.os.tag == .windows) {
-            // No termios/poll/ioctl on Windows: plain line mode only.
-            return self.runPlain();
+        if (comptime is_windows) {
+            return self.runWindows();
         } else {
             return self.runPosix();
         }
@@ -578,6 +701,129 @@ pub const Console = struct {
             }
         }
         self.flushPlain();
+    }
+
+    /// Interactive fullscreen console for Windows (Win32 Console API).
+    /// Same layout as runTty: logs + status + a dedicated bottom input row
+    /// (drawFull), so log spam never interleaves with the half-typed command
+    /// the way it does in inline (cooked) mode. Falls back to runPlain when
+    /// stdin/stdout are redirected (e.g. `echo help | server`).
+    fn runWindows(self: *Console) !void {
+        if (comptime !is_windows) return error.Unsupported;
+        const in_h = GetStdHandle(WIN_STD_INPUT_HANDLE) orelse return self.runPlain();
+        const out_h = GetStdHandle(WIN_STD_OUTPUT_HANDLE) orelse return self.runPlain();
+        if (in_h == windows.INVALID_HANDLE_VALUE or out_h == windows.INVALID_HANDLE_VALUE) {
+            return self.runPlain();
+        }
+        var orig_in: WinDWORD = 0;
+        var orig_out: WinDWORD = 0;
+        if (GetConsoleMode(in_h, &orig_in) == .FALSE) return self.runPlain();
+        if (GetConsoleMode(out_h, &orig_out) == .FALSE) return self.runPlain();
+        _ = self.io orelse return error.InvalidState;
+
+        // Raw character mode, no line echo (we render the input row
+        // ourselves); window-resize events on. No QuickEdit (it freezes
+        // output while text is selected). VT processing on output so the
+        // same ANSI drawFull works as on POSIX.
+        const new_in: WinDWORD = WIN_ENABLE_WINDOW_INPUT | WIN_ENABLE_EXTENDED_FLAGS;
+        const new_out: WinDWORD = orig_out | WIN_ENABLE_PROCESSED_OUTPUT | WIN_ENABLE_WRAP_AT_EOL_OUTPUT | WIN_ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+        if (SetConsoleMode(in_h, new_in) == .FALSE) return self.runPlain();
+        if (SetConsoleMode(out_h, new_out) == .FALSE) {
+            _ = SetConsoleMode(in_h, orig_in);
+            return self.runPlain();
+        }
+        // Remember for restoreTerminal(): stop exits the process directly
+        // and would otherwise skip the defer below.
+        winNoteModes(in_h, out_h, orig_in, orig_out);
+        defer winRestoreModes();
+
+        self.tty_mode = true;
+        self.term_size.refresh();
+        self.clearScreen();
+        _ = self.drainQueue();
+        self.drawFull();
+
+        var esc_state: u8 = 0; // 0 normal, 1 got ESC, 2 got ESC[, 3 got ESC[<digit>
+        var esc_param: u8 = 0;
+        var records: [64]WinInputRecord = undefined;
+
+        while (self.running) {
+            if (self.drainQueue()) self.drawFull();
+
+            const wait = WaitForSingleObject(in_h, 50);
+            if (wait == 0xFFFFFFFF) break; // WAIT_FAILED
+            if (wait == WIN_WAIT_TIMEOUT) continue;
+            if (wait != WIN_WAIT_OBJECT_0) continue;
+
+            var n_events: WinDWORD = 0;
+            if (GetNumberOfConsoleInputEvents(in_h, &n_events) == .FALSE) continue;
+            if (n_events == 0) continue;
+
+            var dirty = false;
+            var remaining: WinDWORD = n_events;
+            while (remaining > 0) {
+                const chunk: WinDWORD = @min(remaining, @as(WinDWORD, @intCast(records.len)));
+                var n_read: WinDWORD = 0;
+                if (ReadConsoleInputW(in_h, records[0..].ptr, chunk, &n_read) == .FALSE) break;
+                if (n_read == 0) break;
+                remaining -= n_read;
+                for (records[0..@as(usize, n_read)]) |rec| {
+                    if (rec.EventType == WIN_KEY_EVENT) {
+                        const key = rec.KeyEvent;
+                        if (key.bKeyDown == .FALSE) continue;
+                        // Alt-modified keys: ignore (avoids AltGr garbage in commands).
+                        if ((key.dwControlKeyState & (WIN_LEFT_ALT_PRESSED | WIN_RIGHT_ALT_PRESSED)) != 0) continue;
+                        if (key.UnicodeChar != 0) {
+                            const wc: u32 = key.UnicodeChar;
+                            if (wc < 0x80) {
+                                const b: u8 = @intCast(wc);
+                                const reps: usize = @min(@as(usize, key.wRepeatCount), 64);
+                                var r: usize = 0;
+                                while (r < reps) : (r += 1) {
+                                    if (self.handleRawByte(b, &esc_state, &esc_param)) dirty = true;
+                                    if (!self.running) break;
+                                }
+                            }
+                            // Non-ASCII input has no command use; drop.
+                        } else {
+                            // Special key without a char: translate to the same
+                            // ESC sequences handleRawByte already understands.
+                            const seq: ?[]const u8 = switch (key.wVirtualKeyCode) {
+                                WIN_VK_UP => "\x1b[A",
+                                WIN_VK_DOWN => "\x1b[B",
+                                WIN_VK_RIGHT => "\x1b[C",
+                                WIN_VK_LEFT => "\x1b[D",
+                                WIN_VK_HOME => "\x1b[H",
+                                WIN_VK_END => "\x1b[F",
+                                WIN_VK_DELETE => "\x1b[3~",
+                                WIN_VK_PRIOR => "\x1b[5~",
+                                WIN_VK_NEXT => "\x1b[6~",
+                                else => null,
+                            };
+                            if (seq) |s| {
+                                const reps: usize = @min(@as(usize, key.wRepeatCount), 64);
+                                var r: usize = 0;
+                                while (r < reps) : (r += 1) {
+                                    for (s) |b| {
+                                        if (self.handleRawByte(b, &esc_state, &esc_param)) dirty = true;
+                                        if (!self.running) break;
+                                    }
+                                    if (!self.running) break;
+                                }
+                            }
+                        }
+                    } else if (rec.EventType == WIN_WINDOW_BUFFER_SIZE_EVENT) {
+                        self.term_size.refresh();
+                        dirty = true;
+                    }
+                    if (!self.running) break;
+                }
+                if (!self.running) break;
+            }
+            // Command callbacks queue their replies; show them immediately.
+            if (self.drainQueue()) dirty = true;
+            if (dirty) self.drawFull();
+        }
     }
 
     /// Interactive fullscreen console with raw line editing.
@@ -892,8 +1138,7 @@ pub fn noteRawMode(orig: std.posix.termios) void {
 
 /// Restore the terminal if we put it in raw mode. Idempotent and safe to
 /// call from any thread right before process.exit(). Also emits a newline
-/// so the shell prompt lands on a fresh line. No-op on Windows (which never
-/// enters raw mode).
+/// so the shell prompt lands on a fresh line.
 pub fn restoreTerminal() void {
     if (comptime have_tty) {
         if (saved_termios) |orig| {
@@ -901,6 +1146,12 @@ pub fn restoreTerminal() void {
             std.posix.tcsetattr(0, .DRAIN, orig) catch {};
             // Fresh line so the shell prompt doesn't sit on the status row
             // (stderr: unbuffered and always a terminal here).
+            std.debug.print("\n", .{});
+        }
+    }
+    if (comptime is_windows) {
+        if (saved_win_in_mode != null or saved_win_out_mode != null) {
+            winRestoreModes();
             std.debug.print("\n", .{});
         }
     }

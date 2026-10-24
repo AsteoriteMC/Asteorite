@@ -5,7 +5,7 @@ const cmd = @import("mod.zig");
 pub const def = cmd.define(.{
     .name = "setworldspawn",
     .node = "asteorite.command.setworldspawn",
-    .min_level = 2,
+    .min_level = .gamemaster,
     .spec = &.{
         &[_]cmd.Slot{},
         &[_]cmd.Slot{ cmd.Slot{ .arg = .{ .int_range = .{} }, .display = "<x>" }, cmd.Slot{ .arg = .{ .int_range = .{} }, .display = "<y>" }, cmd.Slot{ .arg = .{ .int_range = .{} }, .display = "<z>" } },

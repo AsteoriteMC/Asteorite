@@ -5,7 +5,7 @@ const cmd = @import("mod.zig");
 pub const def = cmd.define(.{
     .name = "toggledownfall",
     .node = "asteorite.command.toggledownfall",
-    .min_level = 2,
+    .min_level = .gamemaster,
     .spec = &.{&[_]cmd.Slot{}},
     .usage_override = "/toggledownfall",
 });

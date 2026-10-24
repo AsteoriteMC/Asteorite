@@ -5,7 +5,7 @@ const cmd = @import("mod.zig");
 pub const def = cmd.define(.{
     .name = "testfor",
     .node = "asteorite.command.testfor",
-    .min_level = 2,
+    .min_level = .gamemaster,
     .spec = &.{
         &[_]cmd.Slot{
             cmd.Slot{ .arg = .{ .player = {} } },

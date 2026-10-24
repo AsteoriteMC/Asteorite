@@ -246,7 +246,9 @@ goldens where the algorithm is deterministic.
 
 - [ ] Query protocol (GS4 `enable-query` equivalent) for server lists.
 - [ ] Statistics triggers (blocks mined, distance walked — the `stat.*` criteria strings exist, nothing feeds them) + achievement grants on action (today only via command).
-- [ ] Death messages (`<name> was slain by …`, `… fell out of the world`) broadcast on death + void damage below y=-64.
+- [x] Death messages (yellow join/leave style, plain white text): hunger/starvation, drown, lava, fire, suffocation, cactus, fall, void below y=-64 (kills even in creative, drops destroyed), combat ("was slain by X"), /kill ("died") — broadcast to all play conns + console log; unit goldens for every line + loopback `/kill` broadcast test + live bot check
+- [x] Rate limits: login attempts per IP (5 joins/10s sliding window, `Too many login attempts` + close; IOCP conns carry no IP and bypass), block-place attempts per conn (32/s burst, same vanilla spam kick as chat — creative spam is a chunk-rewrite storm into the LSM). Chat throttle pre-existing. Unit + live bot verified (5 in, 6th/7th rejected)
+- [x] `/tps` (server extension like `/perm`, `/netstat`, usable by players): 1Hz tick p50/p99 + flush timing + player/tick counts (honest about the 1Hz ticker, no fake 20.0)
 - [ ] Spawn protection (16-block, op-bypassed, vanilla radius) + sleeping in beds (skip-night vote + spawn set) + hardcore world flag.
 - [ ] Presentation sweep: S2A particle packet (potion splash, crits, note smoke — K2/K4/L3 consume it), remaining S29 voices (hurt, eat, splash, explode is K4, doors), server-list favicon.
 - [ ] Command blocks (redstone-powered command execution via K1 power + existing dispatch; `testfor` already hardcodes its message).
@@ -569,7 +571,7 @@ and the RAM budget is smaller than a phone's.
 
 - [x] RSA key file 0600, gitignored
 - [~] Attack/use-entity validation (`0x02` Use Entity implemented with 6-block reach check, melee damage table, mob/player health + death + Destroy broadcast, respawn via Client Status 0 — all live-verified; optional ~200ms hitbox history for high-ping fairness later). Scoped to hit validation only — no full rollback, no client reconciliation (1.7 protocol can't do it). Packet first, history later, both measured
-- [ ] Rate limits: login attempts/IP, chat rate, block-place rate (creative spam = chunk rewrite storm → LSM pressure)
+- [x] Rate limits: login attempts/IP (5 joins/10s, see L8) + block-place rate (32/s, same spam kick as chat) done; chat rate pre-existing. Still open: per-IP connection rate limiting at accept (SYN-flood shape, before handshake).
 - [ ] Username/chat validation everywhere (charset + length; chat JSON validated — vanilla disconnects on malformed)
 - [ ] Decompression bomb guards on any client-controlled zlib (chunk packets are server→client today, but future-proof the limit)
 - [ ] Online-mode session cache (avoid Mojang roundtrip per relog; TTL + negative cache)
@@ -579,7 +581,7 @@ and the RAM budget is smaller than a phone's.
 
 - [ ] `server.toml`/JSON config file (currently CLI flags only): motd, ports, view distance, online mode, db path, tick budget, log level
 - [~] Structured logging levels (currently `std.log.info` ad hoc) + per-tick stats line: the stats line exists (Phase D: `stats tick_p50=… out_p50=… players=… rss=… outbox=… ents=…` every 10 ticks) but the tick histogram is a 256-sample rolling window, not a proper histogram, and the SST count is not in the line yet
-- [ ] Metrics endpoint or in-game `/tps` equivalent (tick histogram from existing overrun counters)
+- [~] Metrics endpoint or in-game `/tps`: `/tps` done (tick p50/p99 + counts, console + players). Still open: HTTP metrics endpoint.
 - [ ] Benchmarks: `zig build bench` (codec roundtrip, chunk encode, LSM put/get, tick) — required before any Phase D/G claim
 - [ ] CI: `zig build test` + `zig build` (ReleaseFast) + fuzz smoke on every change; pin Zig version in README (currently 0.16.0). Build matrix: `x86_64-linux` (baseline), `aarch64-linux-musl` (static, Termux/Linux phones; `aarch64-linux-android` only if Bionic issues appear), `aarch64-macos`, `x86_64-windows`
 

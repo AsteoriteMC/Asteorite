@@ -5,7 +5,7 @@ const cmd = @import("mod.zig");
 pub const def = cmd.define(.{
     .name = "setidletimeout",
     .node = "asteorite.command.setidletimeout",
-    .min_level = 3,
+    .min_level = .admin,
     .spec = &.{
         &[_]cmd.Slot{
             cmd.Slot{ .arg = .{ .int_range = .{} }, .display = "<Minutes until kick>" },

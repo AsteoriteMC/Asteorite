@@ -41,6 +41,7 @@ const item_mod = @import("../item.zig");
 const perms_mod = @import("../sim/permissions.zig");
 const console_tui = @import("../console_tui.zig");
 const spin = @import("../sim/spin.zig");
+const ratelimit_mod = @import("../sim/ratelimit.zig");
 const drop_mod = @import("../game/drops.zig");
 const java_random = @import("../worldgen/rng/java_random.zig");
 const packets = @import("../proto/v5/packets.zig");
@@ -50,6 +51,7 @@ const v5gen = @import("../worldgen/v5/gen.zig");
 const v5serve = @import("../worldgen/v5/serve.zig");
 const v5genpool = @import("../worldgen/v5/genpool.zig");
 const game_ids = @import("../ids.zig");
+const rules_mod = @import("../game/rules.zig");
 const wire = @import("../proto/v5/wire_ids.zig");
 const tp_mod = @import("../cmd/tp.zig");
 const cmd_spec = @import("../cmd/spec.zig");
@@ -84,8 +86,8 @@ pub const login_timeout_ms: i64 = 30000;
 /// Phase D: readers take no lock at all (a seqlock read is two atomic
 /// loads and a compare) — region threads never block on the config.
 pub const CfgState = struct {
-    difficulty: u8 = 1,
-    default_gamemode: u8 = 1,
+    difficulty: rules_mod.Difficulty = .easy,
+    default_gamemode: rules_mod.GameMode = .creative,
     gamerules: [9]bool = .{ true, true, false, true, true, true, true, true, true },
     autosave: bool = true,
     idle_timeout_min: u32 = 0,
@@ -271,6 +273,13 @@ pub const Server = struct {
     ban_lock: spin.SpinLock = .{},
     whitelist: ?bans_mod.Whitelist = null,
     wl_lock: spin.SpinLock = .{},
+    /// Per-IP join flood gate (self-locking; admin-tunable window/burst
+    /// below, capacities in sim/ratelimit.zig cap them).
+    login_gate: ratelimit_mod.LoginGate = .{},
+    /// Login flood budget: joins allowed per window per IP. Copied from
+    /// the merged config at boot (see main.zig).
+    login_rate_window_ms: i64 = ratelimit_mod.default_login_window_ms,
+    login_rate_burst: usize = ratelimit_mod.default_login_burst,
     /// Scoreboard (lazy-init; own leaf lock).
     scoreboard: ?scoreboard_mod.Scoreboard = null,
     sb_lock: spin.SpinLock = .{},
@@ -281,6 +290,11 @@ pub const Server = struct {
     /// autosave, idle timeout, world spawn) behind a seqlock: readers
     /// never take a lock.
     cfg: seqlock_mod.Seqlock(CfgState) = seqlock_mod.Seqlock(CfgState).init(.{}),
+    /// Runtime command registry (see ensureCommands): fixed capacity,
+    /// no allocation. Seeded once from the comptime defs; modding-API
+    /// commands append at boot.
+    cmds: [max_commands]CmdEntry = undefined,
+    n_cmds: usize = 0,
     /// Autosave cadence in ticks (5 min at 1Hz).
     pub const autosave_ticks: u64 = 300;
     /// Anti-DoS cap on live item entities (snapshot arrays are fixed-size).
@@ -474,7 +488,7 @@ pub const Server = struct {
         // newcomer, plus the server console log.
         conn.lock.lock();
         const nm_len = conn.username_len;
-        var nm: [16]u8 = undefined;
+        var nm: [perms_mod.max_name_len]u8 = undefined;
         @memcpy(nm[0..nm_len], conn.username[0..nm_len]);
         conn.lock.unlock();
         var jcb: [128]u8 = undefined;
@@ -504,6 +518,60 @@ pub const Server = struct {
             e.conn.lock.unlock();
             flushEntry(e, self.io);
         }
+    }
+
+    /// The void kills below this feet-Y (vanilla "fell out of the world";
+    /// creative included — the void answers to nothing).
+    pub const void_kill_y: f64 = -64.0;
+
+    /// Longest possible death line: two max-length names + the longest
+    /// suffix (" was slain by "). Sizes the line/JSON scratch buffers.
+    const max_death_line: usize = perms_mod.max_name_len * 2 + 16;
+    /// ...as a JSON chat payload ({"text":"..."}).
+    const max_death_json: usize = max_death_line + 16;
+
+    /// Death-message cause (vanilla 1.7.10 English lines; see broadcastDeath).
+    pub const DeathCause = enum {
+        generic, // /kill, unknown: "<n> died"
+        fall, // "<n> fell from a high place"
+        void, // "<n> fell out of the world"
+        starve, // "<n> starved to death"
+        drown, // "<n> drowned"
+        lava, // "<n> tried to swim in lava"
+        fire, // "<n> went up in flames"
+        suffocate, // "<n> suffocated in a wall"
+        cactus, // "<n> was pricked to death"
+        player, // "<n> was slain by <killer>"
+    };
+
+    /// Vanilla 1.7.10 death line into `out` (killer used only for .player).
+    /// Names are charset-validated at login, so no JSON escaping is needed
+    /// (same as the join/leave lines).
+    pub fn deathMessage(victim: []const u8, cause: DeathCause, killer: []const u8, out: []u8) []const u8 {
+        return switch (cause) {
+            .generic => std.fmt.bufPrint(out, "{s} died", .{victim}) catch out[0..0],
+            .fall => std.fmt.bufPrint(out, "{s} fell from a high place", .{victim}) catch out[0..0],
+            .void => std.fmt.bufPrint(out, "{s} fell out of the world", .{victim}) catch out[0..0],
+            .starve => std.fmt.bufPrint(out, "{s} starved to death", .{victim}) catch out[0..0],
+            .drown => std.fmt.bufPrint(out, "{s} drowned", .{victim}) catch out[0..0],
+            .lava => std.fmt.bufPrint(out, "{s} tried to swim in lava", .{victim}) catch out[0..0],
+            .fire => std.fmt.bufPrint(out, "{s} went up in flames", .{victim}) catch out[0..0],
+            .suffocate => std.fmt.bufPrint(out, "{s} suffocated in a wall", .{victim}) catch out[0..0],
+            .cactus => std.fmt.bufPrint(out, "{s} was pricked to death", .{victim}) catch out[0..0],
+            .player => std.fmt.bufPrint(out, "{s} was slain by {s}", .{ victim, killer }) catch out[0..0],
+        };
+    }
+
+    /// Broadcast a vanilla death line to every play conn + console log.
+    /// Caller holds no locks (broadcastChat snapshots the registry).
+    pub fn broadcastDeath(self: *Server, victim: []const u8, cause: DeathCause, killer: []const u8) void {
+        var mb: [max_death_line]u8 = undefined;
+        const line = deathMessage(victim, cause, killer, &mb);
+        if (line.len == 0) return;
+        var jb: [max_death_json]u8 = undefined;
+        const json = std.fmt.bufPrint(&jb, "{{\"text\":\"{s}\"}}", .{line}) catch return;
+        self.broadcastChat(json);
+        std.log.info("{s}", .{line});
     }
 
     /// Remove + broadcast leave (iff announced) + wait for temp refs + destroy.
@@ -760,6 +828,60 @@ pub const Server = struct {
         return &self.perms.?;
     }
 
+    /// Runtime command registry. Help, tab-completion, existence checks,
+    /// and dispatch ALL read this table — never the comptime
+    /// `perms_mod.modules` directly — so modding-API commands registered
+    /// at runtime show up everywhere builtins do. Seeded once from the
+    /// comptime defs; fixed capacity, no allocation, no teardown.
+    /// Registration is boot-time only (reads take no lock).
+    pub const max_commands: usize = 96;
+    pub const CmdRunFn = *const fn (*Server, ?*Conn, []const u8, []u8) []const u8;
+    pub const CmdEntry = struct {
+        def: *const perms_mod.Command,
+        run: CmdRunFn,
+    };
+
+    fn builtinRun(comptime M: type) CmdRunFn {
+        return struct {
+            fn call(srv: *Server, sender: ?*Conn, args: []const u8, out: []u8) []const u8 {
+                return M.run(srv, sender, args, out);
+            }
+        }.call;
+    }
+
+    /// Seed the registry from the comptime defs (idempotent). Called
+    /// lazily on first command use and eagerly at boot (main) so no
+    /// serving thread ever pays for it mid-tick.
+    pub fn ensureCommands(self: *Server) void {
+        if (self.n_cmds > 0) return;
+        self.state_lock.lock();
+        defer self.state_lock.unlock();
+        if (self.n_cmds > 0) return;
+        inline for (perms_mod.modules) |M| {
+            if (self.n_cmds >= self.cmds.len) return;
+            self.cmds[self.n_cmds] = .{ .def = &M.def, .run = builtinRun(M) };
+            self.n_cmds += 1;
+        }
+    }
+
+    /// Modding-API hook (Phase F): append one command at runtime.
+    /// Boot-time only (reads take no lock). Name/alias collisions with an
+    /// existing entry — or a full table — are rejected (false). The def
+    /// must outlive the server (static for builtins; the mod's burden).
+    pub fn registerCommand(self: *Server, def: *const perms_mod.Command, run: CmdRunFn) bool {
+        self.ensureCommands();
+        self.state_lock.lock();
+        defer self.state_lock.unlock();
+        for (self.cmds[0..self.n_cmds]) |e| {
+            if (cmdMatches(e.def, def.name)) return false;
+            for (def.aliases) |a| if (cmdMatches(e.def, a)) return false;
+        }
+        if (self.n_cmds >= self.cmds.len) return false;
+        self.cmds[self.n_cmds] = .{ .def = def, .run = run };
+        self.n_cmds += 1;
+        return true;
+    }
+
     /// Gate: deny-match wins, then grant-match, then level gate. Unknown
     /// commands fail closed (same reply as denied — no oracle). Console
     /// bypasses the matrix entirely.
@@ -774,7 +896,7 @@ pub const Server = struct {
         self.perm_lock.lock();
         defer self.perm_lock.unlock();
         if (self.perms) |*db| return db.allows(name, desc.node, desc.min_level);
-        return perms_mod.DEFAULT_LEVEL >= desc.min_level;
+        return perms_mod.DEFAULT_LEVEL.rank() >= desc.min_level.rank();
     }
 
     /// Persist the matrix (single row). Encode under perm_lock, put under
@@ -868,7 +990,7 @@ pub const Server = struct {
     pub fn grantOp(self: *Server, name: []const u8) void {
         _ = self.permDb();
         self.perm_lock.lock();
-        self.permsDbLocked().setLevel(name, 4) catch {};
+        self.permsDbLocked().setLevel(name, .owner) catch {};
         self.perm_lock.unlock();
         self.savePerms();
     }
@@ -881,23 +1003,28 @@ pub const Server = struct {
     // of them while every command file is reused unchanged.
     // ------------------------------------------------------------------
 
-    /// /help body: page `page` (1-based, 7 entries) of the usages the
-    /// sender may run (console sees everything). Vanilla header/footer.
+    /// /help body: page `page` (1-based, `help_page_size` entries) of the
+    /// usages the sender may use (console sees everything). Vanilla
+    /// header/footer.
     pub fn helpText(self: *Server, sender: ?*Conn, page: i32, out: []u8) []const u8 {
-        var list: [64]*const perms_mod.Command = undefined;
+        // Vanilla shows 7 commands per page.
+        const page_size: usize = 7;
+        self.ensureCommands();
+        var list: [max_commands]*const perms_mod.Command = undefined;
         var n: usize = 0;
-        for (&perms_mod.commands) |*d| {
+        for (self.cmds[0..self.n_cmds]) |e| {
+            const d = e.def;
             const ok = if (sender == null) true else self.commandAllowed(sender, d);
             if (!ok or n >= list.len) continue;
             list[n] = d;
             n += 1;
         }
-        const pages: i32 = @intCast((n + 6) / 7);
+        const pages: i32 = @intCast((n + page_size - 1) / page_size);
         const p = @min(@max(page, 1), @max(pages, 1));
         var ow: usize = 0;
         ow += (std.fmt.bufPrint(out[ow..], "--- Showing help page {d} of {d} (/help <page>) ---\n", .{ p, @max(pages, 1) }) catch return "Commands: /help").len;
-        const start: usize = @intCast((p - 1) * 7);
-        const end: usize = @min(start + 7, n);
+        const start: usize = @as(usize, @intCast(p - 1)) * page_size;
+        const end: usize = @min(start + page_size, n);
         for (list[start..end]) |d| {
             ow += (std.fmt.bufPrint(out[ow..], "{s}\n", .{d.usage()}) catch break).len;
         }
@@ -907,7 +1034,9 @@ pub const Server = struct {
 
     /// /help <command>: that command's usage, or a not-found error.
     pub fn helpCommand(self: *Server, sender: ?*Conn, name: []const u8, out: []u8) []const u8 {
-        for (&perms_mod.commands) |*d| {
+        self.ensureCommands();
+        for (self.cmds[0..self.n_cmds]) |e| {
+            const d = e.def;
             if (!cmdMatches(d, name)) continue;
             const ok = if (sender == null) true else self.commandAllowed(sender, d);
             if (!ok) break;
@@ -958,7 +1087,7 @@ pub const Server = struct {
             e.conn.lock.unlock();
             if (!play) continue;
             self.perm_lock.lock();
-            const can = if (self.perms) |*db| db.allows(nm, def.node, def.min_level) else perms_mod.DEFAULT_LEVEL >= def.min_level;
+            const can = if (self.perms) |*db| db.allows(nm, def.node, def.min_level) else perms_mod.DEFAULT_LEVEL.rank() >= def.min_level.rank();
             self.perm_lock.unlock();
             if (!can) continue;
             e.conn.lock.lock();
@@ -1136,10 +1265,10 @@ pub const Server = struct {
     /// Set a player's gamemode + push the abilities packet. Returns false
     /// when the player isn't online.
     /// Set a player's gamemode. Vanilla `EntityPlayerMP.setGameType` sends
-    /// S2B reason 3 (the client flips its controller + UI/HUD off that),
-    /// plus an S39 refresh with jar-verified flags (0x0D creative / 0x00
+    /// S2B change-gamemode (the client flips its controller + UI/HUD off
+    /// that), plus an S39 refresh with jar-verified flags (0x0D creative / 0x00
     /// survival+adventure). Returns false when the player isn't online.
-    pub fn applyGamemode(self: *Server, name: []const u8, mode: u8) bool {
+    pub fn applyGamemode(self: *Server, name: []const u8, mode: rules_mod.GameMode) bool {
         var batch: [256]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
@@ -1147,9 +1276,9 @@ pub const Server = struct {
         c.lock.lock();
         defer c.lock.unlock();
         c.config.gamemode = mode;
-        const creative = mode == 1;
+        const creative = mode.isCreative();
         var gb: [16]u8 = undefined;
-        if (packets.frameGameState(3, @floatFromInt(mode), &gb)) |f| {
+        if (packets.frameGameState(packets.game_state_change_gamemode, @floatFromInt(mode.wire()), &gb)) |f| {
             c.queueFramed(f) catch {};
         } else |_| {}
         var ab: [32]u8 = undefined;
@@ -1276,7 +1405,7 @@ pub const Server = struct {
             const p = db.lookupRow(player);
             var ow: usize = 0;
             {
-                const s = std.fmt.bufPrint(out[ow..], "{s}: level {d}", .{ player, if (p) |pp| pp.level else perms_mod.DEFAULT_LEVEL }) catch break :blk null;
+                const s = std.fmt.bufPrint(out[ow..], "{s}: level {d}", .{ player, if (p) |pp| pp.level.rank() else perms_mod.DEFAULT_LEVEL.rank() }) catch break :blk null;
                 ow += s.len;
             }
             if (p) |pp| {
@@ -1366,17 +1495,19 @@ pub const Server = struct {
             cmd = cmd[0..sp];
         }
         _ = self.permDb(); // matrix from here on (mutations persist below)
-        // One file per command (src/cmd/); dispatch table and permission
-        // metadata both derive from per-file defs (perms_mod.modules), so
-        // help text, permission checks, and dispatch can never drift apart.
-        inline for (perms_mod.modules) |M| {
-            if (cmdMatches(&M.def, cmd)) {
-                if (!self.commandAllowed(sender, &M.def)) {
+        // One file per command (src/cmd/); the RUNTIME registry
+        // (ensureCommands/registerCommand) owns help text, permission
+        // checks, and dispatch, so the three can never drift apart and
+        // modding-API commands show up everywhere builtins do.
+        self.ensureCommands();
+        for (self.cmds[0..self.n_cmds]) |e| {
+            if (cmdMatches(e.def, cmd)) {
+                if (!self.commandAllowed(sender, e.def)) {
                     // Same reply as unknown: failures never oracle command
                     // existence or the caller's level.
                     return "Unknown command. Try /help for a list of commands";
                 }
-                return M.run(self, sender, args, out);
+                return e.run(self, sender, args, out);
             }
         }
         return "Unknown command. Try /help for a list of commands";
@@ -1688,6 +1819,10 @@ pub const Server = struct {
                 @memcpy(reason[0.."You are not white-listed on this server!".len], "You are not white-listed on this server!");
                 rlen = "You are not white-listed on this server!".len;
             },
+            .rate_limited => {
+                @memcpy(reason[0.."Too many login attempts, try again later.".len], "Too many login attempts, try again later.");
+                rlen = "Too many login attempts, try again later.".len;
+            },
         }
         var eb: [2048]u8 = undefined;
         const esc = packets.escapeJsonText(reason[0..rlen], &eb) catch return;
@@ -1975,7 +2110,7 @@ pub const Server = struct {
 
     /// Login gate: banned names/IPs and non-whitelisted names are rejected
     /// with the jar-hardcoded screens (`oi` login handler strings).
-    pub const LoginReject = enum { banned_name, banned_ip, not_whitelisted };
+    pub const LoginReject = enum { banned_name, banned_ip, not_whitelisted, rate_limited };
 
     pub fn loginRejected(self: *Server, name: []const u8, ip: []const u8) ?LoginReject {
         self.ban_lock.lock();
@@ -1992,12 +2127,21 @@ pub const Server = struct {
         return null;
     }
 
-    pub fn loginRejectText(reject: LoginReject, out: []u8) []const u8 {
-        _ = out;
+    /// Per-IP join flood gate (joins are the expensive path: loadPlayer,
+    /// chunk burst, gen, saves). Empty IPs (IOCP conns carry no peer
+    /// address) bypass — nothing to attribute.
+    pub fn noteLoginAttempt(self: *Server, ip: []const u8) bool {
+        if (ip.len == 0) return true;
+        const now_ms = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
+        return self.login_gate.allow(ip, now_ms, self.login_rate_window_ms, self.login_rate_burst);
+    }
+
+    pub fn loginRejectText(reject: LoginReject, out: []u8) []const u8 {        _ = out;
         return switch (reject) {
             .banned_name => "You are banned from this server.",
             .banned_ip => "Your IP address is banned from this server.",
             .not_whitelisted => "You are not white-listed on this server!",
+            .rate_limited => "Too many login attempts, try again later.",
         };
     }
 
@@ -2064,11 +2208,14 @@ pub const Server = struct {
         const pz = c.pos_z;
         const eid = c.eid;
         c.lock.unlock();
+        var nm: [perms_mod.max_name_len]u8 = undefined;
+        const nm_len = copyUsername(c, &nm);
         // Death metadata + drops outside the conn lock.
         var mdb: [32]u8 = undefined;
         if (packets.frameEntityMetadata(eid, 0, &mdb)) |f| {
             self.broadcastToTrackers(eid, f);
         } else |_| {}
+        self.broadcastDeath(nm[0..nm_len], .generic, "");
         if (dd) |*d| {
             self.spawnDeathDrops(d, px, py, pz);
             self.savePlayer(c);
@@ -2126,10 +2273,10 @@ pub const Server = struct {
         var gb: [16]u8 = undefined;
         switch (mode) {
             .clear => {
-                if (packets.frameGameState(2, 0, &gb)) |f| self.broadcastAll(f) else |_| {}
+                if (packets.frameGameState(packets.game_state_end_rain, 0, &gb)) |f| self.broadcastAll(f) else |_| {}
             },
             .rain, .thunder => {
-                if (packets.frameGameState(1, 0, &gb)) |f| self.broadcastAll(f) else |_| {}
+                if (packets.frameGameState(packets.game_state_begin_rain, 0, &gb)) |f| self.broadcastAll(f) else |_| {}
             },
         }
     }
@@ -2141,7 +2288,7 @@ pub const Server = struct {
         const now_raining = self.raining;
         self.state_lock.unlock();
         var gb: [16]u8 = undefined;
-        if (packets.frameGameState(if (now_raining) 1 else 2, 0, &gb)) |f| {
+        if (packets.frameGameState(if (now_raining) packets.game_state_begin_rain else packets.game_state_end_rain, 0, &gb)) |f| {
             self.broadcastAll(f);
         } else |_| {}
     }
@@ -2196,15 +2343,15 @@ pub const Server = struct {
         self.state_lock.unlock();
         if (changed) {
             var gb: [16]u8 = undefined;
-            if (packets.frameGameState(2, 0, &gb)) |f| self.broadcastAll(f) else |_| {}
+            if (packets.frameGameState(packets.game_state_end_rain, 0, &gb)) |f| self.broadcastAll(f) else |_| {}
         }
         if (rs_moved) {
             var gb: [16]u8 = undefined;
-            if (packets.frameGameState(7, rs, &gb)) |f| self.broadcastAll(f) else |_| {}
+            if (packets.frameGameState(packets.game_state_rain_strength, rs, &gb)) |f| self.broadcastAll(f) else |_| {}
         }
         if (ts_moved) {
             var gb: [16]u8 = undefined;
-            if (packets.frameGameState(8, ts, &gb)) |f| self.broadcastAll(f) else |_| {}
+            if (packets.frameGameState(packets.game_state_thunder_strength, ts, &gb)) |f| self.broadcastAll(f) else |_| {}
         }
     }
 
@@ -2226,13 +2373,13 @@ pub const Server = struct {
         const ts = self.thunder_strength;
         self.state_lock.unlock();
         var gb: [16]u8 = undefined;
-        if (packets.frameGameState(if (raining) 1 else 2, 0, &gb)) |f| {
+        if (packets.frameGameState(if (raining) packets.game_state_begin_rain else packets.game_state_end_rain, 0, &gb)) |f| {
             conn.queueFramed(f) catch {};
         } else |_| {}
-        if (packets.frameGameState(7, rs, &gb)) |f| {
+        if (packets.frameGameState(packets.game_state_rain_strength, rs, &gb)) |f| {
             conn.queueFramed(f) catch {};
         } else |_| {}
-        if (packets.frameGameState(8, ts, &gb)) |f| {
+        if (packets.frameGameState(packets.game_state_thunder_strength, ts, &gb)) |f| {
             conn.queueFramed(f) catch {};
         } else |_| {}
     }
@@ -2300,13 +2447,11 @@ pub const Server = struct {
         } else |_| {}
     }
 
-    const diff_names = [_][]const u8{ "peaceful", "easy", "normal", "hard" };
-
-    pub fn difficultyName(_: *Server, d: u8) []const u8 {
-        return if (d < 4) diff_names[d] else "normal";
+    pub fn difficultyName(_: *Server, d: rules_mod.Difficulty) []const u8 {
+        return d.name();
     }
 
-    pub fn setDifficulty(self: *Server, d: u8) void {
+    pub fn setDifficulty(self: *Server, d: rules_mod.Difficulty) void {
         {
             var c = self.cfg.load();
             c.difficulty = d;
@@ -2322,17 +2467,15 @@ pub const Server = struct {
         }
     }
 
-    pub fn getDifficulty(self: *Server) u8 {
+    pub fn getDifficulty(self: *Server) rules_mod.Difficulty {
         return self.cfg.load().difficulty;
     }
 
-    const gamemode_names = [_][]const u8{ "survival", "creative", "adventure" };
-
-    pub fn gamemodeName(_: *Server, m: u8) []const u8 {
-        return if (m < 3) gamemode_names[m] else "survival";
+    pub fn gamemodeName(_: *Server, m: rules_mod.GameMode) []const u8 {
+        return m.name();
     }
 
-    pub fn setDefaultGamemode(self: *Server, m: u8) void {
+    pub fn setDefaultGamemode(self: *Server, m: rules_mod.GameMode) void {
         var c = self.cfg.load();
         c.default_gamemode = m;
         self.cfg.store(c);
@@ -3034,8 +3177,8 @@ pub const Server = struct {
     /// only with doTileDrops on. (Was once inverted (`!tileDrops`),
     /// which silenced all survival digging drops while /setblock destroy
     /// still dropped.)
-    fn shouldDropBreak(gamemode: u8, old_id: game_ids.Id, tile_drops: bool) bool {
-        return old_id != game_ids.air and gamemode != 1 and tile_drops;
+    fn shouldDropBreak(gamemode: rules_mod.GameMode, old_id: game_ids.Id, tile_drops: bool) bool {
+        return old_id != game_ids.air and !gamemode.isCreative() and tile_drops;
     }
 
     /// Spawn drops for a destroy-mode setblock (gamerule doTileDrops gate).
@@ -3122,6 +3265,23 @@ pub const Server = struct {
         const nconns = self.registry.items.len;
         self.reg_lock.unlock();
         return std.fmt.bufPrint(out, "connections: {d}, mobs: {d}, item entities: {d}, ticks: {d}, time: {d}", .{ nconns, nmobs, nitems, self.tick_counter, self.time_of_day.load(.acquire) }) catch "netstat";
+    }
+
+    /// /tps body: 1Hz tick timing + counts (honest about the 1Hz ticker:
+    /// no fake 20.0 claim). Usable by players and console alike.
+    pub fn tpsText(self: *Server, out: []u8) []const u8 {
+        const p50 = self.percentile(0, 50);
+        const p99 = self.percentile(0, 99);
+        const f50 = self.percentile(1, 50);
+        const f99 = self.percentile(1, 99);
+        return std.fmt.bufPrint(out, "tick 1Hz p50={d}us p99={d}us flush p50={d}us p99={d}us players: {d} ticks: {d}", .{
+            @divFloor(p50, 1_000),
+            @divFloor(p99, 1_000),
+            @divFloor(f50, 1_000),
+            @divFloor(f99, 1_000),
+            self.play_count.load(.acquire),
+            self.tick_counter,
+        }) catch "tps";
     }
 
     pub fn debugStart(self: *Server, now_ms: i64) void {
@@ -3273,6 +3433,22 @@ pub const Server = struct {
 
     // ---- tab completion ----
 
+    /// Mode/difficulty name candidates, derived from the enums so help text,
+    /// parsing, and completion can never drift (short hands + wire numbers
+    /// mirror parseMode/parseDifficulty in cmd/gamemode.zig and
+    /// cmd/difficulty.zig).
+    const gamemode_complete_names = [_][]const u8{
+        rules_mod.GameMode.survival.name(),
+        rules_mod.GameMode.creative.name(),
+        rules_mod.GameMode.adventure.name(),
+    };
+    const difficulty_complete_names = [_][]const u8{
+        rules_mod.Difficulty.peaceful.name(),
+        rules_mod.Difficulty.easy.name(),
+        rules_mod.Difficulty.normal.name(),
+        rules_mod.Difficulty.hard.name(),
+    };
+
     /// Vanilla `getPossibleCommands` + per-command `addTabCompletion`.
     /// Null = suppress (unknown command); otherwise S3A with candidates
     /// (possibly empty). Caller holds no locks; conn queued under its lock.
@@ -3305,10 +3481,11 @@ pub const Server = struct {
             return;
         }
         // Multi-word: find the command (exact, names + aliases).
+        self.ensureCommands();
         var found: ?*const perms_mod.Command = null;
-        for (&perms_mod.commands) |*d| {
-            if (cmdMatches(d, toks[0])) {
-                found = d;
+        for (self.cmds[0..self.n_cmds]) |e| {
+            if (cmdMatches(e.def, toks[0])) {
+                found = e.def;
                 break;
             }
         }
@@ -3360,14 +3537,16 @@ pub const Server = struct {
     /// names made it eat the `/`. (Was bare names; `/game<TAB>` became
     /// `game`.)
     fn completeCommandsFor(self: *Server, sender: ?*Conn, prefix: []const u8, out: [][]const u8, owned: [][64]u8) usize {
+        self.ensureCommands();
         var n: usize = 0;
         var on: usize = 0;
-        inline for (perms_mod.modules) |M| {
-            const ok = if (sender == null) true else self.commandAllowed(sender, &M.def);
+        for (self.cmds[0..self.n_cmds]) |e| {
+            const d = e.def;
+            const ok = if (sender == null) true else self.commandAllowed(sender, d);
             if (ok) {
-                if (cmd_spec.startsWithIgnoreCase(M.def.name, prefix)) {
+                if (cmd_spec.startsWithIgnoreCase(d.name, prefix)) {
                     if (n < out.len and on < owned.len) {
-                        const s = std.fmt.bufPrint(&owned[on], "/{s}", .{M.def.name}) catch null;
+                        const s = std.fmt.bufPrint(&owned[on], "/{s}", .{d.name}) catch null;
                         if (s) |cand| {
                             if (!containsName(out[0..n], cand)) {
                                 out[n] = cand;
@@ -3377,7 +3556,7 @@ pub const Server = struct {
                         }
                     }
                 }
-                for (M.def.aliases) |a| {
+                for (d.aliases) |a| {
                     if (cmd_spec.startsWithIgnoreCase(a, prefix)) {
                         if (n < out.len and on < owned.len) {
                             const s = std.fmt.bufPrint(&owned[on], "/{s}", .{a}) catch null;
@@ -3402,13 +3581,9 @@ pub const Server = struct {
     }
 
     fn completeArgs(self: *Server, def: *const perms_mod.Command, toks: [][]const u8, out: [][]const u8, owned: [][64]u8) usize {
-        // Find the command module to get its spec.
-        inline for (perms_mod.modules) |M| {
-            if (std.mem.eql(u8, M.def.name, def.name)) {
-                return completeArgsFor(self, &M.def, toks, out, owned);
-            }
-        }
-        return 0;
+        // The def carries its own spec (same table help and dispatch use),
+        // so no module re-lookup is needed.
+        return completeArgsFor(self, def, toks, out, owned);
     }
 
     fn completeArgsFor(self: *Server, def: *const perms_mod.Command, toks: [][]const u8, out: [][]const u8, owned: [][64]u8) usize {
@@ -3530,7 +3705,7 @@ pub const Server = struct {
             }
         } else if (std.mem.eql(u8, def.name, "difficulty")) {
             if (arg_index == 0) {
-                for (diff_names ++ [_][]const u8{ "p", "e", "n", "h", "0", "1", "2", "3" }) |v| {
+                for (difficulty_complete_names ++ [_][]const u8{ "p", "e", "n", "h", "0", "1", "2", "3" }) |v| {
                     if (n >= out.len) break;
                     if (cmd_spec.startsWithIgnoreCase(v, prefix)) {
                         out[n] = v;
@@ -3540,7 +3715,7 @@ pub const Server = struct {
             }
         } else if (std.mem.eql(u8, def.name, "gamemode") or std.mem.eql(u8, def.name, "defaultgamemode")) {
             if (arg_index == 0) {
-                for ([_][]const u8{ "survival", "creative", "adventure", "s", "c", "a", "0", "1", "2" }) |v| {
+                for (gamemode_complete_names ++ [_][]const u8{ "s", "c", "a", "0", "1", "2" }) |v| {
                     if (n >= out.len) break;
                     if (cmd_spec.startsWithIgnoreCase(v, prefix)) {
                         out[n] = v;
@@ -4597,21 +4772,32 @@ pub const Server = struct {
         const timed_out = action == .timeout;
         if (!timed_out) {
             // Hunger + hazards before visibility (death gates pickup).
-            var died_now = false;
-            if (hungerTick(e.conn, self.config.difficulty)) died_now = true;
-            if (!died_now) {
+            var died_cause: ?DeathCause = null;
+            if (hungerTick(e.conn, self.config.difficulty)) |c| died_cause = c;
+            if (died_cause == null) {
                 for (vc.players, 0..) |p, i| {
                     if (p.eid != e.conn.eid or i >= vc.envs.len) continue;
-                    if (envTick(e.conn, vc.envs[i].water, vc.envs[i].lava, vc.envs[i].suff, vc.envs[i].cactus)) died_now = true;
+                    if (envTick(e.conn, vc.envs[i].water, vc.envs[i].lava, vc.envs[i].suff, vc.envs[i].cactus)) |c| died_cause = c;
                     break;
                 }
             }
-            if (died_now) {
+            if (died_cause == null and !e.conn.is_dead and e.conn.pos_y < void_kill_y) {
+                // The void kills even in creative (no gamemode gate).
+                e.conn.health = 0;
+                e.conn.is_dead = true;
+                var hb: [32]u8 = undefined;
+                if (packets.frameUpdateHealth(0, e.conn.food, e.conn.saturation, &hb)) |f| {
+                    e.conn.queueFramed(f) catch {};
+                } else |_| {}
+                died_cause = .void;
+            }
+            if (died_cause) |cause| {
                 const dd = if (self.keepInv()) null else collectDeathDrops(e.conn);
                 vc.deaths.append(self.gpa, .{
                     .conn = e.conn,
                     .eid = e.conn.eid,
                     .dd = dd,
+                    .cause = cause,
                     .x = e.conn.pos_x,
                     .y = e.conn.pos_y,
                     .z = e.conn.pos_z,
@@ -5249,16 +5435,25 @@ pub const Server = struct {
             if (s.fuel) |st| if (st.nbt) |n| self.gpa.free(n);
             if (s.out) |st| if (st.nbt) |n| self.gpa.free(n);
         }
-        // Deaths from hunger/environment this tick: spawn drops (ent_lock),
-        // persist emptied rows (savePlayer locks), broadcast death metadata.
-        for (deaths.items) |*di| {
-            if (di.dd) |*d| self.spawnDeathDrops(d, di.x, di.y, di.z);
-        }
+        // Deaths from hunger/environment/void this tick, one pass per
+        // death (drops + metadata + death line), then one save pass.
+        // No ordering is needed across deaths (each is independent).
         {
             var mb: [32]u8 = undefined;
-            for (deaths.items) |di| {
-                const f = packets.frameEntityMetadata(di.eid, 0, &mb) catch continue;
-                self.broadcastToTrackers(di.eid, f);
+            for (deaths.items) |*di| {
+                if (di.dd) |*d| {
+                    if (di.cause == .void) {
+                        self.destroyDrops(d);
+                    } else {
+                        self.spawnDeathDrops(d, di.x, di.y, di.z);
+                    }
+                }
+                if (packets.frameEntityMetadata(di.eid, 0, &mb)) |f| {
+                    self.broadcastToTrackers(di.eid, f);
+                } else |_| {}
+                var nm: [perms_mod.max_name_len]u8 = undefined;
+                const nm_len = copyUsername(di.conn, &nm);
+                self.broadcastDeath(nm[0..nm_len], di.cause, di.killer[0..di.killer_len]);
             }
         }
         for (deaths.items) |di| self.savePlayer(di.conn);
@@ -5437,7 +5632,7 @@ pub const Server = struct {
     /// Caller handles drops/save/broadcast. Returns true on a killing blow.
     fn applyPlayerDamage(conn: *Conn, amount: f32) bool {
         if (conn.is_dead) return false;
-        if (conn.config.gamemode == 1) return false;
+        if (conn.config.gamemode.isCreative()) return false;
         conn.health -= amount;
         if (conn.health <= 0) {
             conn.health = 0;
@@ -5463,6 +5658,9 @@ pub const Server = struct {
         conn: *Conn,
         eid: i32,
         dd: ?DeathDrop,
+        cause: DeathCause,
+        killer_len: usize = 0,
+        killer: [16]u8 = [_]u8{0} ** 16,
         x: f64,
         y: f64,
         z: f64,
@@ -5470,22 +5668,22 @@ pub const Server = struct {
 
     /// Vanilla FoodStats.onUpdate quantized to 1Hz (+20 timer per tick).
     /// Natural-regeneration gamerule assumed on (no gamerules yet).
-    /// Caller holds conn.lock. Returns true on starvation death.
-    fn hungerTick(conn: *Conn, difficulty: u8) bool {
-        if (conn.is_dead or conn.health <= 0) return false;
-        if (conn.config.gamemode == 1) return false; // creative: nothing drains
+    /// Caller holds conn.lock. Returns the death cause on starvation death.
+    fn hungerTick(conn: *Conn, difficulty: rules_mod.Difficulty) ?DeathCause {
+        if (conn.is_dead or conn.health <= 0) return null;
+        if (conn.config.gamemode.isCreative()) return null; // creative: nothing drains
         conn.food_timer +|= 20;
         var dirty = false;
         if (conn.exhaustion > 4.0) {
             conn.exhaustion -= 4.0;
             if (conn.saturation > 0) {
                 conn.saturation = @max(conn.saturation - 1.0, 0.0);
-            } else if (difficulty != 0) {
+            } else if (difficulty != .peaceful) {
                 conn.food = @max(conn.food - 1, 0);
             }
             dirty = true;
         }
-        var died = false;
+        var died: ?DeathCause = null;
         if (conn.food >= 18 and conn.health < 20.0) {
             if (conn.food_timer >= 80) {
                 conn.food_timer = 0;
@@ -5497,15 +5695,15 @@ pub const Server = struct {
             if (conn.food_timer >= 80) {
                 conn.food_timer = 0;
                 const hp = conn.health;
-                if (hp > 10.0 or difficulty == 3 or (hp > 1.0 and difficulty == 2)) {
-                    died = applyPlayerDamage(conn, 1.0);
+                if (hp > 10.0 or difficulty == .hard or (hp > 1.0 and difficulty == .normal)) {
+                    if (applyPlayerDamage(conn, 1.0)) died = .starve;
                     dirty = true;
                 }
             }
         } else {
             conn.food_timer = 0;
         }
-        if (dirty and !died) {
+        if (dirty and died == null) {
             var hb: [32]u8 = undefined;
             if (packets.frameUpdateHealth(conn.health, conn.food, conn.saturation, &hb)) |f| {
                 conn.queueFramed(f) catch {};
@@ -5582,40 +5780,62 @@ pub const Server = struct {
 
     /// Drown/lava/fire/suffocation/cactus for one tick (vanilla Entity
     /// rules, 1Hz-quantized; see deviations). Caller holds conn.lock.
-    /// Returns true on death.
-    fn envTick(conn: *Conn, water: bool, lava: bool, suff: bool, cactus: bool) bool {
-        if (conn.is_dead) return false;
-        var died = false;
+    /// Returns the death cause on death.
+    fn envTick(conn: *Conn, water: bool, lava: bool, suff: bool, cactus: bool) ?DeathCause {
+        if (conn.is_dead) return null;
+        var died: ?DeathCause = null;
         if (water) {
             conn.fire_ticks = 0; // extinguish on submersion
-            if (conn.config.gamemode != 1) {
+            if (!conn.config.gamemode.isCreative()) {
                 conn.air -= 20;
                 if (conn.air <= -20) {
                     conn.air = 0;
-                    died = applyPlayerDamage(conn, 2.0); // then every second
+                    if (applyPlayerDamage(conn, 2.0)) died = .drown; // then every second
                 }
             }
         } else {
             conn.air = 300;
             if (!lava and conn.fire_ticks > 0) {
                 conn.fire_ticks -|= 20;
-                if (!died) died = applyPlayerDamage(conn, 1.0); // 1/s burning
+                if (died == null and applyPlayerDamage(conn, 1.0)) died = .fire; // 1/s burning
             }
         }
-        if (!died and lava and conn.config.gamemode != 1) {
+        if (died == null and lava and !conn.config.gamemode.isCreative()) {
             conn.fire_ticks = 300; // 15s of fire after the bath
-            died = applyPlayerDamage(conn, 4.0); // lenient: vanilla is 4/tick
+            if (applyPlayerDamage(conn, 4.0)) died = .lava; // lenient: vanilla is 4/tick
         }
-        if (!died and suff) {
-            died = applyPlayerDamage(conn, 4.0); // lenient: vanilla is 1/tick
+        if (died == null and suff) {
+            if (applyPlayerDamage(conn, 4.0)) died = .suffocate; // lenient: vanilla is 1/tick
         }
         if (conn.cactus_cd > 0) conn.cactus_cd -= 1;
-        if (!died and cactus and conn.config.gamemode != 1 and conn.cactus_cd == 0) {
+        if (died == null and cactus and !conn.config.gamemode.isCreative() and conn.cactus_cd == 0) {
             conn.cactus_cd = 1; // 1Hz tick: hit every touching tick (~1/s;
             // vanilla hurt-resistance gates to ~1/0.5s, quantized here)
-            died = applyPlayerDamage(conn, 1.0);
+            if (applyPlayerDamage(conn, 1.0)) died = .cactus;
         }
         return died;
+    }
+
+    /// Copy a conn's username under its lock. Broadcast paths use this
+    /// AFTER releasing the victim lock: broadcastChat snapshots the
+    /// registry and takes conn locks itself, so holding one across the
+    /// broadcast would nest conn locks. Names are set once at login and
+    /// never mutated, so the copy can't race.
+    fn copyUsername(c: *Conn, out: *[perms_mod.max_name_len]u8) usize {
+        c.lock.lock();
+        defer c.lock.unlock();
+        @memcpy(out[0..c.username_len], c.username[0..c.username_len]);
+        return c.username_len;
+    }
+
+    /// Void deaths destroy drops (vanilla): free the NBT the victim's
+    /// inventory moved into the drop payload (stacks die with it).
+    fn destroyDrops(self: *Server, dd: *DeathDrop) void {
+        for (dd.stacks[0..dd.n]) |st| {
+            const s = st orelse continue;
+            const n = s.nbt orelse continue;
+            self.gpa.free(n);
+        }
     }
 
     /// Move every stack out of the victim's inventory + cursor (clears both).
@@ -5687,7 +5907,7 @@ pub const Server = struct {
         conn.lock.lock();
         const pf = conn.pending_fall;
         conn.pending_fall = null;
-        const creative = conn.config.gamemode == 1;
+        const creative = conn.config.gamemode.isCreative();
         const dead = conn.is_dead;
         conn.lock.unlock();
         const fall = pf orelse return;
@@ -5708,10 +5928,13 @@ pub const Server = struct {
         var dd: ?DeathDrop = if (died and !self.keepInv()) collectDeathDrops(conn) else null;
         const eid = conn.eid;
         conn.lock.unlock();
+        var nm: [perms_mod.max_name_len]u8 = undefined;
+        const nm_len = if (died) copyUsername(conn, &nm) else 0;
         var mb: [32]u8 = undefined;
         if (packets.frameEntityMetadata(eid, if (died) 0 else hp, &mb)) |f| {
             self.broadcastToTrackers(eid, f);
         } else |_| {}
+        if (died) self.broadcastDeath(nm[0..nm_len], .fall, "");
         if (dd) |*d| {
             self.spawnDeathDrops(d, fall.x, fall.y + 0.1, fall.z);
             self.savePlayer(conn);
@@ -6133,7 +6356,7 @@ pub const Server = struct {
         self: *Server,
         pool: *shard_mod.ShardPool,
         allocator: std.mem.Allocator,
-        gamemode: u8,
+        gamemode: rules_mod.GameMode,
         c: redstone_mod.Change,
     ) void {
         if (!c.silent) {
@@ -6576,7 +6799,7 @@ pub const Server = struct {
             if (parseEnchIds(raw, &have) > 0) has_ench = true;
         }
         if (!enchanting_mod.isEnchantableId(st.id, has_ench)) return;
-        const creative = conn.config.gamemode == 1;
+        const creative = conn.config.gamemode.isCreative();
         if (!creative and conn.xp_level < need) {
             // Insufficient levels: resync offers (vanilla leaves the UI up
             // with the same requirements; the client shows its own text).
@@ -6780,8 +7003,12 @@ pub const Server = struct {
             const py = e.conn.pos_y;
             const pz = e.conn.pos_z;
             e.conn.lock.unlock();
+            var vnm: [perms_mod.max_name_len]u8 = undefined;
+            const vnm_len = if (died) copyUsername(e.conn, &vnm) else 0;
             attacker.lock.lock();
             attacker.addExhaustion(0.3); // vanilla: charged per landed hit
+            var anm: [perms_mod.max_name_len]u8 = undefined;
+            const anm_len = if (died) copyUsername(attacker, &anm) else 0;
             attacker.lock.unlock();
             flushEntry(e, self.io);
             // Show the new health on every tracker (attacker included).
@@ -6789,6 +7016,7 @@ pub const Server = struct {
             if (packets.frameEntityMetadata(ev.target_eid, if (died) 0 else hp, &mdb)) |f| {
                 self.broadcastToTrackers(ev.target_eid, f);
             } else |_| {}
+            if (died) self.broadcastDeath(vnm[0..vnm_len], .player, anm[0..anm_len]);
             if (dd) |*d| {
                 self.spawnDeathDrops(d, px, py, pz);
                 self.savePlayer(e.conn);
@@ -6908,7 +7136,9 @@ pub const Server = struct {
             self.broadcastBlockAction(a.x, @intCast(a.y), a.z, a.event_id, a.facing, a.id);
         }
         for (rs_changes.items[0..rs_changes.n]) |c| {
-            self.flushRsChange(pool, self.gpa, 0, c);
+            // No actor here (redstone loop, not a player break): vanilla
+            // drops as if survival (creative no-drops needs a creative hand).
+            self.flushRsChange(pool, self.gpa, .survival, c);
         }
         for (rs_sounds.evs[0..rs_sounds.n]) |s| self.flushRsSound(s);
     }
@@ -7562,6 +7792,10 @@ fn sessionLocked(
             server.rejectLogin(conn, rej);
             login_rejected = true;
         }
+        if (!login_rejected and !server.noteLoginAttempt(conn.ip[0..conn.ip_len])) {
+            server.rejectLogin(conn, .rate_limited);
+            login_rejected = true;
+        }
         if (!login_rejected) {
             // Own this player row from here on: bump the save epoch so
             // any older session's delayed save (quit/rejoin race, ghost
@@ -7600,9 +7834,9 @@ fn sessionLocked(
             // /gamemode) before the abilities refresh below. Without this a
             // returning survival player keeps the creative JoinGame value
             // while the server deals survival damage.
-            if (conn.config.gamemode != 1) {
+            if (!conn.config.gamemode.isCreative()) {
                 var gb: [16]u8 = undefined;
-                if (packets.frameGameState(3, @floatFromInt(conn.config.gamemode), &gb)) |f| {
+                if (packets.frameGameState(packets.game_state_change_gamemode, @floatFromInt(conn.config.gamemode.wire()), &gb)) |f| {
                     conn.queueFramed(f) catch {};
                 } else |_| {}
             }
@@ -7871,7 +8105,7 @@ pub fn sessionStep(
                     // Survival break: vanilla 0.025 exhaustion per block.
                     if (b.id == game_ids.air) {
                         conn.lock.lock();
-                        if (conn.config.gamemode == 0 and !conn.is_dead) conn.addExhaustion(0.025);
+                        if (conn.config.gamemode == .survival and !conn.is_dead) conn.addExhaustion(0.025);
                         conn.lock.unlock();
                     }
                 },
@@ -8734,6 +8968,19 @@ test "statsLine renders per-subsystem memory independently (no buffer aliasing)"
     a.destroy(conn);
 }
 
+test "tpsText reports tick timing and counts" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    var buf: [256]u8 = undefined;
+    const line = srv.tpsText(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, line, "tick 1Hz") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "players: 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "ticks: 0") != null);
+}
+
 test "K1 tick: scheduled button release fires through tickOnce" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -8864,43 +9111,43 @@ test "broadcastBlockChange/ArmSwing target sent-set viewers only" {
 
 test "hunger: exhaustion drain, regen, starvation gates" {
     const a = std.testing.allocator;
-    var c = Conn.init(a, std.testing.io, .{ .gamemode = 0 }, 7);
+    var c = Conn.init(a, std.testing.io, .{ .gamemode = .survival }, 7);
     defer c.deinit();
     c.state = .play;
     // exhaustion > 4 burns saturation first, then food (normal)
     c.exhaustion = 5.0;
     c.saturation = 5.0;
-    try std.testing.expect(!Server.hungerTick(&c, 2));
+    try std.testing.expect(Server.hungerTick(&c, .normal) == null);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), c.exhaustion, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), c.saturation, 1e-6);
     try std.testing.expectEqual(@as(i16, 20), c.food);
     // saturation 0 -> food drops (peaceful exempts)
     c.exhaustion = 5.0;
     c.saturation = 0;
-    try std.testing.expect(!Server.hungerTick(&c, 2));
+    try std.testing.expect(Server.hungerTick(&c, .normal) == null);
     try std.testing.expectEqual(@as(i16, 19), c.food);
     c.exhaustion = 5.0;
-    try std.testing.expect(!Server.hungerTick(&c, 0));
+    try std.testing.expect(Server.hungerTick(&c, .peaceful) == null);
     try std.testing.expectEqual(@as(i16, 19), c.food); // peaceful: no drain
     // regen at food 18+: +1 hp and +3 exhaustion every 80 timer
     c.health = 10.0;
     c.food = 18;
     c.food_timer = 60;
     c.exhaustion = 0;
-    try std.testing.expect(!Server.hungerTick(&c, 2));
+    try std.testing.expect(Server.hungerTick(&c, .normal) == null);
     try std.testing.expectApproxEqAbs(@as(f32, 11.0), c.health, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), c.exhaustion, 1e-6);
     // starve: normal hits at hp>1, spares hp==1; hard always hits
     c.health = 2.0;
     c.food = 0;
     c.food_timer = 60;
-    try std.testing.expect(!Server.hungerTick(&c, 2));
+    try std.testing.expect(Server.hungerTick(&c, .normal) == null);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), c.health, 1e-6);
     c.food_timer = 60;
-    try std.testing.expect(!Server.hungerTick(&c, 2));
+    try std.testing.expect(Server.hungerTick(&c, .normal) == null);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), c.health, 1e-6); // spared
     c.food_timer = 60;
-    try std.testing.expect(Server.hungerTick(&c, 3));
+    try std.testing.expectEqual(Server.DeathCause.starve, Server.hungerTick(&c, .hard).?);
     try std.testing.expect(c.is_dead); // hard: killing blow
     {
         const o = try c.takeOutput();
@@ -8910,45 +9157,45 @@ test "hunger: exhaustion drain, regen, starvation gates" {
 
 test "env: drown countdown, lava+fire, suffocate; fall resolution" {
     const a = std.testing.allocator;
-    var c = Conn.init(a, std.testing.io, .{ .gamemode = 0 }, 7);
+    var c = Conn.init(a, std.testing.io, .{ .gamemode = .survival }, 7);
     defer c.deinit();
     c.state = .play;
     // drown: 15 ticks grace (air 300->0), damage on the 16th
     var i: usize = 0;
-    while (i < 15) : (i += 1) try std.testing.expect(!Server.envTick(&c, true, false, false, false));
+    while (i < 15) : (i += 1) try std.testing.expect(Server.envTick(&c, true, false, false, false) == null);
     try std.testing.expectEqual(@as(i16, 0), c.air);
     try std.testing.expectApproxEqAbs(@as(f32, 20.0), c.health, 1e-6);
-    try std.testing.expect(!Server.envTick(&c, true, false, false, false));
+    try std.testing.expect(Server.envTick(&c, true, false, false, false) == null);
     try std.testing.expectApproxEqAbs(@as(f32, 18.0), c.health, 1e-6);
     try std.testing.expectEqual(@as(i16, 0), c.air);
     // surface resets air
-    try std.testing.expect(!Server.envTick(&c, false, false, false, false));
+    try std.testing.expect(Server.envTick(&c, false, false, false, false) == null);
     try std.testing.expectEqual(@as(i16, 300), c.air);
     // lava: 4 dmg + 300 fire ticks; fire burns 1/tick after leaving
-    try std.testing.expect(!Server.envTick(&c, false, true, false, false));
+    try std.testing.expect(Server.envTick(&c, false, true, false, false) == null);
     try std.testing.expectApproxEqAbs(@as(f32, 14.0), c.health, 1e-6);
     try std.testing.expectEqual(@as(u32, 300), c.fire_ticks);
-    try std.testing.expect(!Server.envTick(&c, false, false, false, false));
+    try std.testing.expect(Server.envTick(&c, false, false, false, false) == null);
     try std.testing.expectApproxEqAbs(@as(f32, 13.0), c.health, 1e-6);
     // water extinguishes instead of burning
     c.fire_ticks = 100;
-    try std.testing.expect(!Server.envTick(&c, true, false, false, false));
+    try std.testing.expect(Server.envTick(&c, true, false, false, false) == null);
     try std.testing.expectEqual(@as(u32, 0), c.fire_ticks);
     // suffocate: 4 per tick
-    try std.testing.expect(!Server.envTick(&c, false, false, true, false));
+    try std.testing.expect(Server.envTick(&c, false, false, true, false) == null);
     try std.testing.expectApproxEqAbs(@as(f32, 9.0), c.health, 1e-6);
     // cactus: 1.0 per touching tick (1Hz model hits ~1/s; vanilla
     // hurt-resistance gates to ~1/0.5s, quantized to whole ticks here)
-    try std.testing.expect(!Server.envTick(&c, false, false, false, true));
+    try std.testing.expect(Server.envTick(&c, false, false, false, true) == null);
     try std.testing.expectApproxEqAbs(@as(f32, 8.0), c.health, 1e-6);
-    try std.testing.expect(!Server.envTick(&c, false, false, false, true));
+    try std.testing.expect(Server.envTick(&c, false, false, false, true) == null);
     try std.testing.expectApproxEqAbs(@as(f32, 7.0), c.health, 1e-6); // next tick hits again
     // creative is immune to cactus
-    c.config.gamemode = 1;
+    c.config.gamemode = .creative;
     c.cactus_cd = 0;
-    try std.testing.expect(!Server.envTick(&c, false, false, false, true));
+    try std.testing.expect(Server.envTick(&c, false, false, false, true) == null);
     try std.testing.expectApproxEqAbs(@as(f32, 7.0), c.health, 1e-6);
-    c.config.gamemode = 0;
+    c.config.gamemode = .survival;
     // fall: ceil(dist-3) without a world (no water to save us)
     c.pending_fall = .{ .dist = 5.5, .x = 0, .y = 64, .z = 0 };
     var srv = Server{ .net = undefined, .io = std.testing.io, .config = .{}, .gpa = a };
@@ -8967,11 +9214,11 @@ test "env: drown countdown, lava+fire, suffocate; fall resolution" {
 }
 
 test "dig-drop gate: survival+adventure drop, creative/gamerule/air do not" {
-    try std.testing.expect(Server.shouldDropBreak(0, .stone, true));
-    try std.testing.expect(Server.shouldDropBreak(2, .stone, true));
-    try std.testing.expect(!Server.shouldDropBreak(1, .stone, true));
-    try std.testing.expect(!Server.shouldDropBreak(0, .stone, false));
-    try std.testing.expect(!Server.shouldDropBreak(0, .air, true));
+    try std.testing.expect(Server.shouldDropBreak(.survival, .stone, true));
+    try std.testing.expect(Server.shouldDropBreak(.adventure, .stone, true));
+    try std.testing.expect(!Server.shouldDropBreak(.creative, .stone, true));
+    try std.testing.expect(!Server.shouldDropBreak(.survival, .stone, false));
+    try std.testing.expect(!Server.shouldDropBreak(.survival, .air, true));
 }
 
 test "live drop spawn: instant 0x0E/0x1C, no tick re-spawn, tick pickup grants" {
@@ -9003,7 +9250,7 @@ test "live drop spawn: instant 0x0E/0x1C, no tick re-spawn, tick pickup grants" 
         c.deinit();
         a.destroy(c);
     }
-    c.* = Conn.init(a, io, .{ .gamemode = 0 }, 7);
+    c.* = Conn.init(a, io, .{ .gamemode = .survival }, 7);
     c.state = .play;
     c.pos_x = 8.5;
     c.pos_y = 65.0;
@@ -9182,7 +9429,7 @@ test "resolveAttack: mob damage/death/destroy, PvP, reach, pig respawn timer" {
             const c = try a.create(Conn);
             errdefer a.destroy(c);
             // Survival: combat damage applies (creative is immune, like vanilla).
-            c.* = Conn.init(a, io, .{ .gamemode = 0 }, eid);
+            c.* = Conn.init(a, io, .{ .gamemode = .survival }, eid);
             c.state = .play;
             return .{ .conn = c, .srv_stream = sv, .cli_stream = cli };
         }
@@ -9304,6 +9551,95 @@ test "resolveAttack: mob damage/death/destroy, PvP, reach, pig respawn timer" {
         }
     }
     try std.testing.expect(found_pig);
+}
+
+test "deathMessage: vanilla English lines for every cause" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("Al died", Server.deathMessage("Al", .generic, "", &buf));
+    try std.testing.expectEqualStrings("Al fell from a high place", Server.deathMessage("Al", .fall, "", &buf));
+    try std.testing.expectEqualStrings("Al fell out of the world", Server.deathMessage("Al", .void, "", &buf));
+    try std.testing.expectEqualStrings("Al starved to death", Server.deathMessage("Al", .starve, "", &buf));
+    try std.testing.expectEqualStrings("Al drowned", Server.deathMessage("Al", .drown, "", &buf));
+    try std.testing.expectEqualStrings("Al tried to swim in lava", Server.deathMessage("Al", .lava, "", &buf));
+    try std.testing.expectEqualStrings("Al went up in flames", Server.deathMessage("Al", .fire, "", &buf));
+    try std.testing.expectEqualStrings("Al suffocated in a wall", Server.deathMessage("Al", .suffocate, "", &buf));
+    try std.testing.expectEqualStrings("Al was pricked to death", Server.deathMessage("Al", .cactus, "", &buf));
+    try std.testing.expectEqualStrings("Al was slain by Bo", Server.deathMessage("Al", .player, "Bo", &buf));
+}
+
+test "killPlayer broadcasts the vanilla death line" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    var port: u16 = 37981;
+    var listener: std.Io.net.Server = while (true) {
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+        break addr.listen(io, .{ .mode = .stream }) catch |err| switch (err) {
+            error.AddressInUse => {
+                port += 1;
+                if (port > 38000) return err;
+                continue;
+            },
+            else => return err,
+        };
+    };
+    defer listener.deinit(io);
+    const mk = struct {
+        fn run(l: *std.Io.net.Server, p: u16, eid: i32, name: []const u8) !struct {
+            conn: *Conn,
+            srv_stream: std.Io.net.Stream,
+            cli_stream: std.Io.net.Stream,
+        } {
+            const addr = try std.Io.net.IpAddress.parse("127.0.0.1", p);
+            var cli = try addr.connect(io, .{ .mode = .stream });
+            errdefer cli.close(io);
+            const sv = try l.accept(io);
+            const c = try a.create(Conn);
+            errdefer a.destroy(c);
+            c.* = Conn.init(a, io, .{ .gamemode = .survival }, eid);
+            c.state = .play;
+            @memcpy(c.username[0..name.len], name);
+            c.username_len = name.len;
+            return .{ .conn = c, .srv_stream = sv, .cli_stream = cli };
+        }
+    }.run;
+    var alice = try mk(&listener, port, 1, "Alice");
+    defer alice.cli_stream.close(io);
+    defer alice.srv_stream.close(io);
+    var bob = try mk(&listener, port, 2, "Bob");
+    defer bob.cli_stream.close(io);
+    defer bob.srv_stream.close(io);
+    try srv.register(alice.conn, alice.srv_stream);
+    try srv.register(bob.conn, bob.srv_stream);
+    var arb: [128]u8 = undefined;
+    var afb: [512]u8 = undefined;
+    var arr = alice.cli_stream.reader(io, &arb);
+    var brb: [128]u8 = undefined;
+    var bfb: [512]u8 = undefined;
+    var brr = bob.cli_stream.reader(io, &brb);
+    try std.testing.expect(srv.killPlayer("bob"));
+    // Victim first sees the death screen, then the death line.
+    {
+        const f = try readFrame(&brr.interface, &bfb);
+        try std.testing.expectEqual(@as(i32, 0x06), f.id);
+    }
+    {
+        const f = try readFrame(&brr.interface, &bfb);
+        try std.testing.expectEqual(@as(i32, 0x02), f.id);
+        var pr = codec.PacketReader.init(f.body);
+        try std.testing.expectEqualStrings("{\"text\":\"Bob died\"}", try pr.readString());
+    }
+    // Bystanders get the line too.
+    {
+        const f = try readFrame(&arr.interface, &afb);
+        try std.testing.expectEqual(@as(i32, 0x02), f.id);
+        var pr = codec.PacketReader.init(f.body);
+        try std.testing.expectEqualStrings("{\"text\":\"Bob died\"}", try pr.readString());
+    }
+    srv.unregister(alice.conn);
+    srv.unregister(bob.conn);
 }
 
 test "tickOnce spawns/tracks/despawns players + mobs" {
@@ -9551,7 +9887,7 @@ test "player save/load roundtrip via pool (pos/health/inv/NBT)" {
     c.food = 17;
     c.saturation = 3.25;
     c.selected = 4;
-    c.config.gamemode = 0;
+    c.config.gamemode = .survival;
     c.config.spawn_x = 8;
     c.config.spawn_y = 70;
     c.config.spawn_z = 8;
@@ -9569,7 +9905,7 @@ test "player save/load roundtrip via pool (pos/health/inv/NBT)" {
     c.inv[10] = null;
     c.cursor = null;
     c.selected = 0;
-    c.config.gamemode = 1;
+    c.config.gamemode = .creative;
     c.lock.lock();
     try std.testing.expect(srv.loadPlayer(c));
     c.lock.unlock();
@@ -9578,7 +9914,7 @@ test "player save/load roundtrip via pool (pos/health/inv/NBT)" {
     try std.testing.expectApproxEqAbs(@as(f32, 13.5), c.health, 1e-6);
     try std.testing.expectEqual(@as(i16, 17), c.food);
     try std.testing.expectEqual(@as(u8, 4), c.selected);
-    try std.testing.expectEqual(@as(u8, 0), c.config.gamemode);
+    try std.testing.expect(c.config.gamemode == .survival);
     try std.testing.expectEqual(game_ids.diamond_sword, c.inv[36].?.id);
     try std.testing.expectEqualSlices(u8, &tag, c.inv[36].?.nbt.?);
     try std.testing.expectEqual(game_ids.stone, c.inv[10].?.id);
@@ -9765,6 +10101,7 @@ test "commands help/list/save-all/unknown (+ console null-sender)" {
         "/tell <player> <private message ...>",
         "/list",
         "/netstat",
+        "/tps",
         "Tip: Use the <tab> key while typing a command to auto-complete the command or its arguments",
     };
     for (h_lines) |want| {
@@ -9811,6 +10148,44 @@ test "commands help/list/save-all/unknown (+ console null-sender)" {
     a.destroy(alice);
     bob.deinit();
     a.destroy(bob);
+}
+
+test "runtime registry: mods show in help and dispatch" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    defer if (srv.perms) |*db| db.deinit();
+    srv.ensureCommands();
+    const n_builtin = srv.n_cmds;
+    try std.testing.expectEqual(perms_mod.modules.len, n_builtin);
+    const Fake = struct {
+        fn run(s: *Server, sender: ?*Conn, args: []const u8, out: []u8) []const u8 {
+            _ = s;
+            _ = sender;
+            _ = args;
+            _ = out;
+            return "fake-ok";
+        }
+    };
+    var fake_def = perms_mod.Command{
+        .name = "fakecmd",
+        .node = "asteorite.command.fakecmd",
+        .min_level = .all,
+        .spec = &.{},
+    };
+    try std.testing.expect(srv.registerCommand(&fake_def, &Fake.run));
+    try std.testing.expectEqual(n_builtin + 1, srv.n_cmds);
+    // Name collisions are rejected (no silent shadowing).
+    try std.testing.expect(!srv.registerCommand(&fake_def, &Fake.run));
+    // Dispatch reaches the runtime entry (no comptime module needed).
+    var out: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("fake-ok", srv.executeCommand(null, "/fakecmd x", &out));
+    // Help reads the same registry (this is the modding-API guarantee).
+    var hb: [256]u8 = undefined;
+    const h = srv.helpCommand(null, "fakecmd", &hb);
+    try std.testing.expect(std.mem.indexOf(u8, h, "fakecmd") != null);
 }
 
 test "permissions gate commands: op/deop/grant/deny/show/clear/reload" {
@@ -9910,12 +10285,12 @@ test "permissions gate commands: op/deop/grant/deny/show/clear/reload" {
     {
         srv.perm_lock.lock();
         defer srv.perm_lock.unlock();
-        try std.testing.expectEqual(@as(u8, 4), srv.perms.?.levelFor("AliceP"));
+        try std.testing.expectEqual(perms_mod.OpLevel.owner, srv.perms.?.levelFor("AliceP"));
     }
     // /help now lists privileged commands for Alice (vanilla 7-per-page).
     srv.handleCommand(alice, "/help");
     const h1_lines = [_][]const u8{
-        "--- Showing help page 1 of 7 (/help <page>) ---",
+        "--- Showing help page 1 of 8 (/help <page>) ---",
         "/time <set|add> <value>",
         "/gamemode <mode> [player]",
         "/difficulty <new difficulty>",
@@ -10243,7 +10618,7 @@ test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
     try std.testing.expectEqualStrings("{\"text\":\"[Server: Opped AliceG]\",\"color\":\"gray\",\"italic\":true}", _r2);
     // /gamemode on Bob by Alice: config flips + 0x39 abilities (flags 0x00).
     srv.handleCommand(alice, "/gamemode 0 BobG");
-    try std.testing.expectEqual(@as(u8, 0), bob.config.gamemode);
+    try std.testing.expect(bob.config.gamemode == .survival);
     {
         var fr = try Drain.run(bob);
         defer Drain.free(&fr);
@@ -10259,7 +10634,7 @@ test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
     try std.testing.expectEqualStrings("{\"text\":\"Set BobG's game mode to survival\"}", gm);
     // /gamemode self form + invalid forms.
     srv.handleCommand(alice, "/gamemode creative");
-    try std.testing.expectEqual(@as(u8, 1), alice.config.gamemode);
+    try std.testing.expect(alice.config.gamemode == .creative);
     const _d1 = try readChat(alice);
     defer a.free(_d1);
     try std.testing.expectEqualStrings("{\"text\":\"Set own game mode to creative\"}", _d1);
@@ -10276,7 +10651,7 @@ test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
     defer a.free(_r5);
     try std.testing.expectEqualStrings("{\"text\":\"That player cannot be found\"}", _r5);
     srv.handleCommand(alice, "/gamemode adventure BobG");
-    try std.testing.expectEqual(@as(u8, 2), bob.config.gamemode);
+    try std.testing.expect(bob.config.gamemode == .adventure);
     const _d1b = try readChat(alice);
     defer a.free(_d1b);
     try std.testing.expectEqualStrings("{\"text\":\"Set BobG's game mode to adventure\"}", _d1b);

@@ -5,7 +5,7 @@ const cmd = @import("mod.zig");
 pub const def = cmd.define(.{
     .name = "weather",
     .node = "asteorite.command.weather",
-    .min_level = 2,
+    .min_level = .gamemaster,
     .spec = &.{
         &[_]cmd.Slot{
             cmd.Slot{ .arg = .{ .choice = &.{ "clear", "rain", "thunder" } } },

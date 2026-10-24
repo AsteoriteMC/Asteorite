@@ -78,6 +78,10 @@ Precedence is **built-in defaults < config file < CLI flags**.
 | `--send-zc-threshold <bytes>` | 8192 | frames at/above this size go out zerocopy (`SEND_ZC`) |
 | `--tcp-nodelay` / `--no-tcp-nodelay` | on | `TCP_NODELAY` on accepted sockets |
 | `--sndbuf <bytes>` / `--rcvbuf <bytes>` | OS default | socket buffer sizes |
+| `--login-rate-window-ms <ms>` | 10000 | login flood window per IP |
+| `--login-rate-burst <n>` | 5 | logins allowed per window per IP (past it: kick) |
+| `--place-rate-window-ms <ms>` | 1000 | placement flood window per conn |
+| `--place-rate-burst <n>` | 32 | placements allowed per window (past it: kick) |
 | `-c, --config <path>` | `./asteorite.json` if present | JSON config file |
 | `-h, --help` | — | help |
 
@@ -180,7 +184,11 @@ Every key is optional; anything the CLI sets wins over the file:
   "transport": "auto",
   "out_cap_bytes": 4194304,
   "send_zc_threshold": 8192,
-  "storage_profile": "auto"
+  "storage_profile": "auto",
+  "login_rate_window_ms": 10000,
+  "login_rate_burst": 5,
+  "place_rate_window_ms": 1000,
+  "place_rate_burst": 32
 }
 ```
 

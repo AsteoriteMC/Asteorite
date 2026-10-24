@@ -65,6 +65,12 @@ pub const ServeArgs = struct {
     /// Phase B: SO_SNDBUF / SO_RCVBUF (0 = OS default).
     sndbuf: ?usize = null,
     rcvbuf: ?usize = null,
+    /// Login flood budget: joins allowed per window per IP.
+    login_rate_window_ms: ?i64 = null,
+    login_rate_burst: ?usize = null,
+    /// Placement flood budget: placements allowed per window per conn.
+    place_rate_window_ms: ?i64 = null,
+    place_rate_burst: ?usize = null,
     help: bool = false,
 };
 
@@ -314,6 +320,38 @@ pub fn parseServe(arena: std.mem.Allocator, argv: []const []const u8, err: *Pars
                 };
                 out.rcvbuf = std.fmt.parseInt(usize, v, 10) catch return fail(err, .bad_value, "--rcvbuf", v, error.BadValue);
                 continue;
+            } else if (std.mem.eql(u8, name, "--login-rate-window-ms")) {
+                const v = inline_val orelse blk: {
+                    i += 1;
+                    if (i >= argv.len) return fail(err, .missing_value, "--login-rate-window-ms", "", error.MissingValue);
+                    break :blk argv[i];
+                };
+                out.login_rate_window_ms = std.fmt.parseInt(i64, v, 10) catch return fail(err, .bad_value, "--login-rate-window-ms", v, error.BadValue);
+                continue;
+            } else if (std.mem.eql(u8, name, "--login-rate-burst")) {
+                const v = inline_val orelse blk: {
+                    i += 1;
+                    if (i >= argv.len) return fail(err, .missing_value, "--login-rate-burst", "", error.MissingValue);
+                    break :blk argv[i];
+                };
+                out.login_rate_burst = std.fmt.parseInt(usize, v, 10) catch return fail(err, .bad_value, "--login-rate-burst", v, error.BadValue);
+                continue;
+            } else if (std.mem.eql(u8, name, "--place-rate-window-ms")) {
+                const v = inline_val orelse blk: {
+                    i += 1;
+                    if (i >= argv.len) return fail(err, .missing_value, "--place-rate-window-ms", "", error.MissingValue);
+                    break :blk argv[i];
+                };
+                out.place_rate_window_ms = std.fmt.parseInt(i64, v, 10) catch return fail(err, .bad_value, "--place-rate-window-ms", v, error.BadValue);
+                continue;
+            } else if (std.mem.eql(u8, name, "--place-rate-burst")) {
+                const v = inline_val orelse blk: {
+                    i += 1;
+                    if (i >= argv.len) return fail(err, .missing_value, "--place-rate-burst", "", error.MissingValue);
+                    break :blk argv[i];
+                };
+                out.place_rate_burst = std.fmt.parseInt(usize, v, 10) catch return fail(err, .bad_value, "--place-rate-burst", v, error.BadValue);
+                continue;
             }
             return fail(err, .unknown_flag, name, "", error.UnknownFlag);
         }
@@ -374,6 +412,10 @@ pub fn printServeHelp(w: *std.Io.Writer) !void {
         \\  --tcp-nodelay / --no-tcp-nodelay  TCP_NODELAY on accepted sockets
         \\  --sndbuf <bytes>       SO_SNDBUF on accepted sockets (0 = default)
         \\  --rcvbuf <bytes>       SO_RCVBUF on accepted sockets (0 = default)
+        \\  --login-rate-window-ms <ms>  login flood window per IP
+        \\  --login-rate-burst <n>  logins allowed per window per IP
+        \\  --place-rate-window-ms <ms>  placement flood window per conn
+        \\  --place-rate-burst <n>  placements allowed per window per conn
         \\  -c, --config <path>    JSON config file (default ./asteorite.json
         \\                         if present; CLI flags override file keys)
         \\  -h, --help             this help
@@ -395,6 +437,14 @@ pub fn printServeHelp(w: *std.Io.Writer) !void {
         \\  # world seed lives in the config file, e.g. {{"seed": 42}}
         \\
     , .{});
+    // Flood-gate defaults come from the config defaults (single source;
+    // the flag lines above stay static like the rest of this text).
+    try w.print("  (flood-gate defaults: login {d}ms/{d}, place {d}ms/{d})\n", .{
+        (config.Effective{}).login_rate_window_ms,
+        (config.Effective{}).login_rate_burst,
+        (config.Effective{}).place_rate_window_ms,
+        (config.Effective{}).place_rate_burst,
+    });
 }
 
 /// Top-level help (no/unknown subcommand).
@@ -452,6 +502,19 @@ test "parse: bools, negation, repeatable ops, -c/-h, -- terminator" {
     // "--bogus" after -- is positional -> bad port value, not a flag.
     try std.testing.expectEqual(ParseError.Kind.bad_value, err3.kind);
     try std.testing.expectEqualStrings("<port>", err3.flag);
+}
+
+test "parse: rate-limit flags" {
+    const alloc = std.testing.allocator;
+    var err = ParseError{};
+    var a = try parseServe(alloc, &.{ "--login-rate-window-ms", "5000", "--login-rate-burst=3", "--place-rate-window-ms", "2000", "--place-rate-burst=16" }, &err);
+    defer a.ops.deinit(alloc);
+    try std.testing.expectEqual(@as(?i64, 5000), a.login_rate_window_ms);
+    try std.testing.expectEqual(@as(?usize, 3), a.login_rate_burst);
+    try std.testing.expectEqual(@as(?i64, 2000), a.place_rate_window_ms);
+    try std.testing.expectEqual(@as(?usize, 16), a.place_rate_burst);
+    try std.testing.expectError(error.BadValue, parseServe(alloc, &.{"--login-rate-burst=abc"}, &err));
+    try std.testing.expectEqualStrings("--login-rate-burst", err.flag);
 }
 
 test "parse: motd/max-players/brand" {

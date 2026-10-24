@@ -59,6 +59,75 @@ pub const HeightRules = struct {
     lighting_model: []const u8 = "pre_1_18",
 };
 
+/// Player game mode (vanilla 0-2). Gameplay gates compare variants, never
+/// raw ints; `wire()`/`fromWire()` are the only int boundary (packets,
+/// player rows). A later profile extends this instead of scattering `== 1`.
+pub const GameMode = enum(u8) {
+    survival = 0,
+    creative = 1,
+    adventure = 2,
+
+    pub fn isCreative(self: GameMode) bool {
+        return self == .creative;
+    }
+
+    /// Wire/persistence value (1.7.10: survival 0, creative 1).
+    pub fn wire(self: GameMode) u8 {
+        return @intFromEnum(self);
+    }
+
+    /// Wire/persistence value back to a mode; unknown clamps to survival
+    /// (vanilla loads out-of-range rows as survival).
+    pub fn fromWire(v: u8) GameMode {
+        return switch (v) {
+            0 => .survival,
+            1 => .creative,
+            2 => .adventure,
+            else => .survival,
+        };
+    }
+
+    pub fn name(self: GameMode) []const u8 {
+        return switch (self) {
+            .survival => "survival",
+            .creative => "creative",
+            .adventure => "adventure",
+        };
+    }
+};
+
+/// World difficulty (vanilla 0-3). Hunger/environment gates compare
+/// variants; the wire value stays a u8 at packet parse sites.
+pub const Difficulty = enum(u8) {
+    peaceful = 0,
+    easy = 1,
+    normal = 2,
+    hard = 3,
+
+    pub fn wire(self: Difficulty) u8 {
+        return @intFromEnum(self);
+    }
+
+    pub fn fromWire(v: u8) Difficulty {
+        return switch (v) {
+            0 => .peaceful,
+            1 => .easy,
+            2 => .normal,
+            3 => .hard,
+            else => .normal,
+        };
+    }
+
+    pub fn name(self: Difficulty) []const u8 {
+        return switch (self) {
+            .peaceful => "peaceful",
+            .easy => "easy",
+            .normal => "normal",
+            .hard => "hard",
+        };
+    }
+};
+
 pub const Rules = struct {
     redstone: RedstoneRules = .{},
     interaction: InteractionRules = .{},

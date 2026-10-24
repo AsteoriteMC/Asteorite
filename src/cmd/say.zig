@@ -5,7 +5,7 @@ const cmd = @import("mod.zig");
 pub const def = cmd.define(.{
     .name = "say",
     .node = "asteorite.command.say",
-    .min_level = 1,
+    .min_level = .moderator,
     .spec = &.{
         &[_]cmd.Slot{
             cmd.Slot{ .arg = .{ .rest = {} }, .display = "<message ...>" },

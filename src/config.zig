@@ -13,6 +13,10 @@
 //! the vanilla seed field.
 
 const std = @import("std");
+// Shared via the asteorite module (this file lives in main's root module,
+// so it must not import sim/ files by path — that would claim them into
+// two modules).
+const ratelimit = @import("asteorite").ratelimit;
 
 /// Java String.hashCode over bytes. Exact for ASCII (UTF-16 code units ==
 // bytes there); non-ASCII differs from Java the same way any UTF-8 port
@@ -71,6 +75,14 @@ pub const FileConfig = struct {
     /// Phase B: socket buffer sizes (0 = OS default).
     sndbuf: ?usize = null,
     rcvbuf: ?usize = null,
+    /// Anti-flood budgets (all admin-tunable; windows are milliseconds).
+    /// Login gate: joins allowed per window per IP.
+    login_rate_window_ms: ?i64 = null,
+    login_rate_burst: ?usize = null,
+    /// Placement gate: block placements allowed per window per conn
+    /// (creative spam = chunk rewrite storm into the LSM).
+    place_rate_window_ms: ?i64 = null,
+    place_rate_burst: ?usize = null,
 
     /// Resolve the seed union into a plain i64. Errors on float values
     /// and out-of-range integers (with the offending value echoed by the
@@ -126,6 +138,13 @@ pub const Effective = struct {
     /// Phase B: socket buffer sizes (0 = OS default).
     sndbuf: usize = 0,
     rcvbuf: usize = 0,
+    /// Login flood budget: joins allowed per window per IP (capacities in
+    /// sim/ratelimit.zig cap the burst).
+    login_rate_window_ms: i64 = ratelimit.default_login_window_ms,
+    login_rate_burst: usize = ratelimit.default_login_burst,
+    /// Placement flood budget: placements allowed per window per conn.
+    place_rate_window_ms: i64 = ratelimit.default_place_window_ms,
+    place_rate_burst: usize = ratelimit.default_place_burst,
     /// Where non-default values came from (startup log + debugging).
     source: Source = .defaults,
 
@@ -146,6 +165,8 @@ pub const ValidateError = error{
     BadBrand,
     BadTransport,
     BadStorageProfile,
+    BadLoginRate,
+    BadPlaceRate,
 };
 
 /// Protocol/gameplay sanity checks. View is capped at 16: the 1.7.10
@@ -160,6 +181,10 @@ pub fn validate(c: *const Effective) ValidateError!void {
     if (!isKnownBrand(c.brand)) return error.BadBrand;
     if (!isKnownTransport(c.transport)) return error.BadTransport;
     if (!isKnownStorageProfile(c.storage_profile)) return error.BadStorageProfile;
+    // Flood gates: windows below the noise floor are rejected; bursts
+    // are capped by the fixed window capacities (see sim/ratelimit.zig).
+    if (c.login_rate_window_ms < ratelimit.min_window_ms or c.login_rate_burst < 1 or c.login_rate_burst > ratelimit.login_window_capacity) return error.BadLoginRate;
+    if (c.place_rate_window_ms < ratelimit.min_window_ms or c.place_rate_burst < 1 or c.place_rate_burst > ratelimit.place_window_capacity) return error.BadPlaceRate;
 }
 
 /// Accepted storage-profile spellings (Phase B NVMe path).
@@ -188,6 +213,7 @@ pub fn isKnownBrand(s: []const u8) bool {
 }
 
 /// Human message for a validation failure (caller prints + usage).
+/// Burst bounds name the window capacities (single source of truth).
 pub fn validateMessage(err: ValidateError) []const u8 {
     return switch (err) {
         error.BadPort => "port must be 1-65535",
@@ -199,6 +225,8 @@ pub fn validateMessage(err: ValidateError) []const u8 {
         error.BadBrand => "brand must be vanilla, fabric, or forge",
         error.BadTransport => "transport must be auto, uring, kqueue, iocp, or blocking",
         error.BadStorageProfile => "storage_profile must be auto, hdd, ssd, or nvme",
+        error.BadLoginRate => comptime std.fmt.comptimePrint("login_rate_window_ms must be >= {d}, login_rate_burst 1..{d}", .{ ratelimit.min_window_ms, ratelimit.login_window_capacity }),
+        error.BadPlaceRate => comptime std.fmt.comptimePrint("place_rate_window_ms must be >= {d}, place_rate_burst 1..{d}", .{ ratelimit.min_window_ms, ratelimit.place_window_capacity }),
     };
 }
 
@@ -236,6 +264,10 @@ pub fn merge(base: Effective, file: *const FileConfig, file_seed: ?i64) Effectiv
     if (file.tcp_nodelay) |v| out.tcp_nodelay = v;
     if (file.sndbuf) |v| out.sndbuf = v;
     if (file.rcvbuf) |v| out.rcvbuf = v;
+    if (file.login_rate_window_ms) |v| out.login_rate_window_ms = v;
+    if (file.login_rate_burst) |v| out.login_rate_burst = v;
+    if (file.place_rate_window_ms) |v| out.place_rate_window_ms = v;
+    if (file.place_rate_burst) |v| out.place_rate_burst = v;
     return out;
 }
 
@@ -287,6 +319,10 @@ test "config json: full file parses" {
         \\  "region_threads": 6,
         \\  "storage_profile": "nvme",
         \\  "out_cap_bytes": 1048576,
+        \\  "login_rate_window_ms": 5000,
+        \\  "login_rate_burst": 3,
+        \\  "place_rate_window_ms": 2000,
+        \\  "place_rate_burst": 16,
         \\  "future_key": "ignored"
         \\}
     ;
@@ -310,7 +346,11 @@ test "config json: full file parses" {
     try std.testing.expectEqual(@as(?usize, 4), f.transport_workers);
     try std.testing.expectEqual(@as(?usize, 6), f.region_threads);
     try std.testing.expectEqualStrings("nvme", f.storage_profile.?);
-    try std.testing.expectEqual(@as(?usize, 1048576), f.out_cap_bytes);
+    try std.testing.expectEqual(@as(usize, 1048576), f.out_cap_bytes);
+    try std.testing.expectEqual(@as(?i64, 5000), f.login_rate_window_ms);
+    try std.testing.expectEqual(@as(?usize, 3), f.login_rate_burst);
+    try std.testing.expectEqual(@as(?i64, 2000), f.place_rate_window_ms);
+    try std.testing.expectEqual(@as(?usize, 16), f.place_rate_burst);
 }
 
 test "config validate: storage-profile spelling" {
@@ -370,6 +410,10 @@ test "config json: missing keys stay null" {
 test "config validate" {
     var ok = Effective{};
     try validate(&ok);
+    try std.testing.expectEqual(@as(i64, 10000), ok.login_rate_window_ms);
+    try std.testing.expectEqual(@as(usize, 5), ok.login_rate_burst);
+    try std.testing.expectEqual(@as(i64, 1000), ok.place_rate_window_ms);
+    try std.testing.expectEqual(@as(usize, 32), ok.place_rate_burst);
     var bad = Effective{ .view_distance = 0 };
     try std.testing.expectError(error.BadViewDistance, validate(&bad));
     bad = Effective{ .view_distance = 17 };
@@ -380,4 +424,16 @@ test "config validate" {
     try std.testing.expectError(error.BadGenSpawn, validate(&bad));
     bad = Effective{ .gen_workers = 0 };
     try std.testing.expectError(error.BadGenWorkers, validate(&bad));
+    bad = Effective{ .login_rate_window_ms = 50 };
+    try std.testing.expectError(error.BadLoginRate, validate(&bad));
+    bad = Effective{ .login_rate_burst = 0 };
+    try std.testing.expectError(error.BadLoginRate, validate(&bad));
+    bad = Effective{ .login_rate_burst = ratelimit.login_window_capacity + 1 };
+    try std.testing.expectError(error.BadLoginRate, validate(&bad));
+    bad = Effective{ .place_rate_window_ms = 50 };
+    try std.testing.expectError(error.BadPlaceRate, validate(&bad));
+    bad = Effective{ .place_rate_burst = 0 };
+    try std.testing.expectError(error.BadPlaceRate, validate(&bad));
+    bad = Effective{ .place_rate_burst = ratelimit.place_window_capacity + 1 };
+    try std.testing.expectError(error.BadPlaceRate, validate(&bad));
 }

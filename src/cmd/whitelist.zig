@@ -5,7 +5,7 @@ const cmd = @import("mod.zig");
 pub const def = cmd.define(.{
     .name = "whitelist",
     .node = "asteorite.command.whitelist",
-    .min_level = 3,
+    .min_level = .admin,
     .spec = &.{
         &[_]cmd.Slot{
             cmd.Slot{ .arg = .{ .choice = &.{ "on", "off", "list", "add", "remove", "reload" } } },

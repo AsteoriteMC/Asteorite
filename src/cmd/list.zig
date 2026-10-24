@@ -5,7 +5,7 @@ const cmd = @import("mod.zig");
 pub const def = cmd.define(.{
     .name = "list",
     .node = "asteorite.command.list",
-    .min_level = 0,
+    .min_level = .all,
     .spec = &.{&[_]cmd.Slot{}},
     .usage_override = "/list",
 });

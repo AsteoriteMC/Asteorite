@@ -24,6 +24,7 @@ const store_mod = @import("../world/store.zig");
 const shard_mod = @import("../world/shard.zig");
 const item_mod = @import("../item.zig");
 const ids = @import("../ids.zig");
+const rules_mod = @import("../game/rules.zig");
 
 pub const player_dim: u8 = 255;
 pub const magic = "ZPLR";
@@ -56,9 +57,9 @@ pub const Data = struct {
     food: i16 = 20,
     saturation: f32 = 5.0,
     selected: u8 = 0,
-    /// Effective gamemode (0 survival, 1 creative). v1 rows lack the byte
-    /// and decode with the old default (creative).
-    gamemode: u8 = 1,
+    /// Effective gamemode. v1 rows lack the byte and decode with the
+    /// old default (creative).
+    gamemode: rules_mod.GameMode = .creative,
     /// Experience (v4; v3 rows decode to zeroes).
     xp_level: i32 = 0,
     xp_total: i32 = 0,
@@ -137,7 +138,7 @@ pub fn encode(alloc: std.mem.Allocator, d: *const Data) ![]u8 {
     i += 1;
     for (d.inv) |s| i = writeSlot(out, i, s);
     i = writeSlot(out, i, d.cursor);
-    out[i] = d.gamemode;
+    out[i] = d.gamemode.wire();
     i += 1;
     std.mem.writeInt(i32, out[i..][0..4], d.xp_level, .big);
     i += 4;
@@ -236,8 +237,9 @@ fn decodeInner(alloc: std.mem.Allocator, bytes: []const u8, expect_username: []c
     if (!std.math.isFinite(d.saturation) or d.saturation < 0) return error.CorruptPlayer;
     for (&d.inv) |*s| s.* = try readSlot(alloc, &r, take, if (legacy_row) legacy else null);
     d.cursor = try readSlot(alloc, &r, take, if (legacy_row) legacy else null);
-    d.gamemode = (try take(&r, 1))[0];
-    if (d.gamemode > 1) return error.CorruptPlayer;
+    const gm_wire = (try take(&r, 1))[0];
+    if (gm_wire > 1) return error.CorruptPlayer;
+    d.gamemode = @enumFromInt(gm_wire);
     if (ver >= 4) {
         d.xp_level = std.mem.readInt(i32, (try take(&r, 4))[0..4], .big);
         d.xp_total = std.mem.readInt(i32, (try take(&r, 4))[0..4], .big);
@@ -323,7 +325,7 @@ test "player roundtrip incl NBT, cursor, selected, spawn" {
     d.food = 17;
     d.saturation = 3.25;
     d.selected = 4;
-    d.gamemode = 0;
+    d.gamemode = .survival;
     const tag = [_]u8{ 0x0A, 0x00, 0x03, 0x64, 0x75, 0x6D };
     d.inv[36] = .{ .id = ids.diamond_sword, .count = 1, .damage = 0, .nbt = &tag };
     d.inv[10] = .{ .id = ids.stone, .count = 64, .damage = 0, .nbt = null };
@@ -340,7 +342,7 @@ test "player roundtrip incl NBT, cursor, selected, spawn" {
     try std.testing.expectApproxEqAbs(@as(f32, 13.5), back.health, 1e-6);
     try std.testing.expectEqual(@as(i16, 17), back.food);
     try std.testing.expectEqual(@as(u8, 4), back.selected);
-    try std.testing.expectEqual(@as(u8, 0), back.gamemode);
+    try std.testing.expect(back.gamemode == .survival);
     try std.testing.expect(item_mod.stacksEqual(d.inv[36], back.inv[36]));
     try std.testing.expect(back.inv[36].?.nbt.?.ptr != tag[0..].ptr);
     try std.testing.expect(item_mod.stacksEqual(d.cursor, back.cursor));
@@ -360,7 +362,7 @@ test "player v1/v2 rows are rejected; v3/v4 need the legacy mapper" {
     var d = Data{};
     @memcpy(d.username[0.."Al".len], "Al");
     d.username_len = 2;
-    d.gamemode = 0;
+    d.gamemode = .survival;
     const enc = try encode(a, &d);
     defer a.free(enc);
     // Downgrade to v1 on the wire (and snip a tail byte so it cannot be

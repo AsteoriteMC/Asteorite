@@ -1,11 +1,12 @@
-//! /difficulty — set world difficulty 0-3 / peaceful..hard.
+//! /difficulty — set world difficulty peaceful..hard.
 
 const cmd = @import("mod.zig");
+const rules = @import("../game/rules.zig");
 
 pub const def = cmd.define(.{
     .name = "difficulty",
     .node = "asteorite.command.difficulty",
-    .min_level = 2,
+    .min_level = .gamemaster,
     .spec = &.{
         &[_]cmd.Slot{
             cmd.Slot{ .arg = .{ .word = {} }, .display = "<new difficulty>" },
@@ -14,14 +15,14 @@ pub const def = cmd.define(.{
     .usage_override = "/difficulty <new difficulty>",
 });
 
-fn parseDifficulty(s: []const u8) ?u8 {
-    if (std.ascii.eqlIgnoreCase(s, "peaceful") or std.ascii.eqlIgnoreCase(s, "p")) return 0;
-    if (std.ascii.eqlIgnoreCase(s, "easy") or std.ascii.eqlIgnoreCase(s, "e")) return 1;
-    if (std.ascii.eqlIgnoreCase(s, "normal") or std.ascii.eqlIgnoreCase(s, "n")) return 2;
-    if (std.ascii.eqlIgnoreCase(s, "hard") or std.ascii.eqlIgnoreCase(s, "h")) return 3;
+fn parseDifficulty(s: []const u8) ?rules.Difficulty {
+    if (std.ascii.eqlIgnoreCase(s, "peaceful") or std.ascii.eqlIgnoreCase(s, "p")) return .peaceful;
+    if (std.ascii.eqlIgnoreCase(s, "easy") or std.ascii.eqlIgnoreCase(s, "e")) return .easy;
+    if (std.ascii.eqlIgnoreCase(s, "normal") or std.ascii.eqlIgnoreCase(s, "n")) return .normal;
+    if (std.ascii.eqlIgnoreCase(s, "hard") or std.ascii.eqlIgnoreCase(s, "h")) return .hard;
     const v = std.fmt.parseInt(i64, s, 10) catch return null;
-    if (v < 0 or v > 3) return null;
-    return @intCast(v);
+    if (v < 0 or v >= std.enums.values(rules.Difficulty).len) return null;
+    return @enumFromInt(v);
 }
 
 pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u8 {
@@ -39,11 +40,11 @@ const std = @import("std");
 
 test "difficulty usage + parse" {
     try std.testing.expectEqualStrings("/difficulty <new difficulty>", def.usage());
-    try std.testing.expectEqual(@as(?u8, 0), parseDifficulty("peaceful"));
-    try std.testing.expectEqual(@as(?u8, 0), parseDifficulty("P"));
-    try std.testing.expectEqual(@as(?u8, 3), parseDifficulty("hard"));
-    try std.testing.expectEqual(@as(?u8, 3), parseDifficulty("h"));
-    try std.testing.expectEqual(@as(?u8, 2), parseDifficulty("2"));
+    try std.testing.expectEqual(@as(?rules.Difficulty, .peaceful), parseDifficulty("peaceful"));
+    try std.testing.expectEqual(@as(?rules.Difficulty, .peaceful), parseDifficulty("P"));
+    try std.testing.expectEqual(@as(?rules.Difficulty, .hard), parseDifficulty("hard"));
+    try std.testing.expectEqual(@as(?rules.Difficulty, .hard), parseDifficulty("h"));
+    try std.testing.expectEqual(@as(?rules.Difficulty, .normal), parseDifficulty("2"));
     try std.testing.expect(parseDifficulty("9") == null);
     try std.testing.expect(parseDifficulty("nope") == null);
 }

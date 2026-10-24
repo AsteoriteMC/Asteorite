@@ -123,7 +123,7 @@ fn unloadChunk(ctx: *anyopaque, x: i32, z: i32) anyerror!void {
 fn respawn(ctx: *anyopaque) anyerror!void {
     const conn = asConn(ctx);
     var buf: [256]u8 = undefined;
-    const f = try packets.frameRespawn(0, conn.config.difficulty, conn.config.gamemode, conn.config.level_type, &buf);
+    const f = try packets.frameRespawn(0, conn.config.difficulty.wire(), conn.config.gamemode.wire(), conn.config.level_type, &buf);
     try conn.queueFramed(f);
 }
 

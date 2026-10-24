@@ -1400,7 +1400,12 @@ pub fn frameTabComplete(cands: []const []const u8, out: []u8) codec.CodecError![
 // ---------- game state / effects / scoreboard ----------
 
 /// Clientbound 0x2B ChangeGameState: reason byte + float value.
-/// (1 = begin rain, 2 = end rain, 3 = change gamemode.)
+pub const game_state_begin_rain: u8 = 1;
+pub const game_state_end_rain: u8 = 2;
+pub const game_state_change_gamemode: u8 = 3;
+pub const game_state_rain_strength: u8 = 7;
+pub const game_state_thunder_strength: u8 = 8;
+
 pub fn frameGameState(reason: u8, value: f32, out: []u8) codec.CodecError![]const u8 {
     var payload: [8]u8 = undefined;
     var w = codec.PacketWriter.init(&payload);
@@ -1556,7 +1561,7 @@ test "tab-complete frame roundtrip" {
 
 test "game state / sound / effect frames" {
     var b: [512]u8 = undefined;
-    var r = codec.PacketReader.init(try frameGameState(1, 0, &b));
+    var r = codec.PacketReader.init(try frameGameState(game_state_begin_rain, 0, &b));
     try std.testing.expectEqual(@as(i32, 0x2B), (try codec.decodeFrame(&r)).id);
     try std.testing.expectEqual(@as(u8, 1), try r.readByte());
     var s = codec.PacketReader.init(try frameSoundEffect("mob.pig.say", 1, 64, -3, 1.0, 1.0, &b));

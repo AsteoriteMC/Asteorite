@@ -5,7 +5,7 @@ const cmd = @import("mod.zig");
 pub const def = cmd.define(.{
     .name = "publish",
     .node = "asteorite.command.publish",
-    .min_level = 4,
+    .min_level = .owner,
     .spec = &.{&[_]cmd.Slot{}},
     .usage_override = "/publish",
 });

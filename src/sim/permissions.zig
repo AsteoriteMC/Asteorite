@@ -74,12 +74,16 @@ const cmd_list = @import("../cmd/list.zig");
 const cmd_whitelist = @import("../cmd/whitelist.zig");
 const cmd_setidletimeout = @import("../cmd/setidletimeout.zig");
 const cmd_netstat = @import("../cmd/netstat.zig");
+const cmd_tps = @import("../cmd/tps.zig");
 const cmd_publish = @import("../cmd/publish.zig");
 const cmd_perm = @import("../cmd/perm.zig");
 
-pub const MAX_LEVEL: u8 = 4;
-pub const DEFAULT_LEVEL: u8 = 0;
-pub const CONSOLE_LEVEL: u8 = 4;
+/// Vanilla op ladder, shared with `cmd/mod.zig` (command defs gate on
+/// rank, never on a raw int). Re-exported so server code has one path.
+pub const OpLevel = cmd_mod.OpLevel;
+pub const MAX_LEVEL: OpLevel = .owner;
+pub const DEFAULT_LEVEL: OpLevel = .all;
+pub const CONSOLE_LEVEL: OpLevel = .owner;
 
 pub const perm_dim: u8 = 254;
 pub const perm_key = store_mod.encodeKey(perm_dim, 0, 0);
@@ -150,24 +154,20 @@ pub const modules = [_]type{
     cmd_whitelist,
     cmd_setidletimeout,
     cmd_netstat,
+    cmd_tps,
     cmd_publish,
     cmd_perm,
 };
 
-/// One module per command, in /help display order. Server dispatch
-/// iterates this same list, so there is exactly one place to update.
+/// One module per command, in /help display order. The server seeds its
+/// runtime registry from this list once at boot; lookups never touch it
+/// directly (see Server.ensureCommands — the runtime table is the single
+/// source of truth, so modding-API commands show up everywhere).
 pub const commands: [modules.len]Command = blk: {
     var table: [modules.len]Command = undefined;
     for (modules, 0..) |M, i| table[i] = M.def;
     break :blk table;
 };
-
-pub fn findCommand(name: []const u8) ?*const Command {
-    for (&commands) |*c| {
-        if (std.mem.eql(u8, c.name, name)) return c;
-    }
-    return null;
-}
 
 /// Player-name charset (matches login validation: alnum + underscore).
 pub fn validPlayerName(name: []const u8) bool {
@@ -207,7 +207,7 @@ fn nodeMatches(pattern: []const u8, node: []const u8) bool {
 
 const PlayerPerms = struct {
     name: []u8, // owned exact-case username
-    level: u8, // explicit level (DEFAULT_LEVEL when only nodes exist)
+    level: OpLevel, // explicit level (DEFAULT_LEVEL when only nodes exist)
     grants: std.StringHashMap(void), // owned node strings
     denies: std.StringHashMap(void),
 };
@@ -268,14 +268,13 @@ pub const Db = struct {
     }
 
     /// Explicit level, else DEFAULT_LEVEL. Console never reaches here.
-    pub fn levelFor(self: *const Db, name: []const u8) u8 {
+    pub fn levelFor(self: *const Db, name: []const u8) OpLevel {
         const p = self.lookup(name) orelse return DEFAULT_LEVEL;
         return p.level;
     }
 
-    /// Set an explicit level (0-4). Level 0 with no nodes removes the row.
-    pub fn setLevel(self: *Db, name: []const u8, level: u8) !void {
-        std.debug.assert(level <= MAX_LEVEL);
+    /// Set an explicit level. Level .all with no nodes removes the row.
+    pub fn setLevel(self: *Db, name: []const u8, level: OpLevel) !void {
         const p = try self.getOrPut(name);
         p.level = level;
         try self.gc(p.name);
@@ -338,8 +337,9 @@ pub const Db = struct {
 
     /// Decision core: deny-match wins, then grant-match, then level gate.
     /// `sender_level` is CONSOLE_LEVEL for console, else levelFor(name).
-    pub fn allows(self: *const Db, name: []const u8, node: []const u8, min_level: u8) bool {
-        const p = self.lookup(name) orelse return DEFAULT_LEVEL >= min_level;
+    pub fn allows(self: *const Db, name: []const u8, node: []const u8, min_level: OpLevel) bool {
+        const need = min_level.rank();
+        const p = self.lookup(name) orelse return DEFAULT_LEVEL.rank() >= need;
         var it = p.denies.iterator();
         while (it.next()) |e| {
             if (nodeMatches(e.key_ptr.*, node)) return false;
@@ -348,14 +348,14 @@ pub const Db = struct {
         while (jt.next()) |e| {
             if (nodeMatches(e.key_ptr.*, node)) return true;
         }
-        return p.level >= min_level;
+        return p.level.rank() >= need;
     }
 
     pub fn countOps(self: *const Db) usize {
         var n: usize = 0;
         var it = self.players.iterator();
         while (it.next()) |e| {
-            if (e.value_ptr.*.level > 0) n += 1;
+            if (e.value_ptr.*.level != .all) n += 1;
         }
         return n;
     }
@@ -413,7 +413,7 @@ pub fn encode(alloc: std.mem.Allocator, db: *const Db) ![]u8 {
         i += 1;
         @memcpy(out[i..][0..nm.len], nm);
         i += nm.len;
-        out[i] = p.level;
+        out[i] = p.level.rank();
         i += 1;
         const gkeys = try sortedKeys(alloc, &p.grants);
         defer alloc.free(gkeys);
@@ -478,14 +478,14 @@ pub fn decode(alloc: std.mem.Allocator, bytes: []const u8) DbError!Db {
         const name = try take(&r, ulen);
         if (!validPlayerName(name)) return error.CorruptPerms;
         const level = (try take(&r, 1))[0];
-        if (level > MAX_LEVEL) return error.CorruptPerms;
+        if (level > MAX_LEVEL.rank()) return error.CorruptPerms;
         // Duplicate names would fork the matrix — reject (compare folded:
         // old DBs may hold mixed case; folding merges them into one row).
         var fold: [max_name_len]u8 = undefined;
         const fname = Db.normKey(name, &fold);
         if (db.players.contains(fname)) return error.CorruptPerms;
         const p = try db.getOrPut(name);
-        p.level = level;
+        p.level = @enumFromInt(level);
         const ng = std.mem.readInt(u16, (try take(&r, 2))[0..2], .big);
         var g: usize = 0;
         while (g < ng) : (g += 1) {
@@ -547,33 +547,33 @@ test "levels + grants + denies + wildcards" {
     var db = Db.init(a);
     defer db.deinit();
     // default deny
-    try std.testing.expect(!db.allows("Steve", "asteorite.command.save-all", 4));
-    try std.testing.expect(db.allows("Steve", "asteorite.command.list", 0));
+    try std.testing.expect(!db.allows("Steve", "asteorite.command.save-all", .owner));
+    try std.testing.expect(db.allows("Steve", "asteorite.command.list", .all));
     // op level
-    try db.setLevel("Steve", 4);
-    try std.testing.expect(db.allows("Steve", "asteorite.command.save-all", 4));
+    try db.setLevel("Steve", .owner);
+    try std.testing.expect(db.allows("Steve", "asteorite.command.save-all", .owner));
     // deny beats level
     try db.deny("Steve", "asteorite.command.save-all");
-    try std.testing.expect(!db.allows("Steve", "asteorite.command.save-all", 4));
-    try std.testing.expect(db.allows("Steve", "asteorite.command.list", 0));
+    try std.testing.expect(!db.allows("Steve", "asteorite.command.save-all", .owner));
+    try std.testing.expect(db.allows("Steve", "asteorite.command.list", .all));
     // grant beats level-gate for a low player
     try db.grant("Bob", "asteorite.command.save-all");
-    try std.testing.expect(db.allows("Bob", "asteorite.command.save-all", 4));
+    try std.testing.expect(db.allows("Bob", "asteorite.command.save-all", .owner));
     // wildcard grant
     try db.grant("Bob", "asteorite.command.*");
-    try std.testing.expect(db.allows("Bob", "asteorite.command.op", 4));
+    try std.testing.expect(db.allows("Bob", "asteorite.command.op", .owner));
     // wildcard does not cross the dot boundary
-    try std.testing.expect(!db.allows("Bob", "asteorite.cmd", 4));
+    try std.testing.expect(!db.allows("Bob", "asteorite.cmd", .owner));
     // exact deny inside a granted wildcard still wins
     try db.deny("Bob", "asteorite.command.stop");
-    try std.testing.expect(!db.allows("Bob", "asteorite.command.stop", 0));
+    try std.testing.expect(!db.allows("Bob", "asteorite.command.stop", .all));
     // clearNode restores level behavior
     try std.testing.expect(try db.clearNode("Bob", "asteorite.command.stop"));
-    try std.testing.expect(db.allows("Bob", "asteorite.command.stop", 0));
+    try std.testing.expect(db.allows("Bob", "asteorite.command.stop", .all));
     // deop resets everything
     db.clearPlayer("Steve");
-    try std.testing.expect(!db.allows("Steve", "asteorite.command.save-all", 4));
-    try std.testing.expect(db.levelFor("Nobody") == 0);
+    try std.testing.expect(!db.allows("Steve", "asteorite.command.save-all", .owner));
+    try std.testing.expect(db.levelFor("Nobody") == .all);
 }
 
 test "player names are case-insensitive (vanilla UserList folds)" {
@@ -582,14 +582,14 @@ test "player names are case-insensitive (vanilla UserList folds)" {
     defer db.deinit();
     // /op Alice from console covers login `alice` (the reported "opped
     // but every command unknown" was an exact-case lookup miss).
-    try db.setLevel("Alice", 4);
-    try std.testing.expectEqual(@as(u8, 4), db.levelFor("alice"));
-    try std.testing.expectEqual(@as(u8, 4), db.levelFor("ALICE"));
-    try std.testing.expect(db.allows("aLiCe", "asteorite.command.save-all", 4));
+    try db.setLevel("Alice", .owner);
+    try std.testing.expectEqual(OpLevel.owner, db.levelFor("alice"));
+    try std.testing.expectEqual(OpLevel.owner, db.levelFor("ALICE"));
+    try std.testing.expect(db.allows("aLiCe", "asteorite.command.save-all", .owner));
     // deop with any case clears the same row.
     db.clearPlayer("ALICE");
-    try std.testing.expectEqual(@as(u8, 0), db.levelFor("alice"));
-    try std.testing.expect(!db.allows("alice", "asteorite.command.save-all", 4));
+    try std.testing.expectEqual(OpLevel.all, db.levelFor("alice"));
+    try std.testing.expect(!db.allows("alice", "asteorite.command.save-all", .owner));
 }
 
 test "node validation" {
@@ -614,7 +614,7 @@ test "perms roundtrip incl empty + corrupt rejection" {
     const a = std.testing.allocator;
     var db = Db.init(a);
     defer db.deinit();
-    try db.setLevel("Steve", 4);
+    try db.setLevel("Steve", .owner);
     try db.grant("Bob", "asteorite.command.save-all");
     try db.deny("Bob", "asteorite.command.stop");
     try db.grant("Al", "asteorite.*");
@@ -622,11 +622,11 @@ test "perms roundtrip incl empty + corrupt rejection" {
     defer a.free(enc);
     var back = try decode(a, enc);
     defer back.deinit();
-    try std.testing.expectEqual(@as(u8, 4), back.levelFor("Steve"));
-    try std.testing.expect(back.allows("Bob", "asteorite.command.save-all", 4));
-    try std.testing.expect(!back.allows("Bob", "asteorite.command.stop", 4));
-    try std.testing.expect(back.allows("Al", "asteorite.command.stop", 4));
-    try std.testing.expect(!back.allows("Al", "other.tree", 4));
+    try std.testing.expectEqual(OpLevel.owner, back.levelFor("Steve"));
+    try std.testing.expect(back.allows("Bob", "asteorite.command.save-all", .owner));
+    try std.testing.expect(!back.allows("Bob", "asteorite.command.stop", .owner));
+    try std.testing.expect(back.allows("Al", "asteorite.command.stop", .owner));
+    try std.testing.expect(!back.allows("Al", "other.tree", .owner));
     // deterministic bytes (sorted rows + nodes)
     const enc2 = try encode(a, &back);
     defer a.free(enc2);
