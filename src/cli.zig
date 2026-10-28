@@ -13,6 +13,10 @@
 
 const std = @import("std");
 const config = @import("config.zig");
+// Shared via the asteorite module (this file lives in main's root module,
+// so it must not import cmd/ files by path — that would claim them into
+// two modules).
+const spec_mod = @import("asteorite").cmdspec;
 
 /// Profile metadata needed by top-level CLI output. Kept as a value so the
 /// parser does not import the selected profile or `build_options` itself.
@@ -44,7 +48,7 @@ pub const ServeArgs = struct {
     rcon_password: ?[]const u8 = null,
     rcon_port: ?u16 = null,
     motd: ?[]const u8 = null,
-    max_players: ?u8 = null,
+    max_players: ?u16 = null,
     brand: ?[]const u8 = null,
     config_path: ?[]const u8 = null,
     /// Phase B: transport backend (auto|uring|kqueue|iocp|blocking).
@@ -71,6 +75,14 @@ pub const ServeArgs = struct {
     /// Placement flood budget: placements allowed per window per conn.
     place_rate_window_ms: ?i64 = null,
     place_rate_burst: ?usize = null,
+    /// Phase G: GPU offload backend (off|vulkan).
+    gpu: ?[]const u8 = null,
+    /// Phase G: per-tick GPU dispatch budget, milliseconds.
+    gpu_budget_ms: ?u32 = null,
+    /// Phase G: max chunks per GPU dispatch.
+    gpu_max_batch: ?usize = null,
+    /// Phase G: GPU device preference (auto|discrete|integrated|cpu).
+    gpu_device: ?[]const u8 = null,
     help: bool = false,
 };
 
@@ -116,12 +128,29 @@ pub fn message(err: *const ParseError, buf: []u8) []u8 {
     };
 }
 
-fn parseBool(s: []const u8) ?bool {
-    if (std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "1") or
-        std.mem.eql(u8, s, "yes") or std.mem.eql(u8, s, "on")) return true;
-    if (std.mem.eql(u8, s, "false") or std.mem.eql(u8, s, "0") or
-        std.mem.eql(u8, s, "no") or std.mem.eql(u8, s, "off")) return false;
-    return null;
+/// Flag value: `--flag=value` or the next argv element (missing → fail).
+fn flagValue(argv: []const []const u8, i: *usize, inline_val: ?[]const u8, flag: []const u8, err: *ParseError) Error![]const u8 {
+    if (inline_val) |v| return v;
+    i.* += 1;
+    if (i.* >= argv.len) return fail(err, .missing_value, flag, "", error.MissingValue);
+    return argv[i.*];
+}
+
+/// Typed flag value (parse failure → fail).
+fn flagInt(comptime T: type, argv: []const []const u8, i: *usize, inline_val: ?[]const u8, flag: []const u8, err: *ParseError) Error!T {
+    const v = try flagValue(argv, i, inline_val, flag, err);
+    return std.fmt.parseInt(T, v, 10) catch return fail(err, .bad_value, flag, v, error.BadValue);
+}
+
+/// Optional-inline bool flag (`--flag[=bool]`; bare means true).
+fn flagBool(inline_val: ?[]const u8, flag: []const u8, err: *ParseError) Error!bool {
+    const v = inline_val orelse return true;
+    return spec_mod.parseBool(v) orelse return fail(err, .bad_value, flag, v, error.BadValue);
+}
+
+/// Bare-only negating flag (`--no-foo` takes no value).
+fn flagBare(inline_val: ?[]const u8, flag: []const u8, err: *ParseError) Error!void {
+    if (inline_val != null) return fail(err, .bad_value, flag, inline_val.?, error.BadValue);
 }
 
 /// Parse `argv` (WITHOUT argv[0]/subcommand: just the flags). `arena`
@@ -150,207 +179,110 @@ pub fn parseServe(arena: std.mem.Allocator, argv: []const []const u8, err: *Pars
                 out.help = true;
                 continue;
             } else if (std.mem.eql(u8, name, "--config")) {
-                const v = inline_val orelse blk: {
-                    i += 1;
-                    if (i >= argv.len) return fail(err, .missing_value, "--config", "", error.MissingValue);
-                    break :blk argv[i];
-                };
+                const v = try flagValue(argv, &i, inline_val, "--config", err);
                 out.config_path = v;
                 continue;
             } else if (std.mem.eql(u8, name, "--online")) {
-                if (inline_val) |v| {
-                    out.online = parseBool(v) orelse return fail(err, .bad_value, "--online", v, error.BadValue);
-                } else out.online = true;
+                out.online = try flagBool(inline_val, "--online", err);
                 continue;
             } else if (std.mem.eql(u8, name, "--no-online")) {
-                if (inline_val != null) return fail(err, .bad_value, "--no-online", inline_val.?, error.BadValue);
+                try flagBare(inline_val, "--no-online", err);
                 out.online = false;
                 continue;
             } else if (std.mem.eql(u8, name, "--db")) {
-                const v = inline_val orelse blk: {
-                    i += 1;
-                    if (i >= argv.len) return fail(err, .missing_value, "--db", "", error.MissingValue);
-                    break :blk argv[i];
-                };
+                const v = try flagValue(argv, &i, inline_val, "--db", err);
                 out.db = v;
                 continue;
             } else if (std.mem.eql(u8, name, "--view")) {
-                const v = inline_val orelse blk: {
-                    i += 1;
-                    if (i >= argv.len) return fail(err, .missing_value, "--view", "", error.MissingValue);
-                    break :blk argv[i];
-                };
-                out.view_distance = std.fmt.parseInt(u8, v, 10) catch return fail(err, .bad_value, "--view", v, error.BadValue);
+                out.view_distance = try flagInt(u8, argv, &i, inline_val, "--view", err);
                 continue;
             } else if (std.mem.eql(u8, name, "--gen-spawn")) {
-                const v = inline_val orelse blk: {
-                    i += 1;
-                    if (i >= argv.len) return fail(err, .missing_value, "--gen-spawn", "", error.MissingValue);
-                    break :blk argv[i];
-                };
-                out.gen_spawn = std.fmt.parseInt(i32, v, 10) catch return fail(err, .bad_value, "--gen-spawn", v, error.BadValue);
+                out.gen_spawn = try flagInt(i32, argv, &i, inline_val, "--gen-spawn", err);
                 continue;
             } else if (std.mem.eql(u8, name, "--gen-workers")) {
-                const v = inline_val orelse blk: {
-                    i += 1;
-                    if (i >= argv.len) return fail(err, .missing_value, "--gen-workers", "", error.MissingValue);
-                    break :blk argv[i];
-                };
-                out.gen_workers = std.fmt.parseInt(usize, v, 10) catch return fail(err, .bad_value, "--gen-workers", v, error.BadValue);
+                out.gen_workers = try flagInt(usize, argv, &i, inline_val, "--gen-workers", err);
                 continue;
             } else if (std.mem.eql(u8, name, "--op")) {
-                const v = inline_val orelse blk: {
-                    i += 1;
-                    if (i >= argv.len) return fail(err, .missing_value, "--op", "", error.MissingValue);
-                    break :blk argv[i];
-                };
+                const v = try flagValue(argv, &i, inline_val, "--op", err);
                 try out.ops.append(arena, v);
                 continue;
             } else if (std.mem.eql(u8, name, "--rcon-password")) {
-                const v = inline_val orelse blk: {
-                    i += 1;
-                    if (i >= argv.len) return fail(err, .missing_value, "--rcon-password", "", error.MissingValue);
-                    break :blk argv[i];
-                };
+                const v = try flagValue(argv, &i, inline_val, "--rcon-password", err);
                 out.rcon_password = v;
                 continue;
             } else if (std.mem.eql(u8, name, "--rcon-port")) {
-                const v = inline_val orelse blk: {
-                    i += 1;
-                    if (i >= argv.len) return fail(err, .missing_value, "--rcon-port", "", error.MissingValue);
-                    break :blk argv[i];
-                };
-                out.rcon_port = std.fmt.parseInt(u16, v, 10) catch return fail(err, .bad_value, "--rcon-port", v, error.BadValue);
+                out.rcon_port = try flagInt(u16, argv, &i, inline_val, "--rcon-port", err);
                 continue;
             } else if (std.mem.eql(u8, name, "--motd")) {
-                const v = inline_val orelse blk: {
-                    i += 1;
-                    if (i >= argv.len) return fail(err, .missing_value, "--motd", "", error.MissingValue);
-                    break :blk argv[i];
-                };
+                const v = try flagValue(argv, &i, inline_val, "--motd", err);
                 out.motd = v;
                 continue;
             } else if (std.mem.eql(u8, name, "--max-players")) {
-                const v = inline_val orelse blk: {
-                    i += 1;
-                    if (i >= argv.len) return fail(err, .missing_value, "--max-players", "", error.MissingValue);
-                    break :blk argv[i];
-                };
-                out.max_players = std.fmt.parseInt(u8, v, 10) catch return fail(err, .bad_value, "--max-players", v, error.BadValue);
+                out.max_players = try flagInt(u16, argv, &i, inline_val, "--max-players", err);
                 continue;
             } else if (std.mem.eql(u8, name, "--brand")) {
-                const v = inline_val orelse blk: {
-                    i += 1;
-                    if (i >= argv.len) return fail(err, .missing_value, "--brand", "", error.MissingValue);
-                    break :blk argv[i];
-                };
+                const v = try flagValue(argv, &i, inline_val, "--brand", err);
                 if (!config.isKnownBrand(v)) return fail(err, .bad_value, "--brand", v, error.BadValue);
                 out.brand = v;
                 continue;
             } else if (std.mem.eql(u8, name, "--transport")) {
-                const v = inline_val orelse blk: {
-                    i += 1;
-                    if (i >= argv.len) return fail(err, .missing_value, "--transport", "", error.MissingValue);
-                    break :blk argv[i];
-                };
+                const v = try flagValue(argv, &i, inline_val, "--transport", err);
                 out.transport = v;
                 continue;
             } else if (std.mem.eql(u8, name, "--storage-profile")) {
-                const v = inline_val orelse blk: {
-                    i += 1;
-                    if (i >= argv.len) return fail(err, .missing_value, "--storage-profile", "", error.MissingValue);
-                    break :blk argv[i];
-                };
+                const v = try flagValue(argv, &i, inline_val, "--storage-profile", err);
                 out.storage_profile = v;
                 continue;
             } else if (std.mem.eql(u8, name, "--transport-workers")) {
-                const v = inline_val orelse blk: {
-                    i += 1;
-                    if (i >= argv.len) return fail(err, .missing_value, "--transport-workers", "", error.MissingValue);
-                    break :blk argv[i];
-                };
-                out.transport_workers = std.fmt.parseInt(usize, v, 10) catch return fail(err, .bad_value, "--transport-workers", v, error.BadValue);
+                out.transport_workers = try flagInt(usize, argv, &i, inline_val, "--transport-workers", err);
                 continue;
             } else if (std.mem.eql(u8, name, "--region-threads")) {
-                const v = inline_val orelse blk: {
-                    i += 1;
-                    if (i >= argv.len) return fail(err, .missing_value, "--region-threads", "", error.MissingValue);
-                    break :blk argv[i];
-                };
-                out.region_threads = std.fmt.parseInt(usize, v, 10) catch return fail(err, .bad_value, "--region-threads", v, error.BadValue);
+                out.region_threads = try flagInt(usize, argv, &i, inline_val, "--region-threads", err);
                 continue;
             } else if (std.mem.eql(u8, name, "--out-cap")) {
-                const v = inline_val orelse blk: {
-                    i += 1;
-                    if (i >= argv.len) return fail(err, .missing_value, "--out-cap", "", error.MissingValue);
-                    break :blk argv[i];
-                };
-                out.out_cap_bytes = std.fmt.parseInt(usize, v, 10) catch return fail(err, .bad_value, "--out-cap", v, error.BadValue);
+                out.out_cap_bytes = try flagInt(usize, argv, &i, inline_val, "--out-cap", err);
                 continue;
             } else if (std.mem.eql(u8, name, "--send-zc-threshold")) {
-                const v = inline_val orelse blk: {
-                    i += 1;
-                    if (i >= argv.len) return fail(err, .missing_value, "--send-zc-threshold", "", error.MissingValue);
-                    break :blk argv[i];
-                };
-                out.send_zc_threshold = std.fmt.parseInt(usize, v, 10) catch return fail(err, .bad_value, "--send-zc-threshold", v, error.BadValue);
+                out.send_zc_threshold = try flagInt(usize, argv, &i, inline_val, "--send-zc-threshold", err);
                 continue;
             } else if (std.mem.eql(u8, name, "--tcp-nodelay")) {
-                if (inline_val) |v| {
-                    out.tcp_nodelay = parseBool(v) orelse return fail(err, .bad_value, "--tcp-nodelay", v, error.BadValue);
-                } else out.tcp_nodelay = true;
+                out.tcp_nodelay = try flagBool(inline_val, "--tcp-nodelay", err);
                 continue;
             } else if (std.mem.eql(u8, name, "--no-tcp-nodelay")) {
-                if (inline_val != null) return fail(err, .bad_value, "--no-tcp-nodelay", inline_val.?, error.BadValue);
+                try flagBare(inline_val, "--no-tcp-nodelay", err);
                 out.tcp_nodelay = false;
                 continue;
             } else if (std.mem.eql(u8, name, "--sndbuf")) {
-                const v = inline_val orelse blk: {
-                    i += 1;
-                    if (i >= argv.len) return fail(err, .missing_value, "--sndbuf", "", error.MissingValue);
-                    break :blk argv[i];
-                };
-                out.sndbuf = std.fmt.parseInt(usize, v, 10) catch return fail(err, .bad_value, "--sndbuf", v, error.BadValue);
+                out.sndbuf = try flagInt(usize, argv, &i, inline_val, "--sndbuf", err);
                 continue;
             } else if (std.mem.eql(u8, name, "--rcvbuf")) {
-                const v = inline_val orelse blk: {
-                    i += 1;
-                    if (i >= argv.len) return fail(err, .missing_value, "--rcvbuf", "", error.MissingValue);
-                    break :blk argv[i];
-                };
-                out.rcvbuf = std.fmt.parseInt(usize, v, 10) catch return fail(err, .bad_value, "--rcvbuf", v, error.BadValue);
+                out.rcvbuf = try flagInt(usize, argv, &i, inline_val, "--rcvbuf", err);
                 continue;
             } else if (std.mem.eql(u8, name, "--login-rate-window-ms")) {
-                const v = inline_val orelse blk: {
-                    i += 1;
-                    if (i >= argv.len) return fail(err, .missing_value, "--login-rate-window-ms", "", error.MissingValue);
-                    break :blk argv[i];
-                };
-                out.login_rate_window_ms = std.fmt.parseInt(i64, v, 10) catch return fail(err, .bad_value, "--login-rate-window-ms", v, error.BadValue);
+                out.login_rate_window_ms = try flagInt(i64, argv, &i, inline_val, "--login-rate-window-ms", err);
                 continue;
             } else if (std.mem.eql(u8, name, "--login-rate-burst")) {
-                const v = inline_val orelse blk: {
-                    i += 1;
-                    if (i >= argv.len) return fail(err, .missing_value, "--login-rate-burst", "", error.MissingValue);
-                    break :blk argv[i];
-                };
-                out.login_rate_burst = std.fmt.parseInt(usize, v, 10) catch return fail(err, .bad_value, "--login-rate-burst", v, error.BadValue);
+                out.login_rate_burst = try flagInt(usize, argv, &i, inline_val, "--login-rate-burst", err);
                 continue;
             } else if (std.mem.eql(u8, name, "--place-rate-window-ms")) {
-                const v = inline_val orelse blk: {
-                    i += 1;
-                    if (i >= argv.len) return fail(err, .missing_value, "--place-rate-window-ms", "", error.MissingValue);
-                    break :blk argv[i];
-                };
-                out.place_rate_window_ms = std.fmt.parseInt(i64, v, 10) catch return fail(err, .bad_value, "--place-rate-window-ms", v, error.BadValue);
+                out.place_rate_window_ms = try flagInt(i64, argv, &i, inline_val, "--place-rate-window-ms", err);
                 continue;
             } else if (std.mem.eql(u8, name, "--place-rate-burst")) {
-                const v = inline_val orelse blk: {
-                    i += 1;
-                    if (i >= argv.len) return fail(err, .missing_value, "--place-rate-burst", "", error.MissingValue);
-                    break :blk argv[i];
-                };
-                out.place_rate_burst = std.fmt.parseInt(usize, v, 10) catch return fail(err, .bad_value, "--place-rate-burst", v, error.BadValue);
+                out.place_rate_burst = try flagInt(usize, argv, &i, inline_val, "--place-rate-burst", err);
+                continue;
+            } else if (std.mem.eql(u8, name, "--gpu")) {
+                const v = try flagValue(argv, &i, inline_val, "--gpu", err);
+                out.gpu = v;
+                continue;
+            } else if (std.mem.eql(u8, name, "--gpu-budget-ms")) {
+                out.gpu_budget_ms = try flagInt(u32, argv, &i, inline_val, "--gpu-budget-ms", err);
+                continue;
+            } else if (std.mem.eql(u8, name, "--gpu-max-batch")) {
+                out.gpu_max_batch = try flagInt(usize, argv, &i, inline_val, "--gpu-max-batch", err);
+                continue;
+            } else if (std.mem.eql(u8, name, "--gpu-device")) {
+                const v = try flagValue(argv, &i, inline_val, "--gpu-device", err);
+                out.gpu_device = v;
                 continue;
             }
             return fail(err, .unknown_flag, name, "", error.UnknownFlag);
@@ -391,7 +323,7 @@ pub fn printServeHelp(w: *std.Io.Writer) !void {
         \\  --view <1..16>         view distance (default 4; 1.7.10 caps at 16)
         \\  --gen-spawn <r>        pre-generate spawn disk of radius r on boot
         \\  --gen-workers <n>      background gen workers (default: cpus, max 8)
-        \\  --op <name>            grant op (repeatable; persisted in db)
+        \\  --op <name>            grant op (repeatable; persisted in ops.json)
         \\  --rcon-password <pw>   enable RCON with this password
         \\  --rcon-port <port>     RCON port (default 25575)
         \\  --motd <text>          server list message (default "Asteorite")
@@ -416,25 +348,57 @@ pub fn printServeHelp(w: *std.Io.Writer) !void {
         \\  --login-rate-burst <n>  logins allowed per window per IP
         \\  --place-rate-window-ms <ms>  placement flood window per conn
         \\  --place-rate-burst <n>  placements allowed per window per conn
-        \\  -c, --config <path>    JSON config file (default ./asteorite.json
+        \\  --gpu <backend>      GPU chunk-gen offload: off or vulkan
+        \\                         (default off; CPU fill is bit-identical)
+        \\  --gpu-budget-ms <ms>  per-tick GPU dispatch budget (default 4;
+        \\                         stored for the async scheduler)
+        \\  --gpu-max-batch <n>  max chunks per GPU dispatch, 1..64
+        \\                         (default 16; v1 dispatches 1 per fill)
+        \\  --gpu-device <kind>  GPU pick: auto, discrete, integrated, cpu
+        \\                         (default auto; cpu = CPU-type test device)
+        \\  -c, --config <path>    TOML config file (default ./asteorite.toml
         \\                         if present; CLI flags override file keys)
         \\  -h, --help             this help
         \\
-        \\config file (JSON, all keys optional):
-        \\  {{"port": 25565, "online": false, "db": "world", "view_distance": 8,
-        \\   "seed": 42, "gen_spawn": 4, "gen_workers": 4, "ops": ["alice"],
-        \\   "rcon_password": null, "rcon_port": 25575, "motd": "Asteorite",
-        \\   "max_players": 20, "brand": "vanilla"}}
-        \\  "seed" also accepts a string ("Notch") with vanilla hash semantics.
-        \\  "brand" is one of vanilla, fabric, forge (fml accepted for forge).
-        \\  there is no --seed flag: set "seed" in the config file.
+        \\config file (TOML, all sections/keys optional):
+        \\  [server]
+        \\  port = 25565
+        \\  online = false
+        \\  db = "world"
+        \\  view_distance = 8
+        \\  ops = ["alice"]
+        \\  motd = "Asteorite"
+        \\  max_players = 20
+        \\  brand = "vanilla"  # vanilla, fabric, forge (fml accepted)
+        \\  [world]
+        \\  seed = 42  # int64 or string ("Notch" hashes Java-style)
+        \\  gen_spawn = 4
+        \\  gen_workers = 4
+        \\  gamemode = "survival"  # survival, creative, adventure
+        \\  difficulty = "normal"  # peaceful, easy, normal, hard
+        \\  pvp = true
+        \\  idle_timeout = 0
+        \\  autosave = true
+        \\  gamerules = {{ keepInventory = true }}
+        \\  mob_spawns = {{ zombie = false }}
+        \\  [network]
+        \\  bind_address = "0.0.0.0"
+        \\  transport = "auto"  # auto, uring, kqueue, iocp, blocking
+        \\  [storage]
+        \\  storage_profile = "auto"
+        \\  [rates]  # flood budgets: windows ms, bursts per window
+        \\  [telemetry]
+        \\  [wasm]
+        \\  [gpu]
+        \\  gpu = "off"  # off, vulkan
+        \\  there is no --seed flag: set world.seed in the config file.
         \\  precedence: built-in defaults < config file < CLI flags.
         \\
         \\examples:
         \\  asteorite serve --db world --view 8
-        \\  asteorite serve 25566 --config myserver.json --op alice
+        \\  asteorite serve 25566 --config myserver.toml --op alice
         \\  asteorite serve --brand forge --motd "modded-ish" --max-players 50
-        \\  # world seed lives in the config file, e.g. {{"seed": 42}}
+        \\  # world seed lives in the config file, e.g. [world] seed = 42
         \\
     , .{});
     // Flood-gate defaults come from the config defaults (single source;
@@ -517,13 +481,26 @@ test "parse: rate-limit flags" {
     try std.testing.expectEqualStrings("--login-rate-burst", err.flag);
 }
 
+test "parse: gpu flags" {
+    const alloc = std.testing.allocator;
+    var err = ParseError{};
+    var a = try parseServe(alloc, &.{ "--gpu", "vulkan", "--gpu-budget-ms=8", "--gpu-max-batch", "32", "--gpu-device=discrete" }, &err);
+    defer a.ops.deinit(alloc);
+    try std.testing.expectEqualStrings("vulkan", a.gpu.?);
+    try std.testing.expectEqual(@as(?u32, 8), a.gpu_budget_ms);
+    try std.testing.expectEqual(@as(?usize, 32), a.gpu_max_batch);
+    try std.testing.expectEqualStrings("discrete", a.gpu_device.?);
+    try std.testing.expectError(error.BadValue, parseServe(alloc, &.{"--gpu-max-batch=abc"}, &err));
+    try std.testing.expectEqualStrings("--gpu-max-batch", err.flag);
+}
+
 test "parse: motd/max-players/brand" {
     const alloc = std.testing.allocator;
     var err = ParseError{};
     var a = try parseServe(alloc, &.{ "--motd", "hi there", "--max-players=50", "--brand", "forge" }, &err);
     defer a.ops.deinit(alloc);
     try std.testing.expectEqualStrings("hi there", a.motd.?);
-    try std.testing.expectEqual(@as(?u8, 50), a.max_players);
+    try std.testing.expectEqual(@as(?u16, 50), a.max_players);
     try std.testing.expectEqualStrings("forge", a.brand.?);
     try std.testing.expectError(error.BadValue, parseServe(alloc, &.{"--brand=spigot"}, &err));
     try std.testing.expectEqualStrings("--brand", err.flag);
@@ -544,14 +521,14 @@ test "parse: errors carry flag and value" {
 }
 
 test "help text mentions seed semantics and config" {
-    var buf: [4096]u8 = undefined;
+    var buf: [8192]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try printServeHelp(&w);
     const text = w.buffered();
     // Seed lives in the config file; help says so explicitly.
     try std.testing.expect(std.mem.indexOf(u8, text, "no --seed flag") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "\"seed\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "asteorite.json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "seed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "asteorite.toml") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "hash") != null);
 }
 

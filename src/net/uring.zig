@@ -116,6 +116,13 @@ const ConnSlot = struct {
     /// overflow kick fired mid-flush (the flusher held the ref the
     /// closer spun on).
     dead: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Graceful close requested (kick / ping-done / timeout): no new
+    /// inbound reads are processed, but queued output still drains and
+    /// in-flight sends still complete — the slot is destroyed once
+    /// everything went out (see workerMaybeDestroyConn). Same
+    /// flush-then-close contract as the blocking transport, whose write
+    /// path flushes before it closes.
+    closing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
 /// A worker: one ring, many connections.
@@ -228,6 +235,7 @@ const Counters = struct {
     sends_copy: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     recv_arm_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     buffer_starved: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    recv_rearmed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     send_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     kicks_backpressure: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     flushes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -297,7 +305,7 @@ pub const Backend = struct {
                         if (cqe.res == -@as(i32, @intCast(@intFromEnum(linux.E.MFILE))) or
                             cqe.res == -@as(i32, @intCast(@intFromEnum(linux.E.NFILE))))
                         {
-                            sleepMs(self.backend.io, 2);
+                            transport.sleepMs(self.backend.io, 2);
                         }
                         if (!more) _ = arm(self);
                         continue;
@@ -404,21 +412,7 @@ pub const Backend = struct {
 
     /// Transport handle for the server (any-thread flush requests).
     pub fn handle(self: *Backend) transport.Handle {
-        return .{
-            .request_flush = struct {
-                fn f(ctx: *anyopaque, conn_id: u32) void {
-                    const b: *Backend = @ptrCast(@alignCast(ctx));
-                    b.requestFlush(conn_id);
-                }
-            }.f,
-            .close_conn = struct {
-                fn f(ctx: *anyopaque, conn_id: u32) void {
-                    const b: *Backend = @ptrCast(@alignCast(ctx));
-                    b.closeConn(conn_id);
-                }
-            }.f,
-            .ctx = self,
-        };
+        return transport.handleFor(Backend, self);
     }
 
     /// Close a connection (the transport owns the socket).
@@ -427,13 +421,22 @@ pub const Backend = struct {
     /// close (the recv error path) cannot close the same connection
     /// twice: a double close freed the conn and then waited on its
     /// (freed) refcount.
+    /// Request a graceful close: the slot stops taking new reads, its
+    /// queued output still drains (a sweep is woken even with no further
+    /// traffic), and it is destroyed once drained (see
+    /// workerMaybeDestroyConn). Idempotent; safe from any thread. Error
+    /// and EOF paths keep the immediate workerCloseConn — a dead socket
+    /// has nothing left to deliver.
     pub fn closeConn(self: *Backend, conn_id: u32) void {
         for (self.workers) |*w| {
             w.conns_lock.lock();
-            const present = w.conns.contains(conn_id);
+            const slot = w.conns.get(conn_id);
             w.conns_lock.unlock();
-            if (!present) continue;
-            workerCloseConn(w, conn_id);
+            const sl = slot orelse continue;
+            if (sl.closing.swap(true, .acq_rel)) return;
+            _ = sl.flush_requested.swap(true, .acq_rel);
+            w.signal();
+            w.wakeRing();
             return;
         }
     }
@@ -450,6 +453,7 @@ pub const Backend = struct {
             .flushes = self.counters.flushes.load(.acquire),
             .recv_arm_failures = self.counters.recv_arm_failures.load(.acquire),
             .buffer_starved = self.counters.buffer_starved.load(.acquire),
+            .recv_rearmed = self.counters.recv_rearmed.load(.acquire),
             .send_failures = self.counters.send_failures.load(.acquire),
         };
     }
@@ -464,6 +468,8 @@ fn workerMain(w: *Worker) void {
         workerDrainInbox(w);
         // 2. Flush whatever the protocol layer queued.
         workerFlushAll(w);
+        // 2b. Re-arm recv on connections that lost it (below).
+        workerRearmRecvs(w);
         // 3. Submit and wait for completions.
         w.sq_lock.lock();
         _ = w.ring.submit() catch {
@@ -559,15 +565,25 @@ fn workerHandleRecv(w: *Worker, cqe: linux.io_uring_cqe) void {
             return;
         };
         const h = w.backend.handler;
-        h.on_read(h.ctx, sl.id, bytes);
-        _ = w.backend.counters.bytes_in.fetchAdd(bytes.len, .acq_rel);
+        // A closing connection takes no new input (a kicked client
+        // spamming packets must not get served), but its queued output
+        // still drains below.
+        if (!sl.closing.load(.acquire)) {
+            h.on_read(h.ctx, sl.id, bytes);
+            _ = w.backend.counters.bytes_in.fetchAdd(bytes.len, .acq_rel);
+        }
         w.buffers.put(cqe) catch {};
         // The protocol layer queued its answer: drain it now.
         if (h.on_flush(h.ctx, sl.id)) |out| workerQueueBytes(w, sl, out);
+        workerMaybeDestroyConn(w, sl);
     } else if (cqe.res == 0) {
-        // Peer closed.
+        // Peer closed: drain what's queued, then destroy (graceful — a
+        // raced kick message still goes out on a half-close).
         sl.recv_armed = false;
-        workerCloseConn(w, id);
+        sl.closing.store(true, .release);
+        const h_eof = w.backend.handler;
+        if (h_eof.on_flush(h_eof.ctx, sl.id)) |out| workerQueueBytes(w, sl, out);
+        workerMaybeDestroyConn(w, sl);
         return;
     } else {
         // Error (or ENOBUFS: the buffer group ran dry).
@@ -582,9 +598,10 @@ fn workerHandleRecv(w: *Worker, cqe: linux.io_uring_cqe) void {
         return;
     }
     if (!more) {
-        // The multishot recv ended (error or cancellation): re-arm.
+        // The multishot recv ended (error or cancellation): re-arm,
+        // unless closing (no more inbound reads wanted).
         sl.recv_armed = false;
-        workerArmRecv(w, sl);
+        if (!sl.closing.load(.acquire)) workerArmRecv(w, sl);
     }
 }
 
@@ -606,6 +623,7 @@ fn workerHandleSend(w: *Worker, cqe: linux.io_uring_cqe) void {
         return;
     }
     workerFlushConn(w, sl);
+    workerMaybeDestroyConn(w, sl);
 }
 
 fn workerHandleSendNotif(w: *Worker, cqe: linux.io_uring_cqe) void {
@@ -620,6 +638,7 @@ fn workerHandleSendNotif(w: *Worker, cqe: linux.io_uring_cqe) void {
         if (sl.zc_pending.items[i].seq == seq) {
             w.backend.allocator.free(sl.zc_pending.items[i].bytes);
             _ = sl.zc_pending.orderedRemove(i);
+            workerMaybeDestroyConn(w, sl);
             return;
         }
     }
@@ -629,6 +648,46 @@ fn workerDrainWakeup(w: *Worker) void {
     var buf: [8]u8 = undefined;
     _ = linux.read(w.wakeup_fd, &buf, 8);
     workerFlushAll(w);
+}
+
+/// Re-arm recv on live connections that lost it (ENOBUFS starvation or
+/// a failed arm): without a retry a deaf connection never recovers —
+/// its bytes sit in the socket buffer forever and the login never
+/// completes (the 600-conn join stall: the buffer pool drains under
+/// burst load, arms fail, and nothing ever re-armed them). Bounded
+/// batch like the flush sweep (a huge backlog re-arms over a few
+/// sweeps); runs every worker loop so recovery is prompt. Worker-thread
+/// only (same confinement as recv_armed itself); slots stay valid via
+/// the dead_slots retention discipline.
+fn workerRearmRecvs(w: *Worker) void {
+    var batch: [64]*ConnSlot = undefined;
+    var n: usize = 0;
+    w.conns_lock.lock();
+    var it = w.conns.valueIterator();
+    while (it.next()) |slot| {
+        if (n >= batch.len) break;
+        const sl = slot.*;
+        if (sl.recv_armed) continue;
+        if (sl.closing.load(.acquire)) continue;
+        if (sl.dead.load(.acquire)) continue;
+        batch[n] = sl;
+        n += 1;
+    }
+    w.conns_lock.unlock();
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const sl = batch[i];
+        if (sl.dead.load(.acquire)) continue;
+        if (sl.closing.load(.acquire)) continue;
+        // Count clean re-arms (flag was down, arm brought it up): the
+        // diagnostic for deaf-recv recovery. workerArmRecv is a no-op
+        // when already armed, so a flip here means this sweep rescued it.
+        const was_armed = sl.recv_armed;
+        workerArmRecv(w, sl);
+        if (!was_armed and sl.recv_armed) {
+            _ = w.backend.counters.recv_rearmed.fetchAdd(1, .acq_rel);
+        }
+    }
 }
 
 /// Queue bytes for sending (ownership moves to the slot).
@@ -650,6 +709,7 @@ fn workerFlushConn(w: *Worker, slot: *ConnSlot) void {
     if (slot.dead.load(.acquire)) return;
     if (slot.sending) return;
     if (slot.out.items.len == 0) return;
+
     const bytes = slot.out.toOwnedSlice(w.backend.allocator) catch return;
     slot.out = .empty;
     const seq = slot.next_seq;
@@ -696,11 +756,16 @@ fn workerFlushAll(w: *Worker) void {
     w.conns_lock.lock();
     var it = w.conns.valueIterator();
     while (it.next()) |slot| {
-        if (slot.*.flush_requested.swap(false, .acq_rel)) {
-            if (n_pending < pending.len) {
-                pending[n_pending] = slot.*;
-                n_pending += 1;
-            }
+        // Closing slots always ride the sweep (their flag may already
+        // be consumed); a closing slot dropped by the batch cap re-arms
+        // so the re-wake below picks it up instead of stranding it.
+        const want = slot.*.flush_requested.swap(false, .acq_rel) or slot.*.closing.load(.acquire);
+        if (!want) continue;
+        if (n_pending < pending.len) {
+            pending[n_pending] = slot.*;
+            n_pending += 1;
+        } else if (slot.*.closing.load(.acquire)) {
+            _ = slot.*.flush_requested.swap(true, .acq_rel);
         }
     }
     w.conns_lock.unlock();
@@ -710,6 +775,15 @@ fn workerFlushAll(w: *Worker) void {
         if (slot.dead.load(.acquire)) continue;
         const h = w.backend.handler;
         if (h.on_flush(h.ctx, slot.id)) |out| workerQueueBytes(w, slot, out);
+        // A closing connection whose queue just drained (or completed)
+        // is finished: destroy it now instead of waiting for traffic.
+        workerMaybeDestroyConn(w, slot);
+    }
+    // A full batch may have left a closing slot unchecked; re-wake so a
+    // follow-up sweep picks it up instead of stranding it.
+    if (n_pending == pending.len) {
+        w.signal();
+        w.wakeRing();
     }
 }
 
@@ -719,6 +793,20 @@ fn workerFlushAll(w: *Worker) void {
 /// never touch freed memory. No waiting: retention + the `dead` flag make
 /// every concurrent path safe (a refcount spin here deadlocked when an
 /// overflow kick fired mid-flush).
+/// Destroy a closing slot once its queue and in-flight sends drained
+/// (graceful close: pong / kick reason go out first). Called wherever
+/// outbox/sending state can change: after the post-read drain, after
+/// each send (and zerocopy-notif) completion, and on every flush sweep.
+/// A slot with a send in flight waits for its completion; the completion
+/// re-checks here.
+fn workerMaybeDestroyConn(w: *Worker, slot: *ConnSlot) void {
+    if (!slot.closing.load(.acquire)) return;
+    if (slot.out.items.len != 0) return;
+    if (slot.sending) return;
+    if (slot.zc_pending.items.len != 0) return;
+    workerCloseConn(w, slot.id);
+}
+
 fn workerCloseConn(w: *Worker, conn_id: u32) void {
     w.conns_lock.lock();
     const removed = w.conns.fetchRemove(conn_id);
@@ -727,6 +815,12 @@ fn workerCloseConn(w: *Worker, conn_id: u32) void {
     slot.dead.store(true, .release);
     const h = w.backend.handler;
     h.on_close(h.ctx, slot.id);
+    // The armed multishot recv holds a kernel file reference past
+    // close(): without a shutdown the peer never sees FIN (the socket
+    // lingers ESTABLISHED and the server list shows "(no connection)").
+    // shutdown() acts on the socket itself, so the pong/FIN goes out
+    // even though the ring still references the fd.
+    _ = linux.shutdown(slot.fd, linux.SHUT.RDWR);
     _ = linux.close(slot.fd);
     for (slot.zc_pending.items) |p| w.backend.allocator.free(p.bytes);
     slot.zc_pending.deinit(w.backend.allocator);
@@ -735,12 +829,6 @@ fn workerCloseConn(w: *Worker, conn_id: u32) void {
         w.backend.allocator.destroy(slot);
     };
     _ = w.backend.counters.conns_closed.fetchAdd(1, .acq_rel);
-}
-
-/// Sleep helper (the backend has no Io of its own; the server passes one).
-fn sleepMs(io: std.Io, ms: u64) void {
-    const d = std.Io.Clock.Duration{ .raw = std.Io.Duration.fromNanoseconds(@intCast(ms * std.time.ns_per_ms)), .clock = .awake };
-    std.Io.Timeout.sleep(.{ .duration = d }, io) catch {};
 }
 
 /// Can io_uring be used on this kernel? (ring setup probe)

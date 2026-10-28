@@ -24,3 +24,8 @@ pub const blocks = @import("mc5/blocks.zig").table;
 pub const placeBlockForHeld = @import("mc5/blocks.zig").placeBlockForHeld;
 /// 1.7.10 enchanting tables (enchantability, weights, min/max ranges).
 pub const enchanting_data = @import("mc5/enchanting_data.zig");
+/// 1.7.10 potion tables (damage values, brewing chain, corruption map).
+pub const potion_data = @import("mc5/potion_data.zig");
+/// 1.7.10 item behavior tables (stack limits, melee damage), keyed by
+/// canonical id. Engines call through `profile.game.item_data`.
+pub const item_data = @import("mc5/item_data.zig");

@@ -18,9 +18,10 @@ pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u
     const n = cmd.Spec.tokenize(args, &toks);
     if (n != 1) return cmd.usageError(&def, out);
     // Offline parity: any single token resolves (online-mode lookup
-    // failures surface as op.failed, which needs mojang access).
+    // failures surface as unknown_player — UUIDs are bound at grant time,
+    // so an offline target in online mode cannot be opped).
     if (toks[0].len == 0 or toks[0].len > 16) return cmd.usageError(&def, out);
-    srv.grantOp(toks[0]);
+    if (!srv.grantOp(toks[0])) return cmd.unknown_player;
     const msg = std.fmt.bufPrint(out, "Opped {s}", .{toks[0]}) catch "Opped";
     srv.notifyAdmins(sender, &def, msg);
     return msg;

@@ -1,6 +1,6 @@
 //! /perm — inspect and edit the permission matrix.
 //!
-//! The matrix itself lives in sim/permissions.zig; this file only parses
+//! The matrix itself lives in sim/player/permissions.zig; this file only parses
 //! the subcommand and formats replies. Node charset checks go through the
 //! backend so future versions can tighten the rules without touching this.
 
@@ -45,11 +45,11 @@ pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u
     }
     if (is_clear) {
         if (n == 2) {
-            srv.permClear(player, null);
+            if (!srv.permClear(player, null)) return cmd.unknown_player;
             return "Nodes cleared.";
         }
         if (n != 3) return cmd.usageError(&def, out);
-        srv.permClear(player, toks[2]);
+        if (!srv.permClear(player, toks[2])) return cmd.unknown_player;
         return "Cleared.";
     }
     if (n != 3) return cmd.usageError(&def, out);
@@ -57,10 +57,10 @@ pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u
         return "Bad node. Use [a-z0-9_.-], optional trailing .*";
     }
     if (is_grant) {
-        srv.permGrant(player, toks[2]);
+        if (!srv.permGrant(player, toks[2])) return cmd.unknown_player;
         return "Granted.";
     }
-    srv.permDeny(player, toks[2]);
+    if (!srv.permDeny(player, toks[2])) return cmd.unknown_player;
     return "Denied.";
 }
 

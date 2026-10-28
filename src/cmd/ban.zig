@@ -25,7 +25,9 @@ pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u
     if (toks[0].len == 0 or toks[0].len > 16) return cmd.usageError(&def, out);
     var rb: [1024]u8 = undefined;
     const reason = if (n > 1) cmd.Spec.joinRest(toks[0..n], 1, &rb) orelse return def.usage() else "";
-    srv.banName(toks[0], reason);
+    // UUIDs bind at ban time: online-mode offline targets can't resolve
+    // (same rule as /op) — use an IP ban for those, it needs no identity.
+    if (!srv.banName(toks[0], reason)) return std.fmt.bufPrint(out, "Could not ban player {s}", .{toks[0]}) catch "Could not ban player";
     const msg = std.fmt.bufPrint(out, "Banned player {s}", .{toks[0]}) catch "Banned player";
     srv.notifyAdmins(sender, &def, msg);
     return msg;

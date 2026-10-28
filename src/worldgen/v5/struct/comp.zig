@@ -126,8 +126,8 @@ pub fn rotateMeta(id: ids.Id, meta: u4, mode: Facing) u4 {
                     .east => switch (m) {
                         2 => 5,
                         3 => 4,
-                        4 => 3,
-                        5 => 2,
+                        4 => 2,
+                        5 => 3,
                         else => meta,
                     },
                     .north => meta,
@@ -188,10 +188,12 @@ fn rotateStairs(m: u8, mode: Facing) u4 {
 }
 
 /// `BlockDirectional` subclasses placed by structures (bed, pumpkin, lit
-/// pumpkin, fence gate, wooden button) — chest-style 2-bit rotation.
+/// pumpkin, fence gate, wooden button, diodes) — chest-style 2-bit rotation.
 fn isDirectional(id: ids.Id) bool {
     return id == .bed_block or id == .pumpkin or id == .lit_pumpkin or
-        id == .fence_gate or id == .wooden_button;
+        id == .fence_gate or id == .wooden_button or
+        id == .unpowered_repeater or id == .powered_repeater or
+        id == .unpowered_comparator or id == .powered_comparator;
 }
 
 /// Dispenser facing table (`q.a = {1,0,3,2,5,4}`).
@@ -222,11 +224,16 @@ fn p_f(m: u8) u4 {
 /// Block, meta, x, y, z, box)`). NO metadata rotation — callers rotate
 /// explicitly via `rotateMeta` exactly where vanilla calls
 /// `getMetadataWithOffset` (see `placeOrientedAt`).
+/// Oriented cell position (shared by placeAt/getAt).
+const CellPos = struct { x: i32, y: i32, z: i32 };
+
+fn cellPos(c: Component, lx: i32, y: i32, lz: i32) CellPos {
+    return .{ .x = c.xWithOffset(lx, lz), .y = c.yWithOffset(y), .z = c.zWithOffset(lx, lz) };
+}
+
 pub fn placeAt(p: Placer, c: Component, clip: BBox, id: ids.Id, meta: u4, lx: i32, y: i32, lz: i32) void {
-    const x = c.xWithOffset(lx, lz);
-    const yy = c.yWithOffset(y);
-    const z = c.zWithOffset(lx, lz);
-    if (clip.contains(x, yy, z)) p.set(x, yy, z, id, meta);
+    const q = cellPos(c, lx, y, lz);
+    if (clip.contains(q.x, q.y, q.z)) p.set(q.x, q.y, q.z, id, meta);
 }
 
 /// Placement with vanilla-style pre-rotation (`this.a(B, this.a(B, m),
@@ -237,68 +244,83 @@ pub fn placeOrientedAt(p: Placer, c: Component, clip: BBox, id: ids.Id, meta: u4
 
 /// Read one oriented block, air outside the populate box.
 pub fn getAt(p: Placer, c: Component, clip: BBox, lx: i32, y: i32, lz: i32) placer_mod.Block {
-    const x = c.xWithOffset(lx, lz);
-    const yy = c.yWithOffset(y);
-    const z = c.zWithOffset(lx, lz);
-    if (!clip.contains(x, yy, z)) return .{ .id = .air, .meta = 0 };
-    return p.get(x, yy, z);
+    const q = cellPos(c, lx, y, lz);
+    if (!clip.contains(q.x, q.y, q.z)) return .{ .id = .air, .meta = 0 };
+    return p.get(q.x, q.y, q.z);
 }
 
-/// Fill a cuboid with air (`avk.a(World, box, x0..z1)`).
-pub fn fillAir(p: Placer, c: Component, clip: BBox, x0: i32, y0: i32, z0: i32, x1: i32, y1: i32, z1: i32) void {
+/// Cuboid walk shared by the fillBox* family: per-cell air gate + edge
+/// classification, then `doCell`. Each caller maps to one `avk.a`
+/// overload — the skeleton below is shared, the cell action is the spec.
+/// (fillBoxRandom keeps its own loop: its float gate draws on EVERY cell,
+/// before the air gate — folding it in would shift the RNG stream.)
+fn fillEach(
+    p: Placer,
+    c: Component,
+    clip: BBox,
+    x0: i32,
+    y0: i32,
+    z0: i32,
+    x1: i32,
+    y1: i32,
+    z1: i32,
+    replace_air_only: bool,
+    ctx: anytype,
+    comptime doCell: anytype,
+) void {
     var y = y0;
     while (y <= y1) : (y += 1) {
         var x = x0;
         while (x <= x1) : (x += 1) {
             var z = z0;
             while (z <= z1) : (z += 1) {
-                placeAt(p, c, clip, .air, 0, x, y, z);
+                if (replace_air_only and getAt(p, c, clip, x, y, z).id != .air) continue;
+                const edge_cell = y == y0 or y == y1 or x == x0 or x == x1 or z == z0 or z == z1;
+                doCell(ctx, p, c, clip, edge_cell, x, y, z);
             }
         }
     }
+}
+
+/// Fill a cuboid with air (`avk.a(World, box, x0..z1)`).
+pub fn fillAir(p: Placer, c: Component, clip: BBox, x0: i32, y0: i32, z0: i32, x1: i32, y1: i32, z1: i32) void {
+    const doCell = struct {
+        fn f(_: void, pp: Placer, cc: Component, cl: BBox, _: bool, x: i32, y: i32, z: i32) void {
+            placeAt(pp, cc, cl, .air, 0, x, y, z);
+        }
+    }.f;
+    fillEach(p, c, clip, x0, y0, z0, x1, y1, z1, false, {}, doCell);
 }
 
 /// Fill a cuboid: shell `edge`, interior `fill`, skipping non-air when
 /// `replace_air_only` (`avk.a` meta-less overload; interior meta is 0).
 pub fn fillBox(p: Placer, c: Component, clip: BBox, x0: i32, y0: i32, z0: i32, x1: i32, y1: i32, z1: i32, edge: ids.Id, fill: ids.Id, replace_air_only: bool) void {
-    var y = y0;
-    while (y <= y1) : (y += 1) {
-        var x = x0;
-        while (x <= x1) : (x += 1) {
-            var z = z0;
-            while (z <= z1) : (z += 1) {
-                if (!replace_air_only or getAt(p, c, clip, x, y, z).id == .air) {
-                    const edge_cell = y == y0 or y == y1 or x == x0 or x == x1 or z == z0 or z == z1;
-                    if (edge_cell) {
-                        placeAt(p, c, clip, edge, 0, x, y, z);
-                    } else {
-                        placeAt(p, c, clip, fill, 0, x, y, z);
-                    }
-                }
+    const Ctx = struct { edge: ids.Id, fill: ids.Id };
+    const doCell = struct {
+        fn f(ctx: Ctx, pp: Placer, cc: Component, cl: BBox, edge_cell: bool, x: i32, y: i32, z: i32) void {
+            if (edge_cell) {
+                placeAt(pp, cc, cl, ctx.edge, 0, x, y, z);
+            } else {
+                placeAt(pp, cc, cl, ctx.fill, 0, x, y, z);
             }
         }
-    }
+    }.f;
+    fillEach(p, c, clip, x0, y0, z0, x1, y1, z1, replace_air_only, Ctx{ .edge = edge, .fill = fill }, doCell);
 }
 
 /// Fill a cuboid with explicit metas (`avk.a` meta overload).
 pub fn fillBoxMeta(p: Placer, c: Component, clip: BBox, x0: i32, y0: i32, z0: i32, x1: i32, y1: i32, z1: i32, edge: ids.Id, edge_meta: u4, fill: ids.Id, fill_meta: u4, replace_air_only: bool) void {
-    var y = y0;
-    while (y <= y1) : (y += 1) {
-        var x = x0;
-        while (x <= x1) : (x += 1) {
-            var z = z0;
-            while (z <= z1) : (z += 1) {
-                if (!replace_air_only or getAt(p, c, clip, x, y, z).id == .air) {
-                    const edge_cell = y == y0 or y == y1 or x == x0 or x == x1 or z == z0 or z == z1;
-                    if (edge_cell) {
-                        placeAt(p, c, clip, edge, edge_meta, x, y, z);
-                    } else {
-                        placeAt(p, c, clip, fill, fill_meta, x, y, z);
-                    }
-                }
+    const Ctx = struct { edge: ids.Id, edge_meta: u4, fill: ids.Id, fill_meta: u4 };
+    const doCell = struct {
+        fn f(ctx: Ctx, pp: Placer, cc: Component, cl: BBox, edge_cell: bool, x: i32, y: i32, z: i32) void {
+            if (edge_cell) {
+                placeAt(pp, cc, cl, ctx.edge, ctx.edge_meta, x, y, z);
+            } else {
+                placeAt(pp, cc, cl, ctx.fill, ctx.fill_meta, x, y, z);
             }
         }
-    }
+    }.f;
+    fillEach(p, c, clip, x0, y0, z0, x1, y1, z1, replace_air_only, Ctx{ .edge = edge, .edge_meta = edge_meta, .fill = fill, .fill_meta = fill_meta }, doCell);
 }
 
 /// Fill with a per-cell block chooser (`avk.a` selector overload; used by
@@ -317,20 +339,14 @@ pub fn fillBoxChoose(
     replace_air_only: bool,
     choose: *const fn (rand: *JavaRandom, edge: bool) placer_mod.Block,
 ) void {
-    var y = y0;
-    while (y <= y1) : (y += 1) {
-        var x = x0;
-        while (x <= x1) : (x += 1) {
-            var z = z0;
-            while (z <= z1) : (z += 1) {
-                if (!replace_air_only or getAt(p, c, clip, x, y, z).id == .air) {
-                    const edge_cell = y == y0 or y == y1 or x == x0 or x == x1 or z == z0 or z == z1;
-                    const b = choose(rand, edge_cell);
-                    placeAt(p, c, clip, b.id, b.meta, x, y, z);
-                }
-            }
+    const Ctx = struct { rand: *JavaRandom, choose: *const fn (rand: *JavaRandom, edge: bool) placer_mod.Block };
+    const doCell = struct {
+        fn f(ctx: Ctx, pp: Placer, cc: Component, cl: BBox, edge_cell: bool, x: i32, y: i32, z: i32) void {
+            const b = ctx.choose(ctx.rand, edge_cell);
+            placeAt(pp, cc, cl, b.id, b.meta, x, y, z);
         }
-    }
+    }.f;
+    fillEach(p, c, clip, x0, y0, z0, x1, y1, z1, replace_air_only, Ctx{ .rand = rand, .choose = choose }, doCell);
 }
 
 /// Randomly fill a cuboid (`avk.a` float-gate overload).

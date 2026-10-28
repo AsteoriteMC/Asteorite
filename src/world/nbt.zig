@@ -32,6 +32,9 @@ pub const NbtError = error{
     BadString,
 };
 
+/// Recursion cap for skipPayload (malicious nesting guard).
+pub const max_depth: usize = 64;
+
 pub const Reader = struct {
     buf: []const u8,
     pos: usize = 0,
@@ -88,22 +91,26 @@ pub const Reader = struct {
         return try self.take(@intCast(len));
     }
 
-    pub fn readIntArray(self: *Reader) NbtError![]const i32 {
+    /// Read an int-array length prefix (validates sign). The caller then
+    /// reads that many BE i32s via readBE — or skips len*4 bytes.
+    fn readArrayLen(self: *Reader) NbtError!usize {
         const len = try self.readBE(i32);
         if (len < 0) return error.InvalidTag;
-        const n: usize = @intCast(len);
-        const bytes = try self.take(n * 4);
-        // Reinterpret as big-endian i32s; caller converts per element.
-        _ = bytes;
-        // Return raw bytes view is awkward typed; instead expose count and
-        // let caller readBE loop. We return empty slice marker via count check.
-        // (Keep API simple: caller uses readBE in a loop n times.)
-        return &.{};
+        return @intCast(len);
+    }
+
+    /// Consume an int-array payload, returning its element count. Values
+    /// are big-endian i32s; readers that need them loop readBE — the
+    /// slice reader owns no allocation, so there is no zero-copy view.
+    pub fn readIntArrayLen(self: *Reader) NbtError!usize {
+        const n = try self.readArrayLen();
+        _ = try self.take(n * 4);
+        return n;
     }
 
     /// Skip a full payload of the given tag type (no name).
     pub fn skipPayload(self: *Reader, tag: TagType) NbtError!void {
-        if (self.depth > 64) return error.DepthExceeded;
+        if (self.depth > max_depth) return error.DepthExceeded;
         switch (tag) {
             .end => {},
             .byte => _ = try self.take(1),
@@ -113,9 +120,8 @@ pub const Reader = struct {
             .float => _ = try self.take(4),
             .double => _ = try self.take(8),
             .byte_array => {
-                const len = try self.readBE(i32);
-                if (len < 0) return error.InvalidTag;
-                _ = try self.take(@intCast(len));
+                const len = try self.readArrayLen();
+                _ = try self.take(len);
             },
             .string => {
                 const s = try self.readString();
@@ -123,15 +129,12 @@ pub const Reader = struct {
             },
             .list => {
                 const elem = try self.readTagType();
-                const len = try self.readBE(i32);
-                if (len < 0) return error.InvalidTag;
+                const len = try self.readArrayLen();
+                if (elem == .end and len > 0) return error.InvalidTag;
                 self.depth += 1;
                 defer self.depth -= 1;
-                var i: i32 = 0;
-                while (i < len) : (i += 1) {
-                    if (elem == .end and len > 0) return error.InvalidTag;
-                    try self.skipPayload(elem);
-                }
+                var i: usize = 0;
+                while (i < len) : (i += 1) try self.skipPayload(elem);
             },
             .compound => {
                 self.depth += 1;
@@ -144,9 +147,8 @@ pub const Reader = struct {
                 }
             },
             .int_array => {
-                const len = try self.readBE(i32);
-                if (len < 0) return error.InvalidTag;
-                _ = try self.take(@as(usize, @intCast(len)) * 4);
+                const len = try self.readArrayLen();
+                _ = try self.take(len * 4);
             },
             _ => return error.InvalidTag,
         }

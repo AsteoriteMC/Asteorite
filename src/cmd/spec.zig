@@ -140,30 +140,14 @@ pub fn matchOverload(over: Overload, toks: [][]const u8, vals: []Value) ?usize {
                 vals[vi] = .{ .float = v };
             },
             .coord => {
-                if (tok.len > 0 and tok[0] == '~') {
-                    if (tok.len > 1) {
-                        const v = std.fmt.parseFloat(f64, tok[1..]) catch return null;
-                        if (!std.math.isFinite(v)) return null;
-                    }
-                } else {
-                    const v = std.fmt.parseFloat(f64, tok) catch return null;
-                    if (!std.math.isFinite(v)) return null;
-                }
+                if (!isCoord(tok)) return null;
                 vals[vi] = .{ .coord = tok };
             },
             .boolean => {
                 vals[vi] = .{ .boolean = parseBool(tok) orelse return null };
             },
             .choice => |opts| {
-                var hit: ?usize = null;
-                for (opts, 0..) |o, oi| {
-                    if (std.mem.eql(u8, tok, o)) {
-                        hit = oi;
-                        break;
-                    }
-                }
-                const h = hit orelse return null;
-                vals[vi] = .{ .choice = h };
+                vals[vi] = .{ .choice = indexOfStr(opts, tok) orelse return null };
             },
         }
         vi += 1;
@@ -211,10 +195,14 @@ pub fn parseCoord(s: []const u8, base: f64) ?f64 {
     return v;
 }
 
+/// Login-name cap (mirrors conn/perm validation; local literal keeps this
+/// module dependency-free).
+pub const max_name_len: usize = 16;
+
 /// Login-name charset (mirrors conn.validPlayerName; kept local so this
 /// module stays dependency-free).
 pub fn validPlayerNameChars(name: []const u8) bool {
-    if (name.len == 0 or name.len > 16) return false;
+    if (name.len == 0 or name.len > max_name_len) return false;
     for (name) |c| {
         if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
     }
@@ -228,13 +216,7 @@ pub fn isSelector(tok: []const u8) bool {
 
 /// Shape check for Arg.coord (absolute double or `~[offset]`).
 pub fn isCoord(tok: []const u8) bool {
-    if (tok.len > 0 and tok[0] == '~') {
-        if (tok.len == 1) return true;
-        const v = std.fmt.parseFloat(f64, tok[1..]) catch return false;
-        return std.math.isFinite(v);
-    }
-    const v = std.fmt.parseFloat(f64, tok) catch return false;
-    return std.math.isFinite(v);
+    return parseCoord(tok, 0) != null;
 }
 
 /// Render one argument for usage text. `display` wins; otherwise the type
@@ -243,33 +225,21 @@ pub fn isCoord(tok: []const u8) bool {
 /// vanilla (`/time <set|add> <value>`, `/debug <start|stop>`); optional
 /// ones stay bare in brackets (`[ips|players]`, `/banlist [ips|players]`).
 fn renderSlot(slot: Slot, buf: []u8) []const u8 {
-    if (slot.display) |d| {
-        if (slot.optional) {
-            return std.fmt.bufPrint(buf, "[{s}]", .{d}) catch buf[0..0];
-        }
-        return d;
-    }
-    return switch (slot.arg) {
-        .literal => |lit| if (slot.optional)
-            std.fmt.bufPrint(buf, "[{s}]", .{lit}) catch buf[0..0]
-        else
-            lit,
-        .player => if (slot.optional) "[<player>]" else "<player>",
-        .word => if (slot.optional) "[<text>]" else "<text>",
-        .rest => if (slot.optional) "[<message ...>]" else "<message ...>",
-        .int_range => if (slot.optional) "[<number>]" else "<number>",
-        .float_range => if (slot.optional) "[<number>]" else "<number>",
-        .coord => if (slot.optional) "[<number>]" else "<number>",
-        .boolean => if (slot.optional) "[<true|false>]" else "<true|false>",
-        .choice => |opts| blk: {
-            var ibuf: [128]u8 = undefined;
-            const inner = joinChoices(opts, &ibuf);
-            break :blk if (slot.optional)
-                std.fmt.bufPrint(buf, "[{s}]", .{inner}) catch buf[0..0]
-            else
-                std.fmt.bufPrint(buf, "<{s}>", .{inner}) catch buf[0..0];
-        },
+    var ibuf: [128]u8 = undefined;
+    const inner: []const u8 = if (slot.display) |d| d else switch (slot.arg) {
+        .literal => |lit| lit,
+        .player => "<player>",
+        .word => "<text>",
+        .rest => "<message ...>",
+        .int_range, .float_range, .coord => "<number>",
+        .boolean => "<true|false>",
+        .choice => |opts| joinChoices(opts, &ibuf),
     };
+    // Required choices render bracketed (`<set|add>`); optional slots of
+    // any kind render bare in brackets; everything else renders verbatim.
+    if (!slot.optional and slot.arg == .choice) return std.fmt.bufPrint(buf, "<{s}>", .{inner}) catch buf[0..0];
+    if (slot.optional) return std.fmt.bufPrint(buf, "[{s}]", .{inner}) catch buf[0..0];
+    return inner;
 }
 
 fn joinChoices(opts: []const []const u8, buf: []u8) []const u8 {
@@ -333,38 +303,36 @@ pub fn completeStatic(
         if (arg_index >= over.len) continue;
         const slot = over[arg_index];
         switch (slot.arg) {
-            .literal => |lit| {
-                if (n < out.len and startsWithIgnoreCase(lit, prefix) and !containsStr(out[0..n], lit)) {
-                    out[n] = lit;
-                    n += 1;
-                }
-            },
+            .literal => |lit| offer(out, &n, lit, prefix),
             .choice => |opts| {
-                for (opts) |o| {
-                    if (n < out.len and startsWithIgnoreCase(o, prefix) and !containsStr(out[0..n], o)) {
-                        out[n] = o;
-                        n += 1;
-                    }
-                }
+                for (opts) |o| offer(out, &n, o, prefix);
             },
             else => {},
         }
     }
-    for (extra) |e| {
-        if (n >= out.len) break;
-        if (startsWithIgnoreCase(e, prefix)) {
-            out[n] = e;
-            n += 1;
-        }
-    }
+    for (extra) |e| offer(out, &n, e, prefix);
     return n;
 }
 
-fn containsStr(hay: [][]const u8, needle: []const u8) bool {
-    for (hay) |e| {
-        if (std.mem.eql(u8, e, needle)) return true;
+/// Index of `needle` in `hay`, if present.
+fn indexOfStr(hay: []const []const u8, needle: []const u8) ?usize {
+    for (hay, 0..) |e, i| {
+        if (std.mem.eql(u8, e, needle)) return i;
     }
-    return false;
+    return null;
+}
+
+fn containsStr(hay: [][]const u8, needle: []const u8) bool {
+    return indexOfStr(hay, needle) != null;
+}
+
+/// Offer one candidate (prefix-filtered, deduped, capacity-checked).
+fn offer(out: [][]const u8, n: *usize, s: []const u8, prefix: []const u8) void {
+    if (n.* >= out.len) return;
+    if (!startsWithIgnoreCase(s, prefix)) return;
+    if (containsStr(out[0..n.*], s)) return;
+    out[n.*] = s;
+    n.* += 1;
 }
 
 test "usage rendering" {

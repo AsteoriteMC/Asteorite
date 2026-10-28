@@ -7,8 +7,15 @@
 //! encode/decode, Anvil/player.dat import). Sim, worldgen, and storage
 //! all speak canonical ids.
 //!
-//! Names are the 1.7.10 jar registry names (verified against the official
-//! server jar: Block `aji.p` / Item `adb` static init `e.a(ID, "name")`).
+//! Versioning policy: this registry is deliberately NOT per-version. The
+//! values are persisted on disk (ZC1 chunks, ZPLR player rows), so renumber
+//! per profile would break cross-version world readability. New versions
+//! APPEND ids (and extend the per-profile wire/behavior tables in
+//! `game/mcNx/`); existing variants never move.
+//!
+//! Names seed from the 1.7.10 jar registry names (verified against the
+//! official server jar: Block `aji.p` / Item `adb` static init
+//! `e.a(ID, "name")`).
 //! `_block`/`_item` disambiguate the 11 names shared by both registries.
 
 const std = @import("std");

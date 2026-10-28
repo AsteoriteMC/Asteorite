@@ -60,7 +60,7 @@ pub const PacketReader = struct {
             const b = self.buffer[self.index];
             self.index += 1;
             count += 1;
-            if (count > 5) return error.VarIntTooLarge;
+            if (count > max_varint_len) return error.VarIntTooLarge;
             const group: i32 = @as(i32, b & 0x7F);
             // Valid shifts are 0,7,14,21,28 — always < 32.
             num |= group << @as(u5, @intCast(shift));
@@ -74,34 +74,40 @@ pub const PacketReader = struct {
         return (try self.readByte()) != 0;
     }
 
+    /// Read a big-endian integer or float (the six fixed-width readers below
+    /// are one-liners over this; floats reinterpret the same bytes).
+    fn readBE(self: *PacketReader, comptime T: type) CodecError!T {
+        const size = @sizeOf(T);
+        const b = try self.readBytes(size);
+        return switch (@typeInfo(T)) {
+            .int => std.mem.readInt(T, b[0..size], .big),
+            .float => @bitCast(std.mem.readInt(std.meta.Int(.unsigned, size * 8), b[0..size], .big)),
+            else => @compileError("codec.readBE supports int/float types only"),
+        };
+    }
+
     pub fn readShort(self: *PacketReader) CodecError!i16 {
-        const b = try self.readBytes(2);
-        return std.mem.readInt(i16, b[0..2], .big);
+        return self.readBE(i16);
     }
 
     pub fn readUShort(self: *PacketReader) CodecError!u16 {
-        const b = try self.readBytes(2);
-        return std.mem.readInt(u16, b[0..2], .big);
+        return self.readBE(u16);
     }
 
     pub fn readInt(self: *PacketReader) CodecError!i32 {
-        const b = try self.readBytes(4);
-        return std.mem.readInt(i32, b[0..4], .big);
+        return self.readBE(i32);
     }
 
     pub fn readLong(self: *PacketReader) CodecError!i64 {
-        const b = try self.readBytes(8);
-        return std.mem.readInt(i64, b[0..8], .big);
+        return self.readBE(i64);
     }
 
     pub fn readFloat(self: *PacketReader) CodecError!f32 {
-        const b = try self.readBytes(4);
-        return @bitCast(std.mem.readInt(u32, b[0..4], .big));
+        return self.readBE(f32);
     }
 
     pub fn readDouble(self: *PacketReader) CodecError!f64 {
-        const b = try self.readBytes(8);
-        return @bitCast(std.mem.readInt(u64, b[0..8], .big));
+        return self.readBE(f64);
     }
 
     /// 1.7 string: VarInt byte-length + UTF-8, max 32767 chars.
@@ -114,9 +120,12 @@ pub const PacketReader = struct {
         return try self.readBytes(ulen);
     }
 
+    /// 1.7.10 block coords (int x, byte y, int z).
+    pub const BlockCoords = struct { x: i32, y: u8, z: i32 };
+
     /// 1.7.10 Position is NOT used (that packing is post-1.8).
     /// 1.7 uses plain int x/y/z or fixed-point ints. Keep helpers explicit:
-    pub fn readBlockCoords(self: *PacketReader) CodecError!struct { x: i32, y: u8, z: i32 } {
+    pub fn readBlockCoords(self: *PacketReader) CodecError!BlockCoords {
         const x = try self.readInt();
         const y = try self.readByte();
         const z = try self.readInt();
@@ -175,34 +184,39 @@ pub const PacketWriter = struct {
         return n;
     }
 
+    /// Write a big-endian integer or float (mirrors readBE).
+    fn writeBE(self: *PacketWriter, comptime T: type, v: T) CodecError!void {
+        const size = @sizeOf(T);
+        const dst = try self.reserve(size);
+        switch (@typeInfo(T)) {
+            .int => std.mem.writeInt(T, dst[0..size], v, .big),
+            .float => std.mem.writeInt(std.meta.Int(.unsigned, size * 8), dst[0..size], @bitCast(v), .big),
+            else => @compileError("codec.writeBE supports int/float types only"),
+        }
+    }
+
     pub fn writeShort(self: *PacketWriter, v: i16) CodecError!void {
-        const dst = try self.reserve(2);
-        std.mem.writeInt(i16, dst[0..2], v, .big);
+        return self.writeBE(i16, v);
     }
 
     pub fn writeUShort(self: *PacketWriter, v: u16) CodecError!void {
-        const dst = try self.reserve(2);
-        std.mem.writeInt(u16, dst[0..2], v, .big);
+        return self.writeBE(u16, v);
     }
 
     pub fn writeInt(self: *PacketWriter, v: i32) CodecError!void {
-        const dst = try self.reserve(4);
-        std.mem.writeInt(i32, dst[0..4], v, .big);
+        return self.writeBE(i32, v);
     }
 
     pub fn writeLong(self: *PacketWriter, v: i64) CodecError!void {
-        const dst = try self.reserve(8);
-        std.mem.writeInt(i64, dst[0..8], v, .big);
+        return self.writeBE(i64, v);
     }
 
     pub fn writeFloat(self: *PacketWriter, v: f32) CodecError!void {
-        const dst = try self.reserve(4);
-        std.mem.writeInt(u32, dst[0..4], @bitCast(v), .big);
+        return self.writeBE(f32, v);
     }
 
     pub fn writeDouble(self: *PacketWriter, v: f64) CodecError!void {
-        const dst = try self.reserve(8);
-        std.mem.writeInt(u64, dst[0..8], @bitCast(v), .big);
+        return self.writeBE(f64, v);
     }
 
     pub fn writeString(self: *PacketWriter, s: []const u8) CodecError!void {
@@ -226,9 +240,12 @@ pub fn framePacket(id: i32, payload: []const u8, out: []u8) CodecError![]const u
     return w.written();
 }
 
+/// Decoded frame header (packet id + declared body length).
+pub const FrameHeader = struct { length: i32, id: i32 };
+
 /// Decode frame header: returns (packet_id, body_slice consumed from reader).
 /// Caller must have already split the TCP stream on Length prefix.
-pub fn decodeFrame(reader: *PacketReader) CodecError!struct { length: i32, id: i32 } {
+pub fn decodeFrame(reader: *PacketReader) CodecError!FrameHeader {
     const length = try reader.readVarInt();
     if (length < 0) return error.InvalidLength;
     const id = try reader.readVarInt();

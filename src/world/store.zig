@@ -70,6 +70,15 @@ const uring_io = if (builtin.os.tag == .linux) @import("uring_io.zig") else stru
 
 pub const key_len = 9;
 pub const ChunkKey = [key_len]u8;
+/// Whole-file read cap for SSTs and the WAL: files at or under this are
+/// read in one shot; the compaction splitter keeps every output well
+/// below it (see compact_split_bytes). One constant — the 50GB-orphan
+/// spiral came from outputs crossing an unnamed copy of this limit.
+pub const max_file_bytes: usize = 256 * 1024 * 1024;
+/// Cap on one index-stride read during point lookups (writer stride is
+/// 16 entries of <300KB payloads: ~1MB worst case). Larger ranges mean
+/// a torn file, not a big stride.
+pub const max_stride_bytes: usize = 8 * 1024 * 1024;
 pub const tombstone_len: u32 = 0xFFFFFFFF;
 
 pub fn encodeKey(dim: u8, x: i32, z: i32) ChunkKey {
@@ -107,6 +116,13 @@ pub const sst_footer_magic = "ZLSF";
 pub const sst_footer_tail_len = 4 + 4 + 4;
 /// One index sample per this many entries.
 pub const sst_index_stride = 16;
+/// Compaction output budget (values bytes) per SST file. Merged runs are
+/// split at this size so no file can approach the 256MB whole-file read
+/// caps (loadSstMeta, merge reads, sstGet) or the u32 offset ceiling —
+/// without splitting, the first merge past 256MB fails deterministically
+/// and every retry leaks another giant orphan (observed: 50GB+ of them).
+/// 200MB values + per-entry overhead stays safely under 256MB total.
+pub const compact_split_bytes: usize = 200 * 1024 * 1024;
 /// Bloom hash functions probed per key.
 pub const bloom_k = 7;
 
@@ -155,6 +171,16 @@ pub const SstMeta = struct {
         return true;
     }
 };
+
+/// Byte-wise key order (the biased encoding sorts numerically).
+fn lessKey(_: void, a: ChunkKey, b: ChunkKey) bool {
+    return std.mem.lessThan(u8, &a, &b);
+}
+
+/// Format an SST file name ("000042.sst") into `buf`.
+fn sstName(buf: *[16]u8, id: u32) ![]u8 {
+    return std.fmt.bufPrint(buf, "{d:0>6}.sst", .{id});
+}
 
 fn bloomBitsFor(count: u32) u32 {
     // ~16 bits/key, min 64 bits, byte-rounded.
@@ -430,6 +456,19 @@ fn parseManifestData(alloc: std.mem.Allocator, data: []const u8) error{ Invalid,
 // Store.
 // ---------------------------------------------------------------------------
 
+/// WAL segment file name ("wal-NNN.log"). Active WAL stays "wal.log".
+fn walSegName(buf: []u8, id: u32) ![]u8 {
+    return std.fmt.bufPrint(buf, "wal-{d}.log", .{id});
+}
+
+/// Segment filename -> id ("wal-NNN.log"; active "wal.log" excluded).
+fn parseWalSegName(name: []const u8) ?u32 {
+    if (!std.mem.startsWith(u8, name, "wal-")) return null;
+    if (!std.mem.endsWith(u8, name, ".log")) return null;
+    const mid = name["wal-".len .. name.len - ".log".len];
+    return std.fmt.parseInt(u32, mid, 10) catch null;
+}
+
 pub const Store = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -445,6 +484,7 @@ pub const Store = struct {
     flush_threshold_bytes: usize,
     wal_sync_bytes: usize,
     compact_threshold_ssts: usize,
+    compact_split_bytes: usize,
     /// NVMe profile: keep SST files open for the store lifetime (no
     /// per-lookup open/close) and serve stride reads from the io_uring
     /// ring (registered buffers + fixed files). The ring is best-effort:
@@ -466,6 +506,45 @@ pub const Store = struct {
     /// stall for the duration — seconds worst case on big DBs, well under
     /// the 30s keepalive timeout; backgrounding is Phase C/H5).
     mutex: std.Io.Mutex = .init,
+    /// Monotonic SST-set version, bumped under `mutex` on every flush /
+    /// compact (anything that adds, removes or swaps live SST files).
+    /// Lets optimistic readers detect a changed world and retry instead
+    /// of blocking writers behind the full read. Plain u64: only touched
+    /// under `mutex`, so no atomics needed. Memtable-only changes (put /
+    /// delete without flush) do NOT bump: the memtable re-check covers
+    /// those, and bumping on every write would retry-storm readers.
+    generation: u64 = 0,
+    /// Background flush worker (Phase C/H5): the write path only ever
+    /// does WAL append + memtable insert under brief locks. When the
+    /// memtable fills, put() seals it (swap + WAL rotation, all brief)
+    /// and this worker builds the SST + commits without holding the
+    /// mutex across I/O. Single in-flight flush: a second full memtable
+    /// stalls the writer (backpressure, counted) instead of growing
+    /// memory unboundedly. Lock order: mutex -> flush_mutex, both brief.
+    flush_mutex: std.Io.Mutex = .init,
+    flush_cond: std.Io.Condition = .init,
+    flush_pending: ?FlushJob = null,
+    flush_working: bool = false,
+    flush_compact_requested: bool = false,
+    flush_compact_epoch: u64 = 0,
+    /// Last compaction error (set by the worker, consumed by compact()).
+    /// Preserves the old synchronous error contract for manual compacts.
+    compact_err: ?anyerror = null,
+    flush_shutdown: bool = false,
+    flush_thread: ?std.Thread = null,
+    next_wal_id: u32 = 1,
+    /// Backpressure stalls (put waited for a flush slot) + completed
+    /// background flushes (diagnostics / flushStats).
+    flush_stalls: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    bg_flushes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Optimistic-read telemetry (all atomics: bumped on both locked and
+    /// unlocked paths). `retries` counts raced reads + generation
+    /// mismatches; `locked_fallbacks` counts exhausted retry budgets.
+    /// Watch these if write pressure changes (e.g. faster generation):
+    /// climbing retries mean readers are losing races, not corrupting.
+    get_attempts: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    get_retries: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    get_locked_fallbacks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub const KeyCtx = struct {
         pub fn hash(_: KeyCtx, k: ChunkKey) u64 {
@@ -482,7 +561,10 @@ pub const Store = struct {
         /// flush/close only, the P1 behavior). Smaller = less loss window,
         /// more syscalls; batching belongs with the HDD profile (Phase E).
         wal_sync_bytes: usize = 0,
-        /// Auto-compact when live SST count reaches this (0 = manual only).
+        /// Auto-compact when the newest contiguous fragment-run count
+        /// reaches this (0 = manual only). Only sub-split-size runs ever
+        /// merge; big merged runs are exempt, so the threshold bounds
+        /// rewrite work instead of the live set size.
         /// Synchronous (simplest-correct-first); backgrounding is Phase C/H5.
         compact_threshold_ssts: usize = 8,
         /// NVMe storage path: keep SST files open + serve stride reads
@@ -493,6 +575,10 @@ pub const Store = struct {
         /// Covers the 8 MiB stride cap by default; tests set it tiny to
         /// exercise the fallback path deterministically.
         uring_max_bytes: usize = 8 * 1024 * 1024,
+        /// Compaction output budget (values bytes) per SST file; merged
+        /// runs split at this size (see compact_split_bytes). Tests set it
+        /// tiny to exercise multi-file output deterministically.
+        compact_split_bytes: usize = compact_split_bytes,
     };
 
     /// Open (or create) db in `dir`. Creates `sst/` + `wal.log` as needed,
@@ -524,6 +610,7 @@ pub const Store = struct {
             .flush_threshold_bytes = opts.flush_threshold_bytes,
             .wal_sync_bytes = opts.wal_sync_bytes,
             .compact_threshold_ssts = opts.compact_threshold_ssts,
+            .compact_split_bytes = opts.compact_split_bytes,
             .keep_sst_open = opts.use_uring_io,
             .uring_max_bytes = opts.uring_max_bytes,
         };
@@ -597,12 +684,66 @@ pub const Store = struct {
         }
         self.next_sst_id = next_id;
 
+        // Sealed WAL segments (background-flush rotation leftovers):
+        // replay oldest-first, then the active log. Any present segment
+        // is un-consumed (commits delete them) — skipping one would lose
+        // acknowledged writes. next_wal_id resumes past the max seen.
+        var seg_dir = try self.dir.openDir(self.io, ".", .{ .iterate = true });
+        defer seg_dir.close(self.io);
+        var seg_ids = std.ArrayList(u32).empty;
+        defer seg_ids.deinit(allocator);
+        {
+            var it = seg_dir.iterate();
+            while (try it.next(io)) |entry| {
+                if (entry.kind != .file) continue;
+                if (parseWalSegName(entry.name)) |id| try seg_ids.append(allocator, id);
+            }
+        }
+        std.mem.sort(u32, seg_ids.items, {}, struct {
+            fn less(_: void, a: u32, b: u32) bool {
+                return a < b;
+            }
+        }.less);
+        for (seg_ids.items) |id| {
+            if (id >= self.next_wal_id) self.next_wal_id = id + 1;
+            try self.replayWalSegment(id);
+        }
+
         // open or create wal.log
         self.wal = try self.dir.createFile(self.io, "wal.log", .{ .read = true, .truncate = false });
         errdefer self.wal.close(self.io);
         self.wal_len = try self.wal.length(io);
         if (self.wal_len > 0) {
             try self.replayWal();
+        }
+
+        // Background flush worker (parked until the first seal). Join on
+        // every error path below (LIFO: this runs before mem/sst teardown).
+        self.flush_thread = try std.Thread.spawn(.{}, flushWorker, .{self});
+        errdefer {
+            self.flush_mutex.lockUncancelable(self.io);
+            self.flush_shutdown = true;
+            self.flush_cond.broadcast(self.io);
+            self.flush_mutex.unlock(self.io);
+            if (self.flush_thread) |t| t.join();
+            self.flush_thread = null;
+        }
+
+        // Pin any replayed segments into an SST now: their entries live
+        // only in the memtable (and the segments), so a crash before the
+        // first flush would otherwise replay + strand them again. Only
+        // then are the segments safe to delete.
+        if (seg_ids.items.len > 0 and self.mem.count() > 0) {
+            try self.flush();
+            for (seg_ids.items) |id| {
+                var wbuf: [32]u8 = undefined;
+                const wname = try walSegName(&wbuf, id);
+                self.dir.deleteFile(self.io, wname) catch |err| {
+                    std.log.warn("store: consumed {s} not deleted: {}", .{ wname, err });
+                };
+            }
+        } else if (seg_ids.items.len > 0) {
+            std.log.warn("store: {} sealed WAL segments but empty memtable; leaving for next open", .{seg_ids.items.len});
         }
 
         // Orphans (unlisted SSTs) are covered: either duplicated in the live
@@ -644,6 +785,18 @@ pub const Store = struct {
     }
 
     pub fn close(self: *Store) void {
+        // Stop the flush worker first: it finishes any sealed job (commit
+        // or re-insert) and exits; join guarantees no worker access to
+        // anything torn down below. Quiesce puts before close (same
+        // contract as before: concurrent use during teardown is UB).
+        if (self.flush_thread) |t| {
+            self.flush_mutex.lockUncancelable(self.io);
+            self.flush_shutdown = true;
+            self.flush_cond.broadcast(self.io);
+            self.flush_mutex.unlock(self.io);
+            t.join();
+            self.flush_thread = null;
+        }
         self.wal.sync(self.io) catch {};
         self.wal.close(self.io);
         self.sst_dir.close(self.io);
@@ -729,7 +882,7 @@ pub const Store = struct {
     }
 
     fn loadSstMeta(self: *Store, name: []const u8) !SstMeta {
-        const data = try self.sst_dir.readFileAlloc(self.io, name, self.allocator, .limited(256 * 1024 * 1024));
+        const data = try self.sst_dir.readFileAlloc(self.io, name, self.allocator, .limited(max_file_bytes));
         defer self.allocator.free(data);
         const p = try parseSst(data);
         var meta = SstMeta{
@@ -796,6 +949,22 @@ pub const Store = struct {
         return self.ring != null;
     }
 
+    /// Optimistic-read telemetry (see the counter fields): attempts vs
+    /// retries vs fully-locked fallbacks. For tests/bench/live triage.
+    pub const ReadStats = struct {
+        attempts: u64,
+        retries: u64,
+        locked_fallbacks: u64,
+    };
+
+    pub fn readStats(self: *Store) ReadStats {
+        return .{
+            .attempts = self.get_attempts.load(.monotonic),
+            .retries = self.get_retries.load(.monotonic),
+            .locked_fallbacks = self.get_locked_fallbacks.load(.monotonic),
+        };
+    }
+
     fn deleteOrphans(self: *Store, live: ?[][]u8) !void {
         var doomed = std.ArrayList([]u8).empty;
         defer {
@@ -826,8 +995,25 @@ pub const Store = struct {
     }
 
     fn replayWal(self: *Store) !void {
-        const data = try self.dir.readFileAlloc(self.io, "wal.log", self.allocator, .limited(256 * 1024 * 1024));
+        const data = try self.dir.readFileAlloc(self.io, "wal.log", self.allocator, .limited(max_file_bytes));
         defer self.allocator.free(data);
+        const pos = try self.replayWalData(data);
+        if (pos < data.len) {
+            // Truncate the torn tail so the next append lands on valid data.
+            // NOTE: std.log output during `zig build test` makes this 0.16.0
+            // runner print the test command with a "failed command:" prefix
+            // even though the step succeeds (exit 0, all tests counted).
+            // Cosmetic toolchain artifact; keep the warning (silent WAL
+            // truncation would be far worse operationally).
+            std.log.warn("store: wal torn tail {d} bytes truncated", .{data.len - pos});
+            try self.wal.setLength(self.io, pos);
+            self.wal_len = pos;
+        }
+    }
+
+    /// Parse WAL records into the memtable (newest-wins, same as puts).
+    /// Returns bytes consumed (short of len on a torn tail).
+    fn replayWalData(self: *Store, data: []const u8) !usize {
         var pos: usize = 0;
         while (pos < data.len) {
             const rec = parseWalRecord(data, pos) catch |err| switch (err) {
@@ -846,16 +1032,22 @@ pub const Store = struct {
             self.mem_bytes += rec.key.len + (if (val) |v| v.len else 0);
             pos += rec.total_len;
         }
+        return pos;
+    }
+
+    /// Replay one sealed segment into the memtable (oldest-first order is
+    /// the caller's job). Torn tails truncate like the active log.
+    fn replayWalSegment(self: *Store, id: u32) !void {
+        var wbuf: [32]u8 = undefined;
+        const wname = try walSegName(&wbuf, id);
+        const data = try self.dir.readFileAlloc(self.io, wname, self.allocator, .limited(max_file_bytes));
+        defer self.allocator.free(data);
+        const pos = try self.replayWalData(data);
         if (pos < data.len) {
-            // Truncate the torn tail so the next append lands on valid data.
-            // NOTE: std.log output during `zig build test` makes this 0.16.0
-            // runner print the test command with a "failed command:" prefix
-            // even though the step succeeds (exit 0, all tests counted).
-            // Cosmetic toolchain artifact; keep the warning (silent WAL
-            // truncation would be far worse operationally).
-            std.log.warn("store: wal torn tail {d} bytes truncated", .{data.len - pos});
-            try self.wal.setLength(self.io, pos);
-            self.wal_len = pos;
+            std.log.warn("store: sealed {s} torn tail {d} bytes truncated", .{ wname, data.len - pos });
+            var seg = try self.dir.createFile(self.io, wname, .{ .read = true, .truncate = false });
+            defer seg.close(self.io);
+            try seg.setLength(self.io, pos);
         }
     }
 
@@ -913,12 +1105,10 @@ pub const Store = struct {
         }
         try self.mem.put(key, owned);
         self.mem_bytes += key.len + owned.len;
-        if (self.mem_bytes >= self.flush_threshold_bytes) {
-            try self.flushLocked();
-            if (self.compact_threshold_ssts > 0 and self.ssts.items.len >= self.compact_threshold_ssts) {
-                try self.compactLocked();
-            }
-        }
+        // Background flush: seal when full (brief swap + WAL rotation);
+        // the worker builds the SST off the write path. Never holds the
+        // mutex across file I/O here (see seal/build/commit below).
+        try self.maybeSeal(false);
     }
 
     pub fn delete(self: *Store, key: ChunkKey) !void {
@@ -935,11 +1125,339 @@ pub const Store = struct {
         self.mem_bytes += key.len;
     }
 
+    /// Seal a full memtable for background flush (caller holds `mutex` on
+    /// entry and return). Swaps the map out, rotates the WAL so the sealed
+    /// segment covers exactly the sealed entries, hands the job to the
+    /// worker. If a job is already queued, the writer stalls (backpressure,
+    /// counted) with both locks released — disk can't keep up, memory must
+    /// not grow unboundedly. Returns ShuttingDown if close won the race.
+    /// `force` seals regardless of threshold (public flush / open replay).
+    fn maybeSeal(self: *Store, force: bool) !void {
+        if (!force and self.mem_bytes < self.flush_threshold_bytes) return;
+        while (true) {
+            self.flush_mutex.lockUncancelable(self.io);
+            if (self.flush_pending == null and !self.flush_shutdown) break;
+            const shutting = self.flush_shutdown;
+            self.flush_mutex.unlock(self.io);
+            if (shutting) return error.ShuttingDown;
+            _ = self.flush_stalls.fetchAdd(1, .monotonic);
+            // Release the data mutex while stalled: a stalled writer must
+            // never convoy readers (see the pre-split store-mutex convoy).
+            self.mutex.unlock(self.io);
+            self.flush_mutex.lockUncancelable(self.io);
+            while (self.flush_pending != null and !self.flush_shutdown) {
+                self.flush_cond.waitUncancelable(self.io, &self.flush_mutex);
+            }
+            const shut2 = self.flush_shutdown;
+            self.flush_mutex.unlock(self.io);
+            self.mutex.lockUncancelable(self.io);
+            if (shut2) return error.ShuttingDown;
+            if (self.mem_bytes < self.flush_threshold_bytes) return;
+        }
+        // Holding mutex -> flush_mutex (the one nesting order, both brief).
+        // errdefer keeps the documented "store mutex held on return".
+        errdefer self.flush_mutex.unlock(self.io);
+        // fsync first: the sealed segment must be durable on its own.
+        if (self.bytes_since_sync > 0) {
+            try self.wal.sync(self.io);
+            self.bytes_since_sync = 0;
+        }
+        self.wal.close(self.io);
+        const wid = self.next_wal_id;
+        self.next_wal_id += 1;
+        var wbuf: [32]u8 = undefined;
+        const wname = try walSegName(&wbuf, wid);
+        try self.dir.rename("wal.log", self.dir, wname, self.io);
+        self.wal = try self.dir.createFile(self.io, "wal.log", .{ .read = true, .truncate = false });
+        self.wal_len = 0;
+        const sid = self.next_sst_id;
+        self.next_sst_id += 1;
+        const job = FlushJob{
+            .mem = self.mem,
+            .mem_bytes = self.mem_bytes,
+            .wal_id = wid,
+            .sst_id = sid,
+        };
+        self.mem = std.HashMap(ChunkKey, ?[]u8, KeyCtx, 80).init(self.allocator);
+        self.mem_bytes = 0;
+        self.flush_pending = job;
+        self.flush_cond.signal(self.io);
+        self.flush_mutex.unlock(self.io);
+    }
+
+    /// Build one sealed job into an SST file (worker thread, NO locks
+    /// held). Returns the loaded meta on success.
+    fn buildFlushJob(self: *Store, job: *FlushJob) !SstMeta {
+        const n = job.mem.count();
+        var keys = try self.allocator.alloc(ChunkKey, n);
+        defer self.allocator.free(keys);
+        var it = job.mem.keyIterator();
+        var idx: usize = 0;
+        while (it.next()) |k| {
+            keys[idx] = k.*;
+            idx += 1;
+        }
+        std.mem.sort(ChunkKey, keys, {}, lessKey);
+        var entries = try self.allocator.alloc(SstEntry, n);
+        defer self.allocator.free(entries);
+        for (keys, 0..) |k, i| {
+            entries[i] = .{ .key = k, .value = job.mem.get(k).? };
+        }
+        const bytes = try buildSstFile(self.allocator, entries);
+        defer self.allocator.free(bytes);
+        var name_buf: [16]u8 = undefined;
+        const name = try sstName(&name_buf, job.sst_id);
+        var tmp_buf: [300]u8 = undefined;
+        const tmp_name = try std.fmt.bufPrint(&tmp_buf, "{s}" ++ sst_tmp_suffix, .{name});
+        errdefer self.sst_dir.deleteFile(self.io, tmp_name) catch {};
+        try self.writeAtomic(self.sst_dir, tmp_name, name, bytes);
+        return try self.loadSstMeta(name);
+    }
+
+    /// Commit a built job: append + generation bump + MANIFEST + ring
+    /// re-register + sealed-WAL delete, all under a brief hold. Callers:
+    /// the worker (normal path) and nobody else.
+    fn commitFlushJob(self: *Store, job: *FlushJob, meta: SstMeta) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var m = meta;
+        errdefer {
+            m.deinit(self.allocator, self.io);
+            self.sst_dir.deleteFile(self.io, m.name) catch {};
+        }
+        try self.ssts.append(self.allocator, m);
+        // Live set changed: invalidate optimistic readers.
+        self.generation +%= 1;
+        try self.writeManifest();
+        self.syncRingFiles() catch |err| {
+            std.log.warn("store: fixed-file registration failed ({}), SST reads use pread", .{err});
+            if (self.ring) |*r| r.deinit();
+            self.ring = null;
+        };
+        _ = self.bg_flushes.fetchAdd(1, .monotonic);
+        // The SST is durable + listed: the sealed WAL is redundant.
+        var wbuf: [32]u8 = undefined;
+        const wname = walSegName(&wbuf, job.wal_id) catch null;
+        if (wname) |wn| self.dir.deleteFile(self.io, wn) catch |err| {
+            std.log.warn("store: sealed {s} not deleted: {}", .{ wn, err });
+        };
+    }
+
+    /// Return a failed job's entries to the active memtable (newest wins:
+    /// concurrent puts may have replaced keys meanwhile). Transferred
+    /// entries are nulled so the flush-locked teardown below never
+    /// double-frees; leftovers (OOM-skipped) are freed there. The sealed
+    /// WAL segment stays: it still covers everything, crash-safe.
+    fn abortFlushJob(self: *Store, job: *FlushJob) void {
+        self.mutex.lockUncancelable(self.io);
+        var it = job.mem.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.*) |v| {
+                if (self.mem.get(e.key_ptr.*) == null) {
+                    self.mem.put(e.key_ptr.*, v) catch {
+                        // OOM on the error path: leave it for the teardown
+                        // free below (WAL still covers it) instead of
+                        // leaking silently.
+                        continue;
+                    };
+                    self.mem_bytes += e.key_ptr.len + v.len;
+                } else {
+                    self.allocator.free(v);
+                }
+            }
+            e.value_ptr.* = null;
+        }
+        // Teardown under the nested flush lock (store -> flush order):
+        // get's in-flight check must not observe half-freed entries.
+        self.flush_mutex.lockUncancelable(self.io);
+        var free_it = job.mem.iterator();
+        while (free_it.next()) |e| {
+            if (e.value_ptr.*) |v| self.allocator.free(v);
+        }
+        job.mem.deinit();
+        self.flush_mutex.unlock(self.io);
+        self.mutex.unlock(self.io);
+    }
+
+    /// Flush worker: build sealed jobs + commit, then compact when
+    /// requested or over threshold, until shutdown. Never holds any lock
+    /// across file I/O (the merge itself holds `mutex` throughout, as
+    /// before — backgrounding the merge is v2).
+    fn flushWorker(self: *Store) void {
+        while (true) {
+            self.flush_mutex.lockUncancelable(self.io);
+            while (self.flush_pending == null and !self.flush_compact_requested and !self.flush_shutdown) {
+                self.flush_cond.waitUncancelable(self.io, &self.flush_mutex);
+            }
+            if (self.flush_shutdown and self.flush_pending == null and !self.flush_compact_requested) {
+                self.flush_mutex.unlock(self.io);
+                return;
+            }
+            // The sealed job stays in its slot (visible to reads) until the
+            // commit/abort below finishes it — never moved out, so no
+            // ownership gap and no extra copies.
+            const req = self.flush_compact_requested;
+            self.flush_working = true;
+            self.flush_cond.broadcast(self.io);
+            self.flush_mutex.unlock(self.io);
+
+            if (self.flush_pending) |*j| {
+                if (self.buildFlushJob(j)) |meta| {
+                    if (self.commitFlushJob(j, meta)) {
+                        // Free the husk under the flush lock: get's
+                        // in-flight check must not dupe a freed value.
+                        self.flush_mutex.lockUncancelable(self.io);
+                        var free_it = j.mem.iterator();
+                        while (free_it.next()) |e| {
+                            if (e.value_ptr.*) |v| self.allocator.free(v);
+                        }
+                        j.mem.deinit();
+                        self.flush_pending = null;
+                        self.flush_mutex.unlock(self.io);
+                    } else |err| {
+                        std.log.warn("store: background flush commit failed ({}), entries returned to memtable", .{err});
+                        var m = meta;
+                        m.deinit(self.allocator, self.io);
+                        self.abortFlushJob(j);
+                        self.flush_mutex.lockUncancelable(self.io);
+                        self.flush_pending = null;
+                        self.flush_mutex.unlock(self.io);
+                    }
+                } else |err| {
+                    std.log.warn("store: background flush failed ({}), entries returned to memtable", .{err});
+                    self.abortFlushJob(j);
+                    self.flush_mutex.lockUncancelable(self.io);
+                    self.flush_pending = null;
+                    self.flush_mutex.unlock(self.io);
+                }
+                self.flush_mutex.lockUncancelable(self.io);
+                self.flush_working = false;
+                self.flush_cond.broadcast(self.io);
+                self.flush_mutex.unlock(self.io);
+            }
+
+            // Compact when requested or over threshold (same merge, worker
+            // thread instead of the put path).
+            var run_compact = req;
+            if (!run_compact) {
+                self.mutex.lockUncancelable(self.io);
+                run_compact = self.shouldCompact();
+                self.mutex.unlock(self.io);
+            }
+            var cerr: ?anyerror = null;
+            if (run_compact) {
+                self.mutex.lockUncancelable(self.io);
+                self.compactLocked() catch |err| {
+                    std.log.warn("store: compaction failed ({}; {} live SSTs) — disk keeps growing until a merge succeeds", .{ err, self.ssts.items.len });
+                    cerr = err;
+                };
+                self.mutex.unlock(self.io);
+            }
+            self.flush_mutex.lockUncancelable(self.io);
+            self.flush_working = false;
+            if (run_compact or req) {
+                if (cerr) |e| self.compact_err = e;
+                self.flush_compact_requested = false;
+                self.flush_compact_epoch +%= 1;
+            }
+            self.flush_cond.broadcast(self.io);
+            self.flush_mutex.unlock(self.io);
+        }
+    }
+
+    /// Auto-compact predicate (call with `mutex` held): true when the
+    /// newest contiguous fragment-run count reaches the threshold. Only
+    /// fragments (entries_end < split) count — big merged runs are never
+    /// rewritten, so bulk loads can't trigger full-DB rewrites.
+    fn shouldCompact(self: *Store) bool {
+        if (self.compact_threshold_ssts == 0) return false;
+        var n: usize = 0;
+        var i: usize = self.ssts.items.len;
+        while (i > 0 and self.ssts.items[i - 1].entries_end < self.compact_split_bytes) {
+            i -= 1;
+            n += 1;
+        }
+        return n >= self.compact_threshold_ssts;
+    }
+
     /// Returns owned copy, or null if missing/deleted. Caller frees with
     /// `alloc`. (File reads and value copies use `alloc` too — the store's
     /// own allocator may be a never-reset arena, which must never back
     /// per-request bytes.)
+    ///
+    /// Hot path is optimistic: snapshot the SST set under a brief lock,
+    /// do file I/O unlocked, then re-validate (memtable re-check +
+    /// generation check). Writers are never blocked by readers; only a
+    /// genuine mid-read flush/compact retries (bounded) before the
+    /// fully-locked backstop below.
     pub fn get(self: *Store, alloc: std.mem.Allocator, key: ChunkKey) !?[]u8 {
+        var attempt: u32 = 0;
+        while (attempt < 3) : (attempt += 1) {
+            _ = self.get_attempts.fetchAdd(1, .monotonic);
+            // Stack-backed candidates: the locked snapshot below must
+            // never allocate (a faulting alloc under the mutex serializes
+            // every reader). Overflow falls back to the locked path.
+            var stack_buf: [32]SstCandidate = undefined;
+            const snap = try self.snapshotForGet(alloc, key, &stack_buf);
+            switch (snap) {
+                .mem_hit => |v| return v,
+                .sst_overflow => {
+                    _ = self.get_locked_fallbacks.fetchAdd(1, .monotonic);
+                    return self.getLocked(alloc, key);
+                },
+                .ssts => |s| {
+                    // Candidates borrow get's frame: no free, no ownership.
+                    var result: ??[]u8 = null;
+                    var raced = false;
+                    for (s.candidates) |c| {
+                        result = self.readCandidate(alloc, c, key) catch |err| {
+                            // File vanished mid-read (compaction beat us):
+                            // retry with a fresh snapshot, like a
+                            // generation mismatch. Other errors propagate
+                            // exactly as the locked path would surface them.
+                            if (err == error.FileNotFound) {
+                                raced = true;
+                                break;
+                            }
+                            return err;
+                        };
+                        if (result != null) break;
+                    }
+                    if (raced) {
+                        _ = self.get_retries.fetchAdd(1, .monotonic);
+                        continue;
+                    }
+                    // Re-validate: newest write wins; a changed generation
+                    // means the snapshot is stale.
+                    self.mutex.lockUncancelable(self.io);
+                    defer self.mutex.unlock(self.io);
+                    if (self.mem.get(key)) |vv| {
+                        if (result) |r| {
+                            if (r) |b| alloc.free(b);
+                        }
+                        if (vv) |bytes| return try alloc.dupe(u8, bytes);
+                        return null;
+                    }
+                    if (self.generation != s.gen) {
+                        if (result) |r| {
+                            if (r) |b| alloc.free(b);
+                        }
+                        _ = self.get_retries.fetchAdd(1, .monotonic);
+                        continue;
+                    }
+                    if (result) |r| return r;
+                    return null;
+                },
+            }
+        }
+        _ = self.get_locked_fallbacks.fetchAdd(1, .monotonic);
+        return self.getLocked(alloc, key);
+    }
+
+    /// Fully-locked read: today's whole-get under the mutex. Slow path
+    /// (only after optimistic retries exhaust) and correctness backstop:
+    /// identical observable behavior to the pre-split implementation.
+    fn getLocked(self: *Store, alloc: std.mem.Allocator, key: ChunkKey) !?[]u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.mem.get(key)) |v| {
@@ -958,6 +1476,128 @@ pub const Store = struct {
             }
         }
         return null;
+    }
+
+    /// One SST to probe: name copied (not borrowed — the live list may be
+    /// swapped under us) plus the stride range derived under the lock, so
+    /// the unlocked read needs no shared state at all. Pub for tests.
+    pub const SstCandidate = struct {
+        name_buf: [16]u8,
+        name_len: usize,
+        legacy: bool,
+        start: usize,
+        len: usize,
+        count: u32,
+        entries_end: usize,
+    };
+
+    /// One sealed memtable awaiting (or undergoing) background SST build.
+    /// Owns the moved-out map + the WAL segment covering exactly its entries.
+    const FlushJob = struct {
+        mem: std.HashMap(ChunkKey, ?[]u8, KeyCtx, 80),
+        mem_bytes: usize,
+        wal_id: u32,
+        sst_id: u32,
+    };
+
+    /// Snapshot for one optimistic read (caller holds NO lock on entry;
+    /// this takes and releases it). Memtable hits return owned data
+    /// directly; otherwise the SSTs whose Bloom may contain the key,
+    /// newest -> oldest, plus the observed generation. `buf` backs the
+    /// candidate slice (no heap under the lock: even a small ArrayList
+    /// append can mmap-fault while holding the mutex and serialize every
+    /// reader behind the fault). More candidates than fit means a
+    /// pathological live set — the caller takes the locked path.
+    /// Error behavior matches the locked get (OOM on the mem-hit dupe
+    /// only, CorruptSst).
+    fn snapshotForGet(self: *Store, alloc: std.mem.Allocator, key: ChunkKey, buf: []SstCandidate) !union(enum) {
+        mem_hit: ?[]u8,
+        ssts: struct {
+            candidates: []SstCandidate,
+            gen: u64,
+        },
+        sst_overflow,
+    } {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.mem.get(key)) |v| {
+            if (v) |bytes| return .{ .mem_hit = try alloc.dupe(u8, bytes) };
+            return .{ .mem_hit = null };
+        }
+        // In-flight sealed job (newer than SSTs, older than the memtable):
+        // without this, entries sit invisible between seal and commit.
+        // Copied under the flush lock so the worker's free can't race the
+        // dupe (brief HashMap probe, no I/O, same class as the mem dupe).
+        self.flush_mutex.lockUncancelable(self.io);
+        defer self.flush_mutex.unlock(self.io);
+        if (self.flush_pending) |*job| {
+            if (job.mem.get(key)) |v| {
+                if (v) |bytes| return .{ .mem_hit = try alloc.dupe(u8, bytes) };
+                return .{ .mem_hit = null };
+            }
+        }
+        var n: usize = 0;
+        var i = self.ssts.items.len;
+        while (i > 0) {
+            i -= 1;
+            const meta = &self.ssts.items[i];
+            if (!meta.mayContain(key)) continue;
+            if (n >= buf.len) return .sst_overflow;
+            // Internal names are always "NNNNNN.sst"; refuse anything
+            // wider rather than truncating into the wrong file.
+            if (meta.name.len > 16) return error.CorruptSst;
+            var c: SstCandidate = .{
+                .name_buf = undefined,
+                .name_len = meta.name.len,
+                .legacy = meta.index.len == 0,
+                .start = 0,
+                .len = 0,
+                .count = meta.count,
+                .entries_end = meta.entries_end,
+            };
+            @memcpy(c.name_buf[0..meta.name.len], meta.name);
+            if (!c.legacy) {
+                const range = try strideRange(meta, key);
+                c.start = range.start;
+                c.len = range.len;
+            }
+            buf[n] = c;
+            n += 1;
+        }
+        return .{ .ssts = .{
+            .candidates = buf[0..n],
+            .gen = self.generation,
+        } };
+    }
+
+    /// Probe one snapshotted SST without holding the mutex (plain pread;
+    /// no ring: fixed-file registration may change under us). Returns
+    /// null = absent here; ?null = tombstone; ??bytes = hit (owned).
+    /// FileNotFound means compaction deleted the file mid-read — the
+    /// caller retries, never reports it as corruption.
+    fn readCandidate(self: *Store, alloc: std.mem.Allocator, c: SstCandidate, key: ChunkKey) !??[]u8 {
+        const fd = try self.sst_dir.openFile(self.io, c.name_buf[0..c.name_len], .{});
+        defer fd.close(self.io);
+        if (c.legacy) {
+            const size = try fd.length(self.io);
+            if (size > max_file_bytes) return error.CorruptSst;
+            const buf = try alloc.alloc(u8, @intCast(size));
+            errdefer alloc.free(buf);
+            const n = try fd.readPositionalAll(self.io, buf, 0);
+            if (n != buf.len) return error.CorruptSst;
+            const p = try parseSst(buf);
+            if (p.count != c.count) return error.CorruptSst;
+            const out = try scanEntries(alloc, buf[8..p.entries_end], key);
+            alloc.free(buf);
+            return out;
+        }
+        const buf = try alloc.alloc(u8, c.len);
+        errdefer alloc.free(buf);
+        const n = try fd.readPositionalAll(self.io, buf, c.start);
+        if (n != buf.len) return error.CorruptSst;
+        const out = try scanEntries(alloc, buf, key);
+        alloc.free(buf);
+        return out;
     }
 
     /// Scan one stride buffer for `key`. Returns null = absent;
@@ -991,25 +1631,7 @@ pub const Store = struct {
         // index. Reading the whole file per lookup pinned ~1GB+ transient
         // across a login burst (and stalled the serve thread for tens of
         // seconds on cold 89MB databases -> keepalive timeout kicks).
-        // Binary search: last sample with sample.key <= key.
-        var lo: usize = 0;
-        var hi: usize = meta.index.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (std.mem.lessThan(u8, &meta.index[mid].key, &key) or std.mem.eql(u8, &meta.index[mid].key, &key)) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        const start: usize = if (lo > 0) meta.index[lo - 1].offset else 8;
-        const end: usize = if (lo < meta.index.len) meta.index[lo].offset else meta.entries_end;
-        if (end <= start or start < 8 or end > meta.entries_end) return error.CorruptSst;
-        const range_len = end - start;
-        // One stride of entries (writer stride 16, chunk payloads < 300KB):
-        // ~1MB worst case. Refuse absurd ranges (torn file) instead of
-        // trusting a corrupt offset into a huge alloc + read.
-        if (range_len > 8 * 1024 * 1024) return error.CorruptSst;
+        const range = try strideRange(meta, key);
         // NVMe path: the stride goes through the ring (fixed file +
         // registered buffer, no per-IO pinning or fd lookup). The slice
         // aliases the ring buffer — parsed (and the hit duped) below,
@@ -1017,12 +1639,13 @@ pub const Store = struct {
         // plain pread path: same bytes, slower road.
         if (self.ring) |*r| {
             if (meta.fixed_index) |fi| {
-                if (range_len <= self.uring_max_bytes) {
-                    if (r.readAt(fi, start, range_len)) |rb| {
+                if (range.len <= self.uring_max_bytes) {
+                    if (r.readAt(fi, range.start, range.len)) |rb| {
                         return try scanEntries(alloc, rb, key);
-                    } else |_| r.noteFallback();
-                } else r.noteFallback();
-            } else r.noteFallback();
+                    } else |_| {}
+                }
+            }
+            r.noteFallback();
         }
         // Plain path: one stride via pread. The kept-open file (NVMe
         // profile without a working ring) still skips the per-lookup
@@ -1033,57 +1656,88 @@ pub const Store = struct {
             owned = try self.sst_dir.openFile(self.io, meta.name, .{});
             break :blk owned.?;
         };
-        const buf = try alloc.alloc(u8, range_len);
+        const buf = try alloc.alloc(u8, range.len);
         defer alloc.free(buf);
-        const n = try fh.readPositionalAll(self.io, buf, start);
-        if (n != range_len) return error.CorruptSst;
+        const n = try fh.readPositionalAll(self.io, buf, range.start);
+        if (n != range.len) return error.CorruptSst;
         return try scanEntries(alloc, buf, key);
+    }
+
+    /// Byte range of the index stride covering `key`: binary search for
+    /// the last sample with sample.key <= key.
+    fn strideRange(meta: *const SstMeta, key: ChunkKey) error{CorruptSst}!struct { start: usize, len: usize } {
+        var lo: usize = 0;
+        var hi: usize = meta.index.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (std.mem.order(u8, &meta.index[mid].key, &key) != .gt) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        const start: usize = if (lo > 0) meta.index[lo - 1].offset else 8;
+        const end: usize = if (lo < meta.index.len) meta.index[lo].offset else meta.entries_end;
+        if (end <= start or start < 8 or end > meta.entries_end) return error.CorruptSst;
+        const len = end - start;
+        // One stride of entries (writer stride 16, chunk payloads < 300KB):
+        // ~1MB worst case. Refuse absurd ranges (torn file) instead of
+        // trusting a corrupt offset into a huge alloc + read.
+        if (len > max_stride_bytes) return error.CorruptSst;
+        return .{ .start = start, .len = len };
+    }
+
+    /// Whole-file read honoring max_file_bytes (kept-open file or fresh
+    /// open; plain pread either way — large sequential reads gain nothing
+    /// from the ring). Shared by legacy lookups and compaction merges.
+    fn readWholeFile(self: *Store, alloc: std.mem.Allocator, meta: *const SstMeta) ![]u8 {
+        if (meta.file) |fh| {
+            const size = try fh.length(self.io);
+            if (size > max_file_bytes) return error.CorruptSst;
+            const buf = try alloc.alloc(u8, @intCast(size));
+            errdefer alloc.free(buf);
+            const n = try fh.readPositionalAll(self.io, buf, 0);
+            if (n != buf.len) return error.CorruptSst;
+            return buf;
+        }
+        return self.sst_dir.readFileAlloc(self.io, meta.name, alloc, .limited(max_file_bytes));
     }
 
     fn sstGetLegacy(self: *Store, alloc: std.mem.Allocator, meta: *const SstMeta, key: ChunkKey) !??[]u8 {
         // Legacy ZLS1 (no footer index): whole-file scan. Correct, slower;
         // only runs on pre-ZLS2 databases.
         // Returns null = not in this sst; ?null = tombstone; ??bytes = found owned.
-        // The kept-open file (NVMe profile) still skips the per-lookup
-        // open/close; the whole-file read itself stays plain pread (large
-        // sequential reads gain nothing from the ring).
-        const data = if (meta.file) |fh| blk: {
-            const size = try fh.length(self.io);
-            if (size > 256 * 1024 * 1024) return error.CorruptSst;
-            const buf = try alloc.alloc(u8, @intCast(size));
-            errdefer alloc.free(buf);
-            const n = try fh.readPositionalAll(self.io, buf, 0);
-            if (n != buf.len) return error.CorruptSst;
-            break :blk buf;
-        } else try self.sst_dir.readFileAlloc(self.io, meta.name, alloc, .limited(256 * 1024 * 1024));
+        const data = try self.readWholeFile(alloc, meta);
         defer alloc.free(data);
         const p = try parseSst(data);
         if (p.count != meta.count) return error.CorruptSst;
-        var pos: usize = 8;
-        while (pos < p.entries_end) {
-            if (pos + key_len + 4 > p.entries_end) return error.CorruptSst;
-            const k: ChunkKey = data[pos..][0..key_len].*;
-            pos += key_len;
-            const vlen = std.mem.readInt(u32, data[pos..][0..4], .big);
-            pos += 4;
-            if (vlen == tombstone_len) {
-                if (std.mem.eql(u8, &k, &key)) return @as(?[]u8, null);
-                continue;
-            }
-            if (pos + vlen > p.entries_end) return error.CorruptSst;
-            if (std.mem.eql(u8, &k, &key)) {
-                const out = try alloc.dupe(u8, data[pos .. pos + vlen]);
-                return @as(?[]u8, out);
-            }
-            pos += vlen;
-        }
-        return null;
+        return try scanEntries(alloc, data[8..p.entries_end], key);
     }
 
+    /// Seal the active memtable (if dirty) and wait until every sealed
+    /// job is committed: on return all acknowledged writes are SSTs.
+    /// Same durability contract as the old synchronous flush, without
+    /// holding the mutex across file I/O.
     pub fn flush(self: *Store) !void {
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        try self.flushLocked();
+        if (self.mem.count() > 0) {
+            self.maybeSeal(true) catch |err| {
+                self.mutex.unlock(self.io);
+                return err;
+            };
+        }
+        // Release the store mutex BEFORE taking the flush mutex: the wait
+        // below must never hold flush while acquiring store (that order
+        // inverts snapshotForGet's store -> flush nesting and deadlocks
+        // under contention). The predicate is all flush-guarded state.
+        self.mutex.unlock(self.io);
+        self.flush_mutex.lockUncancelable(self.io);
+        while ((self.flush_pending != null or self.flush_working) and !self.flush_shutdown) {
+            self.flush_cond.waitUncancelable(self.io, &self.flush_mutex);
+        }
+        const shut = self.flush_shutdown;
+        self.flush_mutex.unlock(self.io);
+        if (shut) return error.ShuttingDown;
     }
 
     fn flushLocked(self: *Store) !void {
@@ -1098,11 +1752,7 @@ pub const Store = struct {
             keys[idx] = k.*;
             idx += 1;
         }
-        std.mem.sort(ChunkKey, keys, {}, struct {
-            fn less(_: void, a: ChunkKey, b: ChunkKey) bool {
-                return std.mem.lessThan(u8, &a, &b);
-            }
-        }.less);
+        std.mem.sort(ChunkKey, keys, {}, lessKey);
         var entries = try self.allocator.alloc(SstEntry, n);
         defer self.allocator.free(entries);
         for (keys, 0..) |k, i| {
@@ -1112,7 +1762,7 @@ pub const Store = struct {
         defer self.allocator.free(bytes);
         // write file sst/NNNNNN.sst via tmp + sync + rename
         var name_buf: [16]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "{d:0>6}.sst", .{self.next_sst_id});
+        const name = try sstName(&name_buf, self.next_sst_id);
         self.next_sst_id += 1;
         var tmp_buf: [300]u8 = undefined;
         const tmp_name = try std.fmt.bufPrint(&tmp_buf, "{s}" ++ sst_tmp_suffix, .{name});
@@ -1124,12 +1774,16 @@ pub const Store = struct {
                 self.sst_dir.deleteFile(self.io, name) catch {};
             }
             try self.ssts.append(self.allocator, meta);
+            // Live set changed: invalidate optimistic readers.
+            self.generation +%= 1;
         }
         {
             errdefer {
                 var m = self.ssts.pop().?;
                 m.deinit(self.allocator, self.io);
                 self.sst_dir.deleteFile(self.io, name) catch {};
+                // Rollback also changes the live set.
+                self.generation +%= 1;
             }
             // MANIFEST swap BEFORE wal truncate (crash order: SST durable,
             // then live-set durable, then inputs discardable).
@@ -1155,8 +1809,74 @@ pub const Store = struct {
         self.bytes_since_sync = 0;
     }
 
-    /// Merge all live SSTs into one run (newest wins). Tombstones are dropped:
-    /// the merge covers every run, so a surviving tombstone means "absent".
+    /// Emit one compaction output file for a sorted key batch and append
+    /// its meta to new_list. On failure the caller's errdefer drops every
+    /// file emitted so far (no orphans).
+    fn emitCompactRun(
+        self: *Store,
+        keys: []const ChunkKey,
+        merged: *std.HashMap(ChunkKey, ?[]u8, KeyCtx, 80),
+        new_list: *std.ArrayList(SstMeta),
+    ) !void {
+        var entries = try self.allocator.alloc(SstEntry, keys.len);
+        defer self.allocator.free(entries);
+        for (keys, 0..) |k, ei| {
+            entries[ei] = .{ .key = k, .value = merged.get(k).?.? };
+        }
+        const bytes = try buildSstFile(self.allocator, entries);
+        defer self.allocator.free(bytes);
+        var name_buf: [16]u8 = undefined;
+        const name = try sstName(&name_buf, self.next_sst_id);
+        self.next_sst_id += 1;
+        var tmp_buf: [300]u8 = undefined;
+        const tmp_name = try std.fmt.bufPrint(&tmp_buf, "{s}" ++ sst_tmp_suffix, .{name});
+        errdefer self.sst_dir.deleteFile(self.io, name) catch {};
+        try self.writeAtomic(self.sst_dir, tmp_name, name, bytes);
+        const meta = try self.loadSstMeta(name);
+        errdefer {
+            var m = meta;
+            m.deinit(self.allocator, self.io);
+        }
+        try new_list.append(self.allocator, meta);
+    }
+
+    /// Fold one SST file into the merge map (newest-wins: first occurrence
+    /// kept, tombstones included). Shared by compactLocked; the live-key
+    /// collect below then drops the tombstones.
+    fn absorbSst(self: *Store, data: []const u8, merged: *std.HashMap(ChunkKey, ?[]u8, KeyCtx, 80)) !void {
+        const p = try parseSst(data);
+        var pos: usize = 8;
+        var seen: u32 = 0;
+        while (pos < p.entries_end) {
+            if (pos + key_len + 4 > p.entries_end) return error.CorruptSst;
+            const k: ChunkKey = data[pos..][0..key_len].*;
+            pos += key_len;
+            const vlen = std.mem.readInt(u32, data[pos..][0..4], .big);
+            pos += 4;
+            var v: ?[]u8 = null;
+            if (vlen != tombstone_len) {
+                if (pos + vlen > p.entries_end) return error.CorruptSst;
+                v = try self.allocator.dupe(u8, data[pos .. pos + vlen]);
+                pos += vlen;
+            }
+            if (merged.get(k) == null) {
+                merged.put(k, v) catch |err| {
+                    if (v) |vv| self.allocator.free(vv);
+                    return err;
+                };
+            } else if (v) |vv| {
+                self.allocator.free(vv);
+            }
+            seen += 1;
+        }
+        if (seen != p.count) return error.CorruptSst;
+    }
+
+    /// Tiered merge of the newest contiguous fragment runs into one
+    /// logical run, emitted as one or more bounded SST files (see
+    /// compact_split_bytes). Newest wins. Tombstones survive only when an
+    /// older run outside the merge may still hold the key (bloom probe);
+    /// dropping those would resurrect deleted values.
     /// Crash-safe via tmp+rename + MANIFEST swap; old runs deleted after.
     /// Number of live SST files (diagnostics / stats line).
     pub fn sstCount(self: *Store) usize {
@@ -1173,17 +1893,59 @@ pub const Store = struct {
         return 0;
     }
 
+    /// Flush telemetry: backpressure stalls (put waited for a flush slot)
+    /// + completed background flushes. Lock-free atomics.
+    pub const FlushStats = struct {
+        stalls: u64,
+        bg_flushes: u64,
+    };
+
+    pub fn flushStats(self: *Store) FlushStats {
+        return .{
+            .stalls = self.flush_stalls.load(.monotonic),
+            .bg_flushes = self.bg_flushes.load(.monotonic),
+        };
+    }
+
+    /// Request a compaction on the flush worker and wait for it. Same
+    /// observable behavior as the old synchronous merge (same thresholds,
+    /// same error contract via compact_err), but the calling thread never
+    /// holds the mutex across the merge — the worker does, as before.
     pub fn compact(self: *Store) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        try self.compactLocked();
+        self.flush_mutex.lockUncancelable(self.io);
+        defer self.flush_mutex.unlock(self.io);
+        const epoch = self.flush_compact_epoch;
+        self.flush_compact_requested = true;
+        self.flush_cond.signal(self.io);
+        while (self.flush_compact_epoch == epoch and !self.flush_shutdown) {
+            self.flush_cond.waitUncancelable(self.io, &self.flush_mutex);
+        }
+        if (self.flush_shutdown) return error.ShuttingDown;
+        if (self.compact_err) |e| {
+            self.compact_err = null;
+            return e;
+        }
     }
 
     fn compactLocked(self: *Store) !void {
         try self.flushLocked(); // pin everything to SSTs first (no-op if empty)
         if (self.ssts.items.len == 0) return;
         if (self.ssts.items.len == 1 and self.ssts.items[0].bloom.len > 0) return; // already merged + current
-        // Newest -> oldest, first occurrence wins (tombstones included).
+        // Tiered victim selection: the newest contiguous run of fragment
+        // SSTs (entries_end < split). Big merged runs are never rewritten,
+        // so bulk loads no longer trigger full-DB rewrites once the live
+        // set passes threshold*split bytes. Fragments are always the
+        // newest suffix (flushes append small runs; merges output at the
+        // newest end) — enforced by scanning from newest, so this holds
+        // regardless of history or legacy files.
+        var vstart = self.ssts.items.len;
+        while (vstart > 0 and self.ssts.items[vstart - 1].entries_end < self.compact_split_bytes) {
+            vstart -= 1;
+        }
+        const nvict = self.ssts.items.len - vstart;
+        if (nvict < 2) return; // nothing worth merging (singletons need no merge)
+        // Newest -> oldest within the victims, first occurrence wins
+        // (tombstones included).
         var merged = std.HashMap(ChunkKey, ?[]u8, KeyCtx, 80).init(self.allocator);
         defer {
             var it = merged.iterator();
@@ -1193,99 +1955,85 @@ pub const Store = struct {
             merged.deinit();
         }
         var i = self.ssts.items.len;
-        while (i > 0) {
+        while (i > vstart) {
             i -= 1;
-            // Whole-file sequential read: the kept-open file (NVMe
-            // profile) skips the per-file open/close; the bytes still
-            // travel by plain pread (large sequential reads gain nothing
-            // from the ring).
+            // Whole-file sequential read (plain pread either way — large
+            // sequential reads gain nothing from the ring).
             const meta = &self.ssts.items[i];
-            const data = if (meta.file) |fh| blk: {
-                const size = try fh.length(self.io);
-                if (size > 256 * 1024 * 1024) return error.CorruptSst;
-                const buf = try self.allocator.alloc(u8, @intCast(size));
-                errdefer self.allocator.free(buf);
-                const n = try fh.readPositionalAll(self.io, buf, 0);
-                if (n != buf.len) return error.CorruptSst;
-                break :blk buf;
-            } else try self.sst_dir.readFileAlloc(self.io, meta.name, self.allocator, .limited(256 * 1024 * 1024));
+            const data = try self.readWholeFile(self.allocator, meta);
             defer self.allocator.free(data);
-            const p = try parseSst(data);
-            var pos: usize = 8;
-            var seen: u32 = 0;
-            while (pos < p.entries_end) {
-                if (pos + key_len + 4 > p.entries_end) return error.CorruptSst;
-                const k: ChunkKey = data[pos..][0..key_len].*;
-                pos += key_len;
-                const vlen = std.mem.readInt(u32, data[pos..][0..4], .big);
-                pos += 4;
-                var v: ?[]u8 = null;
-                if (vlen != tombstone_len) {
-                    if (pos + vlen > p.entries_end) return error.CorruptSst;
-                    v = try self.allocator.dupe(u8, data[pos .. pos + vlen]);
-                    pos += vlen;
-                }
-                if (merged.get(k) == null) {
-                    merged.put(k, v) catch |err| {
-                        if (v) |vv| self.allocator.free(vv);
-                        return err;
-                    };
-                } else if (v) |vv| {
-                    self.allocator.free(vv);
-                }
-                seen += 1;
-            }
-            if (seen != p.count) return error.CorruptSst;
+            try self.absorbSst(data, &merged);
         }
-        // Collect live (non-tombstone) keys, sorted.
+        // Collect live keys, sorted. Values survive; tombstones survive
+        // only when an older run outside the merge may still hold the key
+        // (bloom probe; legacy files have no filter and always retain).
+        // Dropping such a tombstone would resurrect the older value.
         var live = std.ArrayList(ChunkKey).empty;
         defer live.deinit(self.allocator);
         var mit = merged.keyIterator();
         while (mit.next()) |k| {
-            if (merged.get(k.*).? != null) try live.append(self.allocator, k.*);
-        }
-        std.mem.sort(ChunkKey, live.items, {}, struct {
-            fn less(_: void, a: ChunkKey, b: ChunkKey) bool {
-                return std.mem.lessThan(u8, &a, &b);
+            if (merged.get(k.*).? != null) {
+                try live.append(self.allocator, k.*);
+            } else {
+                var keep = false;
+                var o: usize = 0;
+                while (o < vstart) : (o += 1) {
+                    if (self.ssts.items[o].mayContain(k.*)) {
+                        keep = true;
+                        break;
+                    }
+                }
+                if (keep) try live.append(self.allocator, k.*);
             }
-        }.less);
+        }
+        std.mem.sort(ChunkKey, live.items, {}, lessKey);
         var new_list = std.ArrayList(SstMeta).empty;
         defer new_list.deinit(self.allocator);
         errdefer {
-            // MANIFEST never listed the new file: orphan on disk (next open
-            // cleans it), in-memory ownership freed here.
-            for (new_list.items) |*m| m.deinit(self.allocator, self.io);
+            // Nothing listed yet: drop the unlisted files too (a mid-merge
+            // failure must not leak one orphan per emitted batch).
+            for (new_list.items) |*m| {
+                self.sst_dir.deleteFile(self.io, m.name) catch {};
+                m.deinit(self.allocator, self.io);
+            }
         }
         if (live.items.len > 0) {
-            var entries = try self.allocator.alloc(SstEntry, live.items.len);
-            defer self.allocator.free(entries);
-            for (live.items, 0..) |k, ei| {
-                entries[ei] = .{ .key = k, .value = merged.get(k).?.? };
-            }
-            const bytes = try buildSstFile(self.allocator, entries);
-            defer self.allocator.free(bytes);
-            var name_buf: [16]u8 = undefined;
-            const name = try std.fmt.bufPrint(&name_buf, "{d:0>6}.sst", .{self.next_sst_id});
-            self.next_sst_id += 1;
-            var tmp_buf: [300]u8 = undefined;
-            const tmp_name = try std.fmt.bufPrint(&tmp_buf, "{s}" ++ sst_tmp_suffix, .{name});
-            try self.writeAtomic(self.sst_dir, tmp_name, name, bytes);
-            const meta = try self.loadSstMeta(name);
-            {
-                errdefer {
-                    var m = meta;
-                    m.deinit(self.allocator, self.io);
-                    self.sst_dir.deleteFile(self.io, name) catch {};
+            // Emit the merged run in bounded batches (see
+            // compact_split_bytes): one giant SST would trip the 256MB
+            // whole-file read caps and the u32 offset ceiling.
+            var start: usize = 0;
+            while (start < live.items.len) {
+                var end = start;
+                var budget: usize = self.compact_split_bytes;
+                while (end < live.items.len) {
+                    const vlen = merged.get(live.items[end]).?.?.len;
+                    const need = key_len + 4 + vlen;
+                    if (end > start and budget < need) break;
+                    budget -= @min(budget, need);
+                    end += 1;
                 }
-                try new_list.append(self.allocator, meta);
+                try self.emitCompactRun(live.items[start..end], &merged, &new_list);
+                start = end;
             }
         }
-        try self.writeManifestList(new_list.items);
-        // Commit point passed: swap in-memory list, delete old runs.
-        for (self.ssts.items) |*m| m.deinit(self.allocator, self.io);
-        self.ssts.clearRetainingCapacity();
+        // Commit point: splice merged runs over the victim slice (same
+        // newest-end position), then manifest the full live set.
+        // Untouched big runs keep their files, handles, and order; the
+        // orphan sweep below drops exactly the evicted victim files.
+        // Crash-safe: the pre-swap manifest stays valid (every file it
+        // names is still on disk), and unlisted new runs are orphans the
+        // next open cleans.
+        var vi = self.ssts.items.len;
+        while (vi > vstart) {
+            vi -= 1;
+            var m = self.ssts.orderedRemove(vi);
+            m.deinit(self.allocator, self.io);
+        }
         for (new_list.items) |*m| try self.ssts.append(self.allocator, m.*);
         new_list.clearRetainingCapacity();
+        try self.writeManifestList(self.ssts.items);
+        // Live set swapped wholesale: invalidate optimistic readers.
+        self.generation +%= 1;
         // The live set changed wholesale: re-register the fixed-file
         // table (no-op without a ring; drops the ring on failure).
         self.syncRingFiles() catch |err| {
@@ -1315,9 +2063,11 @@ pub const Store = struct {
     /// Quiesce writers across shards before snapshotting a pool (see
     /// `ShardPool.snapshotAll`). The copy opens as a working store.
     pub fn snapshot(self: *Store, snap_dir: std.Io.Dir) !void {
+        // Pin everything first (flush manages the mutex itself, including
+        // waiting out a stall — never hold it across this call).
+        try self.flush();
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        try self.flushLocked();
         try self.writeManifest();
         snap_dir.createDir(self.io, "sst", .default_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
@@ -1377,9 +2127,27 @@ pub fn verifyDir(alloc: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !VerifyS
     var st = VerifyStats{ .alloc = alloc };
     errdefer st.deinit();
 
-    // WAL (missing file == clean empty, not an error).
-    if (dir.readFileAlloc(io, "wal.log", alloc, .limited(256 * 1024 * 1024))) |data| {
-        defer alloc.free(data);
+    // WAL (missing file == clean empty, not an error). Sealed segments
+    // (wal-NNN.log) predate the active log; count them all.
+    var wal_names = std.ArrayList([]const u8).empty;
+    defer wal_names.deinit(alloc);
+    try wal_names.append(alloc, "wal.log");
+    var wal_dot = dir.openDir(io, ".", .{ .iterate = true }) catch null;
+    if (wal_dot) |*wd| {
+        defer wd.close(io);
+        var wit = wd.iterate();
+        while (wit.next(io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            if (parseWalSegName(entry.name) == null) continue;
+            try wal_names.append(alloc, try alloc.dupe(u8, entry.name));
+        }
+    }
+    defer {
+        for (wal_names.items[1..]) |n| alloc.free(n);
+    }
+    for (wal_names.items) |wname| {
+        if (dir.readFileAlloc(io, wname, alloc, .limited(max_file_bytes))) |data| {
+            defer alloc.free(data);
         var pos: usize = 0;
         while (pos < data.len) {
             if (pos + key_len + 4 + 4 > data.len) {
@@ -1401,9 +2169,10 @@ pub fn verifyDir(alloc: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !VerifyS
             st.wal_records += 1;
             pos = end;
         }
-    } else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
     }
 
     // MANIFEST (missing == legacy/empty: reported, not failed).
@@ -1480,7 +2249,7 @@ pub fn verifyDir(alloc: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !VerifyS
     for (files.items) |n| {
         if (!std.mem.endsWith(u8, n, ".sst")) continue;
         st.sst_files += 1;
-        const data = sst_dir.readFileAlloc(io, n, alloc, .limited(256 * 1024 * 1024)) catch {
+        const data = sst_dir.readFileAlloc(io, n, alloc, .limited(max_file_bytes)) catch {
             st.sst_corrupt += 1;
             continue;
         };
@@ -1750,6 +2519,59 @@ test "auto-compact bounds sst count" {
     }
 }
 
+test "tiered compaction exempts big runs (byte-identical files)" {
+    // Big merged runs are never rewritten: only the newest contiguous
+    // fragment suffix merges. Rewrites always mint new SST names, so an
+    // unchanged name + unchanged bytes proves exemption.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var store = try Store.open(std.testing.allocator, io, tmp.dir, .{ .flush_threshold_bytes = 1 << 30, .compact_threshold_ssts = 0, .compact_split_bytes = 512 });
+    defer store.deinit();
+    // Big run A: ~2KB of values (over the 512-byte split).
+    var i: i32 = 0;
+    while (i < 20) : (i += 1) {
+        var vbuf: [128]u8 = undefined;
+        const v = try std.fmt.bufPrint(&vbuf, "big-value-{d}-padding-bytes-here", .{i});
+        try store.put(encodeKey(0, i, 0), v);
+    }
+    try store.flush();
+    try std.testing.expectEqual(@as(usize, 1), store.ssts.items.len);
+    // Two small fragment runs on top.
+    try store.put(encodeKey(1, 0, 0), "small-one");
+    try store.flush();
+    try store.put(encodeKey(1, 1, 1), "small-two");
+    try store.flush();
+    try std.testing.expectEqual(@as(usize, 3), store.ssts.items.len);
+    const big_name = try std.testing.allocator.dupe(u8, store.ssts.items[0].name);
+    defer std.testing.allocator.free(big_name);
+    const big_before = try store.sst_dir.readFileAlloc(io, big_name, std.testing.allocator, .limited(4 << 20));
+    defer std.testing.allocator.free(big_before);
+    try store.compact();
+    // Big run untouched: same name first in the live set, same bytes.
+    try std.testing.expect(store.ssts.items.len >= 2);
+    try std.testing.expectEqualStrings(big_name, store.ssts.items[0].name);
+    const big_after = try store.sst_dir.readFileAlloc(io, big_name, std.testing.allocator, .limited(4 << 20));
+    defer std.testing.allocator.free(big_after);
+    try std.testing.expectEqualSlices(u8, big_before, big_after);
+    // All values resolve, newest-wins intact.
+    var j: i32 = 0;
+    while (j < 20) : (j += 1) {
+        const g = try store.get(std.testing.allocator, encodeKey(0, j, 0));
+        try std.testing.expect(g != null);
+        var ebuf: [128]u8 = undefined;
+        const want = try std.fmt.bufPrint(&ebuf, "big-value-{d}-padding-bytes-here", .{j});
+        try std.testing.expectEqualStrings(want, g.?);
+        std.testing.allocator.free(g.?);
+    }
+    const g1 = try store.get(std.testing.allocator, encodeKey(1, 0, 0));
+    try std.testing.expectEqualStrings("small-one", g1.?);
+    std.testing.allocator.free(g1.?);
+    const g2 = try store.get(std.testing.allocator, encodeKey(1, 1, 1));
+    try std.testing.expectEqualStrings("small-two", g2.?);
+    std.testing.allocator.free(g2.?);
+}
+
 test "multi-sst get correct with bloom (compaction off)" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1803,9 +2625,12 @@ test "uring_io: stride reads go through the ring when available" {
             try store.flush();
         }
         try std.testing.expectEqual(@as(usize, 10), store.ssts.items.len);
+        // Locked path (the production fallback): strides go through the
+        // ring. The optimistic public `get` uses plain pread (no lock
+        // across I/O), so ring counters only advance here.
         var k: i32 = 0;
         while (k < 10) : (k += 1) {
-            const g = try store.get(std.testing.allocator, encodeKey(0, k, 0));
+            const g = try store.getLocked(std.testing.allocator, encodeKey(0, k, 0));
             try std.testing.expect(g != null);
             var ebuf: [32]u8 = undefined;
             const want = try std.fmt.bufPrint(&ebuf, "v-{d}", .{k});
@@ -1823,13 +2648,14 @@ test "uring_io: stride reads go through the ring when available" {
             }
         }
     }
-    // Reopen: keep-open files + ring come back, data intact.
+    // Reopen: keep-open files + ring come back. Values verified above
+    // through both paths; here the locked path re-checks the ring.
     {
         var store2 = try Store.open(std.testing.allocator, io, tmp.dir, opts);
         defer store2.deinit();
         var j: i32 = 0;
         while (j < 10) : (j += 1) {
-            const g = try store2.get(std.testing.allocator, encodeKey(0, j, 0));
+            const g = try store2.getLocked(std.testing.allocator, encodeKey(0, j, 0));
             try std.testing.expect(g != null);
             var ebuf: [32]u8 = undefined;
             const want = try std.fmt.bufPrint(&ebuf, "v-{d}", .{j});
@@ -1859,7 +2685,8 @@ test "uring_io: oversized strides fall back to pread (same bytes)" {
     }
     var k: i32 = 0;
     while (k < 4) : (k += 1) {
-        const g = try store.get(std.testing.allocator, encodeKey(0, k, 0));
+        // Locked path: oversized strides skip the ring (fallback_reads).
+        const g = try store.getLocked(std.testing.allocator, encodeKey(0, k, 0));
         try std.testing.expect(g != null);
         try std.testing.expectEqualSlices(u8, &vbuf, g.?);
         std.testing.allocator.free(g.?);
@@ -1868,6 +2695,156 @@ test "uring_io: oversized strides fall back to pread (same bytes)" {
         try std.testing.expect(store.ringStats().fallback_reads > 0);
         try std.testing.expectEqual(@as(u64, 0), store.ringStats().ring_reads);
     }
+}
+
+test "store.get stays correct under concurrent flush/compact" {
+    // Exercises the optimistic-read protocol (snapshot, unlocked I/O,
+    // memtable re-check + generation validation, bounded retry) against
+    // real flush/compact races. Values are version-stamped per key; any
+    // torn or stale-beyond-linearizable read fails the format check.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try Store.open(std.testing.allocator, io, tmp.dir, .{
+        .flush_threshold_bytes = 1 << 30,
+        .compact_threshold_ssts = 4,
+    });
+    defer store.deinit();
+
+    const n_keys = 8;
+    const rounds: u32 = 30;
+    var k0: u32 = 0;
+    while (k0 < n_keys) : (k0 += 1) {
+        var vbuf: [32]u8 = undefined;
+        const v = try std.fmt.bufPrint(&vbuf, "r-0000-k-{d:0>2}", .{k0});
+        try store.put(encodeKey(0, @intCast(k0), 0), v);
+    }
+    try store.flush();
+
+    const Ctx = struct {
+        s: *Store,
+        stop: std.atomic.Value(bool),
+    };
+    var ctx = Ctx{ .s = store, .stop = std.atomic.Value(bool).init(false) };
+
+    const Writer = struct {
+        fn run(c: *Ctx) void {
+            var r: u32 = 1;
+            while (r <= rounds) : (r += 1) {
+                var k: u32 = 0;
+                while (k < n_keys) : (k += 1) {
+                    var vbuf: [32]u8 = undefined;
+                    const v = std.fmt.bufPrint(&vbuf, "r-{d:0>4}-k-{d:0>2}", .{ r, k }) catch unreachable;
+                    c.s.put(encodeKey(0, @intCast(k), 0), v) catch unreachable;
+                }
+                c.s.flush() catch unreachable;
+            }
+            c.stop.store(true, .release);
+        }
+    };
+    const Reader = struct {
+        fn run(c: *Ctx, seed: u64) void {
+            // page_allocator: thread-safe (testing.allocator is not).
+            const alloc = std.heap.page_allocator;
+            var st = seed;
+            var it: u32 = 0;
+            while (it < 400) : (it += 1) {
+                // xorshift: spread reads across keys.
+                st ^= st << 13;
+                st ^= st >> 7;
+                st ^= st << 17;
+                const k: u32 = @intCast(st % n_keys);
+                const v = c.s.get(alloc, encodeKey(0, @intCast(k), 0)) catch unreachable;
+                if (v) |bytes| {
+                    defer alloc.free(bytes);
+                    // Exact format "r-RRRR-k-KK" (11 chars); else torn.
+                    if (bytes.len != 11) unreachable;
+                    if (bytes[0] != 'r' or bytes[1] != '-' or bytes[6] != '-' or bytes[7] != 'k' or bytes[8] != '-') unreachable;
+                    var rnum: u32 = 0;
+                    for (bytes[2..6]) |ch| {
+                        if (ch < '0' or ch > '9') unreachable;
+                        rnum = rnum * 10 + (ch - '0');
+                    }
+                    if (rnum > rounds) unreachable;
+                    const knum: u32 = (bytes[9] - '0') * 10 + (bytes[10] - '0');
+                    if (knum != k) unreachable;
+                } else unreachable; // pre-filled: never missing
+            }
+        }
+    };
+    const wt = try std.Thread.spawn(.{}, Writer.run, .{&ctx});
+    var rts: [3]std.Thread = undefined;
+    for (&rts, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Reader.run, .{ &ctx, 0x12345 + i * 7919 });
+    for (rts) |t| t.join();
+    wt.join();
+    // Final state: every key at the last round (validates end state too).
+    var kf: u32 = 0;
+    while (kf < n_keys) : (kf += 1) {
+        const g = try store.get(std.testing.allocator, encodeKey(0, @intCast(kf), 0));
+        try std.testing.expect(g != null);
+        var ebuf: [32]u8 = undefined;
+        const want = try std.fmt.bufPrint(&ebuf, "r-{d:0>4}-k-{d:0>2}", .{ rounds, kf });
+        try std.testing.expectEqualStrings(want, g.?);
+        std.testing.allocator.free(g.?);
+    }
+    // Telemetry: reads flowed through the optimistic path. Retries under
+    // write pressure are expected and correct; the bound below only
+    // guards against a retry *storm* (fallbacks should stay a trace).
+    const rs = store.readStats();
+    try std.testing.expect(rs.attempts > 0);
+    try std.testing.expect(rs.locked_fallbacks * 20 < rs.attempts);
+}
+
+test "snapshotForGet overflows to the locked path when candidates exceed the stack buffer" {
+    // Same key flushed twice lives in two SSTs, so both Blooms pass
+    // deterministically (no false-negative possible). A 1-slot buffer
+    // then forces .sst_overflow on the direct call.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try Store.open(std.testing.allocator, io, tmp.dir, .{
+        .flush_threshold_bytes = 1 << 30,
+        .compact_threshold_ssts = 0,
+    });
+    defer store.deinit();
+    const k = encodeKey(0, 7, 0);
+    try store.put(k, "v-old");
+    try store.flush();
+    try store.put(k, "v-new");
+    try store.flush();
+    try std.testing.expectEqual(@as(usize, 2), store.ssts.items.len);
+    var one: [1]Store.SstCandidate = undefined;
+    const snap = try store.snapshotForGet(std.testing.allocator, k, &one);
+    try std.testing.expect(snap == .sst_overflow);
+}
+
+test "get overflows to getLocked past 32 same-key SSTs, newest wins" {
+    // 33 flushes of one key: every Bloom passes, exceeding get's 32-slot
+    // stack buffer, so the whole read goes through the locked backstop
+    // and still returns the newest value.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try Store.open(std.testing.allocator, io, tmp.dir, .{
+        .flush_threshold_bytes = 1 << 30,
+        .compact_threshold_ssts = 0,
+    });
+    defer store.deinit();
+    const k = encodeKey(0, 9, 0);
+    var r: u32 = 0;
+    while (r < 33) : (r += 1) {
+        var vbuf: [16]u8 = undefined;
+        const v = try std.fmt.bufPrint(&vbuf, "v-{d}", .{r});
+        try store.put(k, v);
+        try store.flush();
+    }
+    try std.testing.expectEqual(@as(usize, 33), store.ssts.items.len);
+    const before = store.readStats().locked_fallbacks;
+    const g = try store.get(std.testing.allocator, k);
+    try std.testing.expect(g != null);
+    defer std.testing.allocator.free(g.?);
+    try std.testing.expectEqualStrings("v-32", g.?);
+    try std.testing.expect(store.readStats().locked_fallbacks > before);
 }
 
 test "fsync policy option honored" {
@@ -2016,3 +2993,68 @@ test "next_sst_id monotonic across restarts incl compaction" {
     }
 }
 
+
+test "compaction splits outputs at the split budget" {
+    // Regression test for the 50GB-orphan spiral: unbounded merged runs
+    // tripped the 256MB whole-file read caps, so every compaction failed
+    // after writing its output and leaked it. Bounded outputs keep every
+    // file readable by construction.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var store = try Store.open(std.testing.allocator, io, tmp.dir, .{ .flush_threshold_bytes = 1 << 30, .compact_threshold_ssts = 0, .compact_split_bytes = 64 });
+    defer store.deinit();
+    var i: i32 = 0;
+    while (i < 8) : (i += 1) {
+        var vbuf: [64]u8 = undefined;
+        const v = try std.fmt.bufPrint(&vbuf, "value-{d}-padding-bytes", .{i});
+        try store.put(encodeKey(0, i, i), v);
+    }
+    try store.flush();
+    try store.put(encodeKey(0, 0, 0), "value-0-newer-version!!");
+    try store.put(encodeKey(0, 8, 8), "value-8-padding-bytes!!");
+    try store.flush();
+    try std.testing.expectEqual(@as(usize, 2), store.ssts.items.len);
+    try store.compact();
+    // 10 small values at a 64-byte budget: several bounded outputs.
+    try std.testing.expect(store.ssts.items.len > 1);
+    // Newest-wins survives the split.
+    const g0 = try store.get(std.testing.allocator, encodeKey(0, 0, 0));
+    try std.testing.expectEqualStrings("value-0-newer-version!!", g0.?);
+    std.testing.allocator.free(g0.?);
+    var j: i32 = 1;
+    while (j < 9) : (j += 1) {
+        var ebuf: [64]u8 = undefined;
+        const want = try std.fmt.bufPrint(&ebuf, "value-{d}-padding-bytes", .{j});
+        if (j == 8) {
+            const g8 = try store.get(std.testing.allocator, encodeKey(0, 8, 8));
+            try std.testing.expectEqualStrings("value-8-padding-bytes!!", g8.?);
+            std.testing.allocator.free(g8.?);
+            continue;
+        }
+        const g = try store.get(std.testing.allocator, encodeKey(0, j, j));
+        try std.testing.expectEqualStrings(want, g.?);
+        std.testing.allocator.free(g.?);
+    }
+    // Manifest lists exactly what's on disk (no orphans).
+    var sdir = try tmp.dir.openDir(io, "sst", .{ .iterate = true });
+    defer sdir.close(io);
+    var on_disk: usize = 0;
+    {
+        var it = sdir.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".sst")) continue;
+            on_disk += 1;
+            var listed = false;
+            for (store.ssts.items) |*m| {
+                if (std.mem.eql(u8, m.name, entry.name)) {
+                    listed = true;
+                    break;
+                }
+            }
+            try std.testing.expect(listed);
+        }
+    }
+    try std.testing.expectEqual(store.ssts.items.len, on_disk);
+}

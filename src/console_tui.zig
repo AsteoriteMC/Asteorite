@@ -1,22 +1,49 @@
+//! Operator console TUI built on the ZigZag framework (Model-Update-View).
+//!
+//! Same process role as before: the console owns a background thread
+//! (`run`, spawned detached from main), every other thread logs through a
+//! lock-guarded MPSC queue, and stdin commands dispatch to
+//! `Server.handleCommand` via the input callback. Only the TTY rendering
+//! and input editing moved to ZigZag — RichLog (level colors, scrollback),
+//! TextInput (editing, suggestions), a Logs/Status/Help tab strip, and a
+//! status bar, all with diff rendering instead of full-screen rewrites.
+//!
+//! Layout (terminal W x H):
+//!   row 0:      header ("Asteorite" + boot status string)
+//!   row 1:      tab strip (F1 Logs / F2 Status / F3 Help)
+//!   rows 2..H-3: active panel (log window, status panel, or help)
+//!   row H-2:    status bar (log count, follow state, key hints)
+//!   row H-1:    command input (prompt "> ", Tab accepts suggestion)
+//!
+//! Keys: Enter runs the line, Up/Down walks history, PgUp/PgDn/Home/End
+//! scroll the log, F1/F2/F3 switch tabs, Ctrl-C (or Ctrl-D on an empty
+//! line) issues `stop`. j/k/g/G deliberately do NOT scroll — they are
+//! command text.
+//!
+//! Shutdown: every stop path (console/RCON/in-game/SIGINT) ends in
+//! `restoreTerminal()` + `exit(0)`. The console-initiated path stops the
+//! Program cleanly first (`.quit` unwinds through `Program.deinit`, which
+//! restores the terminal), and `restoreTerminal()` re-emits the leave-alt-
+//! screen/show-cursor sequences directly so the RCON/in-game paths — which
+//! never touch the Program — restore the terminal too. All of it is safe
+//! from any thread and idempotent.
+
 const std = @import("std");
-const builtin = @import("builtin");
-const linux = std.os.linux;
+const zz = @import("zigzag");
 
-/// ANSI escape sequences
-const CSI = "\u{1b}[";
-
-/// Log levels with colors
+/// Log levels (mirrors std.log so the logFn hook needs no translation table
+/// beyond RichLog's own enum).
 pub const Level = std.log.Level;
 
-/// Stored log capacity
-const MAX_LOG_LINES = 300;
-/// Stored message bytes per line
+/// Stored log capacity (owned copies in the queue, then owned by RichLog).
+const MAX_LOG_LINES = 500;
+/// Stored message bytes per line.
 const MAX_MSG = 512;
-/// Pending messages from other threads
+/// Pending messages from other threads.
 const MAX_LOG_QUEUE = 256;
-/// Command history entries
+/// Command history entries.
 const MAX_HISTORY = 100;
-/// Input line length
+/// Input line length (matches the server command buffer: 1 + 1024).
 const MAX_INPUT_LEN = 1024;
 
 /// One fully-owned pending message from any thread.
@@ -28,7 +55,7 @@ const LogMessage = struct {
 };
 
 /// MPSC queue: many producers (any thread via log()), single consumer
-/// (the console thread in run()). Guarded by q_lock.
+/// (the console thread in the tick handler). Guarded by q_lock.
 const LogQueue = struct {
     buffer: [MAX_LOG_QUEUE]LogMessage = undefined,
     head: usize = 0,
@@ -57,190 +84,6 @@ const LogQueue = struct {
 
     pub fn isEmpty(self: *const LogQueue) bool {
         return !self.full and self.head == self.tail;
-    }
-};
-
-/// Fullscreen console: POSIX uses termios + poll + ioctl; Windows uses the
-/// Win32 Console API (see runWindows below). Both get the same fullscreen
-/// TUI with scrollback, history, colors, and a bottom input row. Only piped
-/// / redirected stdin falls back to plain line mode.
-const have_tty = builtin.os.tag != .windows;
-const is_windows = builtin.os.tag == .windows;
-
-const windows = std.os.windows;
-const WinHANDLE = windows.HANDLE;
-const WinBOOL = windows.BOOL;
-const WinDWORD = windows.DWORD;
-const WinWORD = windows.WORD;
-const WinWCHAR = windows.WCHAR;
-const WinSHORT = windows.SHORT;
-
-extern "kernel32" fn GetStdHandle(nStdHandle: WinDWORD) callconv(.winapi) ?WinHANDLE;
-extern "kernel32" fn GetConsoleMode(hConsoleHandle: WinHANDLE, lpMode: *WinDWORD) callconv(.winapi) WinBOOL;
-extern "kernel32" fn SetConsoleMode(hConsoleHandle: WinHANDLE, dwMode: WinDWORD) callconv(.winapi) WinBOOL;
-extern "kernel32" fn GetConsoleScreenBufferInfo(hConsoleOutput: WinHANDLE, lpConsoleScreenBufferInfo: *WinConsoleScreenBufferInfo) callconv(.winapi) WinBOOL;
-extern "kernel32" fn WaitForSingleObject(hHandle: WinHANDLE, dwMilliseconds: WinDWORD) callconv(.winapi) WinDWORD;
-extern "kernel32" fn GetNumberOfConsoleInputEvents(hConsoleInput: WinHANDLE, lpcNumberOfEvents: *WinDWORD) callconv(.winapi) WinBOOL;
-extern "kernel32" fn ReadConsoleInputW(hConsoleInput: WinHANDLE, lpBuffer: [*]WinInputRecord, nLength: WinDWORD, lpNumberOfEventsRead: *WinDWORD) callconv(.winapi) WinBOOL;
-
-const WIN_STD_INPUT_HANDLE: WinDWORD = @bitCast(@as(i32, -10));
-const WIN_STD_OUTPUT_HANDLE: WinDWORD = @bitCast(@as(i32, -11));
-const WIN_ENABLE_PROCESSED_INPUT: WinDWORD = 0x0001;
-const WIN_ENABLE_LINE_INPUT: WinDWORD = 0x0002;
-const WIN_ENABLE_ECHO_INPUT: WinDWORD = 0x0004;
-const WIN_ENABLE_WINDOW_INPUT: WinDWORD = 0x0008;
-const WIN_ENABLE_EXTENDED_FLAGS: WinDWORD = 0x0080;
-const WIN_ENABLE_PROCESSED_OUTPUT: WinDWORD = 0x0001;
-const WIN_ENABLE_WRAP_AT_EOL_OUTPUT: WinDWORD = 0x0002;
-const WIN_ENABLE_VIRTUAL_TERMINAL_PROCESSING: WinDWORD = 0x0004;
-const WIN_WAIT_OBJECT_0: WinDWORD = 0;
-const WIN_WAIT_TIMEOUT: WinDWORD = 258;
-const WIN_KEY_EVENT: WinWORD = 0x0001;
-const WIN_WINDOW_BUFFER_SIZE_EVENT: WinWORD = 0x0004;
-const WIN_VK_PRIOR: WinWORD = 0x21;
-const WIN_VK_NEXT: WinWORD = 0x22;
-const WIN_VK_END: WinWORD = 0x23;
-const WIN_VK_HOME: WinWORD = 0x24;
-const WIN_VK_LEFT: WinWORD = 0x25;
-const WIN_VK_UP: WinWORD = 0x26;
-const WIN_VK_RIGHT: WinWORD = 0x27;
-const WIN_VK_DOWN: WinWORD = 0x28;
-const WIN_VK_DELETE: WinWORD = 0x2E;
-const WIN_LEFT_ALT_PRESSED: WinDWORD = 0x0002;
-const WIN_RIGHT_ALT_PRESSED: WinDWORD = 0x0001;
-
-const WinCOORD = extern struct {
-    X: WinSHORT,
-    Y: WinSHORT,
-};
-const WinSMALL_RECT = extern struct {
-    Left: WinSHORT,
-    Top: WinSHORT,
-    Right: WinSHORT,
-    Bottom: WinSHORT,
-};
-const WinConsoleScreenBufferInfo = extern struct {
-    dwSize: WinCOORD,
-    dwCursorPosition: WinCOORD,
-    wAttributes: WinWORD,
-    srWindow: WinSMALL_RECT,
-    dwMaximumWindowSize: WinCOORD,
-};
-const WinKeyEventRecord = extern struct {
-    bKeyDown: WinBOOL,
-    wRepeatCount: WinWORD,
-    wVirtualKeyCode: WinWORD,
-    wVirtualScanCode: WinWORD,
-    UnicodeChar: WinWCHAR,
-    dwControlKeyState: WinDWORD,
-};
-const WinInputRecord = extern struct {
-    EventType: WinWORD,
-    Reserved: WinWORD,
-    KeyEvent: WinKeyEventRecord,
-};
-
-/// Console modes saved when the Windows TUI takes over. Kept in globals
-/// (not on Console) so ANY stop path can restore them even though
-/// std.process.exit() skips defers — same reason as saved_termios.
-var saved_win_in_handle: ?WinHANDLE = null;
-var saved_win_out_handle: ?WinHANDLE = null;
-var saved_win_in_mode: ?WinDWORD = null;
-var saved_win_out_mode: ?WinDWORD = null;
-
-fn winNoteModes(in_h: WinHANDLE, out_h: WinHANDLE, in_mode: WinDWORD, out_mode: WinDWORD) void {
-    if (comptime is_windows) {
-        saved_win_in_handle = in_h;
-        saved_win_out_handle = out_h;
-        saved_win_in_mode = in_mode;
-        saved_win_out_mode = out_mode;
-    }
-}
-
-fn winRestoreModes() void {
-    if (comptime is_windows) {
-        if (saved_win_in_handle) |h| {
-            if (saved_win_in_mode) |m| _ = SetConsoleMode(h, m);
-        }
-        if (saved_win_out_handle) |h| {
-            if (saved_win_out_mode) |m| _ = SetConsoleMode(h, m);
-        }
-        saved_win_in_handle = null;
-        saved_win_out_handle = null;
-        saved_win_in_mode = null;
-        saved_win_out_mode = null;
-    }
-}
-
-fn winRefreshTermSize(cols: *usize, rows: *usize) void {
-    if (comptime is_windows) {
-        const out_h = GetStdHandle(WIN_STD_OUTPUT_HANDLE) orelse return;
-        if (out_h == windows.INVALID_HANDLE_VALUE) return;
-        var info: WinConsoleScreenBufferInfo = undefined;
-        if (GetConsoleScreenBufferInfo(out_h, &info) == .FALSE) return;
-        const w: i32 = @as(i32, info.srWindow.Right) - @as(i32, info.srWindow.Left) + 1;
-        const h: i32 = @as(i32, info.srWindow.Bottom) - @as(i32, info.srWindow.Top) + 1;
-        if (w > 0 and h > 0) {
-            cols.* = @intCast(w);
-            rows.* = @intCast(h);
-        }
-    }
-}
-
-/// Seconds since epoch, for HH:MM:SS stamps (portable: the old
-/// linux.clock_gettime(CLOCK.REALTIME) is Linux-only; Io .real is the same
-/// wall clock on every target, Windows included).
-fn getTimestamp(io: ?std.Io) i64 {
-    const io_val = io orelse return 0;
-    return std.Io.Timestamp.now(io_val, .real).toSeconds();
-}
-
-/// A single display line (owned copy, never a slice into temp buffers).
-const LogLine = struct {
-    level: Level,
-    timestamp: i64,
-    message: [MAX_MSG]u8 = undefined,
-    message_len: usize = 0,
-
-    pub fn format(self: *const LogLine, buf: []u8) []const u8 {
-        var time_buf: [8]u8 = undefined;
-        const time_str = formatTimestamp(self.timestamp, &time_buf);
-        const level_str = levelToString(self.level);
-        const level_color = levelToColor(self.level);
-        const reset = CSI ++ "0m";
-        const dim = CSI ++ "2m";
-        if (self.level == .err) {
-            // Errors: the entire line stays red.
-            return std.fmt.bufPrint(buf, "{s}{s}[{s}] {s}{s}\n", .{
-                level_color, time_str, level_str,
-                self.message[0..self.message_len], reset,
-            }) catch buf[0..0];
-        }
-        // Normal lines: dim timestamp, colored [LEVEL] tag, plain message.
-        return std.fmt.bufPrint(buf, "{s}{s}{s} {s}[{s}]{s} {s}\n", .{
-            dim, time_str, reset,
-            level_color, level_str, reset,
-            self.message[0..self.message_len],
-        }) catch buf[0..0];
-    }
-};
-
-/// Ring of display lines. Only touched by the console thread, no lock needed.
-const LogBuffer = struct {
-    lines: [MAX_LOG_LINES]LogLine = undefined,
-    head: usize = 0, // next write slot
-    count: usize = 0,
-
-    pub fn push(self: *LogBuffer, line: LogLine) void {
-        self.lines[self.head] = line;
-        self.head = (self.head + 1) % MAX_LOG_LINES;
-        if (self.count < MAX_LOG_LINES) self.count += 1;
-    }
-
-    /// Index from oldest: 0 == oldest stored line.
-    pub fn atFromOldest(self: *const LogBuffer, idx: usize) *const LogLine {
-        const oldest = (self.head + MAX_LOG_LINES - self.count) % MAX_LOG_LINES;
-        return &self.lines[(oldest + idx) % MAX_LOG_LINES];
     }
 };
 
@@ -285,120 +128,29 @@ const History = struct {
     }
 };
 
-/// Terminal dimensions via ioctl.
-const TermSize = struct {
-    cols: usize = 80,
-    rows: usize = 24,
+/// Seconds since epoch, for the queue (RichLog timestamps the entries
+/// itself on append; this stamps queue transit only for potential loss
+/// accounting — currently unused beyond parity with the old path).
+fn getTimestamp(io: ?std.Io) i64 {
+    const io_val = io orelse return 0;
+    return std.Io.Timestamp.now(io_val, .real).toSeconds();
+}
 
-    pub fn refresh(self: *TermSize) void {
-        if (comptime is_windows) {
-            winRefreshTermSize(&self.cols, &self.rows);
-        }
-        if (comptime have_tty) {
-            var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
-            // Per-OS request code (Linux 0x5413 differs from macOS/*BSD);
-            // raw Linux syscall on Linux, libc ioctl elsewhere.
-            const ok = if (comptime builtin.os.tag == .linux)
-                linux.ioctl(1, linux.T.IOCGWINSZ, @intFromPtr(&ws)) == 0
-            else
-                std.c.ioctl(1, std.posix.T.IOCGWINSZ, &ws) == 0;
-            if (ok and ws.col > 0 and ws.row > 0) {
-                self.cols = @intCast(ws.col);
-                self.rows = @intCast(ws.row);
-            }
-        }
-    }
+/// Slash-command suggestions for Tab completion in the input row.
+const suggestions: []const []const u8 = &.{
+    "help", "list", "stop", "save-all", "save-on", "save-off",
+    "op ", "deop ", "gamemode ", "difficulty ", "time ", "weather ",
+    "give ", "tp ", "spawnpoint ", "setworldspawn ", "gamerule ",
+    "whitelist ", "ban ", "ban-ip ", "pardon ", "kick ", "say ",
+    "tell ", "seed ", "netstat ", "status ",
 };
 
-/// Editable input line (used by the raw-mode console thread only).
-const InputLine = struct {
-    buf: [MAX_INPUT_LEN]u8 = undefined,
-    len: usize = 0,
-    cursor: usize = 0,
-    history_index: ?usize = null,
-
-    pub fn clear(self: *InputLine) void {
-        self.len = 0;
-        self.cursor = 0;
-        self.history_index = null;
-    }
-
-    pub fn insertByte(self: *InputLine, b: u8) void {
-        if (self.len >= MAX_INPUT_LEN) return;
-        var i = self.len;
-        while (i > self.cursor) : (i -= 1) {
-            self.buf[i] = self.buf[i - 1];
-        }
-        self.buf[self.cursor] = b;
-        self.len += 1;
-        self.cursor += 1;
-    }
-
-    pub fn backspace(self: *InputLine) void {
-        if (self.cursor == 0) return;
-        var i: usize = self.cursor;
-        while (i < self.len) : (i += 1) {
-            self.buf[i - 1] = self.buf[i];
-        }
-        self.len -= 1;
-        self.cursor -= 1;
-    }
-
-    pub fn deleteAtCursor(self: *InputLine) void {
-        if (self.cursor >= self.len) return;
-        var i: usize = self.cursor + 1;
-        while (i < self.len) : (i += 1) {
-            self.buf[i - 1] = self.buf[i];
-        }
-        self.len -= 1;
-    }
-
-    pub fn killToEnd(self: *InputLine) void {
-        self.len = self.cursor;
-    }
-
-    pub fn killLine(self: *InputLine) void {
-        self.len = 0;
-        self.cursor = 0;
-        self.history_index = null;
-    }
-
-    pub fn killWordBackward(self: *InputLine) void {
-        if (self.cursor == 0) return;
-        var pos = self.cursor;
-        while (pos > 0 and self.buf[pos - 1] == ' ') pos -= 1;
-        while (pos > 0 and self.buf[pos - 1] != ' ') pos -= 1;
-        const n = self.cursor - pos;
-        var i: usize = self.cursor;
-        while (i < self.len) : (i += 1) {
-            self.buf[i - n] = self.buf[i];
-        }
-        self.len -= n;
-        self.cursor = pos;
-    }
-
-    pub fn getLine(self: *const InputLine) []const u8 {
-        return self.buf[0..self.len];
-    }
-
-    pub fn setText(self: *InputLine, text: []const u8) void {
-        const n = @min(text.len, MAX_INPUT_LEN);
-        @memcpy(self.buf[0..n], text[0..n]);
-        self.len = n;
-        self.cursor = n;
-    }
-};
-
-/// The main console. All display state is owned by the console thread;
-/// other threads only touch log_queue (under q_lock).
+/// The console. Display state (RichLog/TextInput/tabs) lives in the TUI
+/// model on the console thread; other threads only touch log_queue
+/// (under q_lock).
 pub const Console = struct {
     allocator: std.mem.Allocator,
-    log_buffer: LogBuffer = .{},
     history: History = .{},
-    input: InputLine = .{},
-    term_size: TermSize = .{},
-    scroll_offset: usize = 0, // 0 == pinned to bottom
-    running: bool = true,
     prompt: []const u8 = "> ",
     status_buf: [192]u8 = undefined,
     status_len: usize = 0,
@@ -406,16 +158,29 @@ pub const Console = struct {
     log_callback: ?*const fn (*Console, Level, []const u8) void = null,
     user_data: ?*anyopaque = null,
     io: ?std.Io = null,
+    environ_map: ?*const std.process.Environ.Map = null,
     q_lock: std.atomic.Mutex = .unlocked,
     log_queue: LogQueue = .{},
-    tty_mode: ?bool = null,
+    running: bool = true,
+    /// Set by the console input callback when it issues `stop`: tells the
+    /// thread wrapper to exit(0) after the Program unwinds cleanly.
+    exit_after_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Console {
+        // Snapshot the shell's termios BEFORE the TUI thread flips stdin
+        // raw: restoreTerminal() puts it back on every exit(0) path that
+        // skips the Program's own restore defer. Non-tty stdin (tests,
+        // piped runs) fails here and restores as a no-op.
+        saved_termios = std.posix.tcgetattr(std.posix.STDIN_FILENO) catch null;
         return .{ .allocator = allocator, .io = io };
     }
 
     pub fn setIo(self: *Console, io: std.Io) void {
         self.io = io;
+    }
+
+    pub fn setEnvironMap(self: *Console, map: *const std.process.Environ.Map) void {
+        self.environ_map = map;
     }
 
     pub fn setUserData(self: *Console, data: *anyopaque) void {
@@ -440,7 +205,7 @@ pub const Console = struct {
         self.status_len = n;
     }
 
-    fn statusText(self: *const Console) []const u8 {
+    pub fn statusText(self: *const Console) []const u8 {
         return self.status_buf[0..self.status_len];
     }
 
@@ -456,7 +221,7 @@ pub const Console = struct {
             if (seg.len > 0 and seg[seg.len - 1] == '\r') seg = seg[0 .. seg.len - 1];
             if (seg.len > 0) {
                 while (!std.atomic.Mutex.tryLock(&self.q_lock)) std.atomic.spinLoopHint();
-                const ok = self.q_lockPush(level, timestamp, seg);
+                const ok = self.log_queue.push(level, timestamp, seg);
                 std.atomic.Mutex.unlock(&self.q_lock);
                 _ = ok; // drop when full; stats spam must not OOM
                 any = true;
@@ -466,14 +231,10 @@ pub const Console = struct {
         }
         if (!any and msg.len == 0) {
             while (!std.atomic.Mutex.tryLock(&self.q_lock)) std.atomic.spinLoopHint();
-            _ = self.q_lockPush(level, timestamp, "");
+            _ = self.log_queue.push(level, timestamp, "");
             std.atomic.Mutex.unlock(&self.q_lock);
         }
         if (self.log_callback) |cb| cb(self, level, msg);
-    }
-
-    fn q_lockPush(self: *Console, level: Level, timestamp: i64, seg: []const u8) bool {
-        return self.log_queue.push(level, timestamp, seg);
     }
 
     pub fn logf(self: *Console, level: Level, comptime format: []const u8, args: anytype) void {
@@ -486,15 +247,18 @@ pub const Console = struct {
         self.log(.info, msg);
     }
 
-    /// Synchronously drain + display everything queued so far.
-    /// Safe to call from the console thread (e.g. right before exit).
-    /// No-op from any other thread.
+    /// Stop-path helper: the console callback logs its goodbye line into the
+    /// queue and `update` drains it on the next tick before quitting, so the
+    /// bye renders before exit. This only yields briefly: draining happens
+    /// on the TUI thread's ticks, never here.
     pub fn flush(self: *Console) void {
-        if (self.tty_mode == true) {
-            _ = self.drainQueue();
-            self.drawFull();
-        } else if (self.tty_mode == false) {
-            self.flushPlain();
+        var spins: u32 = 0;
+        while (spins < 1000) : (spins += 1) {
+            while (!std.atomic.Mutex.tryLock(&self.q_lock)) std.atomic.spinLoopHint();
+            const empty = self.log_queue.isEmpty();
+            std.atomic.Mutex.unlock(&self.q_lock);
+            if (empty) break;
+            std.atomic.spinLoopHint();
         }
     }
 
@@ -506,615 +270,368 @@ pub const Console = struct {
         self.history.deinit(self.allocator);
     }
 
-    /// Move queued messages into the display buffer. Console thread only.
-    fn drainQueue(self: *Console) bool {
-        var any = false;
-        while (true) {
-            while (!std.atomic.Mutex.tryLock(&self.q_lock)) std.atomic.spinLoopHint();
-            const m = self.log_queue.pop();
-            std.atomic.Mutex.unlock(&self.q_lock);
-            const msg = m orelse break;
-            any = true;
-            var line = LogLine{
-                .level = msg.level,
-                .timestamp = msg.timestamp,
-                .message_len = msg.message_len,
-            };
-            @memcpy(line.message[0..msg.message_len], msg.message[0..msg.message_len]);
-            self.log_buffer.push(line);
-        }
-        return any;
-    }
-
-    fn writer(self: *Console, out_buf: []u8) std.Io.File.Writer {
-        const io = self.io.?;
-        var stdout = std.Io.File.stdout();
-        return stdout.writer(io, out_buf);
-    }
-
-    fn clearScreen(self: *Console) void {
-        var out_buf: [64]u8 = undefined;
-        var w = self.writer(&out_buf);
-        _ = w.interface.writeAll(CSI ++ "2J" ++ CSI ++ "H") catch {};
-        w.interface.flush() catch {};
-    }
-
-    /// Full redraw: logs + status + input. Console thread only.
-    fn drawFull(self: *Console) void {
-        const io = self.io orelse return;
-        var stdout = std.Io.File.stdout();
-        var out_buf: [1024]u8 = undefined;
-        var w = stdout.writer(io, &out_buf);
-        const out = &w.interface;
-
-        self.term_size.refresh();
-        const rows = self.term_size.rows;
-        const log_height = if (rows > 2) rows - 2 else 1;
-
-        _ = out.writeAll(CSI ++ "2J" ++ CSI ++ "H") catch {};
-
-        // Which slice of history to show. Newest at bottom.
-        const total = self.log_buffer.count;
-        const off = @min(self.scroll_offset, total);
-        const show = @min(log_height, total - off);
-        const start = total - off - show; // index from oldest
-        var fmt_buf: [2048]u8 = undefined;
-        var i: usize = 0;
-        while (i < show) : (i += 1) {
-            const line = self.log_buffer.atFromOldest(start + i);
-            const text = line.format(&fmt_buf);
-            _ = out.writeAll(text) catch {};
-        }
-        // Pad so status/input land on fixed rows.
-        var pad = log_height;
-        while (pad > show) : (pad -= 1) {
-            _ = out.writeAll("\n") catch {};
-        }
-
-        // Status row.
-        var row_buf: [16]u8 = undefined;
-        const srow = std.fmt.bufPrint(&row_buf, "{d}", .{rows - 1}) catch "1";
-        _ = out.writeAll(CSI) catch {};
-        _ = out.writeAll(srow) catch {};
-        _ = out.writeAll(";1H") catch {};
-        _ = out.writeAll(CSI ++ "2K") catch {};
-        const dim = CSI ++ "2m";
-        const reset = CSI ++ "0m";
-        if (off > 0) {
-            _ = out.print("{s}[scrolled up ({d}) - PgDn/End to follow]{s}", .{ dim, off, reset }) catch {};
-        } else if (self.status_len > 0) {
-            _ = out.print("{s}{s}{s}", .{ dim, self.statusText(), reset }) catch {};
-        } else {
-            _ = out.print("{s}log lines: {d}{s}", .{ dim, total, reset }) catch {};
-        }
-
-        // Input row.
-        var irow: [16]u8 = undefined;
-        const irows = std.fmt.bufPrint(&irow, "{d}", .{rows}) catch "1";
-        _ = out.writeAll(CSI) catch {};
-        _ = out.writeAll(irows) catch {};
-        _ = out.writeAll(";1H") catch {};
-        _ = out.writeAll(CSI ++ "2K") catch {};
-        const bold = CSI ++ "1m";
-        _ = out.print("{s}{s}{s}", .{ bold, self.prompt, reset }) catch {};
-        _ = out.writeAll(self.input.buf[0..self.input.len]) catch {};
-
-        // Place cursor inside the input.
-        var crow: [16]u8 = undefined;
-        var ccol: [16]u8 = undefined;
-        const crows = std.fmt.bufPrint(&crow, "{d}", .{rows}) catch "1";
-        const ccols = std.fmt.bufPrint(&ccol, "{d}", .{self.prompt.len + self.input.cursor + 1}) catch "1";
-        _ = out.writeAll(CSI) catch {};
-        _ = out.writeAll(crows) catch {};
-        _ = out.writeAll(";") catch {};
-        _ = out.writeAll(ccols) catch {};
-        _ = out.writeAll("H") catch {};
-
-        out.flush() catch {};
-    }
-
-    /// Plain (non-TTY) output: one formatted line per queued message.
-    fn flushPlain(self: *Console) void {
-        const io = self.io orelse return;
-        var stdout = std.Io.File.stdout();
-        var out_buf: [1024]u8 = undefined;
-        var w = stdout.writer(io, &out_buf);
-        const out = &w.interface;
-        var fmt_buf: [2048]u8 = undefined;
-        var any = false;
-        while (true) {
-            while (!std.atomic.Mutex.tryLock(&self.q_lock)) std.atomic.spinLoopHint();
-            const m = self.log_queue.pop();
-            std.atomic.Mutex.unlock(&self.q_lock);
-            const msg = m orelse break;
-            any = true;
-            var line = LogLine{
-                .level = msg.level,
-                .timestamp = msg.timestamp,
-                .message_len = msg.message_len,
-            };
-            @memcpy(line.message[0..msg.message_len], msg.message[0..msg.message_len]);
-            self.log_buffer.push(line);
-            const text = line.format(&fmt_buf);
-            _ = out.writeAll(text) catch {};
-        }
-        if (any) out.flush() catch {};
-    }
-
+    /// Console thread entry: owns the ZigZag Program (terminal init, input,
+    /// diff rendering, restore-on-return). All other threads keep logging
+    /// into the queue while this runs.
     pub fn run(self: *Console) !void {
-        if (comptime is_windows) {
-            return self.runWindows();
-        } else {
-            return self.runPosix();
-        }
-    }
-
-    /// TTY probe + fullscreen raw mode (POSIX only; Windows never calls
-    /// this, so the termios/poll/ioctl references below are never analyzed
-    /// there).
-    fn runPosix(self: *Console) !void {
-        const stdin_fd: std.posix.fd_t = 0;
-        // TTY? If stdin has no termios, fall back to plain line mode.
-        const orig = std.posix.tcgetattr(stdin_fd) catch {
-            return self.runPlain();
-        };
-        // Also require stdout to be a terminal for fullscreen.
-        _ = std.posix.tcgetattr(1) catch {
-            return self.runPlain();
-        };
-        return self.runTty(orig);
-    }
-
-    /// Piped / redirected stdin: blocking line reads, plain log output.
-    /// Never touches cursor addressing, so `echo help | server` works and
-    /// `stop` still shuts the server down.
-    fn runPlain(self: *Console) !void {
-        self.tty_mode = false;
         const io = self.io orelse return error.InvalidState;
-        var stdin = std.Io.File.stdin();
-        var line_buf: [MAX_INPUT_LEN]u8 = undefined;
-        var reader = stdin.reader(io, &line_buf);
-        const rin = &reader.interface;
-        var cmd_buf: [MAX_INPUT_LEN]u8 = undefined;
-        var cmd_len: usize = 0;
-
-        self.flushPlain();
-        while (self.running) {
-            self.flushPlain();
-            const b = std.Io.Reader.takeByte(@constCast(rin)) catch break;
-            if (b == '\n') {
-                if (cmd_len > 0) {
-                    const cmd = cmd_buf[0..cmd_len];
-                    cmd_len = 0;
-                    self.history.push(self.allocator, cmd) catch {};
-                    // Echo first so it prints before the command's output.
-                    self.logf(.info, "{s}{s}", .{ self.prompt, cmd });
-                    if (self.input_callback) |cb| cb(self, cmd);
-                    self.flushPlain();
-                    if (!self.running) break;
-                }
-            } else if (b == '\r') {
-                continue;
-            } else if (cmd_len < MAX_INPUT_LEN and b >= 0x20 and b < 0x7f) {
-                cmd_buf[cmd_len] = b;
-                cmd_len += 1;
-            }
-        }
-        self.flushPlain();
-    }
-
-    /// Interactive fullscreen console for Windows (Win32 Console API).
-    /// Same layout as runTty: logs + status + a dedicated bottom input row
-    /// (drawFull), so log spam never interleaves with the half-typed command
-    /// the way it does in inline (cooked) mode. Falls back to runPlain when
-    /// stdin/stdout are redirected (e.g. `echo help | server`).
-    fn runWindows(self: *Console) !void {
-        if (comptime !is_windows) return error.Unsupported;
-        const in_h = GetStdHandle(WIN_STD_INPUT_HANDLE) orelse return self.runPlain();
-        const out_h = GetStdHandle(WIN_STD_OUTPUT_HANDLE) orelse return self.runPlain();
-        if (in_h == windows.INVALID_HANDLE_VALUE or out_h == windows.INVALID_HANDLE_VALUE) {
-            return self.runPlain();
-        }
-        var orig_in: WinDWORD = 0;
-        var orig_out: WinDWORD = 0;
-        if (GetConsoleMode(in_h, &orig_in) == .FALSE) return self.runPlain();
-        if (GetConsoleMode(out_h, &orig_out) == .FALSE) return self.runPlain();
-        _ = self.io orelse return error.InvalidState;
-
-        // Raw character mode, no line echo (we render the input row
-        // ourselves); window-resize events on. No QuickEdit (it freezes
-        // output while text is selected). VT processing on output so the
-        // same ANSI drawFull works as on POSIX.
-        const new_in: WinDWORD = WIN_ENABLE_WINDOW_INPUT | WIN_ENABLE_EXTENDED_FLAGS;
-        const new_out: WinDWORD = orig_out | WIN_ENABLE_PROCESSED_OUTPUT | WIN_ENABLE_WRAP_AT_EOL_OUTPUT | WIN_ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-        if (SetConsoleMode(in_h, new_in) == .FALSE) return self.runPlain();
-        if (SetConsoleMode(out_h, new_out) == .FALSE) {
-            _ = SetConsoleMode(in_h, orig_in);
-            return self.runPlain();
-        }
-        // Remember for restoreTerminal(): stop exits the process directly
-        // and would otherwise skip the defer below.
-        winNoteModes(in_h, out_h, orig_in, orig_out);
-        defer winRestoreModes();
-
-        self.tty_mode = true;
-        self.term_size.refresh();
-        self.clearScreen();
-        _ = self.drainQueue();
-        self.drawFull();
-
-        var esc_state: u8 = 0; // 0 normal, 1 got ESC, 2 got ESC[, 3 got ESC[<digit>
-        var esc_param: u8 = 0;
-        var records: [64]WinInputRecord = undefined;
-
-        while (self.running) {
-            if (self.drainQueue()) self.drawFull();
-
-            const wait = WaitForSingleObject(in_h, 50);
-            if (wait == 0xFFFFFFFF) break; // WAIT_FAILED
-            if (wait == WIN_WAIT_TIMEOUT) continue;
-            if (wait != WIN_WAIT_OBJECT_0) continue;
-
-            var n_events: WinDWORD = 0;
-            if (GetNumberOfConsoleInputEvents(in_h, &n_events) == .FALSE) continue;
-            if (n_events == 0) continue;
-
-            var dirty = false;
-            var remaining: WinDWORD = n_events;
-            while (remaining > 0) {
-                const chunk: WinDWORD = @min(remaining, @as(WinDWORD, @intCast(records.len)));
-                var n_read: WinDWORD = 0;
-                if (ReadConsoleInputW(in_h, records[0..].ptr, chunk, &n_read) == .FALSE) break;
-                if (n_read == 0) break;
-                remaining -= n_read;
-                for (records[0..@as(usize, n_read)]) |rec| {
-                    if (rec.EventType == WIN_KEY_EVENT) {
-                        const key = rec.KeyEvent;
-                        if (key.bKeyDown == .FALSE) continue;
-                        // Alt-modified keys: ignore (avoids AltGr garbage in commands).
-                        if ((key.dwControlKeyState & (WIN_LEFT_ALT_PRESSED | WIN_RIGHT_ALT_PRESSED)) != 0) continue;
-                        if (key.UnicodeChar != 0) {
-                            const wc: u32 = key.UnicodeChar;
-                            if (wc < 0x80) {
-                                const b: u8 = @intCast(wc);
-                                const reps: usize = @min(@as(usize, key.wRepeatCount), 64);
-                                var r: usize = 0;
-                                while (r < reps) : (r += 1) {
-                                    if (self.handleRawByte(b, &esc_state, &esc_param)) dirty = true;
-                                    if (!self.running) break;
-                                }
-                            }
-                            // Non-ASCII input has no command use; drop.
-                        } else {
-                            // Special key without a char: translate to the same
-                            // ESC sequences handleRawByte already understands.
-                            const seq: ?[]const u8 = switch (key.wVirtualKeyCode) {
-                                WIN_VK_UP => "\x1b[A",
-                                WIN_VK_DOWN => "\x1b[B",
-                                WIN_VK_RIGHT => "\x1b[C",
-                                WIN_VK_LEFT => "\x1b[D",
-                                WIN_VK_HOME => "\x1b[H",
-                                WIN_VK_END => "\x1b[F",
-                                WIN_VK_DELETE => "\x1b[3~",
-                                WIN_VK_PRIOR => "\x1b[5~",
-                                WIN_VK_NEXT => "\x1b[6~",
-                                else => null,
-                            };
-                            if (seq) |s| {
-                                const reps: usize = @min(@as(usize, key.wRepeatCount), 64);
-                                var r: usize = 0;
-                                while (r < reps) : (r += 1) {
-                                    for (s) |b| {
-                                        if (self.handleRawByte(b, &esc_state, &esc_param)) dirty = true;
-                                        if (!self.running) break;
-                                    }
-                                    if (!self.running) break;
-                                }
-                            }
-                        }
-                    } else if (rec.EventType == WIN_WINDOW_BUFFER_SIZE_EVENT) {
-                        self.term_size.refresh();
-                        dirty = true;
-                    }
-                    if (!self.running) break;
-                }
-                if (!self.running) break;
-            }
-            // Command callbacks queue their replies; show them immediately.
-            if (self.drainQueue()) dirty = true;
-            if (dirty) self.drawFull();
-        }
-    }
-
-    /// Interactive fullscreen console with raw line editing.
-    fn runTty(self: *Console, orig: std.posix.termios) !void {
-        const stdin_fd: std.posix.fd_t = 0;
-        var raw = orig;
-        raw.lflag.ICANON = false;
-        raw.lflag.ECHO = false;
-        raw.lflag.ECHONL = false;
-        raw.lflag.ISIG = false;
-        raw.lflag.IEXTEN = false;
-        raw.iflag.IXON = false;
-        raw.iflag.ICRNL = false;
-        raw.iflag.BRKINT = false;
-        raw.iflag.INPCK = false;
-        raw.iflag.ISTRIP = false;
-        raw.oflag.OPOST = true;
-        raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
-        raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
-        // NOTE: .DRAIN, not .FLUSH: FLUSH would discard input bytes that
-        // arrived during startup (e.g. a piped "help\n"), eating commands.
-        std.posix.tcsetattr(stdin_fd, .DRAIN, raw) catch {
-            return self.runPlain();
-        };
-        defer std.posix.tcsetattr(stdin_fd, .DRAIN, orig) catch {};
-        self.tty_mode = true;
-        // Remember for restoreTerminal(): stop exits the process directly
-        // and would otherwise skip the defer above, leaving the shell
-        // without echo.
-        noteRawMode(orig);
-
-        self.term_size.refresh();
-        self.clearScreen();
-        _ = self.drainQueue();
-        self.drawFull();
-
-        var poll_fds: [1]std.posix.pollfd = undefined;
-        poll_fds[0] = .{ .fd = stdin_fd, .events = std.posix.POLL.IN, .revents = 0 };
-        var read_buf: [64]u8 = undefined;
-        var esc_state: u8 = 0; // 0 normal, 1 got ESC, 2 got ESC[, 3 got ESC[<digit>
-        var esc_param: u8 = 0;
-        var input_closed = false;
-
-        while (self.running) {
-            if (self.drainQueue()) self.drawFull();
-
-            const nready = std.posix.poll(&poll_fds, 50) catch break;
-            if (nready == 0) continue;
-            const re = poll_fds[0].revents;
-            if ((re & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0) {
-                input_closed = true;
-            }
-            if ((re & std.posix.POLL.IN) == 0) {
-                if (input_closed) {
-                    // No more input will ever arrive; keep serving logs.
-                    var idle: u32 = 0;
-                    while (self.running and idle < 20) {
-                        if (self.drainQueue()) {
-                            self.drawFull();
-                            idle = 0;
-                        } else {
-                            idle += 1;
-                        }
-                        _ = std.posix.poll(&poll_fds, 50) catch break;
-                    }
-                    if (!self.running) break;
-                    // Stay alive for logs but don't spin forever in tests:
-                    // keep draining at 1Hz until stopped externally.
-                    while (self.running) {
-                        if (self.drainQueue()) self.drawFull();
-                        _ = std.posix.poll(&poll_fds, 1000) catch break;
-                    }
-                    break;
-                }
-                continue;
-            }
-
-            const n = std.posix.read(stdin_fd, &read_buf) catch |err| switch (err) {
-                error.WouldBlock => continue,
-                else => break,
-            };
-            if (n == 0) {
-                input_closed = true;
-                continue;
-            }
-            var dirty = false;
-            for (read_buf[0..n]) |b| {
-                if (self.handleRawByte(b, &esc_state, &esc_param)) dirty = true;
-                if (!self.running) break;
-            }
-            // Command callbacks queue their replies; show them immediately.
-            if (self.drainQueue()) dirty = true;
-            if (dirty) self.drawFull();
-        }
-    }
-
-    /// Returns true if the display needs a redraw. Handles one raw byte.
-    /// esc/esc_param carry ESC-sequence state across calls.
-    fn handleRawByte(self: *Console, b: u8, esc: *u8, esc_param: *u8) bool {
-        // Inside an escape sequence.
-        if (esc.* == 1) {
-            if (b == '[') {
-                esc.* = 2;
-            } else {
-                esc.* = 0;
-            }
-            return false;
-        }
-        if (esc.* == 2) {
-            switch (b) {
-                'A' => { // Up: history older (or scroll if pinned up?)
-                    esc.* = 0;
-                    if (self.scroll_offset > 0) {
-                        self.scroll_offset += 1;
-                    } else if (self.history.count > 0) {
-                        const next = (self.input.history_index orelse MAX_HISTORY) + 1;
-                        // next==MAX_HISTORY sentinel means "before newest"
-                        const idx = if (self.input.history_index == null) @as(usize, 0) else next;
-                        if (idx < self.history.count) {
-                            self.input.history_index = idx;
-                            if (self.history.get(idx)) |h| self.input.setText(h);
-                        }
-                    }
-                    return true;
-                },
-                'B' => { // Down
-                    esc.* = 0;
-                    if (self.scroll_offset > 0) {
-                        self.scroll_offset -= 1;
-                        return true;
-                    }
-                    if (self.input.history_index) |idx| {
-                        if (idx == 0) {
-                            self.input.history_index = null;
-                            self.input.clear();
-                        } else {
-                            self.input.history_index = idx - 1;
-                            if (self.history.get(idx - 1)) |h| self.input.setText(h);
-                        }
-                        return true;
-                    }
-                    return false;
-                },
-                'C' => { // Right
-                    esc.* = 0;
-                    if (self.input.cursor < self.input.len) {
-                        self.input.cursor += 1;
-                        return true;
-                    }
-                    return false;
-                },
-                'D' => { // Left
-                    esc.* = 0;
-                    if (self.input.cursor > 0) {
-                        self.input.cursor -= 1;
-                        return true;
-                    }
-                    return false;
-                },
-                'H' => {
-                    esc.* = 0;
-                    self.input.cursor = 0;
-                    return true;
-                },
-                'F' => {
-                    esc.* = 0;
-                    self.input.cursor = self.input.len;
-                    return true;
-                },
-                '3', '5', '6', '1', '4', '7', '8' => {
-                    esc_param.* = b;
-                    esc.* = 3;
-                    return false;
-                },
-                else => {
-                    esc.* = 0;
-                    return false;
-                },
-            }
-        }
-        if (esc.* == 3) {
-            esc.* = 0;
-            if (b != '~') return false;
-            switch (esc_param.*) {
-                '3' => {
-                    self.input.deleteAtCursor();
-                    return true;
-                },
-                '5' => { // PgUp
-                    const page = if (self.term_size.rows > 3) self.term_size.rows - 3 else 10;
-                    self.scroll_offset = @min(self.scroll_offset + page, self.log_buffer.count);
-                    return true;
-                },
-                '6' => { // PgDn
-                    const page = if (self.term_size.rows > 3) self.term_size.rows - 3 else 10;
-                    if (self.scroll_offset >= page) self.scroll_offset -= page else self.scroll_offset = 0;
-                    return true;
-                },
-                '1', '7' => {
-                    self.input.cursor = 0;
-                    return true;
-                },
-                '4', '8' => {
-                    self.input.cursor = self.input.len;
-                    return true;
-                },
-                else => return false,
-            }
-        }
-
-        // Normal byte.
-        switch (b) {
-            0x1b => {
-                esc.* = 1;
-                return false;
-            },
-            '\r', '\n' => {
-                const cmd = self.input.getLine();
-                if (cmd.len == 0) {
-                    // Empty enter: snap back to live tail.
-                    if (self.scroll_offset != 0) {
-                        self.scroll_offset = 0;
-                        return true;
-                    }
-                    return false;
-                }
-                var echo: [MAX_INPUT_LEN]u8 = undefined;
-                const n = @min(cmd.len, echo.len);
-                @memcpy(echo[0..n], cmd[0..n]);
-                self.history.push(self.allocator, echo[0..n]) catch {};
-                self.input.clear();
-                self.scroll_offset = 0;
-                // Echo before running so it renders above the output.
-                self.logf(.info, "{s}{s}", .{ self.prompt, echo[0..n] });
-                if (self.input_callback) |cb| cb(self, echo[0..n]);
-                return true;
-            },
-            0x03 => { // Ctrl-C: graceful stop
-                self.input.clear();
-                if (self.input_callback) |cb| cb(self, "stop");
-                self.log(.info, "]^C (stop)");
-                return true;
-            },
-            0x04 => { // Ctrl-D: stop when line empty
-                if (self.input.len == 0) {
-                    if (self.input_callback) |cb| cb(self, "stop");
-                    self.log(.info, "]^D (stop)");
-                    return true;
-                }
-                return false;
-            },
-            0x01 => { // Ctrl-A
-                self.input.cursor = 0;
-                return true;
-            },
-            0x05 => { // Ctrl-E
-                self.input.cursor = self.input.len;
-                return true;
-            },
-            0x0b => { // Ctrl-K
-                self.input.killToEnd();
-                return true;
-            },
-            0x15 => { // Ctrl-U
-                self.input.killLine();
-                return true;
-            },
-            0x17 => { // Ctrl-W
-                self.input.killWordBackward();
-                return true;
-            },
-            0x0c => { // Ctrl-L
-                return true; // full redraw
-            },
-            0x7f, 0x08 => { // Backspace/DEL
-                self.input.backspace();
-                return true;
-            },
-            0x09 => return false, // Tab (completion TODO)
-            else => {
-                if (b >= 0x20 and b < 0x7f) {
-                    // Any edit snaps back to live tail.
-                    self.scroll_offset = 0;
-                    self.input.insertByte(b);
-                    return true;
-                }
-                return false;
-            },
-        }
+        const env = self.environ_map orelse return error.InvalidState;
+        var program = zz.Program(TuiModel).initWithModel(self.allocator, io, env, .{
+            .console = self,
+        }, .{
+            .title = "Asteorite",
+            .alt_screen = true,
+            .fps = 30,
+        });
+        defer program.deinit();
+        try program.run();
     }
 };
+
+/// Map std.log levels onto RichLog levels.
+fn mapLevel(l: Level) zz.RichLogLevel {
+    return switch (l) {
+        .debug => .debug,
+        .info => .info,
+        .warn => .warn,
+        .err => .err,
+    };
+}
+
+/// ZigZag application model. Owned by the Program on the console thread.
+/// `console` is pre-set by `initWithModel`; everything else is built in
+/// `init` from the persistent allocator and torn down in `deinit`.
+const TuiModel = struct {
+    console: *Console,
+    log: zz.RichLog = undefined,
+    input: zz.TextInput = undefined,
+    tabs: zz.TabGroup = undefined,
+    status_bar: zz.StatusBar = undefined,
+    history_nav: ?usize = null,
+    log_count: usize = 0,
+    /// Set when a stop arrives mid-frame: one more tick renders the goodbye
+    /// line before `.quit` unwinds the Program (terminal restored by deinit).
+    quit_armed: bool = false,
+
+    pub const Msg = union(enum) {
+        key: zz.KeyEvent,
+        tick: zz.msg.Tick,
+    };
+
+    pub fn init(self: *TuiModel, ctx: *zz.Context) !zz.Cmd(Msg) {
+        const p = ctx.persistent_allocator;
+        self.log = zz.RichLog.init(p, MAX_LOG_LINES);
+        self.log.show_timestamps = true;
+        errdefer self.log.deinit();
+        self.input = zz.TextInput.init(p);
+        self.input.setPrompt("> ");
+        self.input.setPlaceholder("command…  Tab completes  F1/F2/F3 tabs  PgUp/PgDn scrolls");
+        self.input.setCharLimit(MAX_INPUT_LEN);
+        self.input.setSuggestions(suggestions);
+        errdefer self.input.deinit();
+        self.tabs = zz.TabGroup.init(p);
+        // Render-only strip: we switch tabs on F-keys explicitly so number
+        // keys stay command text (number_shortcuts would eat 1/2/3 while
+        // typing) and Tab stays completion.
+        self.tabs.focused = false;
+        self.tabs.number_shortcuts = false;
+        self.tabs.show_numbers = true;
+        errdefer self.tabs.deinit();
+        _ = try self.tabs.addTab(.{ .id = "logs", .title = "Logs" });
+        _ = try self.tabs.addTab(.{ .id = "status", .title = "Status" });
+        _ = try self.tabs.addTab(.{ .id = "help", .title = "Help" });
+        _ = self.tabs.setActive(0, .init);
+        self.status_bar = zz.StatusBar.init(p);
+        errdefer self.status_bar.deinit();
+        self.status_bar.setSeparator(" · ");
+        self.history_nav = null;
+        self.log_count = 0;
+        // Drain anything queued during boot before the first frame.
+        self.drainQueue(ctx);
+        return zz.Cmd(Msg).tickMs(50);
+    }
+
+    pub fn deinit(self: *TuiModel) void {
+        self.status_bar.deinit();
+        self.tabs.deinit();
+        self.input.deinit();
+        self.log.deinit();
+    }
+
+    /// Move every queued message into the RichLog. TUI thread only.
+    fn drainQueue(self: *TuiModel, ctx: *zz.Context) void {
+        const c = self.console;
+        while (true) {
+            while (!std.atomic.Mutex.tryLock(&c.q_lock)) std.atomic.spinLoopHint();
+            const m = c.log_queue.pop();
+            std.atomic.Mutex.unlock(&c.q_lock);
+            const msg = m orelse break;
+            const lvl = mapLevel(msg.level);
+            self.log.append(ctx.io, lvl, msg.message[0..msg.message_len]) catch {
+                // OOM in the log view must never kill the console: drop.
+                continue;
+            };
+            self.log_count += 1;
+        }
+    }
+
+    /// Submit one input line: history + echo + server dispatch.
+    fn submitLine(self: *TuiModel, raw: []const u8) void {
+        const c = self.console;
+        if (raw.len == 0) {
+            self.log.scrollToEnd();
+            return;
+        }
+        var echo: [MAX_INPUT_LEN + 4]u8 = undefined;
+        const n = @min(raw.len, MAX_INPUT_LEN);
+        @memcpy(echo[0..n], raw[0..n]);
+        const line = echo[0..n];
+        c.history.push(c.allocator, line) catch {};
+        self.history_nav = null;
+        self.input.setValue("") catch {};
+        self.log.appendFmt(c.io orelse return, .info, "{s}{s}", .{ c.prompt, line }) catch {};
+        if (c.input_callback) |cb| cb(c, line);
+    }
+
+    pub fn update(self: *TuiModel, msg: Msg, ctx: *zz.Context) !zz.Cmd(Msg) {
+        // A stop issued anywhere (console command, RCON path flag) quits
+        // the Program: deinit restores the terminal, then the thread
+        // wrapper exits the process. The first stop sighting arms one
+        // final tick so the goodbye line renders; the second quits.
+        if (!self.console.running) {
+            self.drainQueue(ctx);
+            if (self.quit_armed) return .quit;
+            self.quit_armed = true;
+            return zz.Cmd(Msg).tickMs(50);
+        }
+        switch (msg) {
+            .tick => {
+                self.drainQueue(ctx);
+                if (!self.console.running) return .quit;
+                return zz.Cmd(Msg).tickMs(50);
+            },
+            .key => |k| {
+                // F-keys switch tabs (never Tab/numbers — those belong to
+                // completion and command text).
+                if (!k.modifiers.any()) {
+                    switch (k.key) {
+                        .f1 => {
+                            _ = self.tabs.setActive(0, .set_active);
+                            return zz.Cmd(Msg).tickMs(50);
+                        },
+                        .f2 => {
+                            _ = self.tabs.setActive(1, .set_active);
+                            return zz.Cmd(Msg).tickMs(50);
+                        },
+                        .f3 => {
+                            _ = self.tabs.setActive(2, .set_active);
+                            return zz.Cmd(Msg).tickMs(50);
+                        },
+                        else => {},
+                    }
+                }
+                // Ctrl-C always means stop (even mid-line); Ctrl-D stops on
+                // an empty line. Matches the old console exactly.
+                if (k.modifiers.ctrl) {
+                    switch (k.key) {
+                        .char => |ch| switch (ch) {
+                            'c' => {
+                                self.submitLine("stop");
+                                if (!self.console.running) return .quit;
+                                return zz.Cmd(Msg).tickMs(50);
+                            },
+                            'd' => {
+                                if (self.input.getValue().len == 0) {
+                                    self.submitLine("stop");
+                                    if (!self.console.running) return .quit;
+                                }
+                                return zz.Cmd(Msg).tickMs(50);
+                            },
+                            else => {},
+                        },
+                        else => {},
+                    }
+                }
+                switch (k.key) {
+                    .enter => {
+                        var cmd_buf: [MAX_INPUT_LEN]u8 = undefined;
+                        const v = self.input.getValue();
+                        const n = @min(v.len, cmd_buf.len);
+                        @memcpy(cmd_buf[0..n], v[0..n]);
+                        self.submitLine(cmd_buf[0..n]);
+                        self.drainQueue(ctx);
+                        if (!self.console.running) return .quit;
+                        return zz.Cmd(Msg).tickMs(50);
+                    },
+                    .up => {
+                        // History older (no log-scroll hijack: Up is history).
+                        const count = self.console.history.count;
+                        if (count > 0) {
+                            const next = if (self.history_nav) |i| @min(i + 1, count - 1) else @as(usize, 0);
+                            self.history_nav = next;
+                            if (self.console.history.get(next)) |h| {
+                                self.input.setValue(h) catch {};
+                            }
+                        }
+                        return zz.Cmd(Msg).tickMs(50);
+                    },
+                    .down => {
+                        if (self.history_nav) |i| {
+                            if (i == 0) {
+                                self.history_nav = null;
+                                self.input.setValue("") catch {};
+                            } else {
+                                self.history_nav = i - 1;
+                                if (self.console.history.get(i - 1)) |h| {
+                                    self.input.setValue(h) catch {};
+                                }
+                            }
+                        }
+                        return zz.Cmd(Msg).tickMs(50);
+                    },
+                    .page_up => {
+                        self.log.scrollUp(self.log.height);
+                        return zz.Cmd(Msg).tickMs(50);
+                    },
+                    .page_down => {
+                        try self.log.scrollDown(self.log.height);
+                        return zz.Cmd(Msg).tickMs(50);
+                    },
+                    .home => {
+                        self.log.scrollToStart();
+                        return zz.Cmd(Msg).tickMs(50);
+                    },
+                    .end => {
+                        self.log.scrollToEnd();
+                        return zz.Cmd(Msg).tickMs(50);
+                    },
+                    else => {},
+                }
+                // Any edit snaps back to the live tail (same as the old
+                // console: typing while scrolled up follows new output).
+                const before = self.input.getValue().len;
+                self.input.handleKey(k);
+                if (self.input.getValue().len != before) self.log.scrollToEnd();
+                return zz.Cmd(Msg).tickMs(50);
+            },
+        }
+    }
+
+    pub fn view(self: *const TuiModel, ctx: *const zz.Context) ![]const u8 {
+        const w: usize = @max(ctx.width, 20);
+        const h: usize = @max(ctx.height, 6);
+        const body_h: usize = @max(h -| 4, 1);
+
+        // Header: title + boot status string.
+        var title_style = zz.Style{};
+        title_style = title_style.bold(true);
+        title_style = title_style.fg(zz.Color.cyan);
+        title_style = title_style.inline_style(true);
+        const title = try title_style.render(ctx.allocator, "▚ Asteorite 1.7.10");
+        var dim_style = zz.Style{};
+        dim_style = dim_style.fg(zz.Color.gray(12));
+        dim_style = dim_style.inline_style(true);
+        const status_raw = self.console.statusText();
+        const status_trim: []const u8 = if (status_raw.len > 0) status_raw else "operator console";
+        const status = try dim_style.render(ctx.allocator, status_trim);
+        const header = try zz.joinHorizontal(ctx.allocator, &.{ title, "  ", status });
+
+        // Tab strip (render-only; switching is F-key driven).
+        const strip = try self.tabs.view(ctx.allocator);
+
+        // Body panel.
+        const active = self.tabs.activeIndex() orelse 0;
+        const body: []const u8 = switch (active) {
+            1 => try self.statusPanel(ctx, w),
+            2 => try helpPanel(ctx),
+            else => blk: {
+                @constCast(&self.log).setSize(@intCast(@min(w, 0xffff)), @intCast(@min(body_h, 0xffff)));
+                break :blk try self.log.view(ctx.allocator);
+            },
+        };
+        const padded_body = try padToHeight(ctx.allocator, body, body_h);
+
+        // Status bar: log count + follow state + key hints.
+        var foot_style = zz.Style{};
+        foot_style = foot_style.fg(zz.Color.gray(12));
+        foot_style = foot_style.inline_style(true);
+        const follow: []const u8 = "follow";
+        const foot_text = try std.fmt.allocPrint(ctx.allocator, "logs {d} · {s} · F1 Logs F2 Status F3 Help · PgUp/PgDn scroll · Enter run", .{ self.log_count, follow });
+        const foot = try foot_style.render(ctx.allocator, foot_text);
+
+        // Input row.
+        @constCast(&self.input).setWidth(@intCast(@min(w, 0xffff)));
+        const input_row = try self.input.view(ctx.allocator);
+
+        return try zz.joinVertical(ctx.allocator, &.{ header, strip, padded_body, foot, input_row });
+    }
+
+    /// Status tab: boot status string + what the console offers.
+    fn statusPanel(self: *const TuiModel, ctx: *const zz.Context, w: usize) ![]const u8 {
+        var box_style = zz.Style{};
+        box_style = box_style.borderAll(zz.Border.rounded);
+        box_style = box_style.borderForeground(zz.Color.cyan);
+        box_style = box_style.paddingAll(1);
+        box_style = box_style.width(@min(w -| 2, 72));
+        var head_style = zz.Style{};
+        head_style = head_style.bold(true);
+        head_style = head_style.fg(zz.Color.cyan);
+        head_style = head_style.inline_style(true);
+        const head = try head_style.render(ctx.allocator, "Server status");
+        const status_raw = self.console.statusText();
+        const status_line: []const u8 = if (status_raw.len > 0) status_raw else "(no status set yet)";
+        const content = try std.fmt.allocPrint(ctx.allocator, "{s}\n\n{s}\n\nType a command below and press Enter.\nF1 returns to the log view.", .{ head, status_line });
+        const boxed = try box_style.render(ctx.allocator, content);
+        return boxed;
+    }
+};
+
+/// Static help tab: every key the console understands.
+fn helpPanel(ctx: *const zz.Context) ![]const u8 {
+    var box_style = zz.Style{};
+    box_style = box_style.borderAll(zz.Border.rounded);
+    box_style = box_style.borderForeground(zz.Color.green);
+    box_style = box_style.paddingAll(1);
+    box_style = box_style.width(62);
+    var head_style = zz.Style{};
+    head_style = head_style.bold(true);
+    head_style = head_style.fg(zz.Color.green);
+    head_style = head_style.inline_style(true);
+    const head = try head_style.render(ctx.allocator, "Console keys");
+    const content = try std.fmt.allocPrint(ctx.allocator,
+        \\{s}
+        \\
+        \\  Enter        run command line
+        \\  Up / Down    command history
+        \\  Tab          accept suggestion
+        \\  PgUp / PgDn  scroll log (Home/End jump)
+        \\  F1 / F2 / F3  Logs / Status / Help tabs
+        \\  Ctrl-C       stop the server (even mid-line)
+        \\  Ctrl-D       stop when the line is empty
+        \\
+        \\Commands run with full console authority: try help, list,
+        \\status, save-all, stop. Log lines keep their level colors;
+        \\errors render red, warnings yellow.
+    , .{head});
+    return try box_style.render(ctx.allocator, content);
+}
+
+/// Pad a (possibly short) panel with blank rows so the status bar and the
+/// input row pin to the bottom of the terminal.
+fn padToHeight(allocator: std.mem.Allocator, body: []const u8, want: usize) ![]const u8 {
+    const have = zz.height(body);
+    if (have >= want) return body;
+    var parts: [64][]const u8 = undefined;
+    var n: usize = 0;
+    parts[n] = body;
+    n += 1;
+    var i: usize = have;
+    while (i < want and n < parts.len) : (i += 1) {
+        parts[n] = "";
+        n += 1;
+    }
+    return try zz.joinVertical(allocator, parts[0..n]);
+}
 
 /// Global console for std.log integration.
 var global_console: ?*Console = null;
@@ -1127,34 +644,19 @@ pub fn getGlobal() ?*Console {
     return global_console;
 }
 
-/// Termios saved when raw mode is enabled. Kept in a global (not on the
-/// Console struct) so ANY stop path — console, RCON, in-game — can restore
-/// the terminal even though std.process.exit() skips defers.
+/// Restore the terminal from ANY stop path (console/RCON/in-game/signal),
+/// even though `std.process.exit()` skips the Program's restore defer.
+/// Restores termios first (ZigZag runs stdin raw: ECHO/ICANON/ISIG off —
+/// escape sequences alone can't bring echo back, which is what stranded
+/// shells), then emits the leave-alternate-screen / show-cursor /
+/// leave-bracketed-paste sequences directly: safe from any thread,
+/// idempotent, and a no-op when output is not a terminal.
 var saved_termios: ?std.posix.termios = null;
 
-pub fn noteRawMode(orig: std.posix.termios) void {
-    saved_termios = orig;
-}
-
-/// Restore the terminal if we put it in raw mode. Idempotent and safe to
-/// call from any thread right before process.exit(). Also emits a newline
-/// so the shell prompt lands on a fresh line.
 pub fn restoreTerminal() void {
-    if (comptime have_tty) {
-        if (saved_termios) |orig| {
-            saved_termios = null;
-            std.posix.tcsetattr(0, .DRAIN, orig) catch {};
-            // Fresh line so the shell prompt doesn't sit on the status row
-            // (stderr: unbuffered and always a terminal here).
-            std.debug.print("\n", .{});
-        }
-    }
-    if (comptime is_windows) {
-        if (saved_win_in_mode != null or saved_win_out_mode != null) {
-            winRestoreModes();
-            std.debug.print("\n", .{});
-        }
-    }
+    if (saved_termios) |t| std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, t) catch {};
+    const seq = "\u{1b}[?2004l\u{1b}[?1049l\u{1b}[?25h\n";
+    std.debug.print("{s}", .{seq});
 }
 
 /// std.log hook: queue the message for the console thread. Never blocks
@@ -1176,57 +678,38 @@ pub fn logFn(
     cptr.logf(level, "{s}", .{msg});
 }
 
-/// HH:MM:SS into the caller's 8-byte buffer.
-fn formatTimestamp(ts: i64, buf: []u8) []const u8 {
-    const secs_per_day: i64 = 86400;
-    const day_secs = @mod(ts, secs_per_day);
-    const hour = @as(u8, @intCast(@divTrunc(day_secs, 3600)));
-    const minute = @as(u8, @intCast(@divTrunc(@mod(day_secs, 3600), 60)));
-    const second = @as(u8, @intCast(@mod(day_secs, 60)));
-    buf[0] = '0' + (hour / 10);
-    buf[1] = '0' + (hour % 10);
-    buf[2] = ':';
-    buf[3] = '0' + (minute / 10);
-    buf[4] = '0' + (minute % 10);
-    buf[5] = ':';
-    buf[6] = '0' + (second / 10);
-    buf[7] = '0' + (second % 10);
-    return buf[0..8];
+test "log queue: push/pop round-trips, full drops" {
+    var q = LogQueue{};
+    try std.testing.expect(q.isEmpty());
+    try std.testing.expect(q.push(.info, 0, "hello"));
+    try std.testing.expect(!q.isEmpty());
+    const m = q.pop().?;
+    try std.testing.expectEqualStrings("hello", m.message[0..m.message_len]);
+    try std.testing.expect(q.pop() == null);
+    // Fill to capacity: further pushes fail instead of growing.
+    for (0..MAX_LOG_QUEUE) |i| {
+        var tmp: [8]u8 = undefined;
+        const t = try std.fmt.bufPrint(&tmp, "{d}", .{i});
+        _ = q.push(.info, 0, t);
+    }
+    try std.testing.expect(!q.push(.info, 0, "overflow"));
 }
 
-fn levelToString(level: Level) []const u8 {
-    return switch (level) {
-        .debug => "DEBUG",
-        .info => "INFO",
-        .warn => "WARN",
-        .err => "ERROR",
-    };
+test "history: newest-first, consecutive dedupe" {
+    const a = std.testing.allocator;
+    var h = History{};
+    defer h.deinit(a);
+    try h.push(a, "list");
+    try h.push(a, "list");
+    try h.push(a, "stop");
+    try std.testing.expectEqual(@as(usize, 2), h.count);
+    try std.testing.expectEqualStrings("stop", h.get(0).?);
+    try std.testing.expectEqualStrings("list", h.get(1).?);
 }
 
-fn levelToColor(level: Level) []const u8 {
-    return switch (level) {
-        .debug => CSI ++ "36m",
-        .info => CSI ++ "32m",
-        .warn => CSI ++ "33m",
-        .err => CSI ++ "31m",
-    };
-}
-
-test "log line colors: tag colored, body plain, errors fully red" {
-    var info_line = LogLine{ .level = .info, .timestamp = 0, .message_len = 3 };
-    @memcpy(info_line.message[0..3], "hey");
-    var buf: [256]u8 = undefined;
-    const info_text = info_line.format(&buf);
-    // Tag colored green...
-    try std.testing.expect(std.mem.indexOf(u8, info_text, CSI ++ "32m[INFO]" ++ CSI ++ "0m") != null);
-    // ...body plain (no color code immediately before it).
-    try std.testing.expect(std.mem.indexOf(u8, info_text, CSI ++ "0m hey\n") != null);
-
-    var err_line = LogLine{ .level = .err, .timestamp = 0, .message_len = 3 };
-    @memcpy(err_line.message[0..3], "bad");
-    var ebuf: [256]u8 = undefined;
-    const err_text = err_line.format(&ebuf);
-    // Whole error line wrapped in red.
-    try std.testing.expect(std.mem.startsWith(u8, err_text, CSI ++ "31m"));
-    try std.testing.expect(std.mem.endsWith(u8, err_text, "bad" ++ CSI ++ "0m\n"));
+test "level map covers std.log levels" {
+    try std.testing.expect(mapLevel(.debug) == .debug);
+    try std.testing.expect(mapLevel(.info) == .info);
+    try std.testing.expect(mapLevel(.warn) == .warn);
+    try std.testing.expect(mapLevel(.err) == .err);
 }

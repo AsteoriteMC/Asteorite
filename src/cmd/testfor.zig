@@ -22,10 +22,8 @@ pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u
     // no command blocks here, and the player path always throws — even the
     // sender's own name. Existence is still validated first (player lookup
     // throws playerNotFound before the command-block check).
-    var target: [16]u8 = undefined;
-    _ = srv.resolvePlayerName(sender, toks[0], &target) orelse {
-        return "That player cannot be found";
-    };
+    var target: [cmd.max_name_len]u8 = undefined;
+    _ = cmd.resolveTarget(srv, sender, toks[0], &target) orelse return cmd.unknown_player;
     return "/testfor is only usable by commandblocks with analog output";
 }
 

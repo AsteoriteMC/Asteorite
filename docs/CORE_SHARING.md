@@ -107,23 +107,23 @@ version-neutral, which is why the profile seam can be small.
 
 | System | Current source | State | Label |
 |---|---|---|---|
-| Region tick loop, 20 TPS budget, load shedding | `src/sim/tick.zig` | No protocol imports; owns region scheduling and backpressure | **S** |
-| MPSC inbox, worker pool, spin/affinity, arena/slab, seqlock, entity store | `src/sim/{mpsc,pool,spin,affinity,arena,slab,seqlock,entity_store}.zig` | No protocol imports | **S** |
+| Region tick loop, 20 TPS budget, load shedding | `src/sim/core/tick.zig` | No protocol imports; owns region scheduling and backpressure | **S** |
+| MPSC inbox, worker pool, spin/affinity, arena/slab, seqlock, entity store | `src/sim/core/{mpsc,pool,spin,affinity,arena,slab,seqlock}.zig + sim/entity/entity_store.zig` | No protocol imports | **S** |
 | LSM/WAL/SST storage, sharding, io_uring read path | `src/world/{store,shard,uring_io}.zig` | No protocol imports | **S** |
 | NBT codec | `src/world/nbt.zig` | Canonical; used by storage and import | **S** |
-| Config, permissions, bans, whitelist/ops | `src/config.zig`, `src/sim/{permissions,bans}.zig`, command files | Version-neutral today | **S** |
+| Config, permissions, bans, whitelist/ops | `src/config.zig`, `src/sim/player/{permissions,bans}.zig`, command files | Version-neutral today | **S** |
 | RCON, TCP transport | `src/net/{rcon,transport}.zig` | Version-neutral | **S** |
 | Canonical item stack | `src/item.zig` | `Stack{id,count,damage,nbt}`; no wire bytes | **E** — hardcoded 45-slot/1.7 rules |
 | Canonical block/item ids | `src/ids.zig` | Dense append-only 1.7 universe; `wire` maps at the edge | **S/E** — needs 1.8/1.12 appendices |
-| Redstone/piston/hopper engine | `src/sim/redstone.zig` | Pure sim over a caller-provided world adapter; canonical ids | **E** — reference pattern |
-| Crafting, smelting, furnace, drops | `src/sim/{recipes,smelting,furnace,drops}.zig` | Pure engines; 1.7 recipe/smelting data tables now in `game/mc5/` | **E** |
+| Redstone/piston/hopper engine | `src/sim/world/redstone.zig` | Pure sim over a caller-provided world adapter; canonical ids | **E** — reference pattern |
+| Crafting, smelting, furnace, drops | `src/sim/world/{recipes,smelting,furnace,drops}.zig` | Pure engines; 1.7 recipe/smelting data tables now in `game/mc5/` | **E** |
 | Worldgen stage driver + RNG | `src/worldgen/pipeline.zig`, `src/worldgen/rng/*` | Version-neutral order/context; stages are profile data | **E** |
 | Command framework | `src/cmd/mod.zig`, `src/cmd/spec.zig` | Explicitly designed around a version-neutral `srv` backend and per-profile data | **E** |
 | Canonical chunk storage | `src/world/chunk.zig` | ZC1 canonical ids; Anvil conversion lives in `world/import/anvil.zig`; runtime module has no protocol imports | **S/E** — ZC2 schema later |
-| Player persistence | `src/sim/players.zig` | ZPLR v5 stores canonical `ids.Id`; v3/v4 wire rows decode through `world/import/player.zig` | **S** |
-| Scoreboard state | `src/sim/scoreboard.zig` | Store, validation and persistence are shared; criteria now come from `profile.game` | **S/E after C0** |
-| Chunk-view scheduling | `src/sim/view.zig` | Spiral/sent-set/hole-heal logic is shared; encoding is v5 | **E** |
-| Entity tracking/update planning | `src/sim/entity.zig` | Plan logic is shared; packet calls and raw `u8` mob kinds are v5 | **E** |
+| Player persistence | `src/sim/player/players.zig` | ZPLR v5 stores canonical `ids.Id`; v3/v4 wire rows decode through `world/import/player.zig` | **S** |
+| Scoreboard state | `src/sim/player/scoreboard.zig` | Store, validation and persistence are shared; criteria now come from `profile.game` | **S/E after C0** |
+| Chunk-view scheduling | `src/sim/world/view.zig` | Spiral/sent-set/hole-heal logic is shared; encoding is v5 | **E** |
+| Entity tracking/update planning | `src/sim/entity/entity.zig` | Plan logic is shared; packet calls and raw `u8` mob kinds are v5 | **E** |
 | Connection/server/status/main | `src/net/{conn,server,status}.zig`, `src/main.zig` | Tightly coupled to v5 packets, IDs, worldgen and `u8 y` | **P** currently |
 
 One canonical-ID leak remains: `wire.toWire` is total over a 1.7-only enum.
@@ -291,7 +291,7 @@ Current state:
 Target:
 
 ```
-src/sim/container.zig          // transaction state machine + conservation
+src/sim/world/container.zig          // transaction state machine + conservation
 src/sim/inventory.zig          // canonical player inventory view
 src/game/containers/*.zig      // per-profile layout: slots, window type, roles
 ```
@@ -347,7 +347,7 @@ elytra check, 1.12 forgot the water speed cap” classes of bug.
 
 ### 5.4 Entity tracking and metadata
 
-Current state: `src/sim/entity.zig` has shared `planUpdate`, tracking sets and
+Current state: `src/sim/entity/entity.zig` has shared `planUpdate`, tracking sets and
 viewer reconciliation, but it calls v5 packet functions directly and uses
 raw `u8` mob kinds (`MOB_PIG = 90`). Metadata is encoded inside the packet
 functions.
@@ -366,7 +366,7 @@ or “health update never reaches the client” bug gets fixed once.
 
 ### 5.5 Redstone and block behaviour
 
-`src/sim/redstone.zig` is the model to copy. It is pure, allocation-free,
+`src/sim/world/redstone.zig` is the model to copy. It is pure, allocation-free,
 canonical-ID based and uses a caller-provided world adapter with `get`/`set`/
 `pop`. It already owns the hard part: weak/strong/indirect power, scheduled
 ticks, torch burnout, repeater delays, piston rules, quasi-connectivity.
@@ -561,7 +561,7 @@ pub const PacketSink = struct {
 };
 ```
 
-This is how `sim/entity.zig` and `sim/view.zig` stop importing v5 packets.
+This is how `sim/entity/entity.zig` and `sim/world/view.zig` stop importing v5 packets.
 The profile implements the sink; the core owns “what happened”.
 
 ### 6.5 Command backend
@@ -576,9 +576,9 @@ the registry/data and the Brigadier tree encoder are profile-owned.
 - **Import gate:** `src/sim/**`, `src/world/**` and `src/cmd/**` must not
   import `src/proto/**` (except `world/import/**` and explicit profile roots).
   `zig build check-imports` enforces this with a temporary allowlist;
-  C2–C5 burn the rest down. C0 removed `sim/scoreboard.zig` and C1 removed
-  `sim/players.zig` and `world/chunk.zig`; today the list contains only
-  `sim/view.zig` and `sim/entity.zig`, both owned by C5.
+  C2–C5 burn the rest down. C0 removed `sim/player/scoreboard.zig` and C1 removed
+  `sim/player/players.zig` and `world/chunk.zig`; today the list contains only
+  `sim/world/view.zig` and `sim/entity/entity.zig`, both owned by C5.
 - **Protocol-number gate:** no `if (protocol >= N)` outside `src/proto/**`,
   `src/versions/**`, `src/version.zig` and `meta`.
 - **Canonical persistence gate:** persisted values must be canonical IDs or
@@ -596,8 +596,8 @@ profile inherits it. Use this table as the ownership map for security work.
 
 | Vulnerability class | Single owner | Invariant/test | Profile input |
 |---|---|---|---|
-| Item duplication/loss | `sim/container.zig` | Sum of stacks + cursor is conserved across every click mode; no negative/overstack; window IDs bounded | Slot layout, stack limits |
-| Cursor/window desync | `sim/container.zig` | Action sequence monotonic; full resync on mismatch; no state change on rejected click | Window IDs/layout |
+| Item duplication/loss | `sim/world/container.zig` | Sum of stacks + cursor is conserved across every click mode; no negative/overstack; window IDs bounded | Slot layout, stack limits |
+| Cursor/window desync | `sim/world/container.zig` | Action sequence monotonic; full resync on mismatch; no state change on rejected click | Window IDs/layout |
 | Reach/placement cheats | `sim/interaction.zig` | Eye-to-target distance, face validity, line of sight, world bounds, protection | Max reach, eye height, min/max Y |
 | Flight/speed/teleport | `sim/movement.zig` | Max delta per tick, ground/water state, teleport confirmation, world border | Movement constants, height |
 | Command permission bypass | `cmd` + `sim/permissions.zig` | Every command path checks node/level; selector expansion is bounded | Command registry, op levels |
@@ -607,9 +607,9 @@ profile inherits it. Use this table as the ownership map for security work.
 | World border/height escape | `world/bounds.zig` | Clamp/teleport outside border; reject Y outside profile bounds | min/max Y, border size |
 | Auth/session replay | `net/auth.zig` | Username/UUID binding, nonce/replay checks, online-mode verification | Login codec |
 | NBT/component abuse | `item` validation + profile codec | Size/depth caps, type checks, no executable data; canonical on disk | NBT/component schema |
-| Redstone lag machine | `sim/redstone.zig` + `sim/tick.zig` | Scheduled-tick budget, per-region load shedding, deterministic update cap | Component set/rules |
-| Chunk unload/ghost chunk | `sim/view.zig` | Sent-set/unload diff, per-column once, resync on dimension change | Chunk codec |
-| Teleport/vehicle desync | `sim/movement.zig` + `sim/entity.zig` | Server-authoritative position, rider/passenger consistency | Entity dimensions/metadata |
+| Redstone lag machine | `sim/world/redstone.zig` + `sim/core/tick.zig` | Scheduled-tick budget, per-region load shedding, deterministic update cap | Component set/rules |
+| Chunk unload/ghost chunk | `sim/world/view.zig` | Sent-set/unload diff, per-column once, resync on dimension change | Chunk codec |
+| Teleport/vehicle desync | `sim/movement.zig` + `sim/entity/entity.zig` | Server-authoritative position, rider/passenger consistency | Entity dimensions/metadata |
 
 ### 7.1 Fix-once workflow
 
@@ -649,9 +649,9 @@ with C0 and grows with every step.
 | C0 (done) | Add the import gate with an explicit temporary allowlist for the current leaks; add the `rules`/`game` fields to the profile contract; move `scoreboard`'s v5 `cmd_data` import behind `profile.game` | Prevents new leaks while the seam is fresh |
 | C1 (done) | Split Anvil import out of `world/chunk.zig`; fix `ZPLR` canonical IDs (v5 writer, v3/v4 wire-row reader at the import boundary) | Storage/player data become truly canonical |
 | C2 (done) | Extract `WorldView` + `BlockDef` table from redstone/server; make redstone read `RedstoneRules` | The reference engine becomes profile-data driven; 1.8 slime/1.11 observer become additive |
-| C3 (done) | Extract `sim/container.zig` from `conn.zig` + furnace/table windows; add conservation tests | Biggest exploit-centralization win; 1.9 offhand/1.14 stations become layouts |
+| C3 (done) | Extract `sim/world/container.zig` from `conn.zig` + furnace/table windows; add conservation tests | Biggest exploit-centralization win; 1.9 offhand/1.14 stations become layouts |
 | C4 (done) | Extract `sim/interaction.zig` and `sim/movement.zig` from `conn.zig`; add profile rules | Reach/placement/movement fixes apply to every profile |
-| C5 | Extract semantic entity metadata and canonical mob kinds; add `PacketSink` for entity/view | Stops `sim/entity.zig`/`sim/view.zig` importing v5 packets |
+| C5 | Extract semantic entity metadata and canonical mob kinds; add `PacketSink` for entity/view | Stops `sim/entity/entity.zig`/`sim/world/view.zig` importing v5 packets |
 | C6 | Move recipe/smelting/drops/redstone tables to `game/legacy` + `game/mc*`; generate registry tables | Makes 1.8/1.12 data additions cheap and reviewable |
 | C7 | Add `ChunkCodec` + `PacketSink` boundary for view; profile scratch/batch sizes | done |
 | C8 | Add `LightingModel` (pre-1.18/1.18+) and profile height/section rules | done |
@@ -661,9 +661,9 @@ with C0 and grows with every step.
 C0 landed with `src/version.zig`, the `mc5` profile root, the `rules`/`game`
 contract fields and `src/import_gate.zig`. C1 landed with
 `world/import/{anvil,player}.zig`, ZPLR v5 canonical slot IDs and the explicit
-v3/v4 migration map; `sim/players.zig` and `world/chunk.zig` are protocol-free.
-The gate's temporary allowlist is now the two C5 leaks: `sim/view.zig` and
-`sim/entity.zig`. C5 removes them; the gate fails on both a new violation and
+v3/v4 migration map; `sim/player/players.zig` and `world/chunk.zig` are protocol-free.
+The gate's temporary allowlist is now the two C5 leaks: `sim/world/view.zig` and
+`sim/entity/entity.zig`. C5 removes them; the gate fails on both a new violation and
 a stale allowlist entry.
 
 C2 landed with `src/sim/world_view.zig` (typed get/set/pop boundary carrying
@@ -677,7 +677,7 @@ path keeps the comptime adapter and reads `world.blocks`/`world.rules`, so no
 engine code imports a profile root. C9 covers the table anchors, rules and
 typed view dispatch.
 
-C3 landed with `src/sim/container.zig`: pickup/place/merge, quick-move, hotbar
+C3 landed with `src/sim/world/container.zig`: pickup/place/merge, quick-move, hotbar
 swap, crafting-result consumption, whole-stack insertion and furnace-output
 take. `conn.zig` window/alias routing and `server.zig` furnace click routing
 keep only packet framing and server-owned state; both call the shared
@@ -703,7 +703,7 @@ C9 is started with `src/exploit_tests.zig` and a standalone
 `zig build test-exploit -Dmc=<profile>` step (also wired into `zig build test`).
 The root deliberately references only the extracted canonical/storage/data
 modules; it does not analyze declarations from `net/server.zig`,
-`net/conn.zig`, `sim/redstone.zig` or `sim/view.zig`, so the security lane
+`net/conn.zig`, `sim/world/redstone.zig` or `sim/world/view.zig`, so the security lane
 stays runnable while those are in flux. Its current
 coverage is the profile contract and all-ID wire round-trip, ZC1 goldens and
 malformed input, NBT depth/truncation/oversized arrays, Anvil rejection, ZPLR
@@ -861,10 +861,10 @@ code. Key references (checked 2026-10-22):
 
 Code references:
 
-- `src/sim/redstone.zig` — pure engine, canonical IDs, world adapter.
-- `src/sim/tick.zig` — region tick/scheduler/load shedding, no protocol.
-- `src/sim/entity.zig` — shared tracking plan + v5 packet calls (to split).
-- `src/sim/view.zig` — shared view scheduling + v5 chunk codec (to split).
+- `src/sim/world/redstone.zig` — pure engine, canonical IDs, world adapter.
+- `src/sim/core/tick.zig` — region tick/scheduler/load shedding, no protocol.
+- `src/sim/entity/entity.zig` — shared tracking plan + v5 packet calls (to split).
+- `src/sim/world/view.zig` — shared view scheduling + v5 chunk codec (to split).
 - `src/net/conn.zig` — click/movement/reach logic currently in the packet
   edge (to extract).
 - `src/net/server.zig` — shared orchestration mixed with v5 packets/worldgen/
@@ -873,7 +873,7 @@ Code references:
 - `src/world/import/anvil.zig` — only chunk-side 1.7.10 wire-id translation.
 - `src/world/import/player.zig` — vanilla `player.dat` import and the v3/v4
   ZPLR wire-id migration map.
-- `src/sim/players.zig` — ZPLR v5 canonical rows; legacy mapping is injected.
+- `src/sim/player/players.zig` — ZPLR v5 canonical rows; legacy mapping is injected.
 - `src/cmd/mod.zig`, `src/cmd/spec.zig` — the existing version-neutral command
   pattern.
 - `docs/MULTIVERSION.md` — profile contract, ownership/import policy and

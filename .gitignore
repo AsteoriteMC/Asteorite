@@ -1,5 +1,6 @@
 .zig-cache/
 zig-out/
+zig-pkg/
 server_rsa.key
 server_rsa.der
 *.key
@@ -7,3 +8,8 @@ server_rsa.der
 tmp_rsa_gen.pem
 .serena
 __pycache__/
+.opencode/
+ops.json
+banned-players.json
+banned-ips.json
+whitelist.json

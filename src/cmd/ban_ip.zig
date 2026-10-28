@@ -43,7 +43,7 @@ pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u
     var ipb: [64]u8 = undefined;
     const ip: []const u8 = if (isIpv4(toks[0])) toks[0] else blk: {
         // Name form: only when that player is online (their live address).
-        var resolved: [16]u8 = undefined;
+        var resolved: [cmd.max_name_len]u8 = undefined;
         const t = srv.resolvePlayerName(sender, toks[0], &resolved) orelse {
             return "You have entered an invalid IP address or a player that is not online";
         };

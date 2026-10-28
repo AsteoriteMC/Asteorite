@@ -5,6 +5,7 @@
 //! (integration) and against test/harness stores (goldens). Out-of-view
 //! reads return air (matches decor `View.get`).
 
+const std = @import("std");
 const ids = @import("../../../ids.zig");
 
 pub const Block = struct {
@@ -52,7 +53,7 @@ pub const Placer = struct {
     }
 };
 
-    /// Entity kinds spawned during generation (runtime mobs, not blocks).
+/// Entity kinds spawned during generation (runtime mobs, not blocks).
 pub const SpawnKind = enum { villager, witch };
 
 /// Exact `getTopSolidOrLiquidBlock` predicate (probed live over all 171
@@ -76,8 +77,6 @@ pub fn countsForTopY(wire_id: u16) bool {
 pub fn isLiquidId(id: ids.Id) bool {
     return id == .water or id == .flowing_water or id == .lava or id == .flowing_lava;
 }
-
-const std = @import("std");
 
 test "topY predicate spot checks" {
     // No water (still or flowing) and no leaves count; snow/rails don't.

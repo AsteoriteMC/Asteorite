@@ -116,13 +116,12 @@ fn installWindows() void {
 // Entry point
 // ---------------------------------------------------------------------------
 
-var installed: bool = false;
+var installed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
-/// Install OS shutdown hooks (idempotent). Async-signal-safe handlers only
+/// Install OS shutdown hooks (idempotent, thread-safe). Async-signal-safe handlers only
 /// set the atomic flag — the ticker loop performs the actual save+exit.
 pub fn install() void {
-    if (installed) return;
-    installed = true;
+    if (installed.swap(true, .acq_rel)) return;
     if (builtin.os.tag == .windows) {
         installWindows();
     } else if (std.posix.Sigaction != void) {

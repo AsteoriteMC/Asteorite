@@ -15,14 +15,12 @@ pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u
     if (cmd.Spec.tokenize(args, &toks) > 0) return cmd.usageError(&def, out);
     // Vanilla /kill targets the sender (must be a player).
     if (sender == null) return cmd.usageError(&def, out);
-    var who: [16]u8 = undefined;
+    var who: [cmd.max_name_len]u8 = undefined;
     const name = cmd.senderName(sender, &who);
     if (name.len == 0) return cmd.usageError(&def, out);
     // Offline check without killing: resolve first for the error text.
-    var probe: [16]u8 = undefined;
-    _ = srv.resolvePlayerName(sender, name, &probe) orelse {
-        return "That player cannot be found";
-    };
+    var probe: [cmd.max_name_len]u8 = undefined;
+    _ = cmd.resolveTarget(srv, sender, name, &probe) orelse return cmd.unknown_player;
     if (!srv.killPlayer(name)) return "That player cannot be found";
     return "Ouch! That looked like it hurt";
 }

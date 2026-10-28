@@ -15,6 +15,14 @@ const biome = @import("biome.zig");
 const LCG_MUL: i64 = 6364136223846793005;
 const LCG_ADD: i64 = 1442695040888963407;
 
+/// One LCG step with additive salt (shared by every seed-mixing loop
+/// below: init x3, initWorldGenSeed x3, initChunkSeed x2/cell, nextInt).
+fn lcgStep(s: i64, salt: i64) i64 {
+    var d = s *% (s *% LCG_MUL +% LCG_ADD);
+    d +%= salt;
+    return d;
+}
+
 pub const Base = struct {
     world_gen_seed: i64,
     base_seed: i64,
@@ -23,10 +31,7 @@ pub const Base = struct {
     pub fn init(world_gen_seed_raw: i64) Base {
         var b = world_gen_seed_raw;
         var i: usize = 0;
-        while (i < 3) : (i += 1) {
-            b = b *% (b *% LCG_MUL +% LCG_ADD);
-            b +%= world_gen_seed_raw;
-        }
+        while (i < 3) : (i += 1) b = lcgStep(b, world_gen_seed_raw);
         return .{ .world_gen_seed = b, .base_seed = 0, .chunk_seed = 0 };
     }
 
@@ -34,10 +39,7 @@ pub const Base = struct {
         self.base_seed = seed;
         if (parent) |p| p.initWorldGenSeed(seed);
         var i: usize = 0;
-        while (i < 3) : (i += 1) {
-            self.base_seed = self.base_seed *% (self.base_seed *% LCG_MUL +% LCG_ADD);
-            self.base_seed +%= self.world_gen_seed;
-        }
+        while (i < 3) : (i += 1) self.base_seed = lcgStep(self.base_seed, self.world_gen_seed);
     }
 
     pub fn initChunkSeed(self: *Base, x: i32, z: i32) void {
@@ -46,10 +48,8 @@ pub const Base = struct {
         const zs: i64 = z;
         var i: usize = 0;
         while (i < 2) : (i += 1) {
-            d = d *% (d *% LCG_MUL +% LCG_ADD);
-            d +%= xs;
-            d = d *% (d *% LCG_MUL +% LCG_ADD);
-            d +%= zs;
+            d = lcgStep(d, xs);
+            d = lcgStep(d, zs);
         }
         self.chunk_seed = d;
     }
@@ -60,8 +60,7 @@ pub const Base = struct {
         std.debug.assert(n > 0);
         var r: i32 = @truncate(@rem(self.chunk_seed >> 24, @as(i64, n)));
         if (r < 0) r += n;
-        self.chunk_seed = self.chunk_seed *% (self.chunk_seed *% LCG_MUL +% LCG_ADD);
-        self.chunk_seed +%= self.base_seed;
+        self.chunk_seed = lcgStep(self.chunk_seed, self.base_seed);
         return r;
     }
 };
@@ -71,18 +70,31 @@ pub const Base = struct {
 
 pub fn areBiomesSimilar(a: i32, b: i32) bool {
     if (a == b) return true;
-    const a_mp = a == 38 or a == 39;
-    const b_mp = b == 38 or b == 39;
+    const a_mp = a == mesa_plateau or a == mesa_plateau_f;
+    const b_mp = b == mesa_plateau or b == mesa_plateau_f;
     if (a_mp or b_mp) return a_mp and b_mp;
     // NOTE: vanilla compares biome CLASSES (ahu.a = getClass equality),
     // NOT temperatures. Same-temp different-class pairs (forest vs hills)
     // are DISSIMILAR — a multi-hour bug caught by live JVM probing
     // (similar(21,3)=false). Groups from BiomeCls2 class dump.
-    if (a < 0 or a > 39 or b < 0 or b > 39) return false;
+    if (!validBiomeId(a) or !validBiomeId(b)) return false;
     const ca = biomeClass(a);
     const cb = biomeClass(b);
-    if (ca == 255 or cb == 255) return false;
+    if (ca == unknown_class or cb == unknown_class) return false;
     return ca == cb;
+}
+
+/// Mesa plateau pair (the only cross-id similarity vanilla checks first).
+pub const mesa_plateau: i32 = 38;
+pub const mesa_plateau_f: i32 = 39;
+/// Highest registered 1.7.10 biome id (BiomeCls2 probe range 0..39).
+pub const max_biome_id: i32 = 39;
+/// biomeClass sentinel for unregistered ids.
+pub const unknown_class: u8 = 255;
+
+/// True for registered 1.7.10 biome ids (shared range gate).
+pub fn validBiomeId(id: i32) bool {
+    return id >= 0 and id <= max_biome_id;
 }
 
 /// getClass() group per biome id (BiomeCls2 probe: nearly every biome has
@@ -106,7 +118,7 @@ fn biomeClass(id: i32) u8 {
         25 => 14, // aiu stoneBeach
         35, 36 => 15, // ais savanna pair
         37, 38, 39 => 16, // ail mesa trio
-        else => 255,
+        else => unknown_class,
     };
 }
 
@@ -329,26 +341,26 @@ pub const Chain = struct {
                     out[@as(usize, @intCast(-x)) + @as(usize, @intCast(-z)) * w] = 1;
                 }
             },
-            .fuzzy_zoom => try self.evalZoom(st, idx, lay.parent, x, z, w, h, out, alloc, true),
-            .zoom => try self.evalZoom(st, idx, lay.parent, x, z, w, h, out, alloc, false),
-            .add_island => try self.evalAddIsland(st, idx, lay.parent, x, z, w, h, out, alloc),
-            .remove_too_much_ocean => try self.evalRemoveOcean(st, idx, lay.parent, x, z, w, h, out, alloc),
-            .add_snow => try self.evalAddSnow(st, idx, lay.parent, x, z, w, h, out, alloc),
-            .edge_cool_warm => try self.evalEdge(st, idx, lay.parent, x, z, w, h, out, alloc, .cool_warm),
-            .edge_heat_ice => try self.evalEdge(st, idx, lay.parent, x, z, w, h, out, alloc, .heat_ice),
-            .edge_special => try self.evalEdgeSpecial(st, idx, lay.parent, x, z, w, h, out, alloc),
-            .mushroom_island => try self.evalMushroom(st, idx, lay.parent, x, z, w, h, out, alloc),
-            .deep_ocean => try self.evalDeepOcean(st, idx, lay.parent, x, z, w, h, out, alloc),
-            .river_init => try self.evalRiverInit(st, idx, lay.parent, x, z, w, h, out, alloc),
-            .river => try self.evalRiver(st, idx, lay.parent, x, z, w, h, out, alloc),
-            .river_mix => try self.evalRiverMix(st, idx, lay.parent, lay.parent_b, x, z, w, h, out, alloc),
-            .biome => try self.evalBiome(st, idx, lay, x, z, w, h, out, alloc),
-            .biome_edge => try self.evalBiomeEdge(st, idx, lay.parent, x, z, w, h, out, alloc),
-            .shore => try self.evalShore(st, idx, lay.parent, x, z, w, h, out, alloc),
-            .smooth => try self.evalSmooth(st, idx, lay.parent, x, z, w, h, out, alloc),
-            .rare_biome => try self.evalRareBiome(st, idx, lay.parent, x, z, w, h, out, alloc),
-            .river_mix2 => try self.evalRiverMix2(st, idx, lay.parent, lay.parent_b, x, z, w, h, out, alloc),
-            .voronoi_zoom => try self.evalVoronoi(st, idx, lay.parent, x, z, w, h, out, alloc),
+            .fuzzy_zoom => try self.evalZoom(st, lay.parent, x, z, w, h, out, alloc, true),
+            .zoom => try self.evalZoom(st, lay.parent, x, z, w, h, out, alloc, false),
+            .add_island => try self.evalAddIsland(st, lay.parent, x, z, w, h, out, alloc),
+            .remove_too_much_ocean => try self.evalRemoveOcean(st, lay.parent, x, z, w, h, out, alloc),
+            .add_snow => try self.evalAddSnow(st, lay.parent, x, z, w, h, out, alloc),
+            .edge_cool_warm => try self.evalEdge(st, lay.parent, x, z, w, h, out, alloc, .cool_warm),
+            .edge_heat_ice => try self.evalEdge(st, lay.parent, x, z, w, h, out, alloc, .heat_ice),
+            .edge_special => try self.evalEdgeSpecial(st, lay.parent, x, z, w, h, out, alloc),
+            .mushroom_island => try self.evalMushroom(st, lay.parent, x, z, w, h, out, alloc),
+            .deep_ocean => try self.evalDeepOcean(st, lay.parent, x, z, w, h, out, alloc),
+            .river_init => try self.evalRiverInit(st, lay.parent, x, z, w, h, out, alloc),
+            .river => try self.evalRiver(st, lay.parent, x, z, w, h, out, alloc),
+            .river_mix => try self.evalRiverMix(st, lay.parent, lay.parent_b, x, z, w, h, out, alloc),
+            .biome => try self.evalBiome(st, lay, x, z, w, h, out, alloc),
+            .biome_edge => try self.evalBiomeEdge(st, lay.parent, x, z, w, h, out, alloc),
+            .shore => try self.evalShore(st, lay.parent, x, z, w, h, out, alloc),
+            .smooth => try self.evalSmooth(st, lay.parent, x, z, w, h, out, alloc),
+            .rare_biome => try self.evalRareBiome(st, lay.parent, x, z, w, h, out, alloc),
+            .river_mix2 => try self.evalRiverMix2(lay.parent, lay.parent_b, x, z, w, h, out, alloc),
+            .voronoi_zoom => try self.evalVoronoi(st, lay.parent, x, z, w, h, out, alloc),
         }
     }
 
@@ -359,14 +371,41 @@ pub const Chain = struct {
         return buf;
     }
 
+    /// Parent fetch with the standard 1-cell padding (neighbor-sampling
+    /// layers read (x-1, z-1, w+2, h+2)). Caller frees the buffer.
+    fn parentPadded(self: *Chain, alloc: std.mem.Allocator, parent: u32, x: i32, z: i32, w: usize, h: usize) anyerror!struct { buf: []i32, pw: usize } {
+        const buf = try self.parentOut(alloc, parent, x - 1, z - 1, w + 2, h + 2);
+        return .{ .buf = buf, .pw = w + 2 };
+    }
+
+    /// Seed one cell's RNG (every neighbor-sampling layer opens its cell
+    /// body this way).
+    fn seedCell(st: *Base, x: i32, z: i32, dx: usize, dz: usize) void {
+        st.initChunkSeed(x + @as(i32, @intCast(dx)), z + @as(i32, @intCast(dz)));
+    }
+
     fn growRoll(st: *Base, center: i32) i32 {
         if (st.nextInt(5) == 0) return if (center == 4) 4 else 0;
         return center;
     }
 
+    /// Reservoir pick over one non-zero neighbor (add_island growth): with
+    /// probability 1/count the neighbor wins. Caller threads count/pick
+    /// through the four neighbors in order.
+    fn reservoirPick(st: *Base, count: *i32, pick: *i32, v: i32) void {
+        if (v == 0) return;
+        if (st.nextInt(count.*) == 0) pick.* = v;
+        count.* += 1;
+    }
+
+    /// Zoom seed coord: grid index + parent offset, doubled (multiply
+    /// AFTER the add — vanilla order, load-bearing for downstream draws).
+    fn zoomSeedCoord(g: usize, p: i32) i32 {
+        return @as(i32, @intCast(@as(i64, @intCast(g)) + p)) * 2;
+    }
+
     // --- zoom (ayc) / fuzzy_zoom (axj). Fuzzy = pure random tie-break.
-    fn evalZoom(self: *Chain, st: *Base, idx: u32, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator, fuzzy: bool) anyerror!void {
-        _ = idx;
+    fn evalZoom(self: *Chain, st: *Base, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator, fuzzy: bool) anyerror!void {
         const px: i32 = x >> 1;
         const pz: i32 = z >> 1;
         const pw: usize = (w >> 1) + 2;
@@ -383,7 +422,7 @@ pub const Chain = struct {
             var v17: i32 = p[0 + (gz + 1) * pw];
             var gx: usize = 0;
             while (gx < pw - 1) : (gx += 1) {
-                st.initChunkSeed((@as(i32, @intCast(@as(i64, @intCast(gx)) + px))) * 2, (@as(i32, @intCast(@as(i64, @intCast(gz)) + pz))) * 2);
+                st.initChunkSeed(zoomSeedCoord(gx, px), zoomSeedCoord(gz, pz));
                 const v18: i32 = p[gx + 1 + gz * pw];
                 const v19: i32 = p[gx + 1 + (gz + 1) * pw];
                 const ox = gx * 2;
@@ -416,8 +455,7 @@ pub const Chain = struct {
         }
     }
 
-    fn evalAddIsland(self: *Chain, st: *Base, idx: u32, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
-        _ = idx;
+    fn evalAddIsland(self: *Chain, st: *Base, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
         const p = try self.parentOut(alloc, parent, x - 1, z - 1, w + 2, h + 2);
         defer alloc.free(p);
         const pw = w + 2;
@@ -434,22 +472,10 @@ pub const Chain = struct {
                         if (v13 == 0 and v14 == 0 and v15 == 0 and v16 == 0) break :blk 0;
                         var count: i32 = 1;
                         var pick: i32 = 1;
-                        if (v13 != 0) {
-                            if (st.nextInt(count) == 0) pick = v13;
-                            count += 1;
-                        }
-                        if (v14 != 0) {
-                            if (st.nextInt(count) == 0) pick = v14;
-                            count += 1;
-                        }
-                        if (v15 != 0) {
-                            if (st.nextInt(count) == 0) pick = v15;
-                            count += 1;
-                        }
-                        if (v16 != 0) {
-                            if (st.nextInt(count) == 0) pick = v16;
-                            count += 1;
-                        }
+                        reservoirPick(st, &count, &pick, v13);
+                        reservoirPick(st, &count, &pick, v14);
+                        reservoirPick(st, &count, &pick, v15);
+                        reservoirPick(st, &count, &pick, v16);
                         if (st.nextInt(3) == 0) break :blk pick;
                         break :blk if (pick == 4) @as(i32, 4) else 0;
                     }
@@ -460,8 +486,7 @@ pub const Chain = struct {
         }
     }
 
-    fn evalRemoveOcean(self: *Chain, st: *Base, idx: u32, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
-        _ = idx;
+    fn evalRemoveOcean(self: *Chain, st: *Base, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
         const p = try self.parentOut(alloc, parent, x - 1, z - 1, w + 2, h + 2);
         defer alloc.free(p);
         const pw = w + 2;
@@ -481,8 +506,7 @@ pub const Chain = struct {
             }
         }
     }
-    fn evalAddSnow(self: *Chain, st: *Base, idx: u32, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
-        _ = idx;
+    fn evalAddSnow(self: *Chain, st: *Base, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
         const p = try self.parentOut(alloc, parent, x - 1, z - 1, w + 2, h + 2);
         defer alloc.free(p);
         const pw = w + 2;
@@ -500,8 +524,7 @@ pub const Chain = struct {
         }
     }
     const EdgeMode = enum { cool_warm, heat_ice, special };
-    fn evalEdge(self: *Chain, st: *Base, idx: u32, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator, mode: EdgeMode) anyerror!void {
-        _ = idx;
+    fn evalEdge(self: *Chain, st: *Base, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator, mode: EdgeMode) anyerror!void {
         std.debug.assert(mode != .special);
         const p = try self.parentOut(alloc, parent, x - 1, z - 1, w + 2, h + 2);
         defer alloc.free(p);
@@ -535,8 +558,7 @@ pub const Chain = struct {
             }
         }
     }
-    fn evalEdgeSpecial(self: *Chain, st: *Base, idx: u32, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
-        _ = idx;
+    fn evalEdgeSpecial(self: *Chain, st: *Base, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
         const p = try self.parentOut(alloc, parent, x, z, w, h);
         defer alloc.free(p);
         for (0..h) |dz| {
@@ -553,8 +575,7 @@ pub const Chain = struct {
             }
         }
     }
-    fn evalMushroom(self: *Chain, st: *Base, idx: u32, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
-        _ = idx;
+    fn evalMushroom(self: *Chain, st: *Base, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
         const p = try self.parentOut(alloc, parent, x - 1, z - 1, w + 2, h + 2);
         defer alloc.free(p);
         const pw = w + 2;
@@ -578,8 +599,7 @@ pub const Chain = struct {
             }
         }
     }
-    fn evalDeepOcean(self: *Chain, _: *Base, idx: u32, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
-        _ = idx;
+    fn evalDeepOcean(self: *Chain, _: *Base, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
         const p = try self.parentOut(alloc, parent, x - 1, z - 1, w + 2, h + 2);
         defer alloc.free(p);
         const pw = w + 2;
@@ -602,8 +622,7 @@ pub const Chain = struct {
             }
         }
     }
-    fn evalRiverInit(self: *Chain, st: *Base, idx: u32, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
-        _ = idx;
+    fn evalRiverInit(self: *Chain, st: *Base, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
         const p = try self.parentOut(alloc, parent, x, z, w, h);
         defer alloc.free(p);
         for (0..h) |dz| {
@@ -618,9 +637,7 @@ pub const Chain = struct {
     }
 
     // NOTE: no initChunkSeed here (verified: axu skips it entirely).
-    fn evalRiver(self: *Chain, st: *Base, idx: u32, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
-        _ = idx;
-        _ = st;
+    fn evalRiver(self: *Chain, _: *Base, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
         const p = try self.parentOut(alloc, parent, x - 1, z - 1, w + 2, h + 2);
         defer alloc.free(p);
         const pw = w + 2;
@@ -636,8 +653,7 @@ pub const Chain = struct {
         }
     }
     // --- river_mix (axr). Hills upgrade + mutated (+128) variants.
-    fn evalRiverMix(self: *Chain, st: *Base, idx: u32, b: u32, r: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
-        _ = idx;
+    fn evalRiverMix(self: *Chain, st: *Base, b: u32, r: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
         const pb = try self.parentOut(alloc, b, x - 1, z - 1, w + 2, h + 2);
         defer alloc.free(pb);
         const pr = try self.parentOut(alloc, r, x - 1, z - 1, w + 2, h + 2);
@@ -645,36 +661,13 @@ pub const Chain = struct {
         const pw = w + 2;
         for (0..h) |dz| {
             for (0..w) |dx| {
-                st.initChunkSeed(x + @as(i32, @intCast(dx)), z + @as(i32, @intCast(dz)));
+                seedCell(st, x, z, dx, dz);
                 const v10 = pb[dx + 1 + (dz + 1) * pw];
                 const v11 = pr[dx + 1 + (dz + 1) * pw];
                 const riverish = v11 >= 2 and @rem(v11 - 2, 29) == 1;
-                // Mutated (+128) variant in river areas.
-                if (v10 != 0 and v11 >= 2 and @rem(v11 - 2, 29) == 1 and v10 < 128) {
-                    if (biome.biomeExists(v10 + 128)) {
-                        out[dz * w + dx] = v10 + 128;
-                    } else {
-                        out[dz * w + dx] = v10;
-                    }
-                    continue;
-                }
-                var v13 = v10;
-                if (st.nextInt(3) == 0 or riverish) {
-                    v13 = hillsVariant(v10, st);
-                    if (riverish and v13 != v10) {
-                        if (biome.biomeExists(v13 + 128)) {
-                            out[dz * w + dx] = v13 + 128;
-                        } else {
-                            out[dz * w + dx] = v10;
-                        }
-                        continue;
-                    }
-                } else {
-                    out[dz * w + dx] = v10;
-                    continue;
-                }
-                if (v13 == v10) {
-                    out[dz * w + dx] = v10;
+                var v13: i32 = v10;
+                if (mixEarly(st, v10, riverish, &v13)) |v| {
+                    out[dz * w + dx] = v;
                     continue;
                 }
                 const n = pb[dx + 1 + dz * pw];
@@ -689,6 +682,31 @@ pub const Chain = struct {
                 out[dz * w + dx] = if (similar >= 3) v13 else v10;
             }
         }
+    }
+
+    /// Early river-mix claims (mutated variant + hills gate): returns the
+    /// output when claimed, null to fall through to the similarity vote
+    /// (writing the hills result to `v13_out` for the vote to reuse —
+    /// recomputing it would draw RNG twice for plains/deepOcean).
+    /// Draw order matches vanilla exactly (nextInt(3) gate, then the
+    /// hillsVariant draws for plains/deepOcean).
+    fn mixEarly(st: *Base, v10: i32, riverish: bool, v13_out: *i32) ?i32 {
+        // Mutated (+128) variant in river areas.
+        if (v10 != 0 and riverish and v10 < 128) {
+            return if (biome.biomeExists(v10 + 128)) v10 + 128 else v10;
+        }
+        var v13 = v10;
+        if (st.nextInt(3) == 0 or riverish) {
+            v13 = hillsVariant(v10, st);
+            if (riverish and v13 != v10) {
+                return if (biome.biomeExists(v13 + 128)) v13 + 128 else v10;
+            }
+        } else {
+            return v10;
+        }
+        if (v13 == v10) return v10;
+        v13_out.* = v13;
+        return null;
     }
 
     fn hillsVariant(v10: i32, st: *Base) i32 {
@@ -713,16 +731,20 @@ pub const Chain = struct {
         return v10;
     }
     // --- biome (axf). 1:1 fetch. Bits 8-11 are the SPECIAL variant tag.
-    fn evalBiome(self: *Chain, st: *Base, idx: u32, lay: Layer, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
-        _ = idx;
+    /// SPECIAL tag: low 8 bits kept, bits 8-11 cleared on read.
+    const variant_keep_mask: u32 = 0xFFFFF0FF;
+    /// SPECIAL tag extract: bits 8-11.
+    const variant_tag_mask: i32 = 0xF00;
+    const variant_tag_shift = 8;
+    fn evalBiome(self: *Chain, st: *Base, lay: Layer, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
         const p = try self.parentOut(alloc, lay.parent, x, z, w, h);
         defer alloc.free(p);
         for (0..h) |dz| {
             for (0..w) |dx| {
                 st.initChunkSeed(x + @as(i32, @intCast(dx)), z + @as(i32, @intCast(dz)));
                 var v5 = p[dz * w + dx];
-                const v6: i32 = (v5 & 0xF00) >> 8;
-                v5 &= @as(i32, @bitCast(@as(u32, 0xFFFFF0FF)));
+                const v6: i32 = (v5 & variant_tag_mask) >> variant_tag_shift;
+                v5 &= @as(i32, @bitCast(variant_keep_mask));
                 if (isOceanic(v5)) {
                     out[dz * w + dx] = v5;
                     continue;
@@ -765,8 +787,7 @@ pub const Chain = struct {
     }
     // --- biome_edge (axe). Helpers a/b write out[idx] and return true
     // when they claim the cell.
-    fn evalBiomeEdge(self: *Chain, st: *Base, idx: u32, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
-        _ = idx;
+    fn evalBiomeEdge(self: *Chain, st: *Base, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
         const p = try self.parentOut(alloc, parent, x - 1, z - 1, w + 2, h + 2);
         defer alloc.free(p);
         const pw = w + 2;
@@ -774,19 +795,14 @@ pub const Chain = struct {
             for (0..w) |dx| {
                 st.initChunkSeed(x + @as(i32, @intCast(dx)), z + @as(i32, @intCast(dz)));
                 const c = p[dx + 1 + (dz + 1) * pw];
-                if (try self.edgeA(st, p, out, dx, dz, w, c, 3, 20)) continue;
-                if (try self.edgeB(st, p, out, dx, dz, w, c, 38, 37)) continue;
-                if (try self.edgeB(st, p, out, dx, dz, w, c, 39, 37)) continue;
-                if (try self.edgeB(st, p, out, dx, dz, w, c, 32, 5)) continue;
+                if (edgeClaim(p, out, dx, dz, w, c, 3, 20, false)) continue;
+                if (edgeClaim(p, out, dx, dz, w, c, 38, 37, true)) continue;
+                if (edgeClaim(p, out, dx, dz, w, c, 39, 37, true)) continue;
+                if (edgeClaim(p, out, dx, dz, w, c, 32, 5, true)) continue;
                 if (c == 2) {
-                    const n = p[dx + 1 + dz * pw];
-                    const e = p[dx + 2 + (dz + 1) * pw];
-                    const ss = p[dx + (dz + 1) * pw];
-                    const wv = p[dx + 1 + (dz + 2) * pw];
-                    _ = ss;
-                    _ = wv;
+                    const nb = edgeNeighbors(p, dx, dz, w + 2);
                     // NOTE: CFR order is N,E,W,S but any-of-4 is order-free.
-                    if (n == 12 or e == 12 or p[dx + (dz + 1) * pw] == 12 or p[dx + 1 + (dz + 2) * pw] == 12) {
+                    if (nb[0] == 12 or nb[1] == 12 or nb[2] == 12 or nb[3] == 12) {
                         out[dz * w + dx] = 34; // extremeHillsPlus
                         continue;
                     }
@@ -794,10 +810,11 @@ pub const Chain = struct {
                     continue;
                 }
                 if (c == 6) {
-                    const n = p[dx + 1 + dz * pw];
-                    const e = p[dx + 2 + (dz + 1) * pw];
-                    const wv = p[dx + (dz + 1) * pw];
-                    const ss = p[dx + 1 + (dz + 2) * pw];
+                    const nb = edgeNeighbors(p, dx, dz, w + 2);
+                    const n = nb[0];
+                    const e = nb[1];
+                    const wv = nb[2];
+                    const ss = nb[3];
                     if (n == 2 or e == 2 or wv == 2 or ss == 2 or n == 30 or e == 30 or wv == 30 or ss == 30 or n == 12 or e == 12 or wv == 12 or ss == 12) {
                         out[dz * w + dx] = 1; // plains
                         continue;
@@ -814,29 +831,35 @@ pub const Chain = struct {
         }
     }
 
-    fn edgeA(self: *Chain, st: *Base, p: []i32, out: []i32, dx: usize, dz: usize, w: usize, c: i32, target: i32, repl: i32) anyerror!bool {
-        _ = self;
-        if (!areBiomesSimilar(c, target)) return false;
-        const pw = w + 2;
-        const n = p[dx + 1 + dz * pw];
-        const e = p[dx + 2 + (dz + 1) * pw];
-        const wv = p[dx + (dz + 1) * pw];
-        const ss = p[dx + 1 + (dz + 2) * pw];
-        out[dz * w + dx] = if (!edgeSimilar(n, target) or !edgeSimilar(e, target) or !edgeSimilar(wv, target) or !edgeSimilar(ss, target)) repl else c;
-        _ = st;
-        return true;
+    /// Orthogonal neighbors (N,E,W,S) of a padded-parent cell.
+    fn edgeNeighbors(p: []i32, dx: usize, dz: usize, pw: usize) [4]i32 {
+        return .{
+            p[dx + 1 + dz * pw],
+            p[dx + 2 + (dz + 1) * pw],
+            p[dx + (dz + 1) * pw],
+            p[dx + 1 + (dz + 2) * pw],
+        };
     }
 
-    fn edgeB(self: *Chain, st: *Base, p: []i32, out: []i32, dx: usize, dz: usize, w: usize, c: i32, target: i32, repl: i32) anyerror!bool {
-        _ = self;
-        if (c != target) return false;
-        const pw = w + 2;
-        const n = p[dx + 1 + dz * pw];
-        const e = p[dx + 2 + (dz + 1) * pw];
-        const wv = p[dx + (dz + 1) * pw];
-        const ss = p[dx + 1 + (dz + 2) * pw];
-        out[dz * w + dx] = if (!areBiomesSimilar(n, target) or !areBiomesSimilar(e, target) or !areBiomesSimilar(wv, target) or !areBiomesSimilar(ss, target)) repl else c;
-        _ = st;
+    /// Biome-edge claim helper (axe a/b): `strict` selects the == claim +
+    /// areBiomesSimilar neighbor test (edgeB) vs the similarity claim +
+    /// edgeSimilar neighbor test (edgeA). Writes out[idx] and returns true
+    /// when the cell is claimed.
+    fn edgeClaim(p: []i32, out: []i32, dx: usize, dz: usize, w: usize, c: i32, target: i32, repl: i32, strict: bool) bool {
+        if (strict) {
+            if (c != target) return false;
+        } else {
+            if (!areBiomesSimilar(c, target)) return false;
+        }
+        const nb = edgeNeighbors(p, dx, dz, w + 2);
+        for (nb) |v| {
+            const ok = if (strict) areBiomesSimilar(v, target) else edgeSimilar(v, target);
+            if (!ok) {
+                out[dz * w + dx] = repl;
+                return true;
+            }
+        }
+        out[dz * w + dx] = c;
         return true;
     }
 
@@ -846,27 +869,25 @@ pub const Chain = struct {
     /// this makes medium-target checks nearly always pass).
     fn edgeSimilar(a: i32, b: i32) bool {
         if (areBiomesSimilar(a, b)) return true;
-        if (a < 0 or a > 39 or b < 0 or b > 39) return false;
+        if (!validBiomeId(a) or !validBiomeId(b)) return false;
         const ba = biome.BIOMES[@as(usize, @intCast(a))] orelse return false;
         const bb = biome.BIOMES[@as(usize, @intCast(b))] orelse return false;
         return ba.temp == bb.temp or ba.temp == .medium or bb.temp == .medium;
     }
     // --- shore (axw).
-    fn evalShore(self: *Chain, st: *Base, idx: u32, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
-        _ = idx;
-        const p = try self.parentOut(alloc, parent, x - 1, z - 1, w + 2, h + 2);
+    fn evalShore(self: *Chain, st: *Base, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
+        const pad = try self.parentPadded(alloc, parent, x, z, w, h);
+        const p = pad.buf;
         defer alloc.free(p);
-        const pw = w + 2;
+        const pw = pad.pw;
         for (0..h) |dz| {
             for (0..w) |dx| {
-                st.initChunkSeed(x + @as(i32, @intCast(dx)), z + @as(i32, @intCast(dz)));
+                seedCell(st, x, z, dx, dz);
                 const c = p[dx + 1 + (dz + 1) * pw];
+                // Four orthogonal neighbors, fetched once per cell.
+                const nb = edgeNeighbors(p, dx, dz, pw);
                 if (c == 14) {
-                    const n = p[dx + 1 + dz * pw];
-                    const e = p[dx + 2 + (dz + 1) * pw];
-                    const wv = p[dx + (dz + 1) * pw];
-                    const ss = p[dx + 1 + (dz + 2) * pw];
-                    if (n == 0 or e == 0 or wv == 0 or ss == 0) {
+                    if (nb[0] == 0 or nb[1] == 0 or nb[2] == 0 or nb[3] == 0) {
                         out[dz * w + dx] = 15; // mushroomIslandShore
                         continue;
                     }
@@ -874,15 +895,11 @@ pub const Chain = struct {
                     continue;
                 }
                 if (isJungle(c)) {
-                    const n = p[dx + 1 + dz * pw];
-                    const e = p[dx + 2 + (dz + 1) * pw];
-                    const wv = p[dx + (dz + 1) * pw];
-                    const ss = p[dx + 1 + (dz + 2) * pw];
-                    if (!(shoreC(n) and shoreC(e) and shoreC(wv) and shoreC(ss))) {
+                    if (!(shoreC(nb[0]) and shoreC(nb[1]) and shoreC(nb[2]) and shoreC(nb[3]))) {
                         out[dz * w + dx] = 23; // jungleEdge
                         continue;
                     }
-                    if (isOceanic(n) or isOceanic(e) or isOceanic(wv) or isOceanic(ss)) {
+                    if (isOceanic(nb[0]) or isOceanic(nb[1]) or isOceanic(nb[2]) or isOceanic(nb[3])) {
                         out[dz * w + dx] = 16; // beach
                         continue;
                     }
@@ -890,23 +907,19 @@ pub const Chain = struct {
                     continue;
                 }
                 if (c == 3 or c == 34 or c == 20) {
-                    self.shoreA(p, out, dx, dz, w, c, 25); // stoneBeach
+                    shoreA(p, out, dx, dz, w, c, 25); // stoneBeach
                     continue;
                 }
                 if (isSnowy(c)) {
-                    self.shoreA(p, out, dx, dz, w, c, 26); // coldBeach
+                    shoreA(p, out, dx, dz, w, c, 26); // coldBeach
                     continue;
                 }
                 if (c == 37 or c == 38) {
-                    const n = p[dx + 1 + dz * pw];
-                    const e = p[dx + 2 + (dz + 1) * pw];
-                    const wv = p[dx + (dz + 1) * pw];
-                    const ss = p[dx + 1 + (dz + 2) * pw];
-                    if (isOceanic(n) or isOceanic(e) or isOceanic(wv) or isOceanic(ss)) {
+                    if (isOceanic(nb[0]) or isOceanic(nb[1]) or isOceanic(nb[2]) or isOceanic(nb[3])) {
                         out[dz * w + dx] = c;
                         continue;
                     }
-                    if (!(isMesa(n) and isMesa(e) and isMesa(wv) and isMesa(ss))) {
+                    if (!(isMesa(nb[0]) and isMesa(nb[1]) and isMesa(nb[2]) and isMesa(nb[3]))) {
                         out[dz * w + dx] = 2; // desert
                         continue;
                     }
@@ -914,11 +927,7 @@ pub const Chain = struct {
                     continue;
                 }
                 if (c != 0 and c != 24 and c != 7 and c != 6) {
-                    const n = p[dx + 1 + dz * pw];
-                    const e = p[dx + 2 + (dz + 1) * pw];
-                    const wv = p[dx + (dz + 1) * pw];
-                    const ss = p[dx + 1 + (dz + 2) * pw];
-                    if (isOceanic(n) or isOceanic(e) or isOceanic(wv) or isOceanic(ss)) {
+                    if (isOceanic(nb[0]) or isOceanic(nb[1]) or isOceanic(nb[2]) or isOceanic(nb[3])) {
                         out[dz * w + dx] = 16; // beach
                         continue;
                     }
@@ -930,18 +939,19 @@ pub const Chain = struct {
         }
     }
 
-    fn shoreA(self: *Chain, p: []i32, out: []i32, dx: usize, dz: usize, w: usize, c: i32, repl: i32) void {
-        _ = self;
+    fn shoreA(p: []i32, out: []i32, dx: usize, dz: usize, w: usize, c: i32, repl: i32) void {
         if (isOceanic(c)) {
             out[dz * w + dx] = c;
             return;
         }
-        const pw = w + 2;
-        const n = p[dx + 1 + dz * pw];
-        const e = p[dx + 2 + (dz + 1) * pw];
-        const wv = p[dx + (dz + 1) * pw];
-        const ss = p[dx + 1 + (dz + 2) * pw];
-        out[dz * w + dx] = if (isOceanic(n) or isOceanic(e) or isOceanic(wv) or isOceanic(ss)) repl else c;
+        const nb = edgeNeighbors(p, dx, dz, w + 2);
+        for (nb) |v| {
+            if (isOceanic(v)) {
+                out[dz * w + dx] = repl;
+                return;
+            }
+        }
+        out[dz * w + dx] = c;
     }
 
     fn isJungle(id: i32) bool {
@@ -959,13 +969,12 @@ pub const Chain = struct {
 
     /// axw.c(int): jungle-class or shore-eligible.
     fn shoreC(id: i32) bool {
-        if (id < 0 or id > 39) return isOceanic(id);
+        if (!validBiomeId(id)) return isOceanic(id);
         if (biome.BIOMES[@as(usize, @intCast(id))] == null) return isOceanic(id);
         return isJungle(id) or id == 4 or id == 5 or isOceanic(id);
     }
     // --- smooth (axx). NOTE: initChunkSeed ONLY in the both-equal branch.
-    fn evalSmooth(self: *Chain, st: *Base, idx: u32, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
-        _ = idx;
+    fn evalSmooth(self: *Chain, st: *Base, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
         const p = try self.parentOut(alloc, parent, x - 1, z - 1, w + 2, h + 2);
         defer alloc.free(p);
         const pw = w + 2;
@@ -988,8 +997,7 @@ pub const Chain = struct {
         }
     }
     // --- rare_biome (axq). Plains -> plains+128 (mutated) at 1/57.
-    fn evalRareBiome(self: *Chain, st: *Base, idx: u32, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
-        _ = idx;
+    fn evalRareBiome(self: *Chain, st: *Base, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
         const p = try self.parentOut(alloc, parent, x - 1, z - 1, w + 2, h + 2);
         defer alloc.free(p);
         const pw = w + 2;
@@ -1007,9 +1015,7 @@ pub const Chain = struct {
     }
     // --- river_mix2 (axv). 1:1 fetch from both parents, no seeds.
     // initWorldGenSeed propagates to both parents (handled in initRec).
-    fn evalRiverMix2(self: *Chain, st: *Base, idx: u32, hills: u32, river: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
-        _ = idx;
-        _ = st;
+    fn evalRiverMix2(self: *Chain, hills: u32, river: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
         const ph = try self.parentOut(alloc, hills, x, z, w, h);
         defer alloc.free(ph);
         const pr = try self.parentOut(alloc, river, x, z, w, h);
@@ -1028,17 +1034,41 @@ pub const Chain = struct {
                     out[i] = 15; // mushroom -> mushroomShore
                     continue;
                 }
-                out[i] = pr[i] & 0xFF;
+                out[i] = 7; // pr[i] == 7 here (branch guard); &0xFF is a no-op
                 continue;
             }
             out[i] = ph[i];
         }
     }
+    /// Voronoi grid coord: grid index + parent offset, quadrupled (Java
+    /// `<<` binds looser than `+`: (gx+px)<<2 — replicate exactly).
+    fn gridCoord(g: usize, p: i32) i32 {
+        return @as(i32, @intCast(@as(i64, @intCast(g)) + p)) << 2;
+    }
+
+    /// One voronoi jitter draw: two nextInt(1024) samples scaled to
+    /// [-1.8, 1.8), plus 4.0 on the far axes (cells gx+1 / gz+1).
+    fn voronoiJitter(st: *Base, gx: usize, px: i32, ox: i32, gz: usize, pz: i32, oz: i32) struct { jx: f64, jz: f64 } {
+        st.initChunkSeed(gridCoord(gx, px + ox), gridCoord(gz, pz + oz));
+        // /1024.0 is an exact power-of-two scale (samples < 1024 exactly
+        // representable): multiply by the exact reciprocal instead.
+        const jx = (@as(f64, @floatFromInt(st.nextInt(1024))) * 0.0009765625 - 0.5) * 3.6 + @as(f64, if (ox == 1) 4.0 else 0.0);
+        const jz = (@as(f64, @floatFromInt(st.nextInt(1024))) * 0.0009765625 - 0.5) * 3.6 + @as(f64, if (oz == 1) 4.0 else 0.0);
+        return .{ .jx = jx, .jz = jz };
+    }
+
+    /// Nearest of the four jittered corners (strict-< chain, vanilla order).
+    fn nearestCorner(d10: f64, d11: f64, d12: f64, d13: f64, n12: i32, n14: i32, n13: i32, n15: i32) i32 {
+        if (d10 < d11 and d10 < d12 and d10 < d13) return n12;
+        if (d11 < d10 and d11 < d12 and d11 < d13) return n14;
+        if (d12 < d10 and d12 < d11 and d12 < d13) return n13;
+        return n15;
+    }
+
     // --- voronoi_zoom (ayb). Nearest-cell pick over jittered 4x4 grid.
     // NOTE: the two middle candidates are masked &0xFF while the outer two
     // are raw (verified in bytecode + CFR). x-=2 / z-=2 prologue included.
-    fn evalVoronoi(self: *Chain, st: *Base, idx: u32, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
-        _ = idx;
+    fn evalVoronoi(self: *Chain, st: *Base, parent: u32, x: i32, z: i32, w: usize, h: usize, out: []i32, alloc: std.mem.Allocator) anyerror!void {
         const xx: i32 = x - 2;
         const zz: i32 = z - 2;
         const px: i32 = xx >> 2;
@@ -1057,19 +1087,10 @@ pub const Chain = struct {
             n12 = p[0 + gz * pw];
             n13 = p[0 + (gz + 1) * pw];
             for (0..pw - 1) |gx| {
-                // NOTE: << binds looser than + in Java: (gx+px)<<2.
-                st.initChunkSeed((@as(i32, @intCast(@as(i64, @intCast(gx)) + px)) << 2), ((@as(i32, @intCast(@as(i64, @intCast(gz)) + pz)) << 2)));
-                const d2: f64 = (@as(f64, @floatFromInt(st.nextInt(1024))) / 1024.0 - 0.5) * 3.6;
-                const d3: f64 = (@as(f64, @floatFromInt(st.nextInt(1024))) / 1024.0 - 0.5) * 3.6;
-                st.initChunkSeed(((@as(i32, @intCast(@as(i64, @intCast(gx)) + px + 1)) << 2)), (((@as(i32, @intCast(@as(i64, @intCast(gz)) + pz)) << 2))));
-                const d4: f64 = (@as(f64, @floatFromInt(st.nextInt(1024))) / 1024.0 - 0.5) * 3.6 + 4.0;
-                const d5: f64 = (@as(f64, @floatFromInt(st.nextInt(1024))) / 1024.0 - 0.5) * 3.6;
-                st.initChunkSeed(((@as(i32, @intCast(@as(i64, @intCast(gx)) + px)) << 2)), (((@as(i32, @intCast(@as(i64, @intCast(gz)) + pz + 1)) << 2))));
-                const d6: f64 = (@as(f64, @floatFromInt(st.nextInt(1024))) / 1024.0 - 0.5) * 3.6;
-                const d7: f64 = (@as(f64, @floatFromInt(st.nextInt(1024))) / 1024.0 - 0.5) * 3.6 + 4.0;
-                st.initChunkSeed(((@as(i32, @intCast(@as(i64, @intCast(gx)) + px + 1)) << 2)), (((@as(i32, @intCast(@as(i64, @intCast(gz)) + pz + 1)) << 2))));
-                const d8: f64 = (@as(f64, @floatFromInt(st.nextInt(1024))) / 1024.0 - 0.5) * 3.6 + 4.0;
-                const d9: f64 = (@as(f64, @floatFromInt(st.nextInt(1024))) / 1024.0 - 0.5) * 3.6 + 4.0;
+                const j00 = voronoiJitter(st, gx, px, 0, gz, pz, 0);
+                const j10 = voronoiJitter(st, gx, px, 1, gz, pz, 0);
+                const j01 = voronoiJitter(st, gx, px, 0, gz, pz, 1);
+                const j11 = voronoiJitter(st, gx, px, 1, gz, pz, 1);
                 const n14: i32 = p[gx + 1 + gz * pw] & 0xFF;
                 const n15: i32 = p[gx + 1 + (gz + 1) * pw] & 0xFF;
                 for (0..4) |j| {
@@ -1077,18 +1098,11 @@ pub const Chain = struct {
                     const row_base = ((gz << 2) + j) * tw + (gx << 2);
                     for (0..4) |k| {
                         const kf: f64 = @floatFromInt(k);
-                        const d10 = (jf - d3) * (jf - d3) + (kf - d2) * (kf - d2);
-                        const d11 = (jf - d5) * (jf - d5) + (kf - d4) * (kf - d4);
-                        const d12 = (jf - d7) * (jf - d7) + (kf - d6) * (kf - d6);
-                        const d13 = (jf - d9) * (jf - d9) + (kf - d8) * (kf - d8);
-                        tmp[row_base + k] = if (d10 < d11 and d10 < d12 and d10 < d13)
-                            n12
-                        else if (d11 < d10 and d11 < d12 and d11 < d13)
-                            n14
-                        else if (d12 < d10 and d12 < d11 and d12 < d13)
-                            n13
-                        else
-                            n15;
+                        const d10 = (jf - j00.jz) * (jf - j00.jz) + (kf - j00.jx) * (kf - j00.jx);
+                        const d11 = (jf - j10.jz) * (jf - j10.jz) + (kf - j10.jx) * (kf - j10.jx);
+                        const d12 = (jf - j01.jz) * (jf - j01.jz) + (kf - j01.jx) * (kf - j01.jx);
+                        const d13 = (jf - j11.jz) * (jf - j11.jz) + (kf - j11.jx) * (kf - j11.jx);
+                        tmp[row_base + k] = nearestCorner(d10, d11, d12, d13, n12, n14, n13, n15);
                     }
                 }
                 n12 = n14;

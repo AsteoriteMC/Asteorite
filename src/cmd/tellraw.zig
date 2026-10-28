@@ -18,10 +18,8 @@ pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u
     var toks: [64][]const u8 = undefined;
     const n = cmd.Spec.tokenize(args, &toks);
     if (n < 2) return cmd.usageError(&def, out);
-    var target: [16]u8 = undefined;
-    const t = srv.resolvePlayerName(sender, toks[0], &target) orelse {
-        return "That player cannot be found";
-    };
+    var target: [cmd.max_name_len]u8 = undefined;
+    const t = cmd.resolveTarget(srv, sender, toks[0], &target) orelse return cmd.unknown_player;
     var jb: [2048]u8 = undefined;
     const json = cmd.Spec.joinRest(toks[0..n], 1, &jb) orelse return cmd.usageError(&def, out);
     // Validate: must parse as JSON (vanilla rejects with jsonException).

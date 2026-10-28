@@ -126,12 +126,41 @@ def status_ping(host: str, port: int) -> dict:
     c.send_frame(0x00, hs)
     c.send_frame(0x00, b"")
     pid, body = c.read_frame()
-    c.close()
     if pid != 0x00:
+        c.close()
         raise RuntimeError(f"status: unexpected packet {pid:#x}")
     # body: string json
     n = body[0]
-    return json.loads(body[1 : 1 + n].decode("utf8"))
+    info = json.loads(body[1 : 1 + n].decode("utf8"))
+    # 0x01 ping -> 0x01 pong echo. Regression guard: async transports
+    # used to close on the finished path before the queued pong went
+    # out, so the server list showed the MOTD with red-X "(no connection)"
+    # bars. The pong must arrive AND the server must then close.
+    import time as _time
+
+    payload = struct.pack(">q", int(_time.time() * 1000))
+    c.send_frame(0x01, payload)
+    c.sock.settimeout(10)
+    try:
+        ppid, pbody = c.read_frame()
+    except (socket.timeout, EOFError, ConnectionError, OSError) as e:
+        c.close()
+        raise RuntimeError(f"status pong never arrived ({e!r})")
+    if ppid != 0x01 or pbody != payload:
+        c.close()
+        raise RuntimeError(f"status pong mangled: pid={ppid:#x} body={pbody!r}")
+    # server closes after the pong (flush-then-close, no leak)
+    c.sock.settimeout(5)
+    try:
+        c.read_frame()
+        c.close()
+        raise RuntimeError("status conn stayed open after pong")
+    except (EOFError, ConnectionError, OSError):
+        c.close()
+    except socket.timeout:
+        c.close()
+        raise RuntimeError("status conn stayed open after pong (read timed out)")
+    return info
 
 
 def play_login(host: str, port: int, name: str, view: int = 4):

@@ -58,6 +58,13 @@ pub const wire_by_kind: [mob.count]u8 = blk: {
     break :blk out;
 };
 
+/// Dense canonical-kind -> display name table (same shape as wire_by_kind).
+pub const name_by_kind: [mob.count][]const u8 = blk: {
+    var out = [_][]const u8{""} ** mob.count;
+    for (defs) |d| out[@intFromEnum(d.kind)] = d.name;
+    break :blk out;
+};
+
 /// Sparse reverse map. Unassigned wire ids fail closed instead of becoming a
 /// neighbouring mob kind.
 pub const kind_by_wire: [256]?Kind = blk: {
@@ -75,8 +82,7 @@ pub fn fromWire(type_id: u8) ?Kind {
 }
 
 pub fn name(kind: Kind) []const u8 {
-    for (defs) |d| if (d.kind == kind) return d.name;
-    unreachable;
+    return name_by_kind[@intFromEnum(kind)];
 }
 
 test "every canonical kind maps to exactly one 1.7.10 wire id" {

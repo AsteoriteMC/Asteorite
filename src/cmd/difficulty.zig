@@ -16,13 +16,7 @@ pub const def = cmd.define(.{
 });
 
 fn parseDifficulty(s: []const u8) ?rules.Difficulty {
-    if (std.ascii.eqlIgnoreCase(s, "peaceful") or std.ascii.eqlIgnoreCase(s, "p")) return .peaceful;
-    if (std.ascii.eqlIgnoreCase(s, "easy") or std.ascii.eqlIgnoreCase(s, "e")) return .easy;
-    if (std.ascii.eqlIgnoreCase(s, "normal") or std.ascii.eqlIgnoreCase(s, "n")) return .normal;
-    if (std.ascii.eqlIgnoreCase(s, "hard") or std.ascii.eqlIgnoreCase(s, "h")) return .hard;
-    const v = std.fmt.parseInt(i64, s, 10) catch return null;
-    if (v < 0 or v >= std.enums.values(rules.Difficulty).len) return null;
-    return @enumFromInt(v);
+    return rules.Difficulty.parse(s);
 }
 
 pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u8 {

@@ -22,6 +22,10 @@ pub const magic = "ZC1";
 pub const section_size = 4096;
 pub const nibble_size = 2048;
 pub const section_bytes = section_size * 2 + nibble_size * 4; // 16384
+/// Header bytes: magic(3) + version(1) + dim(1) + x(4) + z(4) + mask(2).
+pub const header_len: usize = 3 + 1 + 9 + 2;
+/// Tail bytes: biomes(256) + heights(256).
+pub const tail_len: usize = 512;
 
 /// Vanilla light opacity (`aji.k()`, jar-verified over all 175 block ids):
 /// water/ice k=3, leaves k=1, air + flora + snow layer + glass + lava k=0,
@@ -263,7 +267,20 @@ pub const Chunk = struct {
         };
     }
 
-    const light_dirs = [_][3]i32{ .{ 1, 0, 0 }, .{ -1, 0, 0 }, .{ 0, 1, 0 }, .{ 0, -1, 0 }, .{ 0, 0, 1 }, .{ 0, 0, -1 } };
+    /// 6-neighbor offsets (shared by the chunk BFS, the gen-grid flood,
+    /// and the edit-path relight — one table, no drift).
+    pub const light_dirs = [_][3]i32{ .{ 1, 0, 0 }, .{ -1, 0, 0 }, .{ 0, 1, 0 }, .{ 0, -1, 0 }, .{ 0, 0, 1 }, .{ 0, 0, -1 } };
+
+    /// Block-local coordinate (0..15) via two's-complement wrap
+    /// (vanilla `x & 15`, exact for negatives).
+    pub fn localCoord(v: i32) u4 {
+        return @truncate(@as(u32, @bitCast(v & 15)));
+    }
+
+    /// True when the neighbor offset lands inside the chunk.
+    inline fn inBounds(nx: i32, ny: i32, nz: i32) bool {
+        return nx >= 0 and nx <= 15 and ny >= 0 and ny <= 255 and nz >= 0 and nz <= 15;
+    }
 
     /// Raise-BFS core: propagate increases until the fixed point. Only
     /// strict increases enqueue, values cap at 15, so this terminates.
@@ -285,7 +302,7 @@ pub const Chunk = struct {
                 const nx = @as(i32, @intCast(c.x)) + d[0];
                 const ny = @as(i32, @intCast(c.y)) + d[1];
                 const nz = @as(i32, @intCast(c.z)) + d[2];
-                if (nx < 0 or nx > 15 or ny < 0 or ny > 255 or nz < 0 or nz > 15) continue;
+                if (!inBounds(nx, ny, nz)) continue;
                 const ux: usize = @intCast(nx);
                 const uy: usize = @intCast(ny);
                 const uz: usize = @intCast(nz);
@@ -316,21 +333,75 @@ pub const Chunk = struct {
         self.bfsRaise(channel, queue, &head, &tail);
     }
 
+    /// Bounding box over light seeds (expanded ±1 at rescan).
+    const Bbox = struct {
+        minx: usize = 16,
+        maxx: usize = 0,
+        miny: usize = 256,
+        maxy: usize = 0,
+        minz: usize = 16,
+        maxz: usize = 0,
+
+        fn expand(self: *Bbox, c: Cell) void {
+            self.minx = @min(self.minx, c.x);
+            self.maxx = @max(self.maxx, c.x);
+            self.miny = @min(self.miny, c.y);
+            self.maxy = @max(self.maxy, c.y);
+            self.minz = @min(self.minz, c.z);
+            self.maxz = @max(self.maxz, c.z);
+        }
+
+        fn grow(self: *Bbox, x: usize, y: usize, z: usize) void {
+            self.minx = @min(self.minx, x);
+            self.maxx = @max(self.maxx, x);
+            self.miny = @min(self.miny, y);
+            self.maxy = @max(self.maxy, y);
+            self.minz = @min(self.minz, z);
+            self.maxz = @max(self.maxz, z);
+        }
+
+        /// Empty when no seed was ever expanded in (no-op decrease).
+        fn isEmpty(self: *const Bbox) bool {
+            return self.maxx < self.minx;
+        }
+    };
+
+    /// Seed the reflood queue from every lit cell in bbox±1.
+    fn seedBbox(self: *Chunk, queue: []u32, channel: LightChannel, box: *const Bbox) usize {
+        var rtail: usize = 0;
+        var y = box.miny -| 1;
+        const y1 = @min(box.maxy + 1, 255);
+        while (y <= y1) : (y += 1) {
+            var z = box.minz -| 1;
+            const z1 = @min(box.maxz + 1, 15);
+            while (z <= z1) : (z += 1) {
+                var x = box.minx -| 1;
+                const x1 = @min(box.maxx + 1, 15);
+                while (x <= x1) : (x += 1) {
+                    if (self.getChannelAt(channel, x, y, z) == 0) continue;
+                    if (rtail >= queue.len) return rtail;
+                    queue[rtail] = packCell(x, y, z);
+                    rtail += 1;
+                }
+            }
+        }
+        return rtail;
+    }
+
     /// Full-chunk skylight spread (gen path): the columns already hold
     /// exact vertical values (relightColumn); every bright cell seeds the
     /// horizontal flood. Block light keeps its own full flood
     /// (relightBlock seeds emissives directly).
     pub fn spreadSky(self: *Chunk, queue: []u32) void {
         var tail: usize = 0;
-        for (0..16) |lz| {
-            for (0..16) |lx| {
-                for (0..256) |y| {
-                    if (self.getSkyAt(lx, y, lz) > 1) {
-                        if (tail >= queue.len) break;
-                        queue[tail] = packCell(lx, y, lz);
-                        tail += 1;
-                    }
-                }
+        // Linear scan (flattened): one pass over all 64K cells.
+        var i: usize = 0;
+        while (i < 65536) : (i += 1) {
+            if (tail >= queue.len) break;
+            const c = unpackCell(@intCast(i));
+            if (self.getSkyAt(c.x, c.y, c.z) > 1) {
+                queue[tail] = @intCast(i);
+                tail += 1;
             }
         }
         var head: usize = 0;
@@ -355,39 +426,20 @@ pub const Chunk = struct {
     pub fn unspreadLight(self: *Chunk, queue: []u32, channel: LightChannel, old_seeds: []const CellValue, rewrite: []const CellValue) void {
         var head: usize = 0;
         var tail: usize = 0;
-        // Bounding box over seeds + rewrite (expanded ±1 at rescan).
-        var minx: usize = 16;
-        var maxx: usize = 0;
-        var miny: usize = 256;
-        var maxy: usize = 0;
-        var minz: usize = 16;
-        var maxz: usize = 0;
-        const expand = struct {
-            fn f(c: Cell, x0: *usize, x1: *usize, y0: *usize, y1: *usize, z0: *usize, z1: *usize) void {
-                x0.* = @min(x0.*, c.x);
-                x1.* = @max(x1.*, c.x);
-                y0.* = @min(y0.*, c.y);
-                y1.* = @max(y1.*, c.y);
-                z0.* = @min(z0.*, c.z);
-                z1.* = @max(z1.*, c.z);
-            }
-        }.f;
+        var box = Bbox{};
         // Seeds are processed inline (not queued): each cell zeroes at
         // most once, so the cascade queue can never overflow 64K.
         for (old_seeds) |s| {
             const c = unpackCell(s.cell);
-            expand(c, &minx, &maxx, &miny, &maxy, &minz, &maxz);
-            self.invalidateAround(channel, c.x, c.y, c.z, s.value, queue, &tail, &minx, &maxx, &miny, &maxy, &minz, &maxz);
+            box.expand(c);
+            self.invalidateAround(channel, c.x, c.y, c.z, s.value, queue, &tail, &box);
         }
-        for (rewrite) |s| {
-            const c = unpackCell(s.cell);
-            expand(c, &minx, &maxx, &miny, &maxy, &minz, &maxz);
-        }
+        for (rewrite) |s| box.expand(unpackCell(s.cell));
         while (head < tail) {
             const e = unpackOld(queue[head]);
             head += 1;
             const c = unpackCell(e.cell);
-            self.invalidateAround(channel, c.x, c.y, c.z, e.old, queue, &tail, &minx, &maxx, &miny, &maxy, &minz, &maxz);
+            self.invalidateAround(channel, c.x, c.y, c.z, e.old, queue, &tail, &box);
         }
         // Rewrite floors (restores anything phase A zeroed), then reflood
         // from the bbox shell: every value>0 cell in bbox±1, which covers
@@ -396,62 +448,35 @@ pub const Chunk = struct {
             const c = unpackCell(s.cell);
             self.setChannelAt(channel, c.x, c.y, c.z, s.value);
         }
-        var rtail: usize = 0;
-        const x0 = minx -| 1;
-        const x1 = @min(maxx + 1, 15);
-        const y0 = miny -| 1;
-        const y1 = @min(maxy + 1, 255);
-        const z0 = minz -| 1;
-        const z1 = @min(maxz + 1, 15);
         // Empty seed set (no-op decrease): bbox stayed inverted.
-        if (maxx >= minx) {
-            var y = y0;
-            while (y <= y1) : (y += 1) {
-                var z = z0;
-                while (z <= z1) : (z += 1) {
-                    var x = x0;
-                    while (x <= x1) : (x += 1) {
-                        if (self.getChannelAt(channel, x, y, z) > 0) {
-                            if (rtail < queue.len) {
-                                queue[rtail] = packCell(x, y, z);
-                                rtail += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        if (box.isEmpty()) return;
+        const rtail = self.seedBbox(queue, channel, &box);
         var rhead: usize = 0;
-        self.bfsRaise(channel, queue, &rhead, &rtail);
+        var tail2: usize = rtail;
+        self.bfsRaise(channel, queue, &rhead, &tail2);
     }
 
     /// Phase-A step: examine the 6 neighbors of (x,y,z) against the value
     /// `flowed` that light traveled with; zero plausibly-dependent cells
     /// (enqueueing them with their old values) and grow the bbox.
-    fn invalidateAround(self: *Chunk, channel: LightChannel, x: usize, y: usize, z: usize, flowed: u4, queue: []u32, tail: *usize, minx: *usize, maxx: *usize, miny: *usize, maxy: *usize, minz: *usize, maxz: *usize) void {
+    fn invalidateAround(self: *Chunk, channel: LightChannel, x: usize, y: usize, z: usize, flowed: u4, queue: []u32, tail: *usize, box: *Bbox) void {
         for (light_dirs) |d| {
             const nx = @as(i32, @intCast(x)) + d[0];
             const ny = @as(i32, @intCast(y)) + d[1];
             const nz = @as(i32, @intCast(z)) + d[2];
-            if (nx < 0 or nx > 15 or ny < 0 or ny > 255 or nz < 0 or nz > 15) continue;
+            if (!inBounds(nx, ny, nz)) continue;
             const ux: usize = @intCast(nx);
             const uy: usize = @intCast(ny);
             const uz: usize = @intCast(nz);
             const vn = self.getChannelAt(channel, ux, uy, uz);
             if (self.isSourceCell(channel, ux, uy, uz, vn)) continue;
-            if (vn != 0 and vn < flowed) {
-                self.setChannelAt(channel, ux, uy, uz, 0);
-                minx.* = @min(minx.*, ux);
-                maxx.* = @max(maxx.*, ux);
-                miny.* = @min(miny.*, uy);
-                maxy.* = @max(maxy.*, uy);
-                minz.* = @min(minz.*, uz);
-                maxz.* = @max(maxz.*, uz);
-                // Exact fit: each cell zeroes (and enqueues) at most once.
-                if (tail.* < queue.len) {
-                    queue[tail.*] = packOld(packCell(ux, uy, uz), vn);
-                    tail.* += 1;
-                }
+            if (vn == 0 or vn >= flowed) continue;
+            self.setChannelAt(channel, ux, uy, uz, 0);
+            box.grow(ux, uy, uz);
+            // Exact fit: each cell zeroes (and enqueues) at most once.
+            if (tail.* < queue.len) {
+                queue[tail.*] = packOld(packCell(ux, uy, uz), vn);
+                tail.* += 1;
             }
         }
     }
@@ -496,64 +521,36 @@ pub const Chunk = struct {
         for (&self.sections) |*maybe| {
             if (maybe.*) |*s| @memset(&s.light, 0);
         }
+        var tail = self.seedEmissives(queue);
         var head: usize = 0;
+        // Same fixed point as the old hand-rolled flood: raise-BFS over
+        // the block channel with identical costs and edge rules.
+        self.bfsRaise(.block, queue, &head, &tail);
+    }
+
+    /// Pin every emissive cell to its emission value. Returns the seed
+    /// count (capped at queue.len — excess sources are skipped, never
+    /// mislit). Single linear pass per present section (no per-y copy
+    /// of the 12KB Section value).
+    fn seedEmissives(self: *Chunk, queue: []u32) usize {
         var tail: usize = 0;
-        var y: usize = 0;
-        while (y < 256) : (y += 1) {
-            const s = self.sections[y >> 4] orelse continue;
-            var z: usize = 0;
-            while (z < 16) : (z += 1) {
-                var x: usize = 0;
-                while (x < 16) : (x += 1) {
-                    const e = emitLight(s.blocks[Section.index(@intCast(x), @intCast(y & 15), @intCast(z))]);
-                    if (e == 0) continue;
-                    Section.setNibble(
-                        &self.sections[y >> 4].?.light,
-                        Section.index(@intCast(x), @intCast(y & 15), @intCast(z)),
-                        e,
-                    );
-                    if (tail < queue.len) {
-                        queue[tail] = @intCast((y * 16 + z) * 16 + x);
-                        tail += 1;
-                    }
-                }
+        for (&self.sections, 0..) |*maybe, si| {
+            const s = if (maybe.*) |*sec| sec else continue;
+            const y0 = si * 16;
+            for (s.blocks, 0..) |b, i| {
+                const e = emitLight(b);
+                if (e == 0) continue;
+                Section.setNibble(&s.light, i, e);
+                if (tail >= queue.len) return tail;
+                queue[tail] = packCell(i & 15, y0 + (i >> 8), (i >> 4) & 15);
+                tail += 1;
             }
         }
-        while (head < tail) {
-            const cell = queue[head];
-            head += 1;
-            const cx: usize = cell & 15;
-            const cz: usize = (cell >> 4) & 15;
-            const cy: usize = cell >> 8;
-            const cur = self.getLightAt(cx, cy, cz);
-            if (cur == 0) continue;
-            const dirs = [_][3]i32{ .{ 1, 0, 0 }, .{ -1, 0, 0 }, .{ 0, 1, 0 }, .{ 0, -1, 0 }, .{ 0, 0, 1 }, .{ 0, 0, -1 } };
-            for (dirs) |d| {
-                const nx = @as(i32, @intCast(cx)) + d[0];
-                const ny = @as(i32, @intCast(cy)) + d[1];
-                const nz = @as(i32, @intCast(cz)) + d[2];
-                if (nx < 0 or nx > 15 or ny < 0 or ny > 255 or nz < 0 or nz > 15) continue;
-                const ux: usize = @intCast(nx);
-                const uy: usize = @intCast(ny);
-                const uz: usize = @intCast(nz);
-                const op = lightOpacity(self.blockAt(ux, uy, uz));
-                if (op == 255) continue;
-                const drop: u4 = if (op >= 3) 2 else 1;
-                if (cur <= drop) continue;
-                const nl: u4 = cur - drop;
-                if (nl <= self.getLightAt(ux, uy, uz)) continue;
-                if (self.sections[uy >> 4] == null) continue; // don't inflate the mask for air-only sections
-                self.setLightAt(ux, uy, uz, nl);
-                if (tail < queue.len) {
-                    queue[tail] = @intCast((uy * 16 + uz) * 16 + ux);
-                    tail += 1;
-                }
-            }
-        }
+        return tail;
     }
 
     pub fn encodedLen(self: *const Chunk) usize {
-        return 3 + 1 + 9 + 2 + @as(usize, @popCount(self.mask())) * section_bytes + 512;
+        return header_len + @as(usize, @popCount(self.mask())) * section_bytes + tail_len;
     }
 
     pub fn encode(self: *const Chunk, allocator: std.mem.Allocator) ![]u8 {
@@ -595,7 +592,7 @@ pub const Chunk = struct {
     }
 
     pub fn decode(allocator: std.mem.Allocator, data: []const u8) ChunkError!*Chunk {
-        if (data.len < 3 + 1 + 9 + 2 + 512) return error.Truncated;
+        if (data.len < header_len + tail_len) return error.Truncated;
         if (!std.mem.eql(u8, data[0..3], magic)) return error.BadMagic;
         if (data[3] != version) return error.UnsupportedVersion;
         var p: usize = 4;
@@ -607,19 +604,17 @@ pub const Chunk = struct {
         p += 4;
         const section_mask = std.mem.readInt(u16, data[p..][0..2], .big);
         p += 2;
-        const want: usize = 3 + 1 + 9 + 2 + @as(usize, @popCount(section_mask)) * section_bytes + 512;
+        const want: usize = header_len + @as(usize, @popCount(section_mask)) * section_bytes + tail_len;
         if (data.len != want) return error.Truncated;
         const c = try allocator.create(Chunk);
+        errdefer allocator.destroy(c);
         c.* = .{ .dim = dim, .x = x, .z = z };
         for (0..16) |i| {
             if (section_mask & (@as(u16, 1) << @intCast(i)) == 0) continue;
             var s = Section{};
             for (&s.blocks) |*b| {
                 const raw = std.mem.readInt(u16, data[p..][0..2], .big);
-                if (raw >= ids.COUNT) {
-                    allocator.destroy(c);
-                    return error.BlockIdRange;
-                }
+                if (raw >= ids.COUNT) return error.BlockIdRange;
                 b.* = @enumFromInt(raw);
                 p += 2;
             }

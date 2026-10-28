@@ -27,7 +27,7 @@ vice versa).
 ./zig-out/bin/asteorite serve
 # or without installing first:
 zig build run -- serve
-# (put "seed": 42 in asteorite.json for worldgen — see below)
+# (put seed = 42 under [world] in asteorite.toml for worldgen — see below)
 ```
 
 Then connect with a vanilla 1.7.10 client to `localhost:25565`
@@ -39,8 +39,8 @@ First-run notes:
   `--op <name>` (persisted in the db, so you only need it once), then use
   in-game/console commands from there. Console commands: `help`, `list`,
   `save-all`, `stop`.
-- The world **seed lives in the config file** (`"seed"` in `asteorite.json`;
-  there is no `--seed` flag). It drives on-demand chunk generation into
+- The world **seed lives in the config file** (`[world]` → `seed` in
+  `asteorite.toml`; there is no `--seed` flag). It drives on-demand chunk generation into
   the world folder (default `./world`, overridable with `--db`; set
   `"db": null` to disable persistence). If the seed changes, delete the
   world folder — stored chunks are never regenerated.
@@ -82,7 +82,7 @@ Precedence is **built-in defaults < config file < CLI flags**.
 | `--login-rate-burst <n>` | 5 | logins allowed per window per IP (past it: kick) |
 | `--place-rate-window-ms <ms>` | 1000 | placement flood window per conn |
 | `--place-rate-burst <n>` | 32 | placements allowed per window (past it: kick) |
-| `-c, --config <path>` | `./asteorite.json` if present | JSON config file |
+| `-c, --config <path>` | `./asteorite.toml` if present | TOML config file |
 | `-h, --help` | — | help |
 
 `--flag value` and `--flag=value` both work; `--` ends flag parsing.
@@ -163,46 +163,64 @@ interactions — partitioning them needs a halo protocol).
 
 ### Config file
 
-Copy `asteorite.example.json` to `asteorite.json` (or pass `-c <path>`).
-Every key is optional; anything the CLI sets wins over the file:
+Copy `asteorite.example.toml` to `asteorite.toml` (or pass `-c <path>`).
+Every section and every key is optional; anything the CLI sets wins over
+the file. Unknown tables and keys fail boot (typos and legacy flat keys
+land here — a silently dropped seed would mint a random world):
 
-```json
-{
-  "port": 25565,
-  "online": false,
-  "db": "world",
-  "view_distance": 8,
-  "seed": 42,
-  "gen_spawn": 4,
-  "gen_workers": 4,
-  "ops": ["alice"],
-  "rcon_password": null,
-  "rcon_port": 25575,
-  "motd": "Asteorite",
-  "max_players": 20,
-  "brand": "vanilla",
-  "transport": "auto",
-  "out_cap_bytes": 4194304,
-  "send_zc_threshold": 8192,
-  "storage_profile": "auto",
-  "login_rate_window_ms": 10000,
-  "login_rate_burst": 5,
-  "place_rate_window_ms": 1000,
-  "place_rate_burst": 32
-}
+```toml
+# Identity and presence.
+[server]
+port = 25565
+online = false
+db = "world"
+view_distance = 8
+motd = "Asteorite"
+max_players = 20
+brand = "vanilla"
+ops = ["alice"]
+# rcon_password = "choose-a-long-random-secret"
+rcon_port = 25575
+
+# World generation and gameplay.
+[world]
+seed = 42
+# gen_spawn = 4
+# gen_workers = 4
+
+# Sockets, transport, and protocol guards.
+[network]
+transport = "auto"
+out_cap_bytes = 4194304
+send_zc_threshold = 8192
+
+# On-disk store.
+[storage]
+storage_profile = "auto"
+
+# Anti-flood budgets (windows are milliseconds).
+[rates]
+login_rate_window_ms = 10000
+login_rate_burst = 5
+place_rate_window_ms = 1000
+place_rate_burst = 32
+
+# GPU chunk-gen offload.
+[gpu]
+gpu = "off"
 ```
 
 ### Seeds
 
-The world seed is set with `"seed"` in `asteorite.json` (there is no
-`--seed` flag). Seeds are full signed **int64** — every numeric Minecraft
+The world seed is set under `[world]` as `seed` in `asteorite.toml`
+(there is no `--seed` flag). Seeds are full signed **int64** — every numeric Minecraft
 seed works,
 including negatives and the whole 19-digit range (`-2^63..2^63-1`).
 Non-numeric strings hash with Java `String.hashCode`, exactly like typing
 text into the vanilla seed field (`"Notch"` → `75456088`). Quoted numeric
 strings parse as integers (decimal, `0x` hex, `0o` octal); over-long ones
 fall back to hashing, like vanilla's `Long.parseLong` catch path. Bare
-JSON floats and integers outside int64 are rejected at startup.
+floats and integers outside int64 are rejected at startup.
 
 ### Brands
 

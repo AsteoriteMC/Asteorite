@@ -1102,8 +1102,7 @@ pub fn build(b: *Builder, sx: i32, sz: i32, rand: *JavaRandom) void {
     while (i < b.n) : (i += 1) u = u.expandToInclude(b.pieces[i].box);
     b.union_box = u;
     // markAvailableHeight(..., 10): shift so top lands at 53 + draw.
-    var v: i32 = (u.max_y - u.min_y + 1) + 1;
-    if (v < 53) v += rand.nextIntBound(53 - v) catch unreachable;
+    const v: i32 = mapgen_mod.availHeightTop(u.max_y - u.min_y + 1 + 1, rand);
     const sh: i32 = v - u.max_y;
     i = 0;
     while (i < b.n) : (i += 1) b.pieces[i].box = b.pieces[i].box.offset(0, sh, 0);

@@ -25,6 +25,14 @@ fn resolveMc(name: []const u8) ?McSpec {
     return null;
 }
 
+/// Apply the -Dstrip/-Dlto/-Dgc-sections opts to one installed executable.
+/// Call-site is one line per artifact next to its `installArtifact`.
+fn applyBinaryOpts(cs: *std.Build.Step.Compile, strip: bool, lto: ?std.zig.LtoMode, gc_sections: bool) void {
+    if (strip) cs.root_module.strip = true;
+    if (lto) |m| cs.lto = m;
+    if (gc_sections) cs.link_gc_sections = true;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -42,16 +50,53 @@ pub fn build(b: *std.Build) void {
         std.process.exit(1);
     }
 
+    // Binary size / link-time opts for INSTALLED binaries only (never the
+    // test binaries below — LTO on the test suite costs minutes per
+    // `zig build test` for zero signal). Defaults are all off so the
+    // normal dev/test flow is untouched; the deploy recipe turns them on.
+    const strip = b.option(bool, "strip", "Strip debug info from installed binaries (smaller, faster page-in; keep an unstripped copy for crash triage)") orelse false;
+    const lto_str = b.option([]const u8, "lto", "LLVM link-time optimization for installed binaries: off|thin|full (slower build, typically 3-8% runtime)") orelse "off";
+    const gc_sections = b.option(bool, "gc-sections", "Garbage-collect unused sections in installed binaries (smaller, fewer pages)") orelse false;
+    const lto: ?std.zig.LtoMode = if (std.mem.eql(u8, lto_str, "off")) null else if (std.mem.eql(u8, lto_str, "thin")) .thin else if (std.mem.eql(u8, lto_str, "full")) .full else {
+        std.debug.print("error: unsupported -Dlto value '{s}' (want off|thin|full)\n", .{lto_str});
+        std.process.exit(1);
+    };
+
     const opts = b.addOptions();
     opts.addOption(u16, "mc_protocol", mc.protocol);
     opts.addOption([]const u8, "mc_name", mc.name);
     const build_options = opts.createModule();
 
+    const zigzag_dep = b.dependency("zigzag", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // GPU shader assembler driver (build-time only: host target, never
+    // installed). `zig build shaders` runs it explicitly, and every
+    // compile that embeds SPV orders after it, so a stale `.spv` with
+    // SPIRV-Tools installed is impossible. Missing spirv-as/spirv-val
+    // is a soft skip (checked-in `.spv` used as-is) so `zig build test`
+    // stays green on machines without the toolchain.
+    const spv_build_exe = b.addExecutable(.{
+        .name = "spv_build",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/spv_build.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    const spv_run = b.addRunArtifact(spv_build_exe);
+    spv_run.setCwd(b.path("."));
+    const shaders_step = b.step("shaders", "Assemble GPU shaders (.spvasm -> .spv) + spirv-val (soft skip without SPIRV-Tools)");
+    shaders_step.dependOn(&spv_run.step);
+
     const mod = b.addModule("asteorite", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .link_libc = true,
         .imports = &.{
             .{ .name = "build_options", .module = build_options },
+            .{ .name = "zigzag", .module = zigzag_dep.module("zigzag") },
         },
     });
 
@@ -67,6 +112,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(exe);
+    applyBinaryOpts(exe, strip, lto, gc_sections);
 
     const anvil_tool = b.addExecutable(.{
         .name = "anvil_dump",
@@ -80,6 +126,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(anvil_tool);
+    applyBinaryOpts(anvil_tool, strip, lto, gc_sections);
 
     const import_tool = b.addExecutable(.{
         .name = "anvil_import",
@@ -93,6 +140,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(import_tool);
+    applyBinaryOpts(import_tool, strip, lto, gc_sections);
 
     const wgen_tool = b.addExecutable(.{
         .name = "worldgen_dump",
@@ -106,6 +154,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(wgen_tool);
+    applyBinaryOpts(wgen_tool, strip, lto, gc_sections);
 
     const seed_tool = b.addExecutable(.{
         .name = "seed_dump",
@@ -119,6 +168,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(seed_tool);
+    applyBinaryOpts(seed_tool, strip, lto, gc_sections);
 
     const genlayer_tool = b.addExecutable(.{
         .name = "genlayer_dump",
@@ -132,6 +182,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(genlayer_tool);
+    applyBinaryOpts(genlayer_tool, strip, lto, gc_sections);
 
     const genbench_tool = b.addExecutable(.{
         .name = "gen_bench",
@@ -145,6 +196,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(genbench_tool);
+    applyBinaryOpts(genbench_tool, strip, lto, gc_sections);
 
     const check_tool = b.addExecutable(.{
         .name = "check",
@@ -158,6 +210,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(check_tool);
+    applyBinaryOpts(check_tool, strip, lto, gc_sections);
 
     const player_import_tool = b.addExecutable(.{
         .name = "player_import",
@@ -171,6 +224,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(player_import_tool);
+    applyBinaryOpts(player_import_tool, strip, lto, gc_sections);
 
     const player_dump_tool = b.addExecutable(.{
         .name = "player_dump",
@@ -184,6 +238,49 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(player_dump_tool);
+    applyBinaryOpts(player_dump_tool, strip, lto, gc_sections);
+
+    const col_dump_tool = b.addExecutable(.{
+        .name = "col_dump",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/col_dump.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "asteorite", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(col_dump_tool);
+    applyBinaryOpts(col_dump_tool, strip, lto, gc_sections);
+
+    const bulk_dump_tool = b.addExecutable(.{
+        .name = "bulk_dump",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/bulk_dump.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "asteorite", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(bulk_dump_tool);
+    applyBinaryOpts(bulk_dump_tool, strip, lto, gc_sections);
+
+    const chest_dump_tool = b.addExecutable(.{
+        .name = "chest_dump",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/chest_dump.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "asteorite", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(chest_dump_tool);
+    applyBinaryOpts(chest_dump_tool, strip, lto, gc_sections);
 
     const bench_tool = b.addExecutable(.{
         .name = "bench",
@@ -197,6 +294,35 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(bench_tool);
+    applyBinaryOpts(bench_tool, strip, lto, gc_sections);
+
+    const gpu_probe_tool = b.addExecutable(.{
+        .name = "gpu_probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gpu_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "asteorite", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(gpu_probe_tool);
+    applyBinaryOpts(gpu_probe_tool, strip, lto, gc_sections);
+
+    const genq_dump_tool = b.addExecutable(.{
+        .name = "genq_dump",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/genq_dump.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "asteorite", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(genq_dump_tool);
+    applyBinaryOpts(genq_dump_tool, strip, lto, gc_sections);
 
     const run_step = b.step("run", "Run asteorite server (stub)");
     const run_cmd = b.addRunArtifact(exe);
@@ -252,6 +378,18 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| bench_cmd.addArgs(args);
     bench_step.dependOn(&bench_cmd.step);
 
+    const gpu_probe_step = b.step("gpu-probe", "Run Vulkan GPU probe (echo/threshold/batch bit-compare)");
+    const gpu_probe_cmd = b.addRunArtifact(gpu_probe_tool);
+    gpu_probe_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| gpu_probe_cmd.addArgs(args);
+    gpu_probe_step.dependOn(&gpu_probe_cmd.step);
+
+    const genq_dump_step = b.step("genq-dump", "Dump real q[825] + fillChunk output for GPU --realq (seed cx cz path [iters])");
+    const genq_dump_cmd = b.addRunArtifact(genq_dump_tool);
+    genq_dump_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| genq_dump_cmd.addArgs(args);
+    genq_dump_step.dependOn(&genq_dump_cmd.step);
+
     const mod_tests = b.addTest(.{ .root_module = mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
@@ -281,6 +419,12 @@ pub fn build(b: *std.Build) void {
     const player_dump_tests = b.addTest(.{ .root_module = player_dump_tool.root_module });
     const run_player_dump_tests = b.addRunArtifact(player_dump_tests);
 
+    const gpu_probe_tests = b.addTest(.{ .root_module = gpu_probe_tool.root_module });
+    const run_gpu_probe_tests = b.addRunArtifact(gpu_probe_tests);
+
+    const genq_dump_tests = b.addTest(.{ .root_module = genq_dump_tool.root_module });
+    const run_genq_dump_tests = b.addRunArtifact(genq_dump_tests);
+
     // C0 import-boundary gate. Kept as a named step so it can run on its own
     // even while a larger WIP module is temporarily uncompilable.
     const import_gate_mod = b.createModule(.{
@@ -309,6 +453,21 @@ pub fn build(b: *std.Build) void {
     const test_exploit_step = b.step("test-exploit", "Run C9 exploit/core regression suite and fuzz seeds");
     test_exploit_step.dependOn(&run_exploit_tests.step);
 
+    // Every compile embedding SPV (the whole asteorite module graph)
+    // orders after shader assembly. Compare-and-swap means no writes
+    // (hence no recompiles) when shaders are up-to-date.
+    const shader_consumers = [_]*std.Build.Step.Compile{
+        exe,          anvil_tool,       import_tool,      wgen_tool,
+        seed_tool,    genlayer_tool,    genbench_tool,    check_tool,
+        player_import_tool, player_dump_tool, col_dump_tool, bulk_dump_tool,
+        chest_dump_tool, bench_tool, gpu_probe_tool, genq_dump_tool,
+        mod_tests,    exe_tests,        tool_tests,       import_tests,
+        wgen_tests,   seed_tests,       genlayer_tests,   check_tests,
+        player_import_tests, player_dump_tests,
+        gpu_probe_tests, genq_dump_tests,
+    };
+    for (shader_consumers) |cs| cs.step.dependOn(&spv_run.step);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
@@ -320,6 +479,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_check_tests.step);
     test_step.dependOn(&run_player_import_tests.step);
     test_step.dependOn(&run_player_dump_tests.step);
+    test_step.dependOn(&run_gpu_probe_tests.step);
+    test_step.dependOn(&run_genq_dump_tests.step);
     test_step.dependOn(&run_import_gate_tests.step);
     test_step.dependOn(&run_exploit_tests.step);
 }

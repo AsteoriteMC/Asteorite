@@ -130,8 +130,7 @@ fn buildStart(sx: i32, sz: i32, rand: *JavaRandom, b: *Build) BBox {
     var u = BBox.empty();
     for (b.pieces[0..b.n]) |q| u = u.expandToInclude(q.comp.box);
     // Height shift (`avm.a(ahb, Random, 10)`): top lands in [h+1, 53].
-    var top: i32 = u.sizeY() + 1;
-    if (top < 53) top += (rand.nextIntBound(53 - top) catch unreachable);
+    const top: i32 = mapgen_mod.availHeightTop(u.sizeY() + 1, rand);
     const dy = top - u.max_y;
     for (b.pieces[0..b.n]) |*q| q.comp.box = q.comp.box.offset(0, dy, 0);
     // NOTE: room entrances are stored pre-shift and never shifted (vanilla

@@ -71,29 +71,37 @@ pub const v5struct_village = @import("worldgen/v5/struct/village.zig");
 pub const v5struct_stronghold = @import("worldgen/v5/struct/stronghold.zig");
 /// Canonical item model (version-agnostic game data; wire codecs per proto).
 pub const item = @import("item.zig");
+/// Profile rules (gamemode/difficulty enums + engine tuning).
+pub const rules = @import("game/rules.zig");
+/// Canonical mob kinds (spawn allowlist keys + engine identity).
+pub const mob = @import("game/mob.zig");
 /// Canonical block/item identity (interned indices; wire encodings live per proto version).
 pub const ids = @import("ids.zig");
 /// 1.7 slot wire codec over the canonical model (no game tables here).
 pub const v5slot = @import("proto/v5/slot.zig");
+/// Command metadata (gamerule defaults, scoreboard criteria, stats).
+pub const cmd_data = @import("proto/v5/cmd_data.zig");
 /// 1.7.10 wire encodings for canonical ids (single source of truth for v5 conversion).
 pub const v5wire = @import("proto/v5/wire_ids.zig");
 /// Lock-free cross-region handoff queue.
-pub const mpsc = @import("sim/mpsc.zig");
+pub const mpsc = @import("sim/core/mpsc.zig");
 /// CPU topology + pinning for Phase C region threads.
-pub const affinity = @import("sim/affinity.zig");
+pub const affinity = @import("sim/core/affinity.zig");
 /// Deterministic 20 TPS region tick loop.
-pub const tick = @import("sim/tick.zig");
+pub const tick = @import("sim/core/tick.zig");
 /// Persistent futex-barrier worker pool (Phase C follow-up: stable
 /// thread identities for the region tick; falls back to fork-join).
-pub const pool = @import("sim/pool.zig");
+pub const pool = @import("sim/core/pool.zig");
 /// View-distance initial chunk burst + block application.
-pub const view = @import("sim/view.zig");
+pub const view = @import("sim/world/view.zig");
 /// Minimal entity tracking (players + mobs, delta-encoded updates).
-pub const entity = @import("sim/entity.zig");
+pub const entity = @import("sim/entity/entity.zig");
 /// Player persistence (position/inventory/health across restarts, LSM-backed).
-pub const players = @import("sim/players.zig");
+pub const players = @import("sim/player/players.zig");
+/// Per-block chest storage (single chests + double halves, LSM-backed).
+pub const chest = @import("sim/world/chest.zig");
 /// Permission model: op levels + per-player node grants/denies (LSM-backed).
-pub const permissions = @import("sim/permissions.zig");
+pub const permissions = @import("sim/player/permissions.zig");
 /// Server list ping payload: struct-stringified status JSON with
 /// vanilla/fabric/forge handshake brands (FML modinfo for forge).
 pub const status = @import("net/status.zig");
@@ -106,25 +114,32 @@ pub const shutdown = @import("net/shutdown.zig");
 /// Operator console TUI (scrollback, history, colors) + terminal restore
 /// hook used by every stop path (console/RCON/in-game) before exit().
 pub const console_tui = @import("console_tui.zig");
+/// Minimal TOML parser for the server config file (tables, scalars,
+/// arrays, inline tables, comments). Strict subset, fail-closed.
+pub const toml = @import("toml.zig");
 /// Test-and-set spinlock for short critical sections.
-pub const spin = @import("sim/spin.zig");
+pub const spin = @import("sim/core/spin.zig");
 /// Vanilla 1.7.10 redstone simulation: scheduled ticks, power model,
 /// components (wire/torch/lever/button/plates/doors/lamp/repeater/ore).
-pub const redstone = @import("sim/redstone.zig");
+pub const redstone = @import("sim/world/redstone.zig");
 /// Version-neutral interaction geometry/reach rules (C4).
-pub const interaction = @import("sim/interaction.zig");
+pub const interaction = @import("sim/world/interaction.zig");
 /// Version-neutral movement bookkeeping (exhaustion, fall distance) (C4).
-pub const movement = @import("sim/movement.zig");
+pub const movement = @import("sim/world/movement.zig");
 /// Bump arena with O(1) reset (Phase D per-tick transient data).
-pub const arena = @import("sim/arena.zig");
+pub const arena = @import("sim/core/arena.zig");
 /// Fixed-size slab allocator (Phase D entity/block-entity storage).
-pub const slab = @import("sim/slab.zig");
+pub const slab = @import("sim/core/slab.zig");
 /// Seqlock for read-mostly shared state (Phase D lock-free reads).
-pub const seqlock = @import("sim/seqlock.zig");
+pub const seqlock = @import("sim/core/seqlock.zig");
 /// Sliding-window rate limiters (login attempts, block placement).
-pub const ratelimit = @import("sim/ratelimit.zig");
+pub const ratelimit = @import("sim/core/ratelimit.zig");
+/// Command framework: spec-driven usage, parsing, tab-completion.
+/// Shared with main-module files (cli.zig) that must not import cmd/
+/// files by path (that would claim them into two modules).
+pub const cmdspec = @import("cmd/spec.zig");
 /// SoA entity store + SIMD fast paths (Phase D prefetcher-friendly tick).
-pub const entity_store = @import("sim/entity_store.zig");
+pub const entity_store = @import("sim/entity/entity_store.zig");
 /// Network transport abstraction (Phase B: io_uring / kqueue / IOCP / blocking).
 pub const transport = @import("net/transport.zig");
 /// Linux io_uring transport backend (Phase B primary). Linux-only: the
@@ -135,6 +150,20 @@ pub const uring = if (@import("builtin").os.tag == .linux) @import("net/uring.zi
 /// calls are comptime-gated to Windows); pure parts are unit-tested on
 /// every target, runtime needs Windows hardware.
 pub const iocp = @import("net/iocp.zig");
+/// G1 GPU offload: minimal Vulkan loader + headless compute (dlopen,
+/// no link-time dep; soft-fails without a driver). CPU fallback always.
+pub const gpuvk = @import("gpu/vk_min.zig");
+/// G1 async job interface (Backend/TickBudget/bit-compare helper). The v1
+/// sync fill path doesn't route through it yet; v2 batching will.
+pub const gpujob = @import("gpu/job.zig");
+/// Checked-in SPIR-V kernels (embed + structural tests): echo, threshold,
+/// batched threshold. Dispatched by gpu_probe and gpufill.
+pub const gpuecho = @import("gpu/echo_spv.zig");
+pub const gputhreshold = @import("gpu/threshold_spv.zig");
+pub const gpubatch = @import("gpu/threshold_batch_spv.zig");
+/// Persistent GPU fill context for GenPool workers (v1 sync offload with
+/// CPU fallback; bit-identical either way).
+pub const gpufill = @import("gpu/fill.zig");
 
 test {
     _ = @import("version.zig");
@@ -148,6 +177,7 @@ test {
     _ = @import("game/mc5/mobs.zig");
     _ = @import("game/mc5/drops_data.zig");
     _ = @import("game/mc5/enchanting_data.zig");
+    _ = @import("game/mc5/item_data.zig");
     _ = @import("game/rules.zig");
     _ = @import("net/codec.zig");
     _ = @import("net/cfb8.zig");
@@ -155,16 +185,18 @@ test {
     _ = @import("net/mojang.zig");
     _ = @import("net/uuid.zig");
     _ = @import("net/conn.zig");
+    _ = @import("net/conn_tests.zig");
     _ = @import("net/server.zig");
     _ = @import("net/packet_sink.zig");
     _ = @import("net/rcon.zig");
     _ = @import("console_tui.zig");
+    _ = @import("toml.zig");
     _ = @import("net/status.zig");
     _ = @import("proto/v5/ids.zig");
     _ = @import("proto/v5/packets.zig");
     _ = @import("proto/v5/cmd_data.zig");
-    _ = @import("sim/bans.zig");
-    _ = @import("sim/scoreboard.zig");
+    _ = @import("sim/player/bans.zig");
+    _ = @import("sim/player/scoreboard.zig");
     _ = @import("proto/v5/chunks.zig");
     _ = @import("world/nbt.zig");
     _ = @import("world/anvil.zig");
@@ -193,28 +225,29 @@ test {
     _ = @import("ids.zig");
     _ = @import("proto/v5/wire_ids.zig");
     _ = @import("proto/v5/slot.zig");
-    _ = @import("sim/mpsc.zig");
-    _ = @import("sim/affinity.zig");
-    _ = @import("sim/tick.zig");
-    _ = @import("sim/pool.zig");
-    _ = @import("sim/view.zig");
-    _ = @import("sim/entity.zig");
-    _ = @import("sim/players.zig");
-    _ = @import("sim/permissions.zig");
-    _ = @import("sim/spin.zig");
-    _ = @import("sim/redstone.zig");
-    _ = @import("sim/container.zig");
-    _ = @import("sim/enchanting.zig");
-    _ = @import("sim/interaction.zig");
-    _ = @import("sim/movement.zig");
-    _ = @import("sim/world_view.zig");
-    _ = @import("sim/arena.zig");
-    _ = @import("sim/slab.zig");
-    _ = @import("sim/seqlock.zig");
-    _ = @import("sim/ratelimit.zig");
-    _ = @import("sim/entity_store.zig");
-    _ = @import("sim/packet_sink.zig");
-    _ = @import("sim/packet_sink_test.zig");
+    _ = @import("sim/core/mpsc.zig");
+    _ = @import("sim/core/affinity.zig");
+    _ = @import("sim/core/tick.zig");
+    _ = @import("sim/core/pool.zig");
+    _ = @import("sim/world/view.zig");
+    _ = @import("sim/entity/entity.zig");
+    _ = @import("sim/player/players.zig");
+    _ = @import("sim/player/permissions.zig");
+    _ = @import("sim/core/spin.zig");
+    _ = @import("sim/world/redstone.zig");
+    _ = @import("sim/world/container.zig");
+    _ = @import("sim/world/chest.zig");
+    _ = @import("sim/world/enchanting.zig");
+    _ = @import("sim/world/interaction.zig");
+    _ = @import("sim/world/movement.zig");
+    _ = @import("sim/world/world_view.zig");
+    _ = @import("sim/core/arena.zig");
+    _ = @import("sim/core/slab.zig");
+    _ = @import("sim/core/seqlock.zig");
+    _ = @import("sim/core/ratelimit.zig");
+    _ = @import("sim/entity/entity_store.zig");
+    _ = @import("sim/net/packet_sink.zig");
+    _ = @import("sim/net/packet_sink_test.zig");
     _ = @import("net/transport.zig");
     _ = @import("net/shutdown.zig");
     _ = @import("worldgen/v5/struct/bbox.zig");
@@ -230,6 +263,12 @@ test {
     _ = @import("worldgen/v5/struct/stronghold.zig");
     _ = if (@import("builtin").os.tag == .linux) @import("net/uring.zig") else struct {};
     _ = @import("net/iocp.zig");
+    _ = @import("gpu/vk_min.zig");
+    _ = @import("gpu/job.zig");
+    _ = @import("gpu/echo_spv.zig");
+    _ = @import("gpu/threshold_spv.zig");
+    _ = @import("gpu/threshold_batch_spv.zig");
+    _ = @import("gpu/fill.zig");
     _ = @import("cmd/mod.zig");
     _ = @import("cmd/help.zig");
     _ = @import("cmd/list.zig");

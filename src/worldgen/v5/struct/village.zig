@@ -185,19 +185,7 @@ fn spawnRow(p: Placer, c: Component, clip: BBox, x0: i32, y: i32, z0: i32, n: i3
 /// Ground average (`awd.b`): max(topY, provider avg) over box columns
 /// inside the clip; null when no column is inside.
 fn groundAvg(p: Placer, box: BBox, clip: BBox) ?i32 {
-    var sum: i64 = 0;
-    var n: i64 = 0;
-    var z = box.min_z;
-    while (z <= box.max_z) : (z += 1) {
-        var x = box.min_x;
-        while (x <= box.max_x) : (x += 1) {
-            if (!clip.contains(x, 64, z)) continue;
-            sum += @max(p.topY(x, z), p.groundBase());
-            n += 1;
-        }
-    }
-    if (n == 0) return null;
-    return @intCast(@divTrunc(sum, n));
+    return mapgen_mod.groundAverage(p, box, clip);
 }
 
 /// Crop pick (`avr`/`avs` ctor): nextInt(5): 0 carrots, 1 potatoes, else

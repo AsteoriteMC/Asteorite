@@ -1,0 +1,159 @@
+# Asteorite server config. Every section and key is optional; anything the
+# CLI sets wins over the file. Unknown tables and keys fail boot (a typo
+# should never silently boot defaults). Copy to asteorite.toml (or pass
+# -c <path>).
+
+# Identity and presence.
+[server]
+# TCP port (1-65535).
+port = 25565
+# Mojang auth (offline UUIDs when false).
+online = false
+# World folder (vanilla name).
+db = "world"
+# Chunk view radius (1-16, 1.7.10 client cap).
+view_distance = 8
+# Server list message (multiplayer menu).
+motd = "Asteorite"
+# Server list player cap (1-1024).
+max_players = 20
+# Handshake brand: vanilla, fabric, or forge.
+brand = "vanilla"
+# Console operators (repeatable --op works too).
+ops = []
+# RCON password (unset disables RCON).
+# rcon_password = "choose-a-long-random-secret"
+# RCON port.
+rcon_port = 25575
+# Minutes until idle kick (0 = never).
+idle_timeout = 0
+# Periodic autosave every 5 minutes.
+autosave = true
+
+# World generation and gameplay.
+[world]
+# Int64 or string (hashed Java-style); absent = random + loud log.
+seed = 42
+# Spawn disk radius pre-generated at boot.
+# gen_spawn = 4
+# Background gen threads.
+# gen_workers = 4
+# Region tick threads (0 = auto).
+region_threads = 0
+# Default gamemode: survival, creative, adventure.
+gamemode = "creative"
+# peaceful, easy, normal, or hard.
+difficulty = "easy"
+# Player-vs-player damage.
+pvp = true
+# Re-apply default gamemode to returning players.
+force_gamemode = false
+# Vanilla gamerule overrides.
+# gamerules = { keepInventory = true }
+# Natural mob spawn master switch.
+spawn_mobs = true
+# Per-kind spawn allowlist.
+# mob_spawns = { zombie = false }
+# Placeholder (ticking follows view distance).
+simulation_distance = 10
+
+# Sockets, transport, and protocol guards.
+[network]
+# Listen interface (0.0.0.0 = all).
+bind_address = "0.0.0.0"
+# Kernel accept backlog.
+backlog = 4096
+# Ring entries, power of two 1-8192.
+io_uring_entries = 256
+# Backend: auto, uring, kqueue, iocp, blocking.
+transport = "auto"
+# Transport threads (0 = auto).
+transport_workers = 0
+# TCP_NODELAY on accepted sockets.
+tcp_nodelay = true
+# Socket send buffer (0 = OS default).
+sndbuf = 0
+# Socket receive buffer (0 = OS default).
+rcvbuf = 0
+# Per-conn packet cap (0 = off).
+max_packets_per_second = 0
+# Max inbound frame bytes (1-16 MiB).
+max_packet_size = 2097152
+# Compression bytes (-1 = off; no path yet).
+compression_threshold = -1
+# Compression level 1-9.
+compression_level = 3
+# NBT depth guard (rides opaque today).
+max_nbt_depth = 32
+# Max chat/channel string bytes.
+max_string_length = 32767
+# Per-connection outbox cap.
+out_cap_bytes = 4194304
+# Zerocopy send threshold bytes.
+send_zc_threshold = 8192
+
+# On-disk store.
+[storage]
+# auto, hdd, ssd, or nvme.
+storage_profile = "auto"
+# Placeholder (LSM has no region files).
+region_cache_size = 256
+# Placeholder (WAL + autosave rule).
+disk_flush_interval = 30
+# Memtable bytes before background SST flush (profile default when unset).
+# Raise for bulk loads (pregen): fewer seals + WAL rotations.
+# flush_threshold_bytes = 67108864
+# Auto-compact at this fragment-run count (profile default when unset;
+# 0 = manual). Only sub-split-size runs ever merge, so bulk loads can't
+# trigger full-DB rewrites. Raise for bulk loads, then compact once after.
+# compact_threshold_ssts = 32
+
+# Anti-flood budgets (windows are milliseconds).
+[rates]
+# Chat flood window milliseconds.
+chat_rate_window_ms = 750
+# Chats allowed per window.
+chat_rate_burst = 3
+# Dig flood window milliseconds.
+dig_rate_window_ms = 1000
+# Digs allowed per window.
+dig_rate_burst = 32
+# Login flood window milliseconds.
+login_rate_window_ms = 10000
+# Joins allowed per window per IP.
+login_rate_burst = 5
+# Placement flood window milliseconds.
+place_rate_window_ms = 1000
+# Placements allowed per window per conn.
+place_rate_burst = 32
+
+# Performance telemetry.
+[telemetry]
+# Stats logging (no exporter yet).
+telemetry_enabled = false
+# MSPT sampling interval.
+telemetry_sampling_ms = 50
+# Prometheus exporter (needs work).
+telemetry_prometheus = false
+# Prometheus port.
+telemetry_prometheus_port = 9090
+
+# Sandboxed plugins.
+[wasm]
+# Sandboxed plugins (no runtime yet).
+wasm_enabled = false
+# Per-plugin memory cap.
+wasm_max_memory_mb = 128
+# Per-tick instruction gas per callback.
+wasm_instruction_limit = 10000000
+
+# GPU chunk-gen offload.
+[gpu]
+# Offload backend: off or vulkan.
+gpu = "off"
+# Dispatch budget ms (stored for v2).
+gpu_budget_ms = 4
+# Max chunks per dispatch (1-64).
+gpu_max_batch = 16
+# Pick: auto, discrete, integrated, cpu.
+gpu_device = "auto"

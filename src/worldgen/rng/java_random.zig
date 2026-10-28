@@ -16,6 +16,20 @@ pub const multiplier: u64 = 0x5DEECE66D;
 pub const addend: u64 = 0xB;
 pub const mask: u64 = (1 << 48) - 1;
 
+/// Affine batch coefficients: s_{n+k} = A_k * s_n + C_k (mod 2^48).
+/// A_1 = a, C_1 = c; A_{2k} = A_k^2, C_{2k} = A_k*C_k + C_k.
+/// Precomputed for k=2,3,4,8 to evaluate successive seeds independently
+/// from one starting state (shortens the serial multiply chain).
+/// Wrapping u64 arithmetic masked to 48 bits preserves the low bits.
+pub const A2: u64 = (multiplier *% multiplier) & mask;
+pub const C2: u64 = (multiplier *% addend +% addend) & mask;
+pub const A3: u64 = (A2 *% multiplier) & mask;
+pub const C3: u64 = (A2 *% addend +% C2) & mask;
+pub const A4: u64 = (A2 *% A2) & mask;
+pub const C4: u64 = (A2 *% C2 +% C2) & mask;
+pub const A8: u64 = (A4 *% A4) & mask;
+pub const C8: u64 = (A4 *% C4 +% C4) & mask;
+
 pub const JavaRandom = struct {
     seed: u64, // only the low 48 bits are live
     next_next_gaussian: f64 = 0.0,
@@ -70,18 +84,97 @@ pub const JavaRandom = struct {
         return (hi << 32) +% lo;
     }
 
+    /// Exact bulk two-draw long: same two next(32) draws as nextLong, but
+    /// both successor seeds are evaluated independently from the entry
+    /// state (A2/C2 affine form), shortening the serial multiply chain
+    /// from 2 to 1. Committed seed and outputs are bit-identical.
+    pub fn nextLongFast(self: *JavaRandom) i64 {
+        const s0 = self.seed;
+        const s1 = (s0 *% multiplier +% addend) & mask;
+        const s2 = (s0 *% A2 +% C2) & mask;
+        self.seed = s2;
+        const hi_u: u32 = @intCast(s1 >> 16);
+        const lo_u: u32 = @intCast(s2 >> 16);
+        const hi: i64 = @as(i32, @bitCast(hi_u));
+        const lo: i64 = @as(i32, @bitCast(lo_u));
+        return (hi << 32) +% lo;
+    }
+
+    /// Exact bulk two-draw double: same 26+27-bit draws as nextDouble,
+    /// evaluated independently from the entry state. Bit-identical.
+    pub fn nextDoubleFast(self: *JavaRandom) f64 {
+        const s0 = self.seed;
+        const s1 = (s0 *% multiplier +% addend) & mask;
+        const s2 = (s0 *% A2 +% C2) & mask;
+        self.seed = s2;
+        const hi: u64 = @intCast(s1 >> (48 - 26));
+        const lo: u64 = @intCast(s2 >> (48 - 27));
+        return @as(f64, @floatFromInt((hi << 27) + lo)) * (1.0 / 9007199254740992.0);
+    }
+
+    /// Fill `out` with the next N successive seeds (N>=1) evaluated
+    /// independently from the entry state, then commit to the last one.
+    /// Uses the A_k/C_k affine jumps: out[i] = s0*A_{i+1}+C_{i+1}.
+    /// Exact: same seeds as N serial next() steps. Caller extracts the
+    /// top bits exactly as next() would. Unused tails must be discarded
+    /// without committing (commit is always to out[N-1]).
+    pub fn fillSeeds(self: *JavaRandom, out: []u64) void {
+        if (out.len == 0) return;
+        const s0 = self.seed;
+        // Small-N fast paths with precomputed jumps (independent mults).
+        // General tail falls back to serial (still exact).
+        if (out.len >= 1) out[0] = (s0 *% multiplier +% addend) & mask;
+        if (out.len >= 2) out[1] = (s0 *% A2 +% C2) & mask;
+        if (out.len >= 3) out[2] = (s0 *% A3 +% C3) & mask;
+        if (out.len >= 4) out[3] = (s0 *% A4 +% C4) & mask;
+        if (out.len >= 8) {
+            out[7] = (s0 *% A8 +% C8) & mask;
+            // 5..7 via one jump from s4 (still exact, keeps chain short).
+            const s4 = out[3];
+            out[4] = (s4 *% multiplier +% addend) & mask;
+            out[5] = (s4 *% A2 +% C2) & mask;
+            out[6] = (s4 *% A3 +% C3) & mask;
+        } else {
+            var i: usize = 4;
+            while (i < out.len) : (i += 1) {
+                out[i] = (out[i - 1] *% multiplier +% addend) & mask;
+            }
+        }
+        if (out.len > 8) {
+            var i: usize = 8;
+            while (i < out.len) : (i += 1) {
+                out[i] = (out[i - 1] *% multiplier +% addend) & mask;
+            }
+        }
+        self.seed = out[out.len - 1];
+    }
+
+    /// Peek the seed k steps ahead without committing (exact).
+    /// Serial stepping (hot paths use A2/A4/A8 above); validation only.
+    pub fn peekSeed(self: *const JavaRandom, steps: u64) u64 {
+        var s = self.seed;
+        var i: u64 = 0;
+        while (i < steps) : (i += 1) {
+            s = (s *% multiplier +% addend) & mask;
+        }
+        return s;
+    }
+
     pub fn nextBoolean(self: *JavaRandom) bool {
         return self.next(1) != 0;
     }
 
     pub fn nextFloat(self: *JavaRandom) f32 {
-        return @as(f32, @floatFromInt(self.next(24))) / @as(f32, 1 << 24);
+        // `x / 2^24 == x * 2^-24` bit-for-bit (exact power-of-two scale;
+        // next(24) < 2^24 is exactly representable).
+        return @as(f32, @floatFromInt(self.next(24))) * (1.0 / 16777216.0);
     }
 
     pub fn nextDouble(self: *JavaRandom) f64 {
         const hi: u64 = self.next(26);
         const lo: u64 = self.next(27);
-        return @as(f64, @floatFromInt((hi << 27) + lo)) / @as(f64, 1 << 53);
+        // Same exactness argument: value < 2^53, divisor 2^53.
+        return @as(f64, @floatFromInt((hi << 27) + lo)) * (1.0 / 9007199254740992.0);
     }
 
     /// Fills buf like Random.nextBytes: 4 bytes per nextInt, little-endian.
@@ -225,4 +318,36 @@ test "setSeed resets stream incl. gaussian state" {
     var fresh = JavaRandom.init(7);
     try std.testing.expectEqual(fresh.nextInt(), r.nextInt());
     try std.testing.expectEqual(fresh.nextGaussian(), r.nextGaussian());
+}
+
+test "bulk affine LCG matches serial (nextLongFast/nextDoubleFast/fillSeeds)" {
+    const seeds = [_]i64{ 0, 1, 42, -1, 0x123456789ABCDEF, std.math.minInt(i64) };
+    for (seeds) |s| {
+        var a = JavaRandom.init(s);
+        var b = JavaRandom.init(s);
+        // nextLongFast vs nextLong over 8 values.
+        var i: usize = 0;
+        while (i < 8) : (i += 1) {
+            try std.testing.expectEqual(a.nextLong(), b.nextLongFast());
+        }
+        // nextDoubleFast vs nextDouble over 8 values.
+        var c = JavaRandom.init(s);
+        var d = JavaRandom.init(s);
+        i = 0;
+        while (i < 8) : (i += 1) {
+            try std.testing.expectEqual(@as(u64, @bitCast(c.nextDouble())), @as(u64, @bitCast(d.nextDoubleFast())));
+        }
+        // fillSeeds vs serial seeds over 8 steps.
+        var e = JavaRandom.init(s);
+        var f = JavaRandom.init(s);
+        var buf: [8]u64 = undefined;
+        f.fillSeeds(&buf);
+        i = 0;
+        while (i < 8) : (i += 1) {
+            // Serial step: advance once, capture seed.
+            e.seed = (e.seed *% multiplier +% addend) & mask;
+            try std.testing.expectEqual(e.seed, buf[i]);
+        }
+        try std.testing.expectEqual(e.seed, f.seed);
+    }
 }

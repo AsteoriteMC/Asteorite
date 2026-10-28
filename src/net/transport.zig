@@ -35,22 +35,14 @@ pub const Kind = enum {
 
     /// Parse a `--transport` value. Returns null for unknown text.
     pub fn parse(text: []const u8) ?Kind {
-        if (std.mem.eql(u8, text, "auto")) return .auto;
-        if (std.mem.eql(u8, text, "uring")) return .uring;
-        if (std.mem.eql(u8, text, "kqueue")) return .kqueue;
-        if (std.mem.eql(u8, text, "iocp")) return .iocp;
-        if (std.mem.eql(u8, text, "blocking")) return .blocking;
+        inline for (@typeInfo(Kind).@"enum".fields) |f| {
+            if (std.mem.eql(u8, text, f.name)) return @enumFromInt(f.value);
+        }
         return null;
     }
 
     pub fn name(self: Kind) []const u8 {
-        return switch (self) {
-            .auto => "auto",
-            .uring => "uring",
-            .kqueue => "kqueue",
-            .iocp => "iocp",
-            .blocking => "blocking",
-        };
+        return @tagName(self);
     }
 
     /// True when the backend can run on this OS at all.
@@ -97,6 +89,15 @@ pub const Options = struct {
     /// SO_SNDBUF / SO_RCVBUF (0 = leave the OS default).
     send_buf_bytes: usize = 0,
     recv_buf_bytes: usize = 0,
+    /// SO_SNDTIMEO in seconds (0 = leave the OS default = block forever).
+    /// Bounds every synchronous write: a peer that accepts zero bytes for
+    /// this long trips the send, which unwedges the writer (serve thread,
+    /// ticker, or duplicate-login kicker) instead of stalling it for
+    /// TCP-timeout minutes. Only fires on zero-progress windows — a slow
+    /// but moving peer never trips it — while the 30s read timeout owns
+    /// liveness for slow loaders. 10s fits inside the 30s login window so
+    /// a duplicate-kick flush to a dead ghost can't fail the new login.
+    send_timeout_s: u16 = 10,
     /// io_uring entries per ring (power of two, 1..32768).
     ring_entries: u16 = 256,
     /// io_uring worker threads (0 = auto: min(cores, 8)).
@@ -135,6 +136,9 @@ pub const Stats = struct {
     buffer_starved: u64 = 0,
     /// Send submission failures.
     send_failures: u64 = 0,
+    /// Successful recv re-arms by the worker sweep (connections that lost
+    /// their multishot recv and would otherwise stay deaf forever).
+    recv_rearmed: u64 = 0,
 
     pub fn merge(self: *Stats, other: Stats) void {
         self.conns_accepted += other.conns_accepted;
@@ -148,6 +152,7 @@ pub const Stats = struct {
         self.recv_arm_failures += other.recv_arm_failures;
         self.buffer_starved += other.buffer_starved;
         self.send_failures += other.send_failures;
+        self.recv_rearmed += other.recv_rearmed;
     }
 };
 
@@ -165,6 +170,10 @@ pub fn applySocketOpts(fd: std.posix.fd_t, opts: Options) void {
     if (opts.recv_buf_bytes > 0) {
         const v: c_int = @intCast(opts.recv_buf_bytes);
         std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, &std.mem.toBytes(v)) catch {};
+    }
+    if (opts.send_timeout_s > 0) {
+        const tv = std.posix.timeval{ .sec = opts.send_timeout_s, .usec = 0 };
+        std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, &std.mem.toBytes(tv)) catch {};
     }
 }
 
@@ -214,10 +223,39 @@ pub const Handle = struct {
     /// from any thread.
     request_flush: *const fn (ctx: *anyopaque, conn_id: u32) void,
     /// Close the connection (the transport owns the socket). Safe to call
-    /// from any thread.
+    /// from any thread. Graceful: already-queued output still goes out
+    /// first (e.g. the status pong, kick/disconnect reasons), then the
+    /// connection is closed — same flush-then-close contract as the
+    /// blocking transport, whose write path flushes before it closes.
     close_conn: *const fn (ctx: *anyopaque, conn_id: u32) void,
     ctx: *anyopaque,
 };
+
+/// Build a Handle for a backend exposing `requestFlush`/`closeConn`
+/// (the three OS backends had byte-identical vtable shims — one home).
+pub fn handleFor(comptime B: type, backend: *B) Handle {
+    return .{
+        .request_flush = struct {
+            fn f(ctx: *anyopaque, conn_id: u32) void {
+                const b: *B = @ptrCast(@alignCast(ctx));
+                b.requestFlush(conn_id);
+            }
+        }.f,
+        .close_conn = struct {
+            fn f(ctx: *anyopaque, conn_id: u32) void {
+                const b: *B = @ptrCast(@alignCast(ctx));
+                b.closeConn(conn_id);
+            }
+        }.f,
+        .ctx = backend,
+    };
+}
+
+/// Sleep helper for backends (they carry the server's Io for this).
+pub fn sleepMs(io: std.Io, ms: u64) void {
+    const d = std.Io.Clock.Duration{ .raw = std.Io.Duration.fromNanoseconds(@intCast(ms * std.time.ns_per_ms)), .clock = .awake };
+    std.Io.Timeout.sleep(.{ .duration = d }, io) catch {};
+}
 
 /// Peer address of an accepted socket, formatted as IPv4/IPv6 text (the
 /// shape the ban tables use). Returns the number of bytes written into
@@ -266,6 +304,15 @@ test "transport kind parsing" {
     try std.testing.expectEqual(Kind.blocking, Kind.parse("blocking").?);
     try std.testing.expect(Kind.parse("epoll") == null);
     try std.testing.expect(Kind.parse("") == null);
+}
+
+test "send timeout defaults bound synchronous writes" {
+    // applySocketOpts programs SO_SNDTIMEO from this: a peer accepting
+    // zero bytes for this long trips the send instead of wedging the
+    // writer (serve thread, ticker, duplicate-login kicker) for
+    // TCP-timeout minutes. Must stay inside the 30s login window.
+    try std.testing.expectEqual(@as(u16, 10), (Options{}).send_timeout_s);
+    try std.testing.expect((Options{}).send_timeout_s * 1000 < 30000);
 }
 
 test "auto resolves to a backend supported by this OS" {

@@ -24,12 +24,10 @@ pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u
     if (!srv.validStatName(toks[1])) {
         return std.fmt.bufPrint(out, "Unknown achievement or statistic '{s}'", .{toks[1]}) catch "Unknown achievement";
     }
-    var target: [16]u8 = undefined;
+    var target: [cmd.max_name_len]u8 = undefined;
     var t: []const u8 = "";
     if (n == 3) {
-        t = srv.resolvePlayerName(sender, toks[2], &target) orelse {
-            return "That player cannot be found";
-        };
+        t = cmd.resolveTarget(srv, sender, toks[2], &target) orelse return cmd.unknown_player;
     } else {
         if (sender == null) return cmd.usageError(&def, out);
         const self_name = cmd.senderName(sender, &target);

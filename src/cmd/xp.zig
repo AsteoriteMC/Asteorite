@@ -20,12 +20,10 @@ pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u
     const n = cmd.Spec.tokenize(args, &toks);
     if (n == 0 or n > 2) return cmd.usageError(&def, out);
     // Target defaults to the sender (must be a player then).
-    var target: [16]u8 = undefined;
+    var target: [cmd.max_name_len]u8 = undefined;
     var t: []const u8 = "";
     if (n == 2) {
-        t = srv.resolvePlayerName(sender, toks[1], &target) orelse {
-            return "That player cannot be found";
-        };
+        t = cmd.resolveTarget(srv, sender, toks[1], &target) orelse return cmd.unknown_player;
     } else {
         if (sender == null) return cmd.usageError(&def, out);
         const self_name = cmd.senderName(sender, &target);

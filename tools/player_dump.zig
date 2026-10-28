@@ -1,10 +1,13 @@
 //! player_dump: inspect one persisted player row (ZPLR format).
-//! Usage: player_dump <db-dir> <username>
+//! Usage: player_dump <db-dir> <username> [uuid]
 //!
 //! Read-only in spirit (opens the pool like the server does; creates the
 //! dir if missing, in which case there is simply no save). Prints position,
 //! health/food/gamemode, spawn, and every non-empty inventory slot with
 //! NBT byte counts (never dumps raw NBT — use an NBT tool for that).
+//! Rows are UUID-keyed: pass the player's UUID explicitly on online
+//! servers, or omit it on offline servers (derived from the name, exactly
+//! like login does).
 
 const std = @import("std");
 const asteorite = @import("asteorite");
@@ -20,12 +23,26 @@ pub fn main(init: std.process.Init) !void {
 
     const args = try init.minimal.args.toSlice(arena_alloc);
     if (args.len < 3) {
-        try out.print("usage: player_dump <db-dir> <username>\n", .{});
+        try out.print("usage: player_dump <db-dir> <username> [uuid]\n", .{});
         try out.flush();
         return;
     }
     const db_path = args[1];
     const username = args[2];
+    var uuid_buf: [36]u8 = undefined;
+    const uuid: []const u8 = blk: {
+        if (args.len >= 4) {
+            if (args[3].len != 36) {
+                try out.print("bad uuid (36-char hyphenated)\n", .{});
+                try out.flush();
+                return;
+            }
+            @memcpy(&uuid_buf, args[3][0..36]);
+            break :blk uuid_buf[0..];
+        }
+        asteorite.uuid.formatUuid(asteorite.uuid.offlineUuid(username), &uuid_buf);
+        break :blk uuid_buf[0..];
+    };
 
     const cwd = std.Io.Dir.cwd();
     var db_dir = try cwd.createDirPathOpen(io, db_path, .{});
@@ -33,8 +50,8 @@ pub fn main(init: std.process.Init) !void {
     var pool = try asteorite.shard.ShardPool.open(arena_alloc, io, db_dir, 4, .{});
     defer pool.deinit();
 
-    var data = try asteorite.players.loadLegacy(pool, arena_alloc, username, asteorite.player_import.legacySlot) orelse {
-        try out.print("no save found for {s} in {s}\n", .{ username, db_path });
+    var data = try asteorite.players.load(pool, arena_alloc, uuid) orelse {
+        try out.print("no save found for {s} [{s}] in {s}\n", .{ username, uuid, db_path });
         try out.flush();
         return;
     };
@@ -73,6 +90,16 @@ pub fn main(init: std.process.Init) !void {
         try out.print("  cursor: id={d} count={d} dmg={d}", .{ wire.toWire(c.id), c.count, c.damage });
         if (c.nbt) |n| try out.print(" nbt={d}B", .{n.len});
         try out.print("\n", .{});
+    }
+    for (data.ender, 0..) |slot, i| {
+        if (slot) |st| {
+            const wid = wire.toWire(st.id);
+            if (st.nbt) |n| {
+                try out.print("  ender {d}: id={d} count={d} dmg={d} nbt={d}B\n", .{ i, wid, st.count, st.damage, n.len });
+            } else {
+                try out.print("  ender {d}: id={d} count={d} dmg={d}\n", .{ i, wid, st.count, st.damage });
+            }
+        }
     }
     try out.flush();
 }

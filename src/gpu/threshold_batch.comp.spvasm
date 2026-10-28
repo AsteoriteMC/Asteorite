@@ -1,0 +1,276 @@
+; G1 batched density-threshold kernel (amortization vehicle).
+; Same fill as `threshold.comp.spvasm`, new index math: one dispatch covers
+; N chunks (N <= MAXBATCH). Invocation id spans chunks x columns:
+;   chunk = gid.x / 512; col = gid.x % 512   (512 columns per chunk)
+; Dispatch (8*N, 1, 1) with LocalSize 64. Buffers are chunk-major:
+;   q   = [MAXBATCH][825]f64  (flat MAXQ doubles)
+;   out = [MAXBATCH][65536]u32 (flat MAXCELLS u32)
+; The host sizes buffers to the actual N (a smaller bound buffer is legal:
+; every accessed index is < N-chunks by construction); the shader arrays
+; only cap the maximum. Params are the same global 4 as the single-chunk
+; kernel (per-chunk params are the LOD/custom-terrain follow-up).
+;
+; Bit-exactness: identical arithmetic to the single-chunk kernel (same op
+; order, NoContraction on every f64 result) plus integer-only chunk
+; offsets. The probe compares each chunk against the oracle independently.
+;
+; Assembled by `zig build shaders` (spirv-as + spirv-val, vulkan1.0);
+; the words are embedded in `threshold_batch_spv.zig`. Manual fallback:
+;   spirv-as --target-env vulkan1.0 threshold_batch.comp.spvasm -o threshold_batch.comp.spv
+;   spirv-val --target-env vulkan1.0 threshold_batch.comp.spv
+
+OpCapability Shader
+OpCapability Float64
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %gid
+OpExecutionMode %main LocalSize 64 1 1
+
+OpDecorate %q_var DescriptorSet 0
+OpDecorate %q_var Binding 0
+OpDecorate %out_var DescriptorSet 0
+OpDecorate %out_var Binding 1
+OpDecorate %p_var DescriptorSet 0
+OpDecorate %p_var Binding 2
+OpDecorate %qblock BufferBlock
+OpDecorate %qarr ArrayStride 8
+OpMemberDecorate %qblock 0 Offset 0
+OpDecorate %oblock BufferBlock
+OpDecorate %oarr ArrayStride 4
+OpMemberDecorate %oblock 0 Offset 0
+OpDecorate %pblock BufferBlock
+OpMemberDecorate %pblock 0 Offset 0
+OpMemberDecorate %pblock 1 Offset 4
+OpMemberDecorate %pblock 2 Offset 8
+OpMemberDecorate %pblock 3 Offset 12
+OpDecorate %gid BuiltIn GlobalInvocationId
+OpDecorate %t6 NoContraction
+OpDecorate %d6 NoContraction
+OpDecorate %t7 NoContraction
+OpDecorate %d7 NoContraction
+OpDecorate %t8 NoContraction
+OpDecorate %d8 NoContraction
+OpDecorate %t9 NoContraction
+OpDecorate %d9 NoContraction
+OpDecorate %td13 NoContraction
+OpDecorate %d13 NoContraction
+OpDecorate %td14 NoContraction
+OpDecorate %d14 NoContraction
+OpDecorate %td17 NoContraction
+OpDecorate %d17 NoContraction
+OpDecorate %d16_0 NoContraction
+OpDecorate %d16_next NoContraction
+OpDecorate %d11_next NoContraction
+OpDecorate %d12_next NoContraction
+OpDecorate %d2_next NoContraction
+OpDecorate %d3_next NoContraction
+OpDecorate %d4_next NoContraction
+OpDecorate %d5_next NoContraction
+
+%void = OpTypeVoid
+%bool = OpTypeBool
+%uint = OpTypeInt 32 0
+%uvec3 = OpTypeVector %uint 3
+%double = OpTypeFloat 64
+
+%c0 = OpConstant %uint 0
+%c1 = OpConstant %uint 1
+%c2 = OpConstant %uint 2
+%c3 = OpConstant %uint 3
+%c4 = OpConstant %uint 4
+%c5 = OpConstant %uint 5
+%c8 = OpConstant %uint 8
+%c12 = OpConstant %uint 12
+%c32 = OpConstant %uint 32
+%c33 = OpConstant %uint 33
+%c63 = OpConstant %uint 63
+%c64 = OpConstant %uint 64
+%c128 = OpConstant %uint 128
+%c256 = OpConstant %uint 256
+%c512 = OpConstant %uint 512
+%c825 = OpConstant %uint 825
+%c65536 = OpConstant %uint 65536
+%c52800 = OpConstant %uint 52800
+%c4194304 = OpConstant %uint 4194304
+%f0 = OpConstant %double 0.0
+%f0125 = OpConstant %double 0.125
+%f025 = OpConstant %double 0.25
+
+%qarr = OpTypeArray %double %c52800
+%qblock = OpTypeStruct %qarr
+%oarr = OpTypeArray %uint %c4194304
+%oblock = OpTypeStruct %oarr
+%pblock = OpTypeStruct %uint %uint %uint %uint
+%p_q = OpTypePointer Uniform %qblock
+%p_o = OpTypePointer Uniform %oblock
+%p_p = OpTypePointer Uniform %pblock
+%p_du = OpTypePointer Uniform %double
+%p_uu = OpTypePointer Uniform %uint
+%q_var = OpVariable %p_q Uniform
+%out_var = OpVariable %p_o Uniform
+%p_var = OpVariable %p_p Uniform
+%p_in = OpTypePointer Input %uvec3
+%gid = OpVariable %p_in Input
+%fnty = OpTypeFunction %void
+
+%main = OpFunction %void None %fnty
+%entry = OpLabel
+; --- batch decode: chunk = gid.x / 512; col = gid.x % 512
+%gidx3 = OpLoad %uvec3 %gid
+%gidx = OpCompositeExtract %uint %gidx3 0
+%chunk = OpUDiv %uint %gidx %c512
+%col = OpUMod %uint %gidx %c512
+%qb = OpIMul %uint %chunk %c825
+%ob = OpIMul %uint %chunk %c65536
+; --- column decode within the chunk (identical to single-chunk kernel)
+%i = OpUDiv %uint %col %c128
+%r1 = OpUMod %uint %col %c128
+%j = OpUDiv %uint %r1 %c32
+%cg = OpUMod %uint %r1 %c32
+%i4 = OpIMul %uint %i %c4
+%j4 = OpIMul %uint %j %c4
+%cg8 = OpIMul %uint %cg %c8
+; --- q base indices, chunk-offset
+%ij5b = OpIMul %uint %i %c5
+%ij = OpIAdd %uint %ij5b %j
+%n6t = OpIMul %uint %ij %c33
+%n6 = OpIAdd %uint %qb %n6t
+%ij1 = OpIAdd %uint %ij %c1
+%n7t = OpIMul %uint %ij1 %c33
+%n7 = OpIAdd %uint %qb %n7t
+%i1 = OpIAdd %uint %i %c1
+%i15 = OpIMul %uint %i1 %c5
+%ijb = OpIAdd %uint %i15 %j
+%n8t = OpIMul %uint %ijb %c33
+%n8 = OpIAdd %uint %qb %n8t
+%ijb1 = OpIAdd %uint %ijb %c1
+%n9t = OpIMul %uint %ijb1 %c33
+%n9 = OpIAdd %uint %qb %n9t
+; --- density loads
+%n6c = OpIAdd %uint %n6 %cg
+%n7c = OpIAdd %uint %n7 %cg
+%n8c = OpIAdd %uint %n8 %cg
+%n9c = OpIAdd %uint %n9 %cg
+%n6c1 = OpIAdd %uint %n6c %c1
+%n7c1 = OpIAdd %uint %n7c %c1
+%n8c1 = OpIAdd %uint %n8c %c1
+%n9c1 = OpIAdd %uint %n9c %c1
+%pq6 = OpAccessChain %p_du %q_var %c0 %n6c
+%pq7 = OpAccessChain %p_du %q_var %c0 %n7c
+%pq8 = OpAccessChain %p_du %q_var %c0 %n8c
+%pq9 = OpAccessChain %p_du %q_var %c0 %n9c
+%pq61 = OpAccessChain %p_du %q_var %c0 %n6c1
+%pq71 = OpAccessChain %p_du %q_var %c0 %n7c1
+%pq81 = OpAccessChain %p_du %q_var %c0 %n8c1
+%pq91 = OpAccessChain %p_du %q_var %c0 %n9c1
+%d2i = OpLoad %double %pq6
+%d3i = OpLoad %double %pq7
+%d4i = OpLoad %double %pq8
+%d5i = OpLoad %double %pq9
+%q61 = OpLoad %double %pq61
+%q71 = OpLoad %double %pq71
+%q81 = OpLoad %double %pq81
+%q91 = OpLoad %double %pq91
+%t6 = OpFSub %double %q61 %d2i
+%d6 = OpFMul %double %t6 %f0125
+%t7 = OpFSub %double %q71 %d3i
+%d7 = OpFMul %double %t7 %f0125
+%t8 = OpFSub %double %q81 %d4i
+%d8 = OpFMul %double %t8 %f0125
+%t9 = OpFSub %double %q91 %d5i
+%d9 = OpFMul %double %t9 %f0125
+; --- params (global, same 4 as single-chunk)
+%pp0 = OpAccessChain %p_uu %p_var %c0
+%pp1 = OpAccessChain %p_uu %p_var %c1
+%pp2 = OpAccessChain %p_uu %p_var %c2
+%pp3 = OpAccessChain %p_uu %p_var %c3
+%sea = OpLoad %uint %pp0
+%stone_id = OpLoad %uint %pp1
+%water_id = OpLoad %uint %pp2
+%air_id = OpLoad %uint %pp3
+OpBranch %fy_head
+
+; --- fy loop (8): carries d2..d5 (identical body to single-chunk kernel)
+%fy_head = OpLabel
+%fy = OpPhi %uint %c0 %entry %fy_next %fy_latch
+%d2 = OpPhi %double %d2i %entry %d2_next %fy_latch
+%d3 = OpPhi %double %d3i %entry %d3_next %fy_latch
+%d4 = OpPhi %double %d4i %entry %d4_next %fy_latch
+%d5 = OpPhi %double %d5i %entry %d5_next %fy_latch
+%fy_cond = OpULessThan %bool %fy %c8
+OpLoopMerge %fy_merge %fy_latch None
+OpBranchConditional %fy_cond %fy_body %fy_merge
+%fy_body = OpLabel
+%td13 = OpFSub %double %d4 %d2
+%d13 = OpFMul %double %td13 %f025
+%td14 = OpFSub %double %d5 %d3
+%d14 = OpFMul %double %td14 %f025
+%y = OpIAdd %uint %cg8 %fy
+; wet hoist: y/sea/water/air invariant to fx/fz — once per fy (8x),
+; not per cell (128x). Bit-identical, integer/select only.
+%is_shallow = OpULessThan %bool %y %sea
+%wet = OpSelect %uint %is_shallow %water_id %air_id
+OpBranch %fx_head
+
+; --- fx loop (4): carries d11, d12
+%fx_head = OpLabel
+%fx = OpPhi %uint %c0 %fy_body %fx_next %fx_latch
+%d11 = OpPhi %double %d2 %fy_body %d11_next %fx_latch
+%d12 = OpPhi %double %d3 %fy_body %d12_next %fx_latch
+%fx_cond = OpULessThan %bool %fx %c4
+OpLoopMerge %fx_merge %fx_latch None
+OpBranchConditional %fx_cond %fx_body %fx_merge
+%fx_body = OpLabel
+%td17 = OpFSub %double %d12 %d11
+%d17 = OpFMul %double %td17 %f025
+%d16_0 = OpFSub %double %d11 %d17
+%tx = OpIAdd %uint %fx %i4
+%txs = OpShiftLeftLogical %uint %tx %c12
+%j4s = OpShiftLeftLogical %uint %j4 %c8
+%tb = OpBitwiseOr %uint %txs %j4s
+%n10b = OpBitwiseOr %uint %tb %y
+%n10_0 = OpISub %uint %n10b %c256
+OpBranch %fz_head
+
+; --- fz loop (4): carries d16, n10; increment-then-store like vanilla.
+; Store index gets the chunk offset here (only structural delta vs the
+; single-chunk kernel).
+%fz_head = OpLabel
+%fz = OpPhi %uint %c0 %fx_body %fz_next %fz_latch
+%d16 = OpPhi %double %d16_0 %fx_body %d16_next %fz_latch
+%n10 = OpPhi %uint %n10_0 %fx_body %n10_next %fz_latch
+%fz_cond = OpULessThan %bool %fz %c4
+OpLoopMerge %fz_merge %fz_latch None
+OpBranchConditional %fz_cond %fz_body %fz_merge
+%fz_body = OpLabel
+%d16_next = OpFAdd %double %d16 %d17
+%n10_next = OpIAdd %uint %n10 %c256
+%is_stone = OpFOrdGreaterThan %bool %d16_next %f0
+%cell = OpSelect %uint %is_stone %stone_id %wet
+%n10g = OpIAdd %uint %ob %n10_next
+%po = OpAccessChain %p_uu %out_var %c0 %n10g
+OpStore %po %cell
+OpBranch %fz_latch
+%fz_latch = OpLabel
+%fz_next = OpIAdd %uint %fz %c1
+OpBranch %fz_head
+%fz_merge = OpLabel
+OpBranch %fx_latch
+
+%fx_latch = OpLabel
+%d11_next = OpFAdd %double %d11 %d13
+%d12_next = OpFAdd %double %d12 %d14
+%fx_next = OpIAdd %uint %fx %c1
+OpBranch %fx_head
+%fx_merge = OpLabel
+OpBranch %fy_latch
+
+%fy_latch = OpLabel
+%d2_next = OpFAdd %double %d2 %d6
+%d3_next = OpFAdd %double %d3 %d7
+%d4_next = OpFAdd %double %d4 %d8
+%d5_next = OpFAdd %double %d5 %d9
+%fy_next = OpIAdd %uint %fy %c1
+OpBranch %fy_head
+%fy_merge = OpLabel
+OpReturn
+OpFunctionEnd

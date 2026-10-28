@@ -29,6 +29,8 @@
 
 const std = @import("std");
 const console_tui = @import("../console_tui.zig");
+const Conn = @import("conn.zig").Conn;
+const uuid_mod = @import("uuid.zig");
 
 pub const AUTH: i32 = 3;
 pub const AUTH_RESPONSE: i32 = 2;
@@ -154,22 +156,17 @@ pub fn handleConn(stream: std.Io.net.Stream, io: std.Io, server: *Server, passwo
             if (!authed) return;
             // RCON clients send bare commands; tolerate one leading slash.
             var cmd: [max_packet]u8 = undefined;
-            var clen: usize = 0;
             var pl = p.payload;
             if (pl.len > 0 and pl[0] == '/') pl = pl[1..];
             cmd[0] = '/';
-            clen = 1;
             const n = @min(pl.len, cmd.len - 1);
-            @memcpy(cmd[clen..][0..n], pl[0..n]);
-            clen += n;
-            const text = cmd[0..clen];
+            @memcpy(cmd[1..][0..n], pl[0..n]);
+            const text = cmd[0 .. 1 + n];
             var out: [8192]u8 = undefined;
             const reply = server.executeCommand(null, text, &out);
             sendResponse(wout, p.id, reply) catch return;
             if (Server.isStopCommand(text)) {
-                _ = server.saveAllPlayers();
-                server.saveRedstone();
-                if (server.world) |pool| pool.flushAll() catch {};
+                server.saveForHalt();
                 std.log.info("rcon stop: saved players, flushed. bye.", .{});
                 // exit() skips the console thread's restore defer.
                 console_tui.restoreTerminal();
@@ -288,8 +285,6 @@ test "password compare: equal/different/length/empty" {
     try std.testing.expect(!passwordOk("x", ""));
 }
 
-
-const Conn = @import("conn.zig").Conn;
 
 test "rcon loopback: auth, gating, dispatch, close rules" {
     const a = std.testing.allocator;
@@ -439,8 +434,11 @@ test "rcon loopback: auth, gating, dispatch, close rules" {
         var ro = try c.recv();
         defer ro.free();
         try std.testing.expectEqualStrings("Opped MalloryR", ro.payload());
+        // Offline test server: the row is UUID-bound at grant time.
+        var mbuf: [36]u8 = undefined;
+        uuid_mod.formatUuid(uuid_mod.offlineUuid("MalloryR"), &mbuf);
         srv.perm_lock.lock();
-        const lvl = if (srv.perms) |*db| db.levelFor("MalloryR") else .all;
+        const lvl = if (srv.perms) |*db| db.levelForUuid(&mbuf) else .all;
         srv.perm_lock.unlock();
         try std.testing.expect(lvl == .owner);
         c.close();

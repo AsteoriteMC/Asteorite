@@ -18,13 +18,9 @@ pub const def = cmd.define(.{
 
 /// Vanilla mode parse: full names + single letters (case-insensitive),
 /// else the wire value. Bounds track the enum (no hardcoded max).
+/// Single home for the spelling: rules.GameMode.parse.
 fn parseMode(s: []const u8) ?rules.GameMode {
-    if (std.ascii.eqlIgnoreCase(s, "survival") or std.ascii.eqlIgnoreCase(s, "s")) return .survival;
-    if (std.ascii.eqlIgnoreCase(s, "creative") or std.ascii.eqlIgnoreCase(s, "c")) return .creative;
-    if (std.ascii.eqlIgnoreCase(s, "adventure") or std.ascii.eqlIgnoreCase(s, "a")) return .adventure;
-    const v = std.fmt.parseInt(i64, s, 10) catch return null;
-    if (v < 0 or v >= std.enums.values(rules.GameMode).len) return null;
-    return @enumFromInt(v);
+    return rules.GameMode.parse(s);
 }
 
 pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u8 {
@@ -33,13 +29,11 @@ pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u
     if (n == 0 or n > 2) return cmd.usageError(&def, out);
     const mode = parseMode(toks[0]) orelse return cmd.usageError(&def, out);
     const target: []const u8 = if (n == 2) blk: {
-        var tb: [16]u8 = undefined;
-        break :blk srv.resolvePlayerName(sender, toks[1], &tb) orelse {
-            return "That player cannot be found";
-        };
+        var tb: [cmd.max_name_len]u8 = undefined;
+        break :blk cmd.resolveTarget(srv, sender, toks[1], &tb) orelse return cmd.unknown_player;
     } else blk: {
         if (sender == null) return cmd.usageError(&def, out);
-        var who: [16]u8 = undefined;
+        var who: [cmd.max_name_len]u8 = undefined;
         const self_name = cmd.senderName(sender, &who);
         if (self_name.len == 0) return cmd.usageError(&def, out);
         break :blk self_name;

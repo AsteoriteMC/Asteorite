@@ -18,6 +18,10 @@ const Mutable = big.int.Mutable;
 
 pub const key_bytes = 256; // RSA-2048
 
+/// PKCS#1 v1.5 encryption overhead: 0x00 0x02 + separator (3 bytes) plus
+/// the 8-byte minimum random padding.
+pub const pkcs1_overhead: usize = 11;
+
 pub const RsaKeyPair = struct {
     allocator: std.mem.Allocator,
     public_key_der: []const u8, // owned (SubjectPublicKeyInfo DER, sent to client)
@@ -56,7 +60,7 @@ pub const RsaKeyPair = struct {
 
     /// PKCS#1 v1.5 encrypt with e=65537 (used by tests + any client-side tooling).
     pub fn encryptPkcs1v15(self: *const RsaKeyPair, io: std.Io, allocator: std.mem.Allocator, message: []const u8) ![key_bytes]u8 {
-        if (message.len > key_bytes - 11) return error.MessageTooLong;
+        if (message.len > key_bytes - pkcs1_overhead) return error.MessageTooLong;
         var block: [key_bytes]u8 = undefined;
         block[0] = 0x00;
         block[1] = 0x02;
@@ -64,7 +68,9 @@ pub const RsaKeyPair = struct {
         var i: usize = 0;
         while (i < ps_len) : (i += 1) {
             var r: [1]u8 = undefined;
-            // nonzero random padding bytes
+            // Nonzero random padding bytes (CSPRNG; non-secure fallback
+            // only when the platform has no secure source — test/tooling
+            // path, never the login decrypt path).
             while (true) {
                 io.randomSecure(&r) catch {
                     io.random(&r);

@@ -47,9 +47,11 @@ pub fn positionRand(rand: *JavaRandom, world_seed: i64, sx: i32, sz: i32) void {
 
 /// `World.getChunkRandom(x, z, salt)` (`ahb.A`, jar-verified):
 /// fresh `Random` seeded with chunk/salt mixing (separate stream).
+pub const chunk_rand_mul_x: i64 = 341873128712;
+pub const chunk_rand_mul_z: i64 = 132897987541;
 pub fn chunkRand(world_seed: i64, x: i32, z: i32, salt: i64) JavaRandom {
     var r = JavaRandom.init(0);
-    const s: i64 = @as(i64, x) *% 341873128712 +% @as(i64, z) *% 132897987541 +% world_seed +% salt;
+    const s: i64 = @as(i64, x) *% chunk_rand_mul_x +% @as(i64, z) *% chunk_rand_mul_z +% world_seed +% salt;
     r.setSeed(s);
     return r;
 }
@@ -60,6 +62,18 @@ pub fn chunkRand(world_seed: i64, x: i32, z: i32, salt: i64) JavaRandom {
 /// next, partitioning the world with no gaps or overlaps).
 pub fn populateBox(cx: i32, cz: i32) BBox {
     return BBox.init(cx * 16 + 8, 1, cz * 16 + 8, cx * 16 + 23, 255, cz * 16 + 23);
+}
+
+/// Vanilla ceiling for structure height shifts (`markAvailableHeight`
+/// `par5=10` in mineshaft `avm.a` and stronghold: the shifted top lands in
+/// [h+1, 53]). One home so the two call sites cannot drift.
+pub const avail_height_max: i32 = 53;
+
+/// Shift target for `markAvailableHeight`: given the unshifted height `h`
+/// (sizeY+1), draw the shifted top (vanilla: h, or h + nextInt(53-h)).
+pub fn availHeightTop(h: i32, rand: *JavaRandom) i32 {
+    if (h < avail_height_max) return h + (rand.nextIntBound(avail_height_max - h) catch unreachable);
+    return h;
 }
 
 /// Biome access for canSpawn checks (backed by the real genlayer chain).
@@ -81,27 +95,38 @@ pub const BioCtx = struct {
     }
 };
 
-/// `areBiomesViable` (`aib.a(int,int,int,List)`, jar-verified): every 1:4
-/// cell covering [x-r, x+r] must be in the allowed set. Shifts are
-/// arithmetic (Java >> on negatives floors).
-pub fn areBiomesViable(bio: BioCtx, alloc: std.mem.Allocator, x: i32, z: i32, r: i32, allowed: []const i32) bool {
+/// 1:4 rect covering [x-r, x+r] (arithmetic shifts floor negatives).
+const ViabilityRect = struct { x0: i32, z0: i32, w: usize, h: usize };
+
+fn viabilityRect(x: i32, z: i32, r: i32) ViabilityRect {
     const x0 = @divFloor(x - r, 4);
     const z0 = @divFloor(z - r, 4);
     const x1 = @divFloor(x + r, 4);
     const z1 = @divFloor(z + r, 4);
-    const w: usize = @intCast(x1 - x0 + 1);
-    const h: usize = @intCast(z1 - z0 + 1);
-    const out = alloc.alloc(i32, w * h) catch return false;
+    return .{ .x0 = x0, .z0 = z0, .w = @intCast(x1 - x0 + 1), .h = @intCast(z1 - z0 + 1) };
+}
+
+/// True when `b` is in the allowed set.
+fn isAllowed(b: i32, allowed: []const i32) bool {
+    for (allowed) |a| if (a == b) return true;
+    return false;
+}
+
+/// Fetch one 1:4 rect (null on OOM — callers treat as not-viable).
+fn fetchRect(bio: BioCtx, alloc: std.mem.Allocator, rect: ViabilityRect) ?[]i32 {
+    const out = alloc.alloc(i32, rect.w * rect.h) catch return null;
+    bio.layer4(alloc, rect.x0, rect.z0, rect.w, rect.h, out);
+    return out;
+}
+
+/// `areBiomesViable` (`aib.a(int,int,int,List)`, jar-verified): every 1:4
+/// cell covering [x-r, x+r] must be in the allowed set. Shifts are
+/// arithmetic (Java >> on negatives floors).
+pub fn areBiomesViable(bio: BioCtx, alloc: std.mem.Allocator, x: i32, z: i32, r: i32, allowed: []const i32) bool {
+    const rect = viabilityRect(x, z, r);
+    const out = fetchRect(bio, alloc, rect) orelse return false;
     defer alloc.free(out);
-    bio.layer4(alloc, x0, z0, w, h, out);
-    for (out) |b| {
-        var ok = false;
-        for (allowed) |a| if (a == b) {
-            ok = true;
-            break;
-        };
-        if (!ok) return false;
-    }
+    for (out) |b| if (!isAllowed(b, allowed)) return false;
     return true;
 }
 
@@ -111,28 +136,18 @@ pub const FoundBiome = struct { x: i32, z: i32 };
 /// `findBiomePosition` (`aib.a(int,int,int,List,Random)`, jar-verified):
 /// reservoir sampling over matching 1:4 cells; returns cell<<2 coords.
 pub fn findBiomePosition(bio: BioCtx, alloc: std.mem.Allocator, x: i32, z: i32, range: i32, allowed: []const i32, rand: *JavaRandom) ?FoundBiome {
-    const x0 = @divFloor(x - range, 4);
-    const z0 = @divFloor(z - range, 4);
-    const x1 = @divFloor(x + range, 4);
-    const z1 = @divFloor(z + range, 4);
-    const w: usize = @intCast(x1 - x0 + 1);
-    const h: usize = @intCast(z1 - z0 + 1);
-    const out = alloc.alloc(i32, w * h) catch return null;
+    const rect = viabilityRect(x, z, range);
+    const out = fetchRect(bio, alloc, rect) orelse return null;
     defer alloc.free(out);
-    bio.layer4(alloc, x0, z0, w, h, out);
+    const w = rect.w;
     var found: ?FoundBiome = null;
     var n: i32 = 0;
     var i: usize = 0;
-    while (i < w * h) : (i += 1) {
+    while (i < w * rect.h) : (i += 1) {
         const b = out[i];
-        var ok = false;
-        for (allowed) |a| if (a == b) {
-            ok = true;
-            break;
-        };
-        if (!ok) continue;
-        const cx: i32 = x0 + @as(i32, @intCast(i % w));
-        const cz: i32 = z0 + @as(i32, @intCast(i / w));
+        if (!isAllowed(b, allowed)) continue;
+        const cx: i32 = rect.x0 + @as(i32, @intCast(i % w));
+        const cz: i32 = rect.z0 + @as(i32, @intCast(i / w));
         const take = found == null or (rand.nextIntBound(n + 1) catch unreachable) == 0;
         if (take) found = .{ .x = cx << 2, .z = cz << 2 };
         n += 1;
@@ -148,9 +163,12 @@ pub fn mineshaftCanSpawn(rand: *JavaRandom, sx: i32, sz: i32) bool {
     return (rand.nextIntBound(80) catch unreachable) < lim;
 }
 
+/// Region cell shared by the spaced-structure gates.
+pub const RegionCell = struct { cx: i32, cz: i32 };
+
 /// Scattered/village region math shared by both (`atx.a` / `avn.a`):
 /// fold negatives, divide into 32-cells, draw the candidate cell.
-pub fn spacedCell(sx: i32, sz: i32, spacing: i32, separation: i32, salt: i64, world_seed: i64) struct { cx: i32, cz: i32 } {
+pub fn spacedCell(sx: i32, sz: i32, spacing: i32, separation: i32, salt: i64, world_seed: i64) RegionCell {
     var ax = sx;
     var az = sz;
     if (ax < 0) ax -= spacing - 1;
@@ -165,12 +183,19 @@ pub fn spacedCell(sx: i32, sz: i32, spacing: i32, separation: i32, salt: i64, wo
     return .{ .cx = rx, .cz = rz };
 }
 
+/// Shared spaced-structure gate: the candidate cell must equal this chunk,
+/// then the center column's biome must be viable (radius 0). Villages and
+/// scattered features differ only in salt + allowed biomes.
+fn cellSpawn(bio: BioCtx, alloc: std.mem.Allocator, world_seed: i64, sx: i32, sz: i32, salt: i64, allowed: []const i32) bool {
+    const cell = spacedCell(sx, sz, 32, 8, salt, world_seed);
+    if (cell.cx != sx or cell.cz != sz) return false;
+    return areBiomesViable(bio, alloc, sx * 16 + 8, sz * 16 + 8, 0, allowed);
+}
+
 /// Village gate (`avn.a`): candidate cell must equal this chunk, then the
 /// center column's voronoi biome must be viable (radius 0).
 pub fn villageCanSpawn(bio: BioCtx, alloc: std.mem.Allocator, world_seed: i64, sx: i32, sz: i32) bool {
-    const cell = spacedCell(sx, sz, 32, 8, 10387312, world_seed);
-    if (cell.cx != sx or cell.cz != sz) return false;
-    return areBiomesViable(bio, alloc, sx * 16 + 8, sz * 16 + 8, 0, &village_biomes);
+    return cellSpawn(bio, alloc, world_seed, sx, sz, 10387312, &village_biomes);
 }
 
 pub const village_biomes = [_]i32{ 1, 2, 35 }; // plains, desert, savanna
@@ -178,12 +203,29 @@ pub const village_biomes = [_]i32{ 1, 2, 35 }; // plains, desert, savanna
 /// Scattered gate (`atx.a`): candidate cell must equal this chunk, then the
 /// center column's voronoi biome must be desert/jungle/swamp-family.
 pub fn scatteredCanSpawn(bio: BioCtx, alloc: std.mem.Allocator, world_seed: i64, sx: i32, sz: i32) bool {
-    const cell = spacedCell(sx, sz, 32, 8, 14357617, world_seed);
-    if (cell.cx != sx or cell.cz != sz) return false;
-    return areBiomesViable(bio, alloc, sx * 16 + 8, sz * 16 + 8, 0, &scattered_biomes);
+    return cellSpawn(bio, alloc, world_seed, sx, sz, 14357617, &scattered_biomes);
 }
 
 pub const scattered_biomes = [_]i32{ 2, 17, 21, 22, 6 }; // desert(+hills), jungle(+hills), swamp
+
+/// Ground average (`awd.b` / `aue.a` core): max(topY, provider avg) over
+/// box columns inside the clip; null when no column is inside. Shared by
+/// village leveling and scattered ground shifts (one home, no drift).
+pub fn groundAverage(p: Placer, box: BBox, clip: BBox) ?i32 {
+    var sum: i64 = 0;
+    var n: i64 = 0;
+    var z = box.min_z;
+    while (z <= box.max_z) : (z += 1) {
+        var x = box.min_x;
+        while (x <= box.max_x) : (x += 1) {
+            if (!clip.contains(x, 64, z)) continue;
+            sum += @max(p.topY(x, z), p.groundBase());
+            n += 1;
+        }
+    }
+    if (n == 0) return null;
+    return @intCast(@divTrunc(sum, n));
+}
 
 /// Scattered kind from the center biome (`aty.<init>`).
 pub const ScatteredKind = enum { desert, jungle, witch };
@@ -242,11 +284,14 @@ pub const stronghold_biomes = [_]i32{
     1, 3, 4, 5, 12, 13, 14, 17, 18, 19, 20, 21, 22, 23, 25, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
 };
 
+/// Block position (eye-of-ender targeting + nearest-stronghold math).
+pub const Vec3 = struct { x: i32, y: i32, z: i32 };
+
 /// Nearest stronghold block position for eyes of ender (`ave.a`
 /// stronghold path: first component center of the closest valid start).
 /// Callers pass the already-built start centers; kept here for cohesion.
-pub fn nearestOf(xs: []const i32, ys: []const i32, zs: []const i32, x: i32, y: i32, z: i32) ?struct { x: i32, y: i32, z: i32 } {
-    var best: ?struct { x: i32, y: i32, z: i32 } = null;
+pub fn nearestOf(xs: []const i32, ys: []const i32, zs: []const i32, x: i32, y: i32, z: i32) ?Vec3 {
+    var best: ?Vec3 = null;
     var best_d: i64 = std.math.maxInt(i64);
     for (xs, ys, zs) |cx, cy, cz| {
         const dx: i64 = @as(i64, cx) - x;

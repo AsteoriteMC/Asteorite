@@ -19,7 +19,7 @@ pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u
     if (n == 0) return cmd.usageError(&def, out);
     var msg: [1024]u8 = undefined;
     const text = cmd.Spec.joinRest(toks[0..n], 0, &msg) orelse return cmd.usageError(&def, out);
-    var who: [16]u8 = undefined;
+    var who: [cmd.max_name_len]u8 = undefined;
     const name = cmd.senderName(sender, &who);
     srv.broadcastSay(if (name.len == 0) "Server" else name, text);
     return std.fmt.bufPrint(out, "[{s}] {s}", .{ if (name.len == 0) "Server" else name, text }) catch cmd.usageError(&def, out);

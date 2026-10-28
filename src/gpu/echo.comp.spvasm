@@ -1,0 +1,54 @@
+; G1 echo kernel (first checked-in SPIR-V). Copies 1024 u32 from input
+; SSBO to output SSBO, one u32 per invocation, LocalSize 64 -> 16 groups.
+;
+; Source of truth is THIS file. Assembled by `zig build shaders`
+; (spirv-as + spirv-val, vulkan1.0). Manual fallback:
+;   spirv-as --target-env vulkan1.0 echo.comp.spvasm -o echo.comp.spv
+;   spirv-val --target-env vulkan1.0 echo.comp.spv
+; The assembled words are embedded in `echo_spv.zig` (regenerate on change).
+;
+; GLSL equivalent (never compiled here — documents intent only):
+;   #version 450
+;   layout(local_size_x = 64) in;
+;   layout(set = 0, binding = 0) buffer In  { uint d[]; } src;
+;   layout(set = 0, binding = 1) buffer Out { uint d[]; } dst;
+;   void main() { dst.d[gl_GlobalInvocationID.x] = src.d[gl_GlobalInvocationID.x]; }
+;
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %gid
+OpExecutionMode %main LocalSize 64 1 1
+
+OpDecorate %in_var DescriptorSet 0
+OpDecorate %in_var Binding 0
+OpDecorate %out_var DescriptorSet 0
+OpDecorate %out_var Binding 1
+OpDecorate %block BufferBlock
+OpDecorate %arr ArrayStride 4
+OpMemberDecorate %block 0 Offset 0
+OpDecorate %gid BuiltIn GlobalInvocationId
+
+%void = OpTypeVoid
+%uint = OpTypeInt 32 0
+%uvec3 = OpTypeVector %uint 3
+%c1024 = OpConstant %uint 1024
+%c0 = OpConstant %uint 0
+%arr = OpTypeArray %uint %c1024
+%block = OpTypeStruct %arr
+%p_block = OpTypePointer Uniform %block
+%p_uint = OpTypePointer Uniform %uint
+%in_var = OpVariable %p_block Uniform
+%out_var = OpVariable %p_block Uniform
+%p_in_uvec3 = OpTypePointer Input %uvec3
+%gid = OpVariable %p_in_uvec3 Input
+%fn_ty = OpTypeFunction %void
+%main = OpFunction %void None %fn_ty
+%entry = OpLabel
+%loaded = OpLoad %uvec3 %gid
+%idx = OpCompositeExtract %uint %loaded 0
+%in_ptr = OpAccessChain %p_uint %in_var %c0 %idx
+%elem = OpLoad %uint %in_ptr
+%out_ptr = OpAccessChain %p_uint %out_var %c0 %idx
+OpStore %out_ptr %elem
+OpReturn
+OpFunctionEnd

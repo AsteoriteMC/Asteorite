@@ -21,7 +21,7 @@ pub fn main(init: std.process.Init) !void {
 
     const args = try init.minimal.args.toSlice(arena_alloc);
     if (args.len < 4) {
-        try out.print("usage: player_import <player.dat> <db-dir> <username> [shards=4]\n", .{});
+        try out.print("usage: player_import <player.dat> <db-dir> <username> [shards=4] [uuid]\n", .{});
         try out.flush();
         return;
     }
@@ -39,6 +39,23 @@ pub fn main(init: std.process.Init) !void {
         try out.flush();
         return;
     }
+    // Row identity is the UUID: explicit --uuid wins (online servers must
+    // pass the Mojang UUID — deriving would orphan the row under a UUID
+    // the player never presents). Offline servers can omit it (derived).
+    var uuid_buf: [36]u8 = undefined;
+    const uuid: []const u8 = blk: {
+        if (args.len >= 6) {
+            if (args[5].len != 36) {
+                try out.print("bad uuid (36-char hyphenated)\n", .{});
+                try out.flush();
+                return;
+            }
+            @memcpy(&uuid_buf, args[5][0..36]);
+            break :blk uuid_buf[0..];
+        }
+        asteorite.uuid.formatUuid(asteorite.uuid.offlineUuid(username), &uuid_buf);
+        break :blk uuid_buf[0..];
+    };
 
     const cwd = std.Io.Dir.cwd();
     const gz = cwd.readFileAlloc(io, dat_path, arena_alloc, .limited(1 << 26)) catch {
@@ -62,7 +79,7 @@ pub fn main(init: std.process.Init) !void {
     defer db_dir.close(io);
     var pool = try asteorite.shard.ShardPool.open(arena_alloc, io, db_dir, shards, .{});
     defer pool.deinit();
-    try asteorite.players.save(pool, username, &imported.data);
+    try asteorite.players.save(pool, uuid, &imported.data);
     try pool.flushAll();
 
     var nbt_total: usize = 0;
@@ -74,9 +91,10 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     try out.print(
-        "imported {s} -> {s}: pos=({d:.1},{d:.1},{d:.1}) spawn=({d},{d},{d}) health={d:.1} food={d} gamemode={d} inv_slots={d} nbt_bytes={d}",
+        "imported {s} -> {s} as {s}: pos=({d:.1},{d:.1},{d:.1}) spawn=({d},{d},{d}) health={d:.1} food={d} gamemode={d} inv_slots={d} nbt_bytes={d}",
         .{
             dat_path,               db_path,
+            uuid,
             imported.data.pos_x,    imported.data.pos_y,
             imported.data.pos_z,    imported.data.spawn_x,
             imported.data.spawn_y,  imported.data.spawn_z,

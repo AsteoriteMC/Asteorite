@@ -19,7 +19,7 @@ pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u
     const n = cmd.Spec.tokenize(args, &toks);
     if (n != 0 and n != 1 and n != 4) return cmd.usageError(&def, out);
     // Target: named player, or the sender for the bare form.
-    var target: [16]u8 = undefined;
+    var target: [cmd.max_name_len]u8 = undefined;
     var t: []const u8 = "";
     if (n == 0) {
         if (sender == null) return cmd.usageError(&def, out);
@@ -27,9 +27,7 @@ pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u
         if (self_name.len == 0) return cmd.usageError(&def, out);
         t = self_name;
     } else {
-        t = srv.resolvePlayerName(sender, toks[0], &target) orelse {
-            return "That player cannot be found";
-        };
+        t = cmd.resolveTarget(srv, sender, toks[0], &target) orelse return cmd.unknown_player;
     }
     var x: i32 = 0;
     var y: i32 = 0;

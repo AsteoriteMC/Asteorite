@@ -35,11 +35,7 @@ pub const Brand = enum {
     }
 
     pub fn name(self: Brand) []const u8 {
-        return switch (self) {
-            .vanilla => "vanilla",
-            .fabric => "fabric",
-            .forge => "forge",
-        };
+        return @tagName(self);
     }
 };
 
@@ -54,8 +50,8 @@ pub const ModEntry = struct {
 /// caller (serve thread), mods by the future modding API.
 pub const StatusPayload = struct {
     motd: []const u8,
-    max_players: u8,
-    online_players: u8,
+    max_players: u16,
+    online_players: u16,
     brand: Brand = .vanilla,
     mods: []const ModEntry = &.{},
     version_name: []const u8 = version.meta.name,
@@ -65,8 +61,8 @@ pub const StatusPayload = struct {
 /// Serialize to a freshly allocated JSON string (caller frees).
 pub fn writeJson(alloc: std.mem.Allocator, p: StatusPayload) ![]u8 {
     const WirePlayers = struct {
-        max: u8,
-        online: u8,
+        max: u16,
+        online: u16,
     };
     const WireVersion = struct {
         name: []const u8,

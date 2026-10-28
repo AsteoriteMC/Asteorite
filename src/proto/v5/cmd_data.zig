@@ -73,12 +73,8 @@ pub fn enchantsCombine(a: u8, b: u8) bool {
         return a == 2 or b == 2;
     }
     const damage_trio = [_]u8{ 16, 17, 18 };
-    var ai = false;
-    var bi = false;
-    for (damage_trio) |id| {
-        if (id == a) ai = true;
-        if (id == b) bi = true;
-    }
+    const ai = std.mem.indexOfScalar(u8, &damage_trio, a) != null;
+    const bi = std.mem.indexOfScalar(u8, &damage_trio, b) != null;
     if (ai and bi) return false;
     return true;
 }
@@ -102,17 +98,12 @@ const boots = [_]u16{ 301, 305, 309, 313, 317 };
 /// Tools, armor, bow, rod, shears, flint+steel, carrot on a stick.
 pub fn isDamageable(wire: u16) bool {
     if (wire == 259 or wire == 261 or wire == 346 or wire == 359 or wire == 398) return true;
-    if (inSet(wire, &swords)) return true;
-    if (inSet(wire, &axes)) return true;
-    if (inSet(wire, &picks)) return true;
-    if (inSet(wire, &shovels)) return true;
-    if (inSet(wire, &hoes)) return true;
-    if (inSet(wire, &helmets)) return true;
-    if (inSet(wire, &chests)) return true;
-    if (inSet(wire, &legs)) return true;
-    if (inSet(wire, &boots)) return true;
+    for (damage_sets) |set| if (inSet(wire, set)) return true;
     return false;
 }
+
+/// Tool/armor set table backing isDamageable (one loop, no 9-arm chain).
+const damage_sets = [_][]const u16{ &swords, &axes, &picks, &shovels, &hoes, &helmets, &chests, &legs, &boots };
 
 pub fn enchantApplies(cat: EnchCat, wire: u16) bool {
     return switch (cat) {

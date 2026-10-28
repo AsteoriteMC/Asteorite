@@ -74,6 +74,7 @@ extern "kernel32" fn PostQueuedCompletionStatus(CompletionPort: HANDLE, dwNumber
 extern "ws2_32" fn WSARecv(s: SOCKET, lpBuffers: [*]WSABUF, dwBufferCount: DWORD, lpNumberOfBytesRecvd: ?*DWORD, lpFlags: *DWORD, lpOverlapped: ?*OVERLAPPED, lpCompletionRoutine: ?*const anyopaque) callconv(.c) c_int;
 extern "ws2_32" fn WSASend(s: SOCKET, lpBuffers: [*]WSABUF, dwBufferCount: DWORD, lpNumberOfBytesSent: ?*DWORD, dwFlags: DWORD, lpOverlapped: ?*OVERLAPPED, lpCompletionRoutine: ?*const anyopaque) callconv(.c) c_int;
 extern "ws2_32" fn closesocket(s: SOCKET) callconv(.c) c_int;
+extern "ws2_32" fn shutdown(s: SOCKET, how: c_int) callconv(.c) c_int;
 extern "ws2_32" fn accept(s: SOCKET, addr: ?*std.posix.sockaddr, addrlen: ?*std.posix.socklen_t) callconv(.c) SOCKET;
 extern "ws2_32" fn setsockopt(s: SOCKET, level: c_int, optname: c_int, optval: [*]const u8, optlen: c_int) callconv(.c) c_int;
 extern "ws2_32" fn WSAGetLastError() callconv(.c) c_int;
@@ -145,6 +146,12 @@ const ConnSlot = struct {
     sending: bool = false,
     /// Set by `request_flush` (any thread), cleared by the worker.
     flush_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Graceful close requested (kick / ping-done / timeout): no new
+    /// inbound reads are served, but queued output still drains and
+    /// in-flight sends still complete — the slot is destroyed once
+    /// drained (see maybeDestroyConn). Same flush-then-close contract
+    /// as the other transports. Guarded by `lock` like `dead`.
+    closing: bool = false,
     /// Removed from the map (closed): flush/send paths stop here. Memory
     /// is still valid (retained until worker exit).
     dead: bool = false,
@@ -277,26 +284,37 @@ pub const Backend = struct {
 
     /// Transport handle for the server (any-thread flush requests).
     pub fn handle(self: *Backend) transport.Handle {
-        return .{
-            .request_flush = struct {
-                fn f(ctx: *anyopaque, conn_id: u32) void {
-                    const b: *Backend = @ptrCast(@alignCast(ctx));
-                    b.requestFlush(conn_id);
-                }
-            }.f,
-            .close_conn = struct {
-                fn f(ctx: *anyopaque, conn_id: u32) void {
-                    const b: *Backend = @ptrCast(@alignCast(ctx));
-                    b.closeConn(conn_id);
-                }
-            }.f,
-            .ctx = self,
-        };
+        return transport.handleFor(Backend, self);
     }
 
-    /// Close a connection (the transport owns the socket). Map-authority:
-    /// whoever removes the entry owns the close (exactly once).
+    /// Close a connection gracefully: mark it closing (new inbound reads
+    /// are no longer served), wake a drain sweep, and destroy it once
+    /// its queue drains and in-flight sends complete (see
+    /// maybeDestroyConn) — the pong / kick reason goes out first.
+    /// Idempotent; safe to call from any thread. Error paths
+    /// (arm/recv/send failures) keep the immediate destroyConn below —
+    /// a broken socket has nothing left to deliver.
     pub fn closeConn(self: *Backend, conn_id: u32) void {
+        self.conns_lock.lock();
+        const slot = self.conns.get(conn_id);
+        self.conns_lock.unlock();
+        const sl = slot orelse return;
+        sl.lock.lock();
+        if (sl.dead or sl.closing) {
+            sl.lock.unlock();
+            return;
+        }
+        sl.closing = true;
+        sl.lock.unlock();
+        _ = sl.flush_requested.swap(true, .acq_rel);
+        _ = PostQueuedCompletionStatus(self.iocp, 0, conn_id, null);
+    }
+
+    /// Destroy a connection immediately: remove from the map (exactly
+    /// once — whoever removes the entry owns the close), run on_close,
+    /// close the socket and retain the slot. For broken sockets only;
+    /// graceful closes go through closeConn above.
+    fn destroyConn(self: *Backend, conn_id: u32) void {
         self.conns_lock.lock();
         const removed = self.conns.fetchRemove(conn_id);
         self.conns_lock.unlock();
@@ -306,6 +324,9 @@ pub const Backend = struct {
         slot.lock.unlock();
         const h = self.handler;
         h.on_close(h.ctx, slot.id);
+        // Match the uring backend: shutdown before close so the peer
+        // sees FIN promptly even with an outstanding recv.
+        _ = shutdown(slot.sock, 2);
         _ = closesocket(slot.sock);
         slot.lock.lock();
         slot.out.deinit(self.allocator);
@@ -365,7 +386,7 @@ fn acceptorMain(backend: *Backend) void {
             // Listener closed (shutdown) or transient error: transient
             // errors must not spin the loop.
             if (backend.acceptor_stop.load(.acquire)) return;
-            sleepMs(backend.io, 2);
+            transport.sleepMs(backend.io, 2);
             continue;
         }
         applySocketOpts(sock, backend.opts);
@@ -455,7 +476,7 @@ fn armRecv(backend: *Backend, slot: *ConnSlot) void {
     if (WSAGetLastError() != WSA_IO_PENDING) {
         slot.lock.unlock();
         _ = backend.counters.recv_arm_failures.fetchAdd(1, .acq_rel);
-        backend.closeConn(slot.id);
+        backend.destroyConn(slot.id);
         return;
     }
     slot.recv_pending = true;
@@ -472,19 +493,25 @@ fn handleRecvBytes(backend: *Backend, slot: *ConnSlot, nbytes: DWORD) void {
         return;
     }
     if (nbytes == 0) {
-        // Peer closed (graceful FIN).
+        // Peer closed (graceful FIN): drain what's queued, then destroy.
         const id = slot.id;
         slot.lock.unlock();
         backend.closeConn(id);
         return;
     }
+    const closing = slot.closing;
     const bytes = slot.recv.buf[0..nbytes];
     slot.lock.unlock();
     const h = backend.handler;
-    h.on_read(h.ctx, slot.id, bytes);
-    _ = backend.counters.bytes_in.fetchAdd(nbytes, .acq_rel);
+    // A closing connection takes no new input (a kicked client spamming
+    // packets must not get served), but its queued output still drains.
+    if (!closing) {
+        h.on_read(h.ctx, slot.id, bytes);
+        _ = backend.counters.bytes_in.fetchAdd(nbytes, .acq_rel);
+    }
     drainOutbox(backend, slot);
-    armRecv(backend, slot);
+    if (!closing) armRecv(backend, slot);
+    maybeDestroyConn(backend, slot);
 }
 
 /// Pull the protocol layer's outbox and send it (one send in flight:
@@ -578,7 +605,7 @@ fn handleCompletion(backend: *Backend, key: usize, ovl: *OVERLAPPED, ok: bool, n
             const live = if (backend.conns.get(@intCast(key))) |s| s == slot else false;
             backend.conns_lock.unlock();
             if (!live or !ok) {
-                if (!ok) backend.closeConn(@intCast(key));
+                if (!ok) backend.destroyConn(@intCast(key));
                 return;
             }
             handleRecvBytes(backend, slot, nbytes);
@@ -593,11 +620,12 @@ fn handleCompletion(backend: *Backend, key: usize, ovl: *OVERLAPPED, ok: bool, n
             slot.lock.unlock();
             if (!ok) {
                 backend.allocator.free(bytes);
-                backend.closeConn(@intCast(key));
+                backend.destroyConn(@intCast(key));
                 return;
             }
             backend.allocator.free(bytes);
             if (!dead) trySend(backend, slot);
+            maybeDestroyConn(backend, slot);
         },
     }
 }
@@ -624,14 +652,27 @@ fn workerMain(w: *Worker) void {
         backend.conns_lock.lock();
         const slot = backend.conns.get(@intCast(key));
         backend.conns_lock.unlock();
-        if (slot) |sl| drainOutbox(backend, sl);
+        if (slot) |sl| {
+            drainOutbox(backend, sl);
+            maybeDestroyConn(backend, sl);
+        }
     }
 }
 
-/// Sleep helper (the backend carries the server's Io for this).
-fn sleepMs(io: std.Io, ms: u64) void {
-    const d = std.Io.Clock.Duration{ .raw = std.Io.Duration.fromNanoseconds(@intCast(ms * std.time.ns_per_ms)), .clock = .awake };
-    std.Io.Timeout.sleep(.{ .duration = d }, io) catch {};
+/// Destroy a closing slot once its queue drained and no send is in
+/// flight (graceful close: pong / kick reason go out first). Called
+/// wherever outbox/sending state can change: after each drain and
+/// after each completed send.
+fn maybeDestroyConn(backend: *Backend, slot: *ConnSlot) void {
+    slot.lock.lock();
+    const closing = slot.closing;
+    const dead = slot.dead;
+    const pending = slot.out.items.len != 0;
+    const inflight = slot.sending;
+    slot.lock.unlock();
+    if (dead or !closing) return;
+    if (pending or inflight) return;
+    backend.destroyConn(slot.id);
 }
 
 /// Can IOCP be used here? (completion-port creation probe; no sockets.)

@@ -39,17 +39,15 @@ pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u
     var vals: [4]cmd.Value = undefined;
     if (cmd.matchFirst(def.spec, toks[0..n], &vals) == null) return cmd.usageError(&def, out);
     // Resolve mover + destination per arity.
-    var mover_name: [16]u8 = undefined;
-    var dest_name: [16]u8 = undefined;
+    var mover_name: [cmd.max_name_len]u8 = undefined;
+    var dest_name: [cmd.max_name_len]u8 = undefined;
     if (n == 1 or n == 3) {
         // Sender is the mover (console cannot use these forms).
         if (sender == null) return cmd.usageError(&def, out);
         const self_name = cmd.senderName(sender, &mover_name);
         if (self_name.len == 0) return cmd.usageError(&def, out);
         if (n == 1) {
-            const d = srv.resolvePlayerName(sender, toks[0], &dest_name) orelse {
-                return "That player cannot be found";
-            };
+            const d = cmd.resolveTarget(srv, sender, toks[0], &dest_name) orelse return cmd.unknown_player;
             if (!srv.teleportPlayer(self_name, d)) return "That player cannot be found";
             const msg = std.fmt.bufPrint(out, "Teleported {s} to {s}", .{ self_name, d }) catch "Teleported";
             srv.notifyAdmins(sender, &def, msg);
@@ -65,13 +63,9 @@ pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u
         return msg;
     }
     // n == 2 or 4: first arg is the mover.
-    const mover = srv.resolvePlayerName(sender, toks[0], &mover_name) orelse {
-        return "That player cannot be found";
-    };
+    const mover = cmd.resolveTarget(srv, sender, toks[0], &mover_name) orelse return cmd.unknown_player;
     if (n == 2) {
-        const d = srv.resolvePlayerName(sender, toks[1], &dest_name) orelse {
-            return "That player cannot be found";
-        };
+        const d = cmd.resolveTarget(srv, sender, toks[1], &dest_name) orelse return cmd.unknown_player;
         if (std.mem.eql(u8, mover, d)) {
             // Same player: vanilla skips the dimension check and succeeds.
             return std.fmt.bufPrint(out, "Teleported {s} to {s}", .{ mover, d }) catch "Teleported";

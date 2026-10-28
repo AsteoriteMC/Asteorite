@@ -25,10 +25,8 @@ pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u
     var toks: [9][]const u8 = undefined;
     const n = cmd.Spec.tokenize(args, &toks);
     if (n < 2 or n > 8) return cmd.usageError(&def, out);
-    var target: [16]u8 = undefined;
-    const t = srv.resolvePlayerName(sender, toks[1], &target) orelse {
-        return "That player cannot be found";
-    };
+    var target: [cmd.max_name_len]u8 = undefined;
+    const t = cmd.resolveTarget(srv, sender, toks[1], &target) orelse return cmd.unknown_player;
     // Defaults: the target's block position, volume/pitch 1, minVolume 0.
     // x/y/z are sequential parseCoordinate slots (partial allowed, `~`
     // relative — vanilla advances one index per present arg).

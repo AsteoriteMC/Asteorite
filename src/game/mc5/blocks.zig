@@ -1,6 +1,6 @@
 //! 1.7.10 block definitions consumed by shared behaviour engines.
 //!
-//! The switches below are the old `sim/redstone.zig` predicates moved behind
+//! The switches below are the old `sim/world/redstone.zig` predicates moved behind
 //! profile data. They are compiled into a dense canonical-id table at
 //! comptime; no runtime profile dispatch remains.
 
@@ -314,6 +314,7 @@ fn orientation(id: ids.Id) block.Orientation {
         .dispenser, .dropper => .directional,
         .hopper => .hopper,
         .anvil => .anvil,
+        .furnace, .chest, .trapped_chest, .ender_chest => .chest,
         else => .none,
     };
 }
@@ -344,6 +345,8 @@ pub fn placeBlockForHeld(held: ids.Id) ?ids.Id {
         .lava_bucket => .lava,
         .repeater => .unpowered_repeater,
         .comparator => .unpowered_comparator,
+        .cake_item => .cake_block,
+        .brewing_stand_item => .brewing_stand_block,
         .wooden_door_item => .wooden_door_block,
         .iron_door_item => .iron_door_block,
         else => null,

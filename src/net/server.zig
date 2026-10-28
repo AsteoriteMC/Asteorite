@@ -11,6 +11,15 @@
 //! - `conn.lock`: guards one conn's state + outbox. Never held with another.
 //! - `conn.wlock`: serializes socket writes (serve flush vs ticker flush).
 //! - Registry snapshots take temp refs; destroy waits for refs == 0.
+//!
+//! Contents (one `Server` struct; sections in file order):
+//! lifecycle | registry | chat+death | sessions | commands | player ops |
+//! moderation | social+weather | rules+xp | editing+ops | tab-complete |
+//! scoreboard | tick regions | broadcasts+combat | items+containers |
+//! loops+serve | session state | tests.
+//! Section banners (`// ---- ... ----`) mark each span; a future split
+//! follows these lines (methods cannot leave the struct in Zig, so the
+//! grouping is documentary until the god-object is decomposed).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -20,33 +29,42 @@ const Action = @import("conn.zig").Action;
 const AttackEvent = @import("conn.zig").AttackEvent;
 const QDropEvent = @import("conn.zig").QDropEvent;
 const FurnaceClick = @import("conn.zig").FurnaceClick;
+const BrewClick = @import("conn.zig").BrewClick;
+const ChestClick = @import("conn.zig").ChestClick;
+const ChestClose = @import("conn.zig").ChestClose;
+const EnderClose = @import("conn.zig").EnderClose;
 const EnchantClick = @import("conn.zig").EnchantClick;
 const EnchantEvent = @import("conn.zig").EnchantEvent;
 const TableClose = @import("conn.zig").TableClose;
 const BlockEvent = @import("conn.zig").BlockEvent;
-const furnace_mod = @import("../sim/furnace.zig");
-const smelting_mod = @import("../sim/smelting.zig");
-const container_mod = @import("../sim/container.zig");
-const enchanting_mod = @import("../sim/enchanting.zig");
+const ThrowPotionEvent = @import("conn.zig").ThrowPotionEvent;
+const furnace_mod = @import("../sim/world/furnace.zig");
+const brewing_mod = @import("../sim/world/brewing.zig");
+const smelting_mod = @import("../sim/world/smelting.zig");
+const container_mod = @import("../sim/world/container.zig");
+const chest_mod = @import("../sim/world/chest.zig");
+const enchanting_mod = @import("../sim/world/enchanting.zig");
 const codec = @import("codec.zig");
-const view = @import("../sim/view.zig");
+const uuid_mod = @import("uuid.zig");
+const view = @import("../sim/world/view.zig");
 const conn_sink = @import("packet_sink.zig");
-const sink_mod = @import("../sim/packet_sink.zig");
+const sink_mod = @import("../sim/net/packet_sink.zig");
 const shard_mod = @import("../world/shard.zig");
 const store_mod = @import("../world/store.zig");
 const chunk_mod = @import("../world/chunk.zig");
-const player_db = @import("../sim/players.zig");
+const player_db = @import("../sim/player/players.zig");
 const player_import = @import("../world/import/player.zig");
 const item_mod = @import("../item.zig");
-const perms_mod = @import("../sim/permissions.zig");
+const perms_mod = @import("../sim/player/permissions.zig");
 const console_tui = @import("../console_tui.zig");
-const spin = @import("../sim/spin.zig");
-const ratelimit_mod = @import("../sim/ratelimit.zig");
+const spin = @import("../sim/core/spin.zig");
+const ratelimit_mod = @import("../sim/core/ratelimit.zig");
 const drop_mod = @import("../game/drops.zig");
 const java_random = @import("../worldgen/rng/java_random.zig");
 const packets = @import("../proto/v5/packets.zig");
 const ids = @import("../proto/v5/ids.zig");
-const entity = @import("../sim/entity.zig");
+const entity = @import("../sim/entity/entity.zig");
+const mob_mod = @import("../game/mob.zig");
 const v5gen = @import("../worldgen/v5/gen.zig");
 const v5serve = @import("../worldgen/v5/serve.zig");
 const v5genpool = @import("../worldgen/v5/genpool.zig");
@@ -56,17 +74,17 @@ const wire = @import("../proto/v5/wire_ids.zig");
 const tp_mod = @import("../cmd/tp.zig");
 const cmd_spec = @import("../cmd/spec.zig");
 const cmd_data = @import("../proto/v5/cmd_data.zig");
-const bans_mod = @import("../sim/bans.zig");
-const scoreboard_mod = @import("../sim/scoreboard.zig");
-const redstone_mod = @import("../sim/redstone.zig");
-const interaction_mod = @import("../sim/interaction.zig");
+const bans_mod = @import("../sim/player/bans.zig");
+const scoreboard_mod = @import("../sim/player/scoreboard.zig");
+const redstone_mod = @import("../sim/world/redstone.zig");
+const interaction_mod = @import("../sim/world/interaction.zig");
 const profile = @import("../version.zig");
 const transport_mod = @import("transport.zig");
-const memstat_mod = @import("../sim/memstat.zig");
-const seqlock_mod = @import("../sim/seqlock.zig");
-const tick_mod = @import("../sim/tick.zig");
-const affinity_mod = @import("../sim/affinity.zig");
-const pool_mod = @import("../sim/pool.zig");
+const memstat_mod = @import("../sim/core/memstat.zig");
+const seqlock_mod = @import("../sim/core/seqlock.zig");
+const tick_mod = @import("../sim/core/tick.zig");
+const affinity_mod = @import("../sim/core/affinity.zig");
+const pool_mod = @import("../sim/core/pool.zig");
 /// The io_uring backend is Linux-only and the kqueue backend is
 /// macOS/BSD-only: the comptime condition makes the other import dead
 /// code (never analyzed) on the wrong target.
@@ -88,6 +106,20 @@ pub const login_timeout_ms: i64 = 30000;
 pub const CfgState = struct {
     difficulty: rules_mod.Difficulty = .easy,
     default_gamemode: rules_mod.GameMode = .creative,
+    /// Vanilla pvp flag (default true): false makes player-vs-player
+    /// swings fizzle (config file only; no runtime command yet).
+    pvp: bool = true,
+    /// Vanilla force-gamemode (default false): when true, returning
+    /// players inherit the default gamemode at login instead of their
+    /// saved one (fresh logins always inherit it).
+    force_gamemode: bool = false,
+    /// Natural-spawn master switch (config "spawn_mobs", default true).
+    spawn_mobs: bool = true,
+    /// Per-kind spawn allowlist (config "mob_spawns" map; absent kinds
+    /// stay allowed). Existing mobs are unaffected — only new spawns
+    /// consult it, via canSpawnMob (the gate every spawn ingress, present
+    /// and future, must call).
+    mob_spawn_allowed: [mob_mod.count]bool = [_]bool{true} ** mob_mod.count,
     gamerules: [9]bool = .{ true, true, false, true, true, true, true, true, true },
     autosave: bool = true,
     idle_timeout_min: u32 = 0,
@@ -100,10 +132,81 @@ pub const RegistryEntry = struct {
     stream: std.Io.net.Stream,
 };
 
+/// Registry snapshot cap for fan-out broadcasts (join/leave/chat/sound/
+/// block paths all size their batch from this). Sized for the max
+/// player cap (config max_players validates 1..1024): every online
+/// player must fit or viewers past the cap silently miss broadcasts.
+pub const max_fanout: usize = 1024;
+
+/// Blocking-transport I/O buffer (socket reads, reader/writer scratch).
+pub const io_buf_len: usize = 4096;
+
+/// Scratch for tiny frames (S2B game-state, animation, block-action…).
+/// Framers bounds-check, so an undersize buffer drops the frame, never OOB.
+pub const tiny_frame_buf: usize = 8;
+/// Scratch for small frames (S1F experience, effect-remove, health…).
+pub const small_frame_buf: usize = 16;
+
+/// Queue a just-built frame, dropping it when the build failed.
+/// Collapses the ubiquitous `if (frame...() |f| {queue} else|_|{})`.
+fn queueBuilt(conn: *Conn, r: anytype) void {
+    if (r) |f| {
+        conn.queueFramed(f) catch {};
+    } else |_| {}
+}
+
+/// Vanilla sound-hearing radius² (16 blocks; sounds carry no farther).
+pub const hear_radius_sq: f64 = 256.0;
+
+/// Chunk-column offset (pregen spiral, neighbor resends).
+pub const ColOffset = struct { dx: i32, dz: i32 };
+
+/// Block id + meta at one position (getBlockAt).
+pub const BlockWire = struct { wire: u16, meta: u4 };
+
+/// Debug-profiling span (debugStop).
+pub const DebugSpan = struct { secs: f64, ticks: u64 };
+
 pub const Server = struct {
+    /// Login-burst singleflight (thundering-herd coalescing): concurrent
+    /// logins for the same chunk disk share one worldgen/read/zlib pass
+    /// instead of each paying the full 289-column burst. Only in-flight
+    /// work is shared (never cached), so there is no invalidation story:
+    /// a late joiner just starts its own flight. Waiters park on the
+    /// condvar (no spinning); the executor always publishes or fails,
+    /// so waits always terminate (plus waiters re-check liveness after).
+    /// Locking: flight mutex only, never nested with conn locks.
+    pub const BurstFlight = struct {
+        mutex: std.Io.Mutex = .init,
+        cond: std.Io.Condition = .init,
+        active: bool = false,
+        key: BurstKey = .{},
+        done: bool = false,
+        failed: bool = false,
+        gen: u64 = 0,
+        frames: std.ArrayListUnmanaged([]u8) = .empty,
+        sent_n: usize = 0,
+        sent_keys: [view.max_disk_cols]i64 = undefined,
+        refs: u32 = 0,
+        /// Allocator that owns `frames` (the executor's own). Reset frees
+        /// with exactly this allocator — waiters may run under different
+        /// allocators in tests, so it must travel with the payload.
+        alloc: std.mem.Allocator = undefined,
+    };
+    pub const BurstKey = struct {
+        dim: u8 = 0,
+        cx: i32 = 0,
+        cz: i32 = 0,
+        radius: u8 = 0,
+        sky: bool = true,
+        fn eql(a: BurstKey, b: BurstKey) bool {
+            return a.dim == b.dim and a.cx == b.cx and a.cz == b.cz and a.radius == b.radius and a.sky == b.sky;
+        }
+    };
     net: std.Io.net.Server,
     io: std.Io,
     config: Config,
+    burst_flight: BurstFlight = .{},
     /// Phase B: transport selection. `auto` picks the best backend for
     /// this OS (io_uring on Linux, kqueue on macOS, IOCP on Windows);
     /// `blocking` keeps the portable thread-per-connection transport.
@@ -177,11 +280,21 @@ pub const Server = struct {
     /// Background generation workers (null = sync legacy path in GenSource).
     /// Borrowed; must outlive the server (owned by main).
     gen_pool: ?*v5genpool.GenPool = null,
+    /// Chunky-style pregeneration task (/pregen). Guarded by pregen_lock
+    /// (leaf: never held while acquiring conn, pool, or world locks —
+    /// pollPregren snapshots under it, then works lock-free).
+    pregen_lock: spin.SpinLock = .{},
+    pregen: PregenState = .{},
     view_distance: u8 = 4,
     /// Allocator for the registry list. Set by serveForever/tests.
     gpa: std.mem.Allocator = undefined,
     registry: std.ArrayList(RegistryEntry) = .empty,
     reg_lock: spin.SpinLock = .{},
+    /// Pending join announcements (batched fan-out, drained by the ticker).
+    /// Entries are pinned conn refs; the drain releases them. Leaf lock:
+    /// never held while acquiring conn or registry locks.
+    announce_lock: spin.SpinLock = .{},
+    announce_queue: std.ArrayList(*Conn) = .empty,
     /// Serializes chunk read-modify-write cycles across connections.
     /// Never held together with any conn.lock (strict one-lock-at-a-time).
     world_lock: spin.SpinLock = .{},
@@ -194,12 +307,28 @@ pub const Server = struct {
     ent_lock: spin.SpinLock = .{},
     /// Global item-entity list (break drops + Q-drops; guarded by ent_lock).
     items: std.ArrayList(entity.ItemEnt) = .empty,
+    /// Global thrown-splash-potion list (guarded by ent_lock, like items).
+    /// Short-lived arcs (impact or age/void despawn); capped like items.
+    potions: std.ArrayList(entity.PotionEnt) = .empty,
     /// Furnace tile entities (server-owned; in-memory only, lost on restart —
     /// no chunk unloading exists so lifetime matches the loaded world).
     /// Guarded by furn_lock (leaf; furn is never held while acquiring conn,
     /// so nesting conn->furn is deadlock-free by construction).
     furnaces: std.ArrayList(FurnaceEnt) = .empty,
     furn_lock: spin.SpinLock = .{},
+    /// Brewing-stand tile entities (same ownership/lifetime discipline as
+    /// furnaces; slots OWNED). Guarded by brew_lock (leaf like furn_lock).
+    brews: std.ArrayList(BrewEnt) = .empty,
+    brew_lock: spin.SpinLock = .{},
+    /// Chest tile entities (server-owned, persisted per-block to
+    /// chest_dim rows; see chest.zig). Entries exist only for chests
+    /// opened since boot (lazy load on open, dropped when empty, clean,
+    /// and viewerless). Viewers are DERIVED (conns with an open window
+    /// at the pos), never stored — so disconnects can't leak counts.
+    /// Guarded by chest_lock (leaf like furn_lock: nesting conn->chest
+    /// and world->chest is deadlock-free; chest never nests outward).
+    chests: std.ArrayList(ChestEnt) = .empty,
+    chest_lock: spin.SpinLock = .{},
     /// K1 redstone state: scheduled ticks, torch burnout trackers, and the
     /// pressure-plate registry. No allocator, no locks of their own — only
     /// ever touched with world_lock held (serve mutation + ticker pass).
@@ -220,6 +349,17 @@ pub const Server = struct {
     rand_lock: spin.SpinLock = .{},
     /// Seed for the gameplay stream (world seed from the config file).
     drop_seed: i64 = 0,
+    /// Item-toss stream (break/death/Q-drop scatter direction only). A
+    /// SEPARATE JavaRandom from drop_rand, seeded with a fixed
+    /// domain constant — never the world seed. Vanilla draws toss
+    /// motion from Math.random(), not world.rand; sharing the world
+    /// stream would leak worldgen RNG state through observable item
+    /// motion (the randar class of seed-recovery exploit). Guarded by
+    /// rand_lock like drop_rand (leaf lock, never nested).
+    toss_rand: ?java_random.JavaRandom = null,
+    /// Fixed seed for the toss stream ("TossRand" as i64 — deliberately
+    /// world-independent; see toss_rand).
+    toss_seed: i64 = 0x546F737352616E64,
     pig_spawned: bool = false,
     /// Ticks until the demo pig respawns after death (tickOnce is 1Hz).
     /// Set on pig death; first spawn is immediate via pig_spawned.
@@ -227,7 +367,7 @@ pub const Server = struct {
     world_age: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     time_of_day: std.atomic.Value(i64) = std.atomic.Value(i64).init(6000),
     /// Announced play conns, for the server list ping. Bumped in
-    /// announceJoin (once per conn, guarded by announced) and dropped in
+    /// queueAnnounce/drainAnnounces (once per conn, guarded by announced) and dropped in
     /// unregister; read lock-free by serveConn when answering status.
     play_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// Ticks since boot (1Hz ticker). Periodic player save every 300.
@@ -273,8 +413,12 @@ pub const Server = struct {
     ban_lock: spin.SpinLock = .{},
     whitelist: ?bans_mod.Whitelist = null,
     wl_lock: spin.SpinLock = .{},
+    /// Directory for ops.json / banned-*.json / whitelist.json. Null means
+    /// the process working directory (where asteorite.toml and the world
+    /// dir live). Tests point it at a tmp dir.
+    list_dir: ?std.Io.Dir = null,
     /// Per-IP join flood gate (self-locking; admin-tunable window/burst
-    /// below, capacities in sim/ratelimit.zig cap them).
+    /// below, capacities in sim/core/ratelimit.zig cap them).
     login_gate: ratelimit_mod.LoginGate = .{},
     /// Login flood budget: joins allowed per window per IP. Copied from
     /// the merged config at boot (see main.zig).
@@ -299,6 +443,8 @@ pub const Server = struct {
     pub const autosave_ticks: u64 = 300;
     /// Anti-DoS cap on live item entities (snapshot arrays are fixed-size).
     pub const max_items: usize = 256;
+
+    // ---- lifecycle: bind/deinit/chunk source ----
 
     pub fn bind(io: std.Io, port: u16, config: Config) !Server {
         const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
@@ -333,6 +479,8 @@ pub const Server = struct {
     }
 
     /// Snapshotted refs; caller must `releaseSnap` when done.
+    // ---- connection registry ----
+
     fn snapshot(self: *Server, out: []RegistryEntry) []RegistryEntry {
         self.reg_lock.lock();
         defer self.reg_lock.unlock();
@@ -362,6 +510,29 @@ pub const Server = struct {
             const match = e.conn.state == .play and !e.conn.dead and !e.conn.close_after_flush and std.ascii.eqlIgnoreCase(e.conn.username[0..e.conn.username_len], name);
             e.conn.lock.unlock();
             if (match) return e.conn;
+        }
+        return null;
+    }
+
+    /// Resolve a player name to its UUID (authoritative permission
+    /// identity). Online targets resolve via the registry snapshot
+    /// (case-insensitive, like getPlayer); offline servers derive the
+    /// offline UUID from the name. Null in online mode when the target
+    /// isn't online — UUIDs are never invented there (a guessed row
+    /// would be a hijack vector: renames free old names for recycling).
+    fn resolveUuid(self: *Server, name: []const u8) ?[perms_mod.uuid_len]u8 {
+        var batch: [max_fanout]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        if (findInSnap(snap, name)) |c| {
+            c.lock.lock();
+            defer c.lock.unlock();
+            if (c.username_len > 0) return c.uuid_str;
+        }
+        if (!self.config.online_mode) {
+            var out: [perms_mod.uuid_len]u8 = undefined;
+            uuid_mod.formatUuid(uuid_mod.offlineUuid(name), &out);
+            return out;
         }
         return null;
     }
@@ -433,81 +604,165 @@ pub const Server = struct {
     /// Phase B: the packets are queued on each conn and flushed through
     /// the transport (blocking: straight to the socket; async: batched
     /// by the owning worker). One output path for every transport.
-    pub fn announceJoin(self: *Server, conn: *Conn) !void {
-        var others: [256]RegistryEntry = undefined;
+    /// Queue a completed login for batched announcement. The ticker drains
+    /// the queue once per tick with a single combined fan-out (one player-
+    /// list + chat burst per conn) instead of one O(players) fan-out per
+    /// join — under a join storm the immediate version serializes every
+    /// worker behind every conn's lock. Pins a ref; the drain releases it.
+    /// Best-effort (queue OOM drops the announcement, like the old
+    /// immediate path dropped frames on framer failure).
+    pub fn queueAnnounce(self: *Server, conn: *Conn) void {
+        _ = conn.refs.fetchAdd(1, .acq_rel);
+        errdefer _ = conn.refs.fetchSub(1, .acq_rel);
+        self.announce_lock.lock();
+        defer self.announce_lock.unlock();
+        self.announce_queue.append(self.gpa, conn) catch {};
+    }
+
+    /// Fan out one combined join burst for every queued login. Called by
+    /// the ticker (and tests). Same bytes as the old per-join announce —
+    /// each recipient gets list-adds for everyone else first, then every
+    /// newcomer's yellow join line — but each conn takes its lock once
+    /// and flushes once no matter how many joins drained.
+    pub fn drainAnnounces(self: *Server) void {
+        self.announce_lock.lock();
+        if (self.announce_queue.items.len == 0) {
+            self.announce_lock.unlock();
+            return;
+        }
+        var pending = self.announce_queue;
+        self.announce_queue = .empty;
+        self.announce_lock.unlock();
+        defer pending.deinit(self.gpa);
+        defer {
+            for (pending.items) |c| _ = c.refs.fetchSub(1, .acq_rel);
+        }
+
+        // Liveness filter (mirrors the login-burst re-check): conns that
+        // disconnected mid-queue were already unregistered with announced
+        // unset, so skipping them keeps unregister balanced.
+        var live: std.ArrayList(*Conn) = .empty;
+        defer live.deinit(self.gpa);
+        for (pending.items) |c| {
+            c.lock.lock();
+            const alive = !c.dead and !c.close_after_flush and !c.closed;
+            const dup = c.announced;
+            c.lock.unlock();
+            if (alive and !dup) live.append(self.gpa, c) catch {};
+        }
+        if (live.items.len == 0) return;
+
+        // Pre-copy every snap member's name+ping (one lock each); every
+        // frame below builds from these copies, so the recipient loop
+        // takes each conn's lock exactly once no matter the batch size.
+        var others: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&others);
         defer releaseSnap(snap);
-        // The newcomer's own registry entry (it was registered at accept):
-        // its queued output goes out through the normal flush path.
-        var self_entry: ?RegistryEntry = null;
+        var snames: std.ArrayList([perms_mod.max_name_len]u8) = .empty;
+        defer snames.deinit(self.gpa);
+        var slens: std.ArrayList(usize) = .empty;
+        defer slens.deinit(self.gpa);
+        var spings: std.ArrayList(i16) = .empty;
+        defer spings.deinit(self.gpa);
         for (snap) |e| {
-            if (e.conn == conn) {
-                self_entry = e;
-                break;
-            }
-        }
-        // newcomer learns existing players
-        var nb: [64]u8 = undefined;
-        for (snap) |e| {
-            if (e.conn == conn) continue;
             e.conn.lock.lock();
-            const nm = e.conn.username[0..e.conn.username_len];
+            var nm: [perms_mod.max_name_len]u8 = undefined;
+            @memcpy(nm[0..e.conn.username_len], e.conn.username[0..e.conn.username_len]);
+            const len = e.conn.username_len;
             const ping = e.conn.ping_ms.load(.acquire);
             e.conn.lock.unlock();
-            const f = try packets.framePlayerListItem(nm, true, ping, &nb);
-            conn.lock.lock();
-            conn.queueFramed(f) catch {};
-            conn.lock.unlock();
-            if (self_entry) |se| flushEntry(se, self.io);
+            snames.append(self.gpa, nm) catch break;
+            slens.append(self.gpa, len) catch break;
+            spings.append(self.gpa, ping) catch break;
         }
-        // existing players learn the newcomer
-        var jb: [64]u8 = undefined;
-        const jf = try packets.framePlayerListItem(
-            conn.username[0..conn.username_len],
-            true,
-            conn.ping_ms.load(.acquire),
-            &jb,
-        );
-        for (snap) |e| {
-            if (e.conn == conn) continue;
+        const n_copied = @min(snap.len, @min(snames.items.len, @min(slens.items.len, spings.items.len)));
+        // Fast newcomer-membership test for the recipient loop, plus the
+        // live-newcomer subset (dead ones were filtered above).
+        var is_new: [max_fanout]bool = undefined;
+        var nlive: std.ArrayList(usize) = .empty;
+        defer nlive.deinit(self.gpa);
+        for (snap, 0..) |e, i| {
+            if (i >= is_new.len) break;
+            is_new[i] = false;
+            for (live.items) |c| {
+                if (e.conn == c) {
+                    is_new[i] = true;
+                    break;
+                }
+            }
+            if (is_new[i]) nlive.append(self.gpa, i) catch {};
+        }
+        for (snap, 0..) |e, i| {
+            if (i >= max_fanout or i >= n_copied) break;
             e.conn.lock.lock();
-            e.conn.queueFramed(jf) catch {
+            const recv = e.conn.state == .play and !e.conn.dead and !e.conn.close_after_flush;
+            if (!recv) {
                 e.conn.lock.unlock();
                 continue;
-            };
+            }
+            // Same bytes as sequential per-join announces, one lock hold
+            // + one flush per conn: newcomers learn everyone else first
+            // (vanilla list order), then every newcomer's join line.
+            var nb: [64]u8 = undefined;
+            if (is_new[i]) {
+                for (0..n_copied) |j| {
+                    if (j == i) continue;
+                    const nm = snames.items[j][0..slens.items[j]];
+                    if (packets.framePlayerListItem(nm, true, spings.items[j], &nb)) |f| {
+                        e.conn.queueFramed(f) catch {};
+                    } else |_| {}
+                }
+            } else {
+                for (nlive.items) |j| {
+                    if (j >= n_copied) continue;
+                    const nm = snames.items[j][0..slens.items[j]];
+                    if (packets.framePlayerListItem(nm, true, spings.items[j], &nb)) |f| {
+                        e.conn.queueFramed(f) catch {};
+                    } else |_| {}
+                }
+            }
+            var jcb: [128]u8 = undefined;
+            var cfb: [512]u8 = undefined;
+            for (nlive.items) |j| {
+                if (j >= n_copied) continue;
+                const nm = snames.items[j][0..slens.items[j]];
+                const join = std.fmt.bufPrint(&jcb, "{{\"text\":\"{s} joined the game\",\"color\":\"yellow\"}}", .{nm}) catch continue;
+                e.conn.queueFramed(packets.frameChat(join, &cfb) catch continue) catch {};
+            }
+            // Count once per conn: unregister drops iff announced. The
+            // closed re-check (under the same lock unregister sets it
+            // with) closes the race where unregister already passed its
+            // check: a closed conn is never counted, so the pair stays
+            // exact no matter the interleaving.
+            if (is_new[i] and !e.conn.announced and !e.conn.closed) {
+                e.conn.announced = true;
+                _ = self.play_count.fetchAdd(1, .release);
+            }
             e.conn.lock.unlock();
             flushEntry(e, self.io);
         }
-        // Count once per conn: unregister drops iff announced, so these pair
-        // exactly even if announceJoin is ever re-entered.
-        if (!conn.announced) {
-            conn.announced = true;
-            _ = self.play_count.fetchAdd(1, .release);
+        for (nlive.items) |j| {
+            if (j >= n_copied) continue;
+            std.log.info("{s} joined the game", .{snames.items[j][0..slens.items[j]]});
         }
-        // Vanilla join line (yellow) to every online player, including the
-        // newcomer, plus the server console log.
-        conn.lock.lock();
-        const nm_len = conn.username_len;
-        var nm: [perms_mod.max_name_len]u8 = undefined;
-        @memcpy(nm[0..nm_len], conn.username[0..nm_len]);
-        conn.lock.unlock();
-        var jcb: [128]u8 = undefined;
-        const join = std.fmt.bufPrint(&jcb, "{{\"text\":\"{s} joined the game\",\"color\":\"yellow\"}}", .{nm[0..nm_len]}) catch null;
-        if (join) |j| self.broadcastChat(j);
-        std.log.info("{s} joined the game", .{nm[0..nm_len]});
     }
 
     /// Broadcast a chat line to every registered play conn (including sender;
     /// vanilla echoes). Caller holds no locks.
+    // ---- chat + death announcements ----
+
     pub fn broadcastChat(self: *Server, json: []const u8) void {
         var cb: [512]u8 = undefined;
         const f = packets.frameChat(json, &cb) catch return;
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         for (snap) |e| {
             e.conn.lock.lock();
-            if (e.conn.state != .play or e.conn.dead) {
+            // Skips non-play conns, dead ones, and ones already closing
+            // (a kick/timeout/ping-done conn takes no new output — the
+            // transport drains its final message(s) and closes it).
+            if (e.conn.state != .play or e.conn.dead or e.conn.close_after_flush) {
                 e.conn.lock.unlock();
                 continue;
             }
@@ -576,7 +831,16 @@ pub const Server = struct {
 
     /// Remove + broadcast leave (iff announced) + wait for temp refs + destroy.
     /// No locks held on return.
+    // ---- sessions + player persistence ----
+
     pub fn unregister(self: *Server, conn: *Conn) void {
+        // Liveness first: mark closed under conn.lock before anything
+        // else, so an unlocked gap (login burst) sees the teardown and
+        // aborts instead of completing a dead login. Conn-lock only
+        // (never nested with reg_lock — see Conn.closed).
+        conn.lock.lock();
+        conn.closed = true;
+        conn.lock.unlock();
         // Persist first: conn is still fully readable here (destroyed below).
         // Skips conns that never reached play. Lock discipline: savePlayer
         // takes conn.lock then world_lock, one at a time, never nested.
@@ -591,9 +855,9 @@ pub const Server = struct {
         self.reg_lock.unlock();
 
         if (conn.announced) {
-            // Paired with the fetchAdd in announceJoin (guarded by the same flag).
+            // Paired with the fetchAdd in drainAnnounces (guarded by the same flag).
             _ = self.play_count.fetchSub(1, .release);
-            var others: [256]RegistryEntry = undefined;
+            var others: [max_fanout]RegistryEntry = undefined;
             const snap = self.snapshot(&others);
             defer releaseSnap(snap);
             var lb: [64]u8 = undefined;
@@ -636,7 +900,7 @@ pub const Server = struct {
         const pool = self.world orelse return false;
         if (conn.username_len == 0) return false;
         const name = conn.username[0..conn.username_len];
-        const data = player_db.loadLegacy(pool, self.gpa, name, player_import.legacySlot) catch return false;
+        const data = player_db.loadLegacy(pool, self.gpa, name, conn.uuid_str[0..], player_import.legacySlot) catch return false;
         if (data == null) return false;
         var d = data.?;
         defer player_db.freeData(self.gpa, &d);
@@ -673,10 +937,13 @@ pub const Server = struct {
         }
         item_mod.freeStack(conn.allocator, &conn.cursor);
         conn.cursor = item_mod.cloneStack(conn.allocator, d.cursor) catch null;
+        for (&conn.ender, d.ender) |*slot, saved| {
+            item_mod.freeStack(conn.allocator, slot);
+            slot.* = item_mod.cloneStack(conn.allocator, saved) catch null;
+        }
         conn.selected = d.selected;
         conn.config.gamemode = d.gamemode;
-        conn.click_seq = 0;
-        conn.click_seen = false;
+        for (0..7) |w| conn.resetClickSeq(w); // fresh client: all containers restart
         conn.refreshCrafting();
         return true;
     }
@@ -722,6 +989,9 @@ pub const Server = struct {
             dst.* = item_mod.cloneStack(self.gpa, src) catch null;
         }
         d.cursor = item_mod.cloneStack(self.gpa, conn.cursor) catch null;
+        for (&d.ender, conn.ender) |*dst, src| {
+            dst.* = item_mod.cloneStack(self.gpa, src) catch null;
+        }
         conn.lock.unlock();
         defer player_db.freeData(self.gpa, &d);
         // Stale-session guard: a newer login for this name owns the row
@@ -730,14 +1000,14 @@ pub const Server = struct {
         if (!self.saveEpochCurrent(d.username[0..d.username_len], epoch)) return;
         self.world_lock.lock();
         defer self.world_lock.unlock();
-        player_db.save(pool, name, &d) catch {};
+        player_db.save(pool, conn.uuid_str[0..], &d) catch {};
     }
 
     /// Persist every logged-in player (disconnect path calls savePlayer per
     /// conn; this is the periodic + save-all + stop path). One world_lock
     /// for the batch; per-conn locks taken one at a time, never nested.
     pub fn saveAllPlayers(self: *Server) usize {
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         var n: usize = 0;
@@ -755,6 +1025,27 @@ pub const Server = struct {
     /// Called with conn.lock held (login bootstrap): pool reads are leaf
     /// locks, gen requests take the pool mutex, and drain() only waits on
     /// workers (which never take conn locks) — no nesting, no deadlock.
+    /// True while any of ensureLanding's 5x5 disk is still queued or
+    /// mid-generation. Bounded-poll helper for the scoped login wait below
+    /// (no LSM reads: a key leaves the set exactly when its worker finishes
+    /// the store attempt — success, failure, or shed all clear it).
+    fn landingInflight(self: *Server, gp: *v5genpool.GenPool, pcx: i32, pcz: i32) bool {
+        _ = self;
+        var dx: i32 = -2;
+        while (dx <= 2) : (dx += 1) {
+            var dz: i32 = -2;
+            while (dz <= 2) : (dz += 1) {
+                if (gp.isInflight(0, pcx + dx, pcz + dz)) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Scoped-wait poll bound (2ms each): 30s covers a cold 5x5 many times
+    /// over; anything slower means our columns are queued behind a bulk
+    /// backlog, and waiting longer would just extend the hang.
+    const landing_wait_polls: usize = 15000;
+
     fn ensureLanding(self: *Server, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, conn: *Conn) void {
         const pcx: i32 = @intFromFloat(@floor(conn.pos_x / 16.0));
         const pcz: i32 = @intFromFloat(@floor(conn.pos_z / 16.0));
@@ -771,7 +1062,8 @@ pub const Server = struct {
                 }
                 need += 1;
                 if (self.gen_pool) |gp| {
-                    gp.request(0, pcx + dx, pcz + dz);
+                    // Login disk outranks bulk backlog (priority lane).
+                    gp.requestPriority(0, pcx + dx, pcz + dz);
                 } else if (self.gen) |gen| {
                     // No workers (tests / no-seed fallback): sync fill.
                     const filled = v5serve.getOrGen(pool, gen, &self.world_lock, 0, pcx + dx, pcz + dz, allocator) catch null;
@@ -780,8 +1072,17 @@ pub const Server = struct {
             }
         }
         // Wait out only what we enqueued (warm logins skip the wait).
+        // Scoped to our 25 columns: a global drain() parks the serve
+        // thread behind the entire pool backlog — under /pregen that is
+        // the whole remaining task. Bounded: leftovers stay holes and the
+        // login grace covers them, exactly like a generation failure.
         if (need > 0) {
-            if (self.gen_pool) |gp| gp.drain();
+            if (self.gen_pool) |gp| {
+                var waits: usize = 0;
+                while (waits < landing_wait_polls and self.landingInflight(gp, pcx, pcz)) : (waits += 1) {
+                    transport_mod.sleepMs(conn.io, 2);
+                }
+            }
         }
     }
 
@@ -791,13 +1092,34 @@ pub const Server = struct {
     /// exists, snap the client back up with a PosLook re-send (its echo
     /// clears the grace). Timeout or horizontal movement clears it.
     fn maybeLoginResync(self: *Server, conn: *Conn) void {
-        _ = self;
         const now_ms = std.Io.Timestamp.now(conn.io, .awake).toMilliseconds();
         conn.lock.lock();
         defer conn.lock.unlock();
-        if (conn.login_grace_ms == 0) return;
-        if (now_ms > conn.login_grace_ms) {
+        if (conn.login_grace_ms == 0 and !conn.login_grace_lapsed) return;
+        if (conn.login_grace_lapsed or now_ms > conn.login_grace_ms) {
+            // Lapse/timeout resolution (needs the pool: packets can't see
+            // generation state). While the client's column is still a hole,
+            // re-arm instead of releasing: adopting the held fall would
+            // bury the player in terrain that generates solid around it
+            // (login embedded/suffocating on join). Once ground exists,
+            // release so falls adopt normally. Chunk presence (not block
+            // reads): missing sections are not holes.
+            var present = true;
+            if (self.world) |pool| {
+                const cc = conn.playerChunk();
+                const raw = pool.get(self.gpa, store_mod.encodeKey(0, cc.cx, cc.cz)) catch null;
+                if (raw) |r| {
+                    self.gpa.free(r);
+                } else present = false;
+            }
+            if (!present) {
+                conn.login_grace_ms = now_ms + 10_000;
+                conn.login_grace_lapsed = false;
+                conn.login_resynced = false; // snap again on delivery
+                return;
+            }
             conn.login_grace_ms = 0;
+            conn.login_grace_lapsed = false;
             return;
         }
         // Ground delivered means the login column left in a bulk the client
@@ -809,6 +1131,36 @@ pub const Server = struct {
         if (conn.login_fell and !conn.login_resynced) {
             conn.login_resynced = true;
             conn.login_fell = false;
+            // Never affirm an embedded cell: sub-threshold falls (within
+            // a block of the teleport) adopt before suppression engages,
+            // and a bare re-send would pin the client inside solid ground
+            // (fallrepro: snap to feet-in-grass y=71). Lift to headroom
+            // first (rescueEmbedded's two-open rule); no headroom in reach
+            // keeps the adopted pos (deep solid stays the per-tick
+            // rescue's case, which requires both cells opaque).
+            if (self.world) |pool| {
+                const lex: i32 = @intFromFloat(@floor(conn.pos_x));
+                const lez: i32 = @intFromFloat(@floor(conn.pos_z));
+                const lfeet: i32 = @intFromFloat(@floor(conn.pos_y));
+                if (lfeet >= 0 and lfeet <= 253) {
+                    const solid_feet = if (view.peekBlock(pool, self.gpa, lex, @intCast(lfeet), lez) catch null) |b| view.isOpaqueCube(b.id) else false;
+                    if (solid_feet) {
+                        var ly = lfeet + 1;
+                        while (ly <= lfeet + 16 and ly <= 253) : (ly += 1) {
+                            const fy: u8 = @intCast(ly);
+                            const ey: u8 = @intCast(ly + 1);
+                            const bf = view.peekBlock(pool, self.gpa, lex, fy, lez) catch null;
+                            const be = view.peekBlock(pool, self.gpa, lex, ey, lez) catch null;
+                            const f_ok = if (bf) |b| !view.isOpaqueCube(b.id) else false;
+                            const e_ok = if (be) |b| !view.isOpaqueCube(b.id) else false;
+                            if (f_ok and e_ok) {
+                                conn.pos_y = @floatFromInt(ly);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
             // Re-baseline the grace at the agreed position (sub-threshold
             // falls may have been adopted before suppression engaged): the
             // client's echo of this exact snapshot clears the grace.
@@ -821,6 +1173,8 @@ pub const Server = struct {
 
     /// Lazy permission matrix (allocator = server gpa). Caller need hold no
     /// locks; the matrix has its own leaf lock.
+    // ---- command registry, permissions, admin lookups ----
+
     fn permDb(self: *Server) *perms_mod.Db {
         self.perm_lock.lock();
         defer self.perm_lock.unlock();
@@ -889,45 +1243,48 @@ pub const Server = struct {
         if (sender == null) return true;
         const c = sender.?;
         c.lock.lock();
-        const name = c.username[0..c.username_len];
         const has_name = c.username_len > 0;
+        const uuid = c.uuid_str;
         c.lock.unlock();
         if (!has_name) return false;
         self.perm_lock.lock();
         defer self.perm_lock.unlock();
-        if (self.perms) |*db| return db.allows(name, desc.node, desc.min_level);
+        if (self.perms) |*db| return db.allowsUuid(&uuid, desc.node, desc.min_level);
         return perms_mod.DEFAULT_LEVEL.rank() >= desc.min_level.rank();
     }
 
-    /// Persist the matrix (single row). Encode under perm_lock, put under
-    /// world_lock — one at a time, never nested (matches player rows).
+    /// Persist the matrix to `ops.json` next to the server (atomic
+    /// replace). Encode under perm_lock, write after unlocking — disk IO
+    /// never holds the leaf lock. No world needed.
     pub fn savePerms(self: *Server) void {
-        const pool = self.world orelse return;
+        const dir = self.list_dir orelse std.Io.Dir.cwd();
         self.perm_lock.lock();
-        const enc = if (self.perms) |*db| perms_mod.encode(pool.allocator, db) catch null else null;
+        const enc = if (self.perms) |*db| perms_mod.encodeJson(self.gpa, db) catch null else null;
         self.perm_lock.unlock();
         if (enc) |e| {
-            defer pool.allocator.free(e);
-            self.world_lock.lock();
-            defer self.world_lock.unlock();
-            pool.put(perms_mod.perm_key, e) catch {};
+            defer self.gpa.free(e);
+            perms_mod.writeOpsFile(self.io, dir, e) catch |err| {
+                std.log.warn("ops.json write failed ({})", .{err});
+            };
         }
     }
 
-    /// Load the matrix at boot (single-threaded; no locks needed). Corrupt
-    /// rows fail closed to an empty matrix (logged; the next mutation
-    /// overwrites the bad row).
+    /// Load the matrix at boot (single-threaded; no locks needed): `ops.json`
+    /// if present, else empty. Corrupt files fail closed to an empty matrix
+    /// (logged; the next mutation overwrites the bad file). `/perm reload`
+    /// re-reads the file, so hand edits apply live.
     pub fn loadPerms(self: *Server) void {
-        const pool = self.world orelse return;
-        const loaded = perms_mod.load(pool, self.gpa) catch |err| blk: {
-            std.log.warn("permissions row unreadable ({}) — starting empty", .{err});
-            break :blk null;
+        const dir = self.list_dir orelse std.Io.Dir.cwd();
+        const file_db = perms_mod.loadFile(self.io, dir, self.gpa) catch |err| {
+            std.log.warn("ops.json unreadable ({}) — starting empty", .{err});
+            return;
         };
-        if (loaded) |db| {
+        if (file_db) |loaded| {
+            if (loaded.skipped_legacy > 0) std.log.warn("ops.json: {d} legacy name-only rows ignored (no UUID) — re-op affected players so their rows are UUID-bound", .{loaded.skipped_legacy});
             self.perm_lock.lock();
             defer self.perm_lock.unlock();
             if (self.perms) |*old| old.deinit();
-            self.perms = db;
+            self.perms = loaded.db;
         }
     }
 
@@ -986,13 +1343,20 @@ pub const Server = struct {
     }
 
     /// Grant level 4 to a validated name (bootstrap + /op path helper).
-    /// Persists immediately. Name validity is the caller's job.
-    pub fn grantOp(self: *Server, name: []const u8) void {
+    /// Resolves to the player's UUID (online target, or offline-UUID on
+    /// offline servers); unresolvable names fail closed. Persists
+    /// immediately. Name validity is the caller's job.
+    pub fn grantOp(self: *Server, name: []const u8) bool {
+        const uuid = self.resolveUuid(name) orelse return false;
         _ = self.permDb();
         self.perm_lock.lock();
-        self.permsDbLocked().setLevel(name, .owner) catch {};
+        self.permsDbLocked().setLevelUuid(&uuid, name, .owner) catch {
+            self.perm_lock.unlock();
+            return false;
+        };
         self.perm_lock.unlock();
         self.savePerms();
+        return true;
     }
 
     // ------------------------------------------------------------------
@@ -1057,7 +1421,7 @@ pub const Server = struct {
     /// (op + canUse, exactly like `bl.a`), plus the console log. The sender
     /// gets the raw reply via executeCommand's return — never both.
     pub fn notifyAdmins(self: *Server, sender: ?*Conn, def: *const perms_mod.Command, inner: []const u8) void {
-        var sname: [16]u8 = undefined;
+        var sname: [perms_mod.max_name_len]u8 = undefined;
         const s = if (sender) |c| blk: {
             c.lock.lock();
             defer c.lock.unlock();
@@ -1070,7 +1434,7 @@ pub const Server = struct {
         if (sender != null) std.log.info("[{s}: {s}]", .{ s, inner });
         // Command-block senders honor commandBlockOutput (we have no command
         // blocks; console/player senders always broadcast).
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         var eb: [2048]u8 = undefined;
@@ -1083,11 +1447,11 @@ pub const Server = struct {
             if (e.conn == sender) continue;
             e.conn.lock.lock();
             const play = e.conn.state == .play and !e.conn.dead and e.conn.username_len > 0;
-            const nm = e.conn.username[0..e.conn.username_len];
+            const uuid = e.conn.uuid_str;
             e.conn.lock.unlock();
             if (!play) continue;
             self.perm_lock.lock();
-            const can = if (self.perms) |*db| db.allows(nm, def.node, def.min_level) else perms_mod.DEFAULT_LEVEL.rank() >= def.min_level.rank();
+            const can = if (self.perms) |*db| db.allowsUuid(&uuid, def.node, def.min_level) else perms_mod.DEFAULT_LEVEL.rank() >= def.min_level.rank();
             self.perm_lock.unlock();
             if (!can) continue;
             e.conn.lock.lock();
@@ -1112,7 +1476,7 @@ pub const Server = struct {
     /// Raw pre-formatted JSON to one online player (/tellraw). False when
     /// the target isn't online.
     pub fn sendJsonPlayer(self: *Server, name: []const u8, json: []const u8) bool {
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         const c = findInSnap(snap, name) orelse return false;
@@ -1125,7 +1489,7 @@ pub const Server = struct {
         return true;
     }
 
-    pub fn maxPlayers(self: *Server) u8 {
+    pub fn maxPlayers(self: *Server) u16 {
         return self.config.max_players;
     }
 
@@ -1137,20 +1501,25 @@ pub const Server = struct {
         return self.time_of_day.load(.acquire);
     }
 
-    /// Snapshot-free play roster: copies online names under each conn's
-    /// lock (registry lock held throughout, so unregister can't destroy
-    /// a conn mid-copy). Returns the count.
-    pub fn playNames(self: *Server, names: [][16]u8, lens: []u8) usize {
-        self.reg_lock.lock();
-        defer self.reg_lock.unlock();
+    /// Snapshot-free player roster: copies online names under each conn's
+    /// lock. Uses a pinned snapshot (refs keep conns alive for the walk)
+    /// instead of holding reg_lock across all conns — the old version
+    /// serialized every join/leave fan-out behind bulk roster reads.
+    pub fn playNames(self: *Server, names: [][perms_mod.max_name_len]u8, lens: []u8, uuids: ?[][perms_mod.uuid_len]u8) usize {
+        var batch: [max_fanout]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
         var n: usize = 0;
-        for (self.registry.items) |e| {
+        for (snap) |e| {
             if (n >= names.len or n >= lens.len) break;
             e.conn.lock.lock();
             const play = e.conn.state == .play;
             if (play) {
                 @memcpy(names[n][0..e.conn.username_len], e.conn.username[0..e.conn.username_len]);
                 lens[n] = @intCast(e.conn.username_len);
+                if (uuids) |u| {
+                    if (n < u.len) @memcpy(u[n][0..], e.conn.uuid_str[0..]);
+                }
             }
             e.conn.lock.unlock();
             if (!play) continue;
@@ -1164,12 +1533,15 @@ pub const Server = struct {
         if (self.world) |pool| pool.flushAll() catch {};
     }
 
-    /// Strip all nodes from a player (keeps level). Used by /deop.
-    pub fn deopPlayer(self: *Server, name: []const u8) void {
+    /// Full reset of a player row (deop). Used by /deop.
+    /// Resolves like grantOp; unresolvable names fail closed.
+    pub fn deopPlayer(self: *Server, name: []const u8) bool {
+        const uuid = self.resolveUuid(name) orelse return false;
         self.perm_lock.lock();
-        if (self.perms) |*db| db.clearPlayer(name);
+        if (self.perms) |*db| db.clearUuid(&uuid);
         self.perm_lock.unlock();
         self.savePerms();
+        return true;
     }
 
     /// Login-name charset (single source; mirrors conn.zig validation).
@@ -1178,7 +1550,7 @@ pub const Server = struct {
         return Conn.validPlayerName(name);
     }
 
-    /// Permission-node charset (single source; see sim/permissions.zig).
+    /// Permission-node charset (single source; see sim/player/permissions.zig).
     pub fn validNode(self: *Server, node: []const u8) bool {
         _ = self;
         return perms_mod.validNode(node);
@@ -1237,7 +1609,7 @@ pub const Server = struct {
 
     /// Drop leftover /give stacks at the target's feet (vanilla overflow).
     pub fn dropLeftover(self: *Server, name: []const u8, id: game_ids.Id, count: i32, damage: i16) void {
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         const c = findInSnap(snap, name) orelse return;
@@ -1252,14 +1624,14 @@ pub const Server = struct {
         while (left > 0) {
             const put: i8 = @intCast(@min(left, 64));
             left -= put;
-            self.spawnItemLive(.{ .id = id, .count = put, .damage = damage, .nbt = null }, px, py + 0.5, pz, 10);
+            self.spawnItemLive(.{ .id = id, .count = put, .damage = damage, .nbt = null }, px, py + 0.5, pz, 10, self.tossPopMotion());
         }
     }
 
-    /// Max stack size for /give (vanilla 1.7 table).
+    /// Max stack size for /give (profile table).
     pub fn maxStack(self: *Server, id: game_ids.Id) u8 {
         _ = self;
-        return item_mod.maxStackSize(id);
+        return profile.game.item_data.maxStackSize(id);
     }
 
     /// Set a player's gamemode + push the abilities packet. Returns false
@@ -1268,8 +1640,10 @@ pub const Server = struct {
     /// S2B change-gamemode (the client flips its controller + UI/HUD off
     /// that), plus an S39 refresh with jar-verified flags (0x0D creative / 0x00
     /// survival+adventure). Returns false when the player isn't online.
+    // ---- player admin ops + command dispatch ----
+
     pub fn applyGamemode(self: *Server, name: []const u8, mode: rules_mod.GameMode) bool {
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         const c = findInSnap(snap, name) orelse return false;
@@ -1277,10 +1651,8 @@ pub const Server = struct {
         defer c.lock.unlock();
         c.config.gamemode = mode;
         const creative = mode.isCreative();
-        var gb: [16]u8 = undefined;
-        if (packets.frameGameState(packets.game_state_change_gamemode, @floatFromInt(mode.wire()), &gb)) |f| {
-            c.queueFramed(f) catch {};
-        } else |_| {}
+        var gb: [perms_mod.max_name_len]u8 = undefined;
+        queueBuilt(c, packets.frameGameState(packets.game_state_change_gamemode, @floatFromInt(mode.wire()), &gb));
         var ab: [32]u8 = undefined;
         const f = packets.framePlayerAbilities(packets.abilityFlags(creative), 0.05, 0.1, &ab) catch return true;
         c.queueFramed(f) catch {};
@@ -1295,15 +1667,15 @@ pub const Server = struct {
     /// Fill an online player's inventory (vanilla merge-then-empties rule)
     /// and sync dirty slots. Null when the player isn't online.
     pub fn giveItems(self: *Server, target: []const u8, id: game_ids.Id, count: i32, damage: i16) ?GiveResult {
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         const c = findInSnap(snap, target) orelse return null;
         c.lock.lock();
         defer c.lock.unlock();
-        var dirty: [45]bool = [_]bool{false} ** 45;
-        const r = item_mod.fillInventory(&c.inv, id, count, damage, &dirty);
-        for (9..45) |ds| {
+        var dirty: [item_mod.inv_size]bool = [_]bool{false} ** item_mod.inv_size;
+        const r = item_mod.fillInventory(&c.inv, id, count, damage, &dirty, profile.game.item_data.maxStackSize(id));
+        for (item_mod.main_lo..item_mod.inv_size) |ds| {
             if (!dirty[ds]) continue;
             const f = packets.frameSetSlotAlloc(self.gpa, 0, @intCast(ds), c.inv[ds]) catch continue;
             defer self.gpa.free(f);
@@ -1322,7 +1694,7 @@ pub const Server = struct {
 
     /// Live position of an online player (for `~` relative coords).
     pub fn playerPos(self: *Server, name: []const u8) ?[3]f64 {
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         const c = findInSnap(snap, name) orelse return null;
@@ -1346,7 +1718,7 @@ pub const Server = struct {
     /// player (with immediate chunk resync, same as the serve loop does
     /// after a move). False when mover (or target) isn't online.
     pub fn teleport(self: *Server, mover: []const u8, dest: tp_mod.Dest) bool {
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         const mc = findInSnap(snap, mover) orelse return false;
@@ -1393,16 +1765,19 @@ pub const Server = struct {
     }
 
     /// /perm show <player>: "name: level N +node -node", or null when the
-    /// line doesn't fit (caller prints "Show failed.").
+    /// line doesn't fit (caller prints "Show failed."). Unknown players
+    /// show level 0, same as before (no row, no match).
     pub fn permShow(self: *Server, player: []const u8, out: []u8) ?[]const u8 {
-        // Build the whole reply under perm_lock, release, then return
-        // (the caller sends it; reply takes the sender's conn lock —
-        // never nest the two).
+        // Resolve before locking (snapshot + conn locks must never nest
+        // inside perm_lock). Build the whole reply under perm_lock,
+        // release, then return (the caller sends it; reply takes the
+        // sender's conn lock — never nest the two).
+        const uuid = self.resolveUuid(player);
         const built: ?usize = blk: {
             self.perm_lock.lock();
             defer self.perm_lock.unlock();
             const db = self.permsDbLocked();
-            const p = db.lookupRow(player);
+            const p = if (uuid) |*u| db.lookupRowUuid(u) else null;
             var ow: usize = 0;
             {
                 const s = std.fmt.bufPrint(out[ow..], "{s}: level {d}", .{ player, if (p) |pp| pp.level.rank() else perms_mod.DEFAULT_LEVEL.rank() }) catch break :blk null;
@@ -1430,27 +1805,38 @@ pub const Server = struct {
     }
 
     /// /perm grant|deny <player> <node> (persists immediately).
-    pub fn permGrant(self: *Server, player: []const u8, node: []const u8) void {
+    pub fn permGrant(self: *Server, player: []const u8, node: []const u8) bool {
+        const uuid = self.resolveUuid(player) orelse return false;
         self.perm_lock.lock();
-        self.permsDbLocked().grant(player, node) catch {};
+        self.permsDbLocked().grantUuid(&uuid, player, node) catch {
+            self.perm_lock.unlock();
+            return false;
+        };
         self.perm_lock.unlock();
         self.savePerms();
+        return true;
     }
 
-    pub fn permDeny(self: *Server, player: []const u8, node: []const u8) void {
+    pub fn permDeny(self: *Server, player: []const u8, node: []const u8) bool {
+        const uuid = self.resolveUuid(player) orelse return false;
         self.perm_lock.lock();
-        self.permsDbLocked().deny(player, node) catch {};
+        self.permsDbLocked().denyUuid(&uuid, player, node) catch {
+            self.perm_lock.unlock();
+            return false;
+        };
         self.perm_lock.unlock();
         self.savePerms();
+        return true;
     }
 
     /// /perm clear <player> [node] (null node = drop all nodes, keep level).
-    pub fn permClear(self: *Server, player: []const u8, node: ?[]const u8) void {
+    pub fn permClear(self: *Server, player: []const u8, node: ?[]const u8) bool {
+        const uuid = self.resolveUuid(player) orelse return false;
         self.perm_lock.lock();
         if (node) |n| {
-            _ = self.permsDbLocked().clearNode(player, n) catch false;
+            _ = self.permsDbLocked().clearNodeUuid(&uuid, n) catch false;
         } else if (self.perms) |*db| {
-            if (db.lookupRow(player)) |pp| {
+            if (db.lookupRowUuid(&uuid)) |pp| {
                 var gi = pp.grants.iterator();
                 while (gi.next()) |e| db.alloc.free(e.key_ptr.*);
                 pp.grants.clearRetainingCapacity();
@@ -1461,6 +1847,7 @@ pub const Server = struct {
         }
         self.perm_lock.unlock();
         self.savePerms();
+        return true;
     }
 
     /// "/stop" (bare or with args): persist + exit. Callers deliver the
@@ -1522,7 +1909,7 @@ pub const Server = struct {
     /// `getPlayer` — a direct message, not a broadcast). Command backend
     /// surface (cmd/op.zig, cmd/deop.zig).
     pub fn notifyPlayer(self: *Server, name: []const u8, text: []const u8) void {
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         for (snap) |e| {
@@ -1580,9 +1967,9 @@ pub const Server = struct {
     /// Vanilla target selectors for single-player args: @p nearest, @r
     /// random, @a only when exactly one player is online (vanilla errors
     /// otherwise). Returns the resolved name, or null for unknown/offline.
-    pub fn resolvePlayerName(self: *Server, sender: ?*Conn, token: []const u8, out: *[16]u8) ?[]const u8 {
+    pub fn resolvePlayerName(self: *Server, sender: ?*Conn, token: []const u8, out: *[perms_mod.max_name_len]u8) ?[]const u8 {
         if (!cmd_spec.isSelector(token)) {
-            var batch: [256]RegistryEntry = undefined;
+            var batch: [max_fanout]RegistryEntry = undefined;
             const snap = self.snapshot(&batch);
             defer releaseSnap(snap);
             const c = findInSnap(snap, token) orelse return null;
@@ -1592,10 +1979,10 @@ pub const Server = struct {
             @memcpy(out[0..c.username_len], c.username[0..c.username_len]);
             return out[0..c.username_len];
         }
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
-        var names: [256][16]u8 = undefined;
+        var names: [256][perms_mod.max_name_len]u8 = undefined;
         var lens: [256]u8 = undefined;
         var pos: [256][3]f64 = undefined;
         var n: usize = 0;
@@ -1661,7 +2048,7 @@ pub const Server = struct {
 
     /// Live peer address of an online player (for /ban-ip name form).
     pub fn playerIp(self: *Server, name: []const u8, out: *[64]u8) ?[]const u8 {
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         const c = findInSnap(snap, name) orelse return null;
@@ -1674,8 +2061,8 @@ pub const Server = struct {
 
     /// Multi-target resolution for spreadplayers: @a = all online,
     /// @p/@r = single, plain = single (null when nobody matches).
-    pub fn resolvePlayerList(self: *Server, sender: ?*Conn, token: []const u8, out: [][16]u8, lens: []u8) usize {
-        var batch: [256]RegistryEntry = undefined;
+    pub fn resolvePlayerList(self: *Server, sender: ?*Conn, token: []const u8, out: [][perms_mod.max_name_len]u8, lens: []u8) usize {
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         var n: usize = 0;
@@ -1693,7 +2080,7 @@ pub const Server = struct {
             }
             return n;
         }
-        var one: [16]u8 = undefined;
+        var one: [perms_mod.max_name_len]u8 = undefined;
         const t = self.resolvePlayerName(sender, token, &one) orelse return 0;
         if (out.len == 0) return 0;
         @memcpy(out[0][0..t.len], t);
@@ -1703,7 +2090,7 @@ pub const Server = struct {
 
     /// Online check (play state). Used for "player not found" errors.
     pub fn isOnline(self: *Server, name: []const u8) bool {
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         const c = findInSnap(snap, name) orelse return false;
@@ -1714,12 +2101,23 @@ pub const Server = struct {
 
     /// Bump the save epoch for a login name; the caller stores the
     /// returned value on the conn. Leaf lock only (never nested).
+    // ---- kicks, login rejects, save epochs ----
+
+    /// Lowercase a login name for the save-epoch map (session bookkeeping
+    /// only — NOT authorization; the perm matrix keys on UUIDs and never
+    /// folds).
+    fn foldEpochName(name: []const u8, buf: *[perms_mod.max_name_len]u8) []const u8 {
+        const n = @min(name.len, perms_mod.max_name_len);
+        for (name[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
+        return buf[0..n];
+    }
+
     fn bumpSaveEpoch(self: *Server, name: []const u8) u64 {
         self.epoch_lock.lock();
         defer self.epoch_lock.unlock();
         if (self.save_epochs == null) self.save_epochs = std.StringHashMap(u64).init(self.gpa);
         var fold: [perms_mod.max_name_len]u8 = undefined;
-        const key = perms_mod.Db.normKey(name, &fold);
+        const key = foldEpochName(name, &fold);
         const e = self.save_epochs.?.get(key) orelse 0;
         const next = e + 1;
         if (self.save_epochs.?.getPtr(key)) |p| {
@@ -1741,8 +2139,19 @@ pub const Server = struct {
         defer self.epoch_lock.unlock();
         const m = self.save_epochs orelse return true;
         var fold: [perms_mod.max_name_len]u8 = undefined;
-        const cur = m.get(perms_mod.Db.normKey(name, &fold)) orelse return true;
+        const cur = m.get(foldEpochName(name, &fold)) orelse return true;
         return cur == epoch;
+    }
+
+    /// Current epoch for a name without bumping (0 = no login yet). Read
+    /// at login start into `login_epoch_seen`; the straggler fence aborts
+    /// when it no longer matches. Leaf lock only (never nested).
+    fn epochFor(self: *Server, name: []const u8) u64 {
+        self.epoch_lock.lock();
+        defer self.epoch_lock.unlock();
+        const m = self.save_epochs orelse return 0;
+        var fold: [perms_mod.max_name_len]u8 = undefined;
+        return m.get(foldEpochName(name, &fold)) orelse 0;
     }
 
     /// Kick by registry entry: queue the play disconnect, flush it from
@@ -1752,25 +2161,39 @@ pub const Server = struct {
     /// queue-only kick never lands and the ghost lingers in the registry
     /// shadowing the live session. Shutdown wakes the victim's thread so
     /// it unregisters promptly. Same shape as the idle-kick path.
+    /// Abort our own wedged login when the straggler fence trips (a newer
+    /// login owns the row now). Queues the superseded screen and unwinds
+    /// via close_after_flush (finished=true); our death-rattle save is
+    /// dropped by the epoch guard. Caller holds conn.lock and returns
+    /// right after (need_announce stays unset). Same shape as the
+    /// post-LoginSuccess rejectLogin path.
+    fn abortStaleLogin(self: *Server, conn: *Conn) !void {
+        _ = self;
+        // Flag first: the screen is best-effort (OOM below must still
+        // unwind to a close, never to a half-logged-in linger).
+        conn.close_after_flush = true;
+        var ab: [512]u8 = undefined;
+        if (packets.frameDisconnect("{\"text\":\"You logged in from another location!\"}", &ab)) |f| {
+            try conn.queueFramed(f);
+        } else |_| {}
+    }
+
     fn kickEntry(self: *Server, e: RegistryEntry, reason: []const u8) void {
         var eb: [512]u8 = undefined;
         const esc = packets.escapeJsonText(reason, &eb) catch return;
         var jb: [560]u8 = undefined;
         const json = std.fmt.bufPrint(&jb, "{{\"text\":\"{s}\"}}", .{esc}) catch return;
         e.conn.lock.lock();
-        if (e.conn.state != .play or e.conn.dead) {
+        if (e.conn.state != .play or e.conn.dead or e.conn.close_after_flush) {
+            // Already dying (kick/timeout in flight): its row and save are
+            // decided — re-queueing another disconnect just re-flushes a
+            // dead peer's outbox (the write that wedges kickers).
             e.conn.lock.unlock();
             return;
         }
         // Disconnect carries the JSON (client shows it on the screen).
-        var pb: [640]u8 = undefined;
-        var w = codec.PacketWriter.init(&pb);
-        w.writeString(json) catch {
-            e.conn.lock.unlock();
-            return;
-        };
         var fb: [700]u8 = undefined;
-        const d = codec.framePacket(@intFromEnum(ids.PlayClient.disconnect), w.written(), &fb) catch {
+        const d = packets.frameDisconnect(json, &fb) catch {
             e.conn.lock.unlock();
             return;
         };
@@ -1787,13 +2210,12 @@ pub const Server = struct {
     /// LoginSuccess already went out, so this is a post-login kick with the
     /// same screen vanilla shows pre-login.
     fn rejectLogin(self: *Server, c: *Conn, rej: LoginReject) void {
-        const name = c.username[0..c.username_len];
         var reason: [1024]u8 = undefined;
         var rlen: usize = 0;
         switch (rej) {
             .banned_name => {
                 self.ban_lock.lock();
-                const r = if (self.bans) |*db| db.bannedName(name) else null;
+                const r = if (self.bans) |*db| db.bannedUuid(&c.uuid_str) else null;
                 if (r) |rr| {
                     const s = std.fmt.bufPrint(&reason, "You are banned from this server!\nReason: {s}", .{rr}) catch reason[0..0];
                     rlen = s.len;
@@ -1828,19 +2250,14 @@ pub const Server = struct {
         const esc = packets.escapeJsonText(reason[0..rlen], &eb) catch return;
         var jb: [2112]u8 = undefined;
         const json = std.fmt.bufPrint(&jb, "{{\"text\":\"{s}\"}}", .{esc}) catch return;
-        var pb: [2200]u8 = undefined;
-        var w = codec.PacketWriter.init(&pb);
-        w.writeString(json) catch return;
         var fb: [2300]u8 = undefined;
-        if (codec.framePacket(@intFromEnum(ids.PlayClient.disconnect), w.written(), &fb)) |f| {
-            c.queueFramed(f) catch {};
-        } else |_| {}
+        queueBuilt(c, packets.frameDisconnect(json, &fb));
         c.close_after_flush = true;
     }
 
     /// Kick an online player. False when they aren't online.
     pub fn kickPlayer(self: *Server, name: []const u8, reason: ?[]const u8) bool {
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         for (snap) |e| {
@@ -1854,6 +2271,8 @@ pub const Server = struct {
         return false;
     }
 
+    // ---- moderation: bans, whitelist, scoreboard stores, ban logic ----
+
     fn banDb(self: *Server) *bans_mod.BanDb {
         self.ban_lock.lock();
         defer self.ban_lock.unlock();
@@ -1862,29 +2281,34 @@ pub const Server = struct {
     }
 
     fn banSave(self: *Server) void {
-        const pool = self.world orelse return;
+        const dir = self.list_dir orelse std.Io.Dir.cwd();
         self.ban_lock.lock();
-        const enc = if (self.bans) |*db| db.encode(pool.allocator) catch null else null;
+        const enc = if (self.bans) |*db| bans_mod.encodeBansJson(self.gpa, db) catch null else null;
         self.ban_lock.unlock();
         if (enc) |e| {
-            defer pool.allocator.free(e);
-            self.world_lock.lock();
-            defer self.world_lock.unlock();
-            pool.put(bans_mod.bans_key, e) catch {};
+            defer self.gpa.free(e.names);
+            defer self.gpa.free(e.ips);
+            bans_mod.writePlayersFile(self.io, dir, e.names) catch |err| {
+                std.log.warn("banned-players.json write failed ({})", .{err});
+            };
+            bans_mod.writeIpsFile(self.io, dir, e.ips) catch |err| {
+                std.log.warn("banned-ips.json write failed ({})", .{err});
+            };
         }
     }
 
     pub fn banLoad(self: *Server) void {
-        const pool = self.world orelse return;
-        const loaded = bans_mod.loadBans(pool, self.gpa) catch |err| blk: {
-            std.log.warn("bans row unreadable ({}) — starting empty", .{err});
-            break :blk null;
+        const dir = self.list_dir orelse std.Io.Dir.cwd();
+        const file_db = bans_mod.loadBansFile(self.io, dir, self.gpa, !self.config.online_mode) catch |err| {
+            std.log.warn("ban files unreadable ({}) — starting empty", .{err});
+            return;
         };
-        if (loaded) |db| {
+        if (file_db) |loaded| {
+            if (loaded.skipped_legacy > 0) std.log.warn("banned-players.json: {d} legacy name-only rows ignored (no UUID) — re-ban affected players", .{loaded.skipped_legacy});
             self.ban_lock.lock();
             defer self.ban_lock.unlock();
             if (self.bans) |*old| old.deinit();
-            self.bans = db;
+            self.bans = loaded.db;
         }
     }
 
@@ -1895,30 +2319,40 @@ pub const Server = struct {
         return &self.whitelist.?;
     }
 
-    fn wlSave(self: *Server) void {
+    /// Delete a migrated legacy world-DB row (one-time migration helper;
+    /// best-effort — a leftover row is re-migrated harmlessly next boot).
+    fn deleteLegacyRow(self: *Server, key: store_mod.ChunkKey) void {
         const pool = self.world orelse return;
+        self.world_lock.lock();
+        defer self.world_lock.unlock();
+        pool.delete(key) catch {};
+    }
+
+    fn wlSave(self: *Server) void {
+        const dir = self.list_dir orelse std.Io.Dir.cwd();
         self.wl_lock.lock();
-        const enc = if (self.whitelist) |*wl| wl.encode(pool.allocator) catch null else null;
+        const enc = if (self.whitelist) |*wl| bans_mod.encodeWhitelistJson(self.gpa, wl) catch null else null;
         self.wl_lock.unlock();
         if (enc) |e| {
-            defer pool.allocator.free(e);
-            self.world_lock.lock();
-            defer self.world_lock.unlock();
-            pool.put(bans_mod.whitelist_key, e) catch {};
+            defer self.gpa.free(e);
+            bans_mod.writeWhitelistFile(self.io, dir, e) catch |err| {
+                std.log.warn("whitelist.json write failed ({})", .{err});
+            };
         }
     }
 
     pub fn whitelistLoad(self: *Server) void {
-        const pool = self.world orelse return;
-        const loaded = bans_mod.loadWhitelist(pool, self.gpa) catch |err| blk: {
-            std.log.warn("whitelist row unreadable ({}) — starting empty", .{err});
-            break :blk null;
+        const dir = self.list_dir orelse std.Io.Dir.cwd();
+        const file_wl = bans_mod.loadWhitelistFile(self.io, dir, self.gpa, !self.config.online_mode) catch |err| {
+            std.log.warn("whitelist.json unreadable ({}) — starting empty", .{err});
+            return;
         };
-        if (loaded) |wl| {
+        if (file_wl) |loaded| {
+            if (loaded.skipped_legacy > 0) std.log.warn("whitelist.json: {d} legacy name-only rows ignored (no UUID) — re-add affected players", .{loaded.skipped_legacy});
             self.wl_lock.lock();
             defer self.wl_lock.unlock();
             if (self.whitelist) |*old| old.deinit();
-            self.whitelist = wl;
+            self.whitelist = loaded.wl;
         }
     }
 
@@ -1932,9 +2366,10 @@ pub const Server = struct {
 
     pub fn wlAdd(self: *Server, name: []const u8) bool {
         if (name.len == 0 or name.len > 16) return false;
+        const uuid = self.resolveUuid(name) orelse return false;
         const wl = self.wlDb();
         self.wl_lock.lock();
-        wl.add(name) catch {
+        wl.add(&uuid, name) catch {
             self.wl_lock.unlock();
             return false;
         };
@@ -1944,9 +2379,10 @@ pub const Server = struct {
     }
 
     pub fn wlRemove(self: *Server, name: []const u8) bool {
+        const uuid = self.resolveUuid(name) orelse return false;
         const wl = self.wlDb();
         self.wl_lock.lock();
-        const ok = wl.remove(name);
+        const ok = wl.remove(&uuid);
         self.wl_lock.unlock();
         if (ok) self.wlSave();
         return ok;
@@ -1956,21 +2392,23 @@ pub const Server = struct {
     /// union of whitelisted + currently online (player rows need a store
     /// scan, which the LSM doesn't offer — this is the best available).
     pub fn wlList(self: *Server, out: []u8) []const u8 {
-        var names: [256][16]u8 = undefined;
+        var names: [256][perms_mod.max_name_len]u8 = undefined;
         var lens: [256]u8 = undefined;
-        const online = self.playNames(&names, &lens);
+        var uuids: [256][perms_mod.uuid_len]u8 = undefined;
+        const online = self.playNames(&names, &lens, &uuids);
         self.wl_lock.lock();
         defer self.wl_lock.unlock();
         const wl = if (self.whitelist) |*w| w else {
             return std.fmt.bufPrint(out, "There are 0 (out of {d} seen) whitelisted players:", .{online}) catch out[0..0];
         };
-        // Union count for "seen".
+        // Union count for "seen": a whitelisted row with a live session
+        // (matched by UUID, so renames display once) counts once.
         var seen = online;
-        var wit = wl.names.iterator();
+        var wit = wl.rows.iterator();
         while (wit.next()) |e| {
             var known = false;
-            for (names[0..online], lens[0..online]) |nm, ln| {
-                if (std.mem.eql(u8, nm[0..ln], e.key_ptr.*)) {
+            for (uuids[0..online]) |ou| {
+                if (std.mem.eql(u8, ou[0..], e.key_ptr.*)) {
                     known = true;
                     break;
                 }
@@ -1978,10 +2416,10 @@ pub const Server = struct {
             if (!known) seen += 1;
         }
         var ow: usize = 0;
-        ow += (std.fmt.bufPrint(out[ow..], "There are {d} (out of {d} seen) whitelisted players:", .{ wl.names.count(), seen }) catch return out[0..ow]).len;
-        var jit = wl.names.iterator();
+        ow += (std.fmt.bufPrint(out[ow..], "There are {d} (out of {d} seen) whitelisted players:", .{ wl.rows.count(), seen }) catch return out[0..ow]).len;
+        var jit = wl.rows.iterator();
         while (jit.next()) |e| {
-            ow += (std.fmt.bufPrint(out[ow..], "\n{s}", .{e.key_ptr.*}) catch break).len;
+            ow += (std.fmt.bufPrint(out[ow..], "\n{s}", .{e.value_ptr.*}) catch break).len;
         }
         return out[0..ow];
     }
@@ -2020,32 +2458,39 @@ pub const Server = struct {
         }
     }
 
-    /// Ban a name (any valid name in offline mode) and kick them if online.
+    /// Ban a UUID (any valid name in offline mode) and kick them if online.
     /// Reason may be empty (login screen then shows the bare ban line).
-    pub fn banName(self: *Server, name: []const u8, reason: []const u8) void {
+    /// Unresolvable names fail closed (online mode, target offline).
+    pub fn banName(self: *Server, name: []const u8, reason: []const u8) bool {
+        const uuid = self.resolveUuid(name) orelse return false;
         const db = self.banDb();
         self.ban_lock.lock();
-        db.banName(name, reason) catch {};
+        db.banUuid(&uuid, name, reason) catch {
+            self.ban_lock.unlock();
+            return false;
+        };
         self.ban_lock.unlock();
         self.banSave();
         _ = self.kickPlayer(name, "You are banned from this server.");
+        return true;
     }
 
     pub fn pardonName(self: *Server, name: []const u8) bool {
+        const uuid = self.resolveUuid(name) orelse return false;
         const db = self.banDb();
         self.ban_lock.lock();
-        const ok = db.unbanName(name);
+        const ok = db.unbanUuid(&uuid);
         self.ban_lock.unlock();
         if (ok) self.banSave();
         return ok;
     }
 
-    pub fn isNameBanned(self: *Server, name: []const u8) ?[]const u8 {
+    pub fn isUuidBanned(self: *Server, uuid: *const [perms_mod.uuid_len]u8) ?[]const u8 {
         // Reason slice borrows the map — copy out under the lock.
         self.ban_lock.lock();
         defer self.ban_lock.unlock();
         if (self.bans) |*db| {
-            if (db.bannedName(name)) |r| return r;
+            if (db.bannedUuid(uuid)) |r| return r;
         }
         return null;
     }
@@ -2057,7 +2502,7 @@ pub const Server = struct {
         db.banIp(ip, reason) catch {};
         self.ban_lock.unlock();
         self.banSave();
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         for (snap) |e| {
@@ -2102,19 +2547,19 @@ pub const Server = struct {
             ow += (std.fmt.bufPrint(out[ow..], "There are {d} total banned players:", .{db.nameCount()}) catch return out[0..ow]).len;
             var it = db.names.iterator();
             while (it.next()) |e| {
-                ow += (std.fmt.bufPrint(out[ow..], "\n{s}", .{e.key_ptr.*}) catch break).len;
+                ow += (std.fmt.bufPrint(out[ow..], "\n{s}", .{e.value_ptr.name}) catch break).len;
             }
         }
         return out[0..ow];
     }
 
-    /// Login gate: banned names/IPs and non-whitelisted names are rejected
+    /// Login gate: banned UUIDs/IPs and non-whitelisted UUIDs are rejected
     /// with the jar-hardcoded screens (`oi` login handler strings).
     pub const LoginReject = enum { banned_name, banned_ip, not_whitelisted, rate_limited };
 
-    pub fn loginRejected(self: *Server, name: []const u8, ip: []const u8) ?LoginReject {
+    pub fn loginRejected(self: *Server, ip: []const u8, uuid: *const [perms_mod.uuid_len]u8) ?LoginReject {
         self.ban_lock.lock();
-        const bn = if (self.bans) |*db| db.bannedName(name) != null else false;
+        const bn = if (self.bans) |*db| db.bannedUuid(uuid) != null else false;
         const bi = if (self.bans) |*db| (if (ip.len > 0) db.bannedIp(ip) != null else false) else false;
         self.ban_lock.unlock();
         if (bn) return .banned_name;
@@ -2122,7 +2567,7 @@ pub const Server = struct {
         self.wl_lock.lock();
         defer self.wl_lock.unlock();
         if (self.whitelist) |*wl| {
-            if (wl.enabled and !wl.contains(name)) return .not_whitelisted;
+            if (wl.enabled and !wl.contains(uuid)) return .not_whitelisted;
         }
         return null;
     }
@@ -2147,6 +2592,8 @@ pub const Server = struct {
 
     /// Broadcast `[name] message` (vanilla `chat.type.announcement`).
     /// Multi-line input goes out as one packet per line (never `\n`).
+    // ---- social, weather, gameplay RNG ----
+
     pub fn broadcastSay(self: *Server, name: []const u8, msg: []const u8) void {
         var it = std.mem.splitScalar(u8, msg, '\n');
         while (it.next()) |line| {
@@ -2187,7 +2634,7 @@ pub const Server = struct {
     /// Kill a player even in creative (vanilla /kill bypasses the damage
     /// gate). Mirrors the ticker death flow: drops honor keepInventory.
     pub fn killPlayer(self: *Server, name: []const u8) bool {
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         const c = findInSnap(snap, name) orelse return false;
@@ -2199,9 +2646,7 @@ pub const Server = struct {
         c.health = 0;
         c.is_dead = true;
         var hb: [32]u8 = undefined;
-        if (packets.frameUpdateHealth(0, c.food, c.saturation, &hb)) |f| {
-            c.queueFramed(f) catch {};
-        } else |_| {}
+        queueBuilt(c, packets.frameUpdateHealth(0, c.food, c.saturation, &hb));
         var dd: ?DeathDrop = if (self.keepInv()) null else collectDeathDrops(c);
         const px = c.pos_x;
         const py = c.pos_y;
@@ -2270,7 +2715,7 @@ pub const Server = struct {
             },
         }
         self.state_lock.unlock();
-        var gb: [16]u8 = undefined;
+        var gb: [perms_mod.max_name_len]u8 = undefined;
         switch (mode) {
             .clear => {
                 if (packets.frameGameState(packets.game_state_end_rain, 0, &gb)) |f| self.broadcastAll(f) else |_| {}
@@ -2287,7 +2732,7 @@ pub const Server = struct {
         if (!self.raining) self.thundering = false;
         const now_raining = self.raining;
         self.state_lock.unlock();
-        var gb: [16]u8 = undefined;
+        var gb: [perms_mod.max_name_len]u8 = undefined;
         if (packets.frameGameState(if (now_raining) packets.game_state_begin_rain else packets.game_state_end_rain, 0, &gb)) |f| {
             self.broadcastAll(f);
         } else |_| {}
@@ -2295,7 +2740,7 @@ pub const Server = struct {
 
     /// Raw frame to every play conn (weather, game state).
     fn broadcastAll(self: *Server, framed: []const u8) void {
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         for (snap) |e| {
@@ -2342,15 +2787,15 @@ pub const Server = struct {
         self.thunder_strength = ts;
         self.state_lock.unlock();
         if (changed) {
-            var gb: [16]u8 = undefined;
+            var gb: [perms_mod.max_name_len]u8 = undefined;
             if (packets.frameGameState(packets.game_state_end_rain, 0, &gb)) |f| self.broadcastAll(f) else |_| {}
         }
         if (rs_moved) {
-            var gb: [16]u8 = undefined;
+            var gb: [perms_mod.max_name_len]u8 = undefined;
             if (packets.frameGameState(packets.game_state_rain_strength, rs, &gb)) |f| self.broadcastAll(f) else |_| {}
         }
         if (ts_moved) {
-            var gb: [16]u8 = undefined;
+            var gb: [perms_mod.max_name_len]u8 = undefined;
             if (packets.frameGameState(packets.game_state_thunder_strength, ts, &gb)) |f| self.broadcastAll(f) else |_| {}
         }
     }
@@ -2372,16 +2817,10 @@ pub const Server = struct {
         const rs = self.rain_strength;
         const ts = self.thunder_strength;
         self.state_lock.unlock();
-        var gb: [16]u8 = undefined;
-        if (packets.frameGameState(if (raining) packets.game_state_begin_rain else packets.game_state_end_rain, 0, &gb)) |f| {
-            conn.queueFramed(f) catch {};
-        } else |_| {}
-        if (packets.frameGameState(packets.game_state_rain_strength, rs, &gb)) |f| {
-            conn.queueFramed(f) catch {};
-        } else |_| {}
-        if (packets.frameGameState(packets.game_state_thunder_strength, ts, &gb)) |f| {
-            conn.queueFramed(f) catch {};
-        } else |_| {}
+        var gb: [perms_mod.max_name_len]u8 = undefined;
+        queueBuilt(conn, packets.frameGameState(if (raining) packets.game_state_begin_rain else packets.game_state_end_rain, 0, &gb));
+        queueBuilt(conn, packets.frameGameState(packets.game_state_rain_strength, rs, &gb));
+        queueBuilt(conn, packets.frameGameState(packets.game_state_thunder_strength, ts, &gb));
     }
 
     /// Thunderstorm lightning: every ~5s strike near a random online
@@ -2400,7 +2839,7 @@ pub const Server = struct {
         if (self.thunder_tick < 5) return;
         self.thunder_tick = 0;
         // Random online player (own draw stream; see thunder_rand).
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         var players: [256]*Conn = undefined;
@@ -2447,6 +2886,8 @@ pub const Server = struct {
         } else |_| {}
     }
 
+    // ---- world rules, xp, effects, enchants ----
+
     pub fn difficultyName(_: *Server, d: rules_mod.Difficulty) []const u8 {
         return d.name();
     }
@@ -2457,7 +2898,7 @@ pub const Server = struct {
             c.difficulty = d;
             self.cfg.store(c);
         }
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         for (snap) |e| {
@@ -2502,6 +2943,17 @@ pub const Server = struct {
         return false;
     }
 
+    /// Natural-spawn gate (config spawn_mobs + per-kind mob_spawns +
+    /// doMobSpawning gamerule, vanilla semantics): existing mobs are
+    /// unaffected, only new spawns are refused. Every spawn ingress
+    /// (pig auto-spawn today; spawners/eggs when they land) must call this.
+    pub fn canSpawnMob(self: *Server, kind: mob_mod.Kind) bool {
+        const c = self.cfg.load();
+        if (!c.spawn_mobs) return false;
+        if (!c.mob_spawn_allowed[@intFromEnum(kind)]) return false;
+        return self.gameruleGet("doMobSpawning") orelse true;
+    }
+
     /// keepInventory gamerule (death drops).
     pub fn keepInv(self: *Server) bool {
         return self.cfg.load().gamerules[2];
@@ -2526,6 +2978,11 @@ pub const Server = struct {
         return std.fmt.bufPrint(out, "Seed: {d}", .{self.drop_seed}) catch "Seed: 0";
     }
 
+    /// World spawn block coords (default-center fallback for /pregen).
+    pub fn worldSpawnPos(self: *Server) [3]i32 {
+        return self.cfg.load().world_spawn;
+    }
+
     // ---- experience ----
 
     pub fn xpCap(level: i32) i32 {
@@ -2536,17 +2993,15 @@ pub const Server = struct {
 
     /// Queue S1F for one conn (lock must be held by the caller).
     fn queueExperience(c: *Conn) void {
-        var eb: [16]u8 = undefined;
+        var eb: [perms_mod.max_name_len]u8 = undefined;
         const total: i16 = @truncate(c.xp_total);
-        if (packets.frameSetExperience(c.xp_bar, @intCast(c.xp_level), total, &eb)) |f| {
-            c.queueFramed(f) catch {};
-        } else |_| {}
+        queueBuilt(c, packets.frameSetExperience(c.xp_bar, @intCast(c.xp_level), total, &eb));
     }
 
     /// Vanilla EntityPlayer.addExperience: capped total, fractional bar,
     /// level-ups preserve leftover against the new cap.
     pub fn addXp(self: *Server, name: []const u8, amount: i32) bool {
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         const c = findInSnap(snap, name) orelse return false;
@@ -2571,7 +3026,7 @@ pub const Server = struct {
     /// Vanilla addExperienceLevel: negative clamps to 0/0/0; multiples of 5
     /// play the level-up sound.
     pub fn addLevels(self: *Server, name: []const u8, amount: i32) bool {
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         const c = findInSnap(snap, name) orelse return false;
@@ -2599,12 +3054,520 @@ pub const Server = struct {
         return true;
     }
 
+    // ---- pregeneration (/pregen, Chunky-style) ----
+    //
+    // 1.7.10 has no bossbar packet, so progress rides the next best
+    // vanilla surfaces: the XP bar (level = percent, bar = fraction) for
+    // the task owner, refreshed every 1Hz tick, plus chat lines for
+    // milestones/rate/ETA. Progress frames are EPHEMERAL — conn.xp_* is
+    // never mutated, so saves, /xp, and relogs are unaffected.
+
+    /// Pregeneration task state (one at a time; guarded by pregen_lock).
+    pub const PregenState = struct {
+        active: bool = false,
+        paused: bool = false,
+        ccx: i32 = 0,
+        ccz: i32 = 0,
+        radius: i32 = 0,
+        total: usize = 0,
+        next_idx: usize = 0,
+        done_idx: usize = 0,
+        t_start_ms: i64 = 0,
+        last_ms: i64 = 0,
+        last_done: usize = 0,
+        /// Smoothed chunks/sec (EMA over 1Hz polls).
+        rate: f64 = 0,
+        /// Independent completion counters for throughput discrimination:
+        /// `last_completed`/`last_store_hits` snapshot the pool totals at
+        /// the previous poll; `rate_true` is the EMA of fresh-generation
+        /// completions, `rate_total` includes store hits. The concentric
+        /// `done_idx` cursor still drives progress/ETA (order matters), but
+        /// the displayed rate no longer caps at advance_cap/poll.
+        last_completed: u64 = 0,
+        last_store_hits: u64 = 0,
+        rate_true: f64 = 0,
+        rate_total: f64 = 0,
+        /// Announced milestones (bit0=25%, bit1=50%, bit2=75%).
+        milestones: u8 = 0,
+        last_chat_ms: i64 = 0,
+        /// Pool-wide failed counter at start (includes view-driven gen;
+        /// reported as-is, see pollPregen).
+        fail_base: u64 = 0,
+        /// Pool-wide completed/store-hit baselines at start (fresh vs total
+        /// throughput discrimination; view-driven gen pollutes both, so
+        /// these are deltas for diagnosis, not task-exact counts).
+        completed_base: u64 = 0,
+        store_base: u64 = 0,
+        /// GPU/cache counters sampled per 1Hz poll (deltas since task
+        /// start are derived against these baselines where needed).
+        /// Rendered on the progress line; all zero until the first poll
+        /// with a pool attached.
+        gpu_fill: u64 = 0,
+        gpu_fallback: u64 = 0,
+        gpu_batches: u64 = 0,
+        cache_hits: u64 = 0,
+        cache_misses: u64 = 0,
+        cache_dup_misses: u64 = 0,
+        cache_single_flight_hits: u64 = 0,
+        ore_hits: u64 = 0,
+        ore_misses: u64 = 0,
+        owner_len: usize = 0,
+        owner: [perms_mod.max_name_len]u8 = [_]u8{0} ** 16,
+        /// Fake-Wither bossbar live on the owner's client (spawn frame sent;
+        /// cleared when the owner drops offline so the next poll respawns).
+        bar_spawned: bool = false,
+        /// Bumped on begin/stop: polls commit cursors only into the task
+        /// generation they snapshotted (stop+start inside one 1Hz window
+        /// must not graft old cursors onto the new task).
+        epoch: u64 = 0,
+    };
+
+    /// Max radius in chunks ((2r+1)^2 chunks; r=1000 is ~4M).
+    pub const pregen_max_radius: i32 = 1000;
+    /// In-flight ceiling for pregen top-ups (below GenPool.max_pending;
+    /// leaves headroom for live view traffic on the shared pool).
+    pub const pregen_inflight_cap: usize = 256;
+    /// Head-advance iterations per 1Hz poll (each is one pool-mutex probe).
+    /// Raised from 1024 so the concentric cursor no longer caps reported
+    /// throughput at ~1024/s: 16384 probes per 1Hz poll still costs a single
+    /// brief mutex per probe and only binds when the backlog is that deep.
+    pub const pregen_advance_cap: usize = 16384;
+    /// Milestone/heartbeat chat cadence (ms).
+    pub const pregen_chat_ms: i64 = 30_000;
+    /// Fake-Wither bossbar: fixed negative eid (eid_counter starts at 1 and
+    /// only grows, so this can never collide with a real entity), WitherBoss
+    /// network type, 300.0 max health (all jar-verified, see
+    /// entity.writeBossMetadata). The wither never exists server-side.
+    pub const pregen_bar_eid: i32 = -424242;
+    /// Bossbar follow-point drop below the owner's feet (1.8 blocks).
+    /// Jar-grounded (1.7.10 client, verified against the obfuscated jars):
+    /// the bar is fed from RenderWither.doRender (BossStatus expires 100
+    /// rendered frames after the wither leaves the frustum), so the fake
+    /// must stay rendered — and a rendered wither is a particle fountain
+    /// that invisibility does NOT silence: onLivingUpdate spawns 3 smoke
+    /// puffs per tick at the head positions (middle +3.0, sides +2.2,
+    /// ±1.3 lateral — no visibility check) plus a mobSpell aura while
+    /// "armored" (health <= max/2, i.e. the whole first half of the bar).
+    /// At feet level the heads sit at/above eye height (1.62) and the
+    /// in-camera puffs wash out the screen. Dropping 1.8 puts the heads at
+    /// +1.2/+0.4 (below the ahead-view, partly terrain-occluded) while the
+    /// camera stays inside the 4.0-tall wither AABB (top at +2.2 vs eye
+    /// 1.62, margin 0.58 — sneak/boat/horse stances included), which keeps
+    /// it frustum-immune in every view direction.
+    pub const pregen_bar_drop: f64 = 1.8;
+
+    /// Concentric-square generation order: idx 0 is the center chunk,
+    /// then rings r=1.. Each ring holds 8r chunks starting at
+    /// 1+4r(r-1); within a ring the walk matches serve.Spiral (north edge
+    /// L-to-R, east edge top-down, south edge R-to-L, west edge bottom-up).
+    /// Pure/geometry-only: no locks, no IO.
+    pub fn pregenOffset(idx: usize) ColOffset {
+        if (idx == 0) return .{ .dx = 0, .dz = 0 };
+        // Ring r: start(r) = 1+4r(r-1) <= idx < start(r+1).
+        var r: usize = 1;
+        while (true) : (r += 1) {
+            const nr = r + 1;
+            if (idx < 1 + 4 * nr * (nr - 1)) break;
+        }
+        const ri: i32 = @intCast(r);
+        const side: usize = @intCast(2 * ri);
+        const i = idx - (1 + 4 * r * (r - 1));
+        if (i < side) return .{ .dx = -ri + @as(i32, @intCast(i)), .dz = -ri };
+        if (i < 2 * side) return .{ .dx = ri, .dz = -ri + @as(i32, @intCast(i - side)) };
+        if (i < 3 * side) return .{ .dx = ri - @as(i32, @intCast(i - 2 * side)), .dz = ri };
+        return .{ .dx = -ri, .dz = ri - @as(i32, @intCast(i - 3 * side)) };
+    }
+
+    pub const PregenBegin = enum { started, already_running, no_gen };
+
+    /// Start a task (center chunk ccx,ccz, radius chunks). Owner "" =
+    /// console (progress via logs only). Caller formats the reply.
+    pub fn pregenBegin(self: *Server, owner: []const u8, radius: i32, ccx: i32, ccz: i32) PregenBegin {
+        if (self.gen_pool == null) return .no_gen;
+        // Best-effort cleanup of a stale bar eid on the owner's client
+        // (a kill -9 between spawn and destroy orphans it client-side;
+        // the spawn below would otherwise fight it for BossStatus).
+        self.destroyBossBar(owner);
+        const now = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
+        self.pregen_lock.lock();
+        defer self.pregen_lock.unlock();
+        if (self.pregen.active) return .already_running;
+        const side: usize = @intCast(2 * radius + 1);
+        self.pregen = .{
+            .active = true,
+            .ccx = ccx,
+            .ccz = ccz,
+            .radius = radius,
+            .total = side * side,
+            .t_start_ms = now,
+            .last_ms = now,
+            .last_chat_ms = now,
+            .owner_len = @min(owner.len, 16),
+        };
+        @memcpy(self.pregen.owner[0..self.pregen.owner_len], owner[0..self.pregen.owner_len]);
+        self.pregen.epoch +%= 1;
+        if (self.gen_pool) |gp| {
+            const gs = gp.snapshotStats();
+            self.pregen.fail_base = gs.failed;
+            self.pregen.completed_base = gs.completed;
+            self.pregen.store_base = gs.store_hits;
+            self.pregen.last_completed = gs.completed;
+            self.pregen.last_store_hits = gs.store_hits;
+        }
+        return .started;
+    }
+
+    /// Cancel the active task. True when something was running.
+    pub fn pregenStop(self: *Server) bool {
+        self.pregen_lock.lock();
+        if (!self.pregen.active) {
+            self.pregen_lock.unlock();
+            return false;
+        }
+        self.pregen.active = false;
+        self.pregen.epoch +%= 1;
+        self.pregen.bar_spawned = false;
+        var owner: [perms_mod.max_name_len]u8 = undefined;
+        const owner_len = self.pregen.owner_len;
+        @memcpy(owner[0..owner_len], self.pregen.owner[0..owner_len]);
+        self.pregen_lock.unlock();
+        self.destroyBossBar(owner[0..owner_len]);
+        return true;
+    }
+
+    pub const PregenPause = enum { paused, resumed, not_running };
+
+    /// Toggle pause. Paused tasks hold their cursors (in-flight chunks
+    /// still land); resume continues where it left off.
+    pub fn pregenPauseToggle(self: *Server, pause: bool) PregenPause {
+        self.pregen_lock.lock();
+        defer self.pregen_lock.unlock();
+        if (!self.pregen.active) return .not_running;
+        self.pregen.paused = pause;
+        return if (pause) .paused else .resumed;
+    }
+
+    /// One status line for /pregen status (or "" when idle — caller prints
+    /// the idle message). Pure snapshot under the lock.
+    pub fn pregenStatus(self: *Server, out: []u8) []const u8 {
+        self.pregen_lock.lock();
+        const st = self.pregen;
+        self.pregen_lock.unlock();
+        if (!st.active) return "";
+        return formatPregenLine(st, memstat_mod.rssBytes(self.io), memstat_mod.peakRssBytes(self.io), out);
+    }
+
+    /// Shared line format: `12.4% (3412/27556) chunks — 87.3/s, ETA 04:12,
+    /// elapsed 00:39 [paused]`.
+    fn mmss(v: i64, out: []u8) []const u8 {
+        const mm = @divFloor(v, 60);
+        const ss = @mod(v, 60);
+        return std.fmt.bufPrint(out, "{s}{d}:{s}{d}", .{
+            if (mm < 10) "0" else "", mm,
+            if (ss < 10) "0" else "", ss,
+        }) catch "--:--";
+    }
+
+    pub fn formatPregenLine(st: PregenState, rss: usize, peak: usize, out: []u8) []const u8 {
+        const pct: f64 = if (st.total == 0) 0 else @as(f64, @floatFromInt(st.done_idx)) * 100.0 / @as(f64, @floatFromInt(st.total));
+        const el_s: i64 = @divFloor(st.last_ms - st.t_start_ms, 1000);
+        var ebuf: [perms_mod.max_name_len]u8 = undefined;
+        var lbuf: [perms_mod.max_name_len]u8 = undefined;
+        var eta: []const u8 = "?";
+        if (st.rate > 0.001 and st.done_idx < st.total) {
+            const eta_s: i64 = @intFromFloat(@as(f64, @floatFromInt(st.total - st.done_idx)) / st.rate);
+            eta = mmss(eta_s, &ebuf);
+        }
+        const el = mmss(el_s, &lbuf);
+        var rss_buf: [32]u8 = undefined;
+        var peak_buf: [32]u8 = undefined;
+        // GPU/cache tail: average batch size (fills/dispatches) spots a
+        // dispatch-overhead collapse; fallback count spots a failing GPU
+        // path; cache hit% spots column-cache thrashing. Always shown so
+        // the line shape never shifts mid-run. True/total rates (fresh
+        // completions vs completions+store-hits) discriminate the old
+        // 1024/poll cursor cap from real generation throughput.
+        const avg_batch: f64 = if (st.gpu_batches == 0) 0 else @as(f64, @floatFromInt(st.gpu_fill)) / @as(f64, @floatFromInt(st.gpu_batches));
+        const ch_total: u64 = st.cache_hits + st.cache_misses;
+        const ore_total: u64 = st.ore_hits + st.ore_misses;
+        const ore_pct: f64 = if (ore_total == 0) 0 else @as(f64, @floatFromInt(st.ore_hits)) * 100.0 / @as(f64, @floatFromInt(ore_total));
+        var tail_buf: [192]u8 = undefined;
+        const tail: []const u8 = if (ch_total == 0)
+            std.fmt.bufPrint(&tail_buf, ", gpu {d}ch/{d}dsp fb={d} avg={d:.1}, cache n/a, true {d:.1}/s tot {d:.1}/s dup {d} sf {d} ore {d:.0}%", .{ st.gpu_fill, st.gpu_batches, st.gpu_fallback, avg_batch, st.rate_true, st.rate_total, st.cache_dup_misses, st.cache_single_flight_hits, ore_pct }) catch ""
+        else
+            std.fmt.bufPrint(&tail_buf, ", gpu {d}ch/{d}dsp fb={d} avg={d:.1}, cache {d:.0}% dup {d} sf {d} ore {d:.0}%, true {d:.1}/s tot {d:.1}/s", .{ st.gpu_fill, st.gpu_batches, st.gpu_fallback, avg_batch, @as(f64, @floatFromInt(st.cache_hits)) * 100.0 / @as(f64, @floatFromInt(ch_total)), st.cache_dup_misses, st.cache_single_flight_hits, ore_pct, st.rate_true, st.rate_total }) catch "";
+        return std.fmt.bufPrint(out, "{d:.1}% ({d}/{d}) chunks — {d:.1}/s, ETA {s}, elapsed {s}, rss={s} peak={s}{s}{s}", .{
+            pct, st.done_idx, st.total, st.rate, eta, el,
+            memstat_mod.formatBytes(rss, &rss_buf),
+            memstat_mod.formatBytes(peak, &peak_buf),
+            if (st.paused) " [paused]" else "",
+            tail,
+        }) catch "pregen: ?%";
+    }
+
+    /// Bossbar fill from progress (Wither max health 300.0; clamped to a
+    ///sliver so the bar renders ~empty rather than dead at 0%).
+    pub fn pregenBarHealth(pct01: f64) f32 {
+        return @floatCast(@max(1.0, @max(0, @min(1, pct01)) * 300.0));
+    }
+
+    /// Bossbar title ("Pregeneration 12%" + " (paused)" when held).
+    pub fn pregenBarTitle(pct01: f64, paused: bool, out: []u8) []const u8 {
+        const pct: i32 = @intFromFloat(@max(0, @min(1, pct01)) * 100.0);
+        return std.fmt.bufPrint(out, "Pregeneration {d}%{s}", .{ pct, if (paused) " (paused)" else "" }) catch "Pregeneration";
+    }
+
+    /// Fake-Wither bossbar send: spawn once at the owner's feet minus
+    /// pregen_bar_drop, then per-tick teleport-follow + metadata refresh
+    /// (title + fill). Frames go to the owner only. Returns false when
+    /// unreachable (offline/dead).
+    ///
+    /// Position is deliberate: the camera sits inside the wither's AABB,
+    /// so it is never frustum-culled in any view direction (a parked
+    /// wither feeds no BossStatus — the bar expires 100 frames after its
+    /// last render — so parking it away is not an option). Invisible + tag
+    /// hidden, so nothing shows except the bar; the client still ticks it,
+    /// so a faint wither groan may occasionally play (same as BarAPI-era
+    /// fake bars).
+    fn updateBossBar(self: *Server, owner: []const u8, pct01: f64, title: []const u8, spawn: bool) bool {
+        if (owner.len == 0) return false;
+        var batch: [max_fanout]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        const c = findInSnap(snap, owner) orelse return false;
+        c.lock.lock();
+        defer c.lock.unlock();
+        if (c.state != .play or c.dead) return false;
+        const health = pregenBarHealth(pct01);
+        const bar_y = c.pos_y - pregen_bar_drop;
+        if (spawn) {
+            var sb: [384]u8 = undefined;
+            queueBuilt(c, packets.frameBossSpawn(pregen_bar_eid, c.pos_x, bar_y, c.pos_z, health, title, &sb));
+        } else {
+            var tb: [64]u8 = undefined;
+            queueBuilt(c, packets.frameEntityTeleport(pregen_bar_eid, c.pos_x, bar_y, c.pos_z, 0, 0, &tb));
+            var mb: [384]u8 = undefined;
+            queueBuilt(c, packets.frameBossUpdate(pregen_bar_eid, health, title, &mb));
+        }
+        return true;
+    }
+
+    /// Destroy the fake Wither on the owner's client (finish/cancel).
+    /// Silent when the owner is offline (their client state is gone anyway).
+    fn destroyBossBar(self: *Server, owner: []const u8) void {
+        if (owner.len == 0) return;
+        var batch: [max_fanout]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        const c = findInSnap(snap, owner) orelse return;
+        c.lock.lock();
+        defer c.lock.unlock();
+        if (c.state != .play or c.dead) return;
+        var db: [perms_mod.max_name_len]u8 = undefined;
+        queueBuilt(c, packets.frameDestroyEntitiesFramed(&[_]i32{pregen_bar_eid}, &db));
+    }
+
+    /// One poll's bossbar refresh: spawn-or-update when the owner is live,
+    /// else clear the spawned flag so the next live poll respawns.
+    fn refreshBossBar(self: *Server, st: PregenState, pct01: f64, paused: bool) void {
+        if (st.owner_len == 0) return;
+        var tb: [64]u8 = undefined;
+        const title = pregenBarTitle(pct01, paused, &tb);
+        const live = self.updateBossBar(st.owner[0..st.owner_len], pct01, title, !st.bar_spawned);
+        self.pregen_lock.lock();
+        defer self.pregen_lock.unlock();
+        if (self.pregen.epoch != st.epoch) return;
+        self.pregen.bar_spawned = live;
+    }
+
+    /// Chat a line to the task owner (player) and always to the log.
+    fn pregenTell(self: *Server, owner: []const u8, text: []const u8) void {
+        std.log.info("(pregen) {s}", .{text});
+        if (owner.len > 0) self.notifyPlayer(owner, text);
+    }
+
+    /// Pregen queue top-up (10Hz driver: called from redstoneLoop; the 1Hz
+    /// poll below keeps advance/rate/bar/chat). Refills in-flight to the
+    /// cap so fast workers never idle between 1Hz polls — with 1Hz-only
+    /// top-up, throughput capped at ~cap chunks/s (256/s) no matter how
+    /// fast generation was. Respects pause; top-up only (no done cursor,
+    /// no rate). Same epoch guard as the 1Hz poll on commit.
+    fn topupPregen(self: *Server) void {
+        self.pregen_lock.lock();
+        if (!self.pregen.active or self.pregen.paused) {
+            self.pregen_lock.unlock();
+            return;
+        }
+        const st = self.pregen;
+        self.pregen_lock.unlock();
+        const gp = self.gen_pool orelse return;
+        var budget: usize = pregen_inflight_cap - @min(gp.pending(), pregen_inflight_cap);
+        var next = st.next_idx;
+        while (budget > 0 and next < st.total) : (budget -= 1) {
+            const o = pregenOffset(next);
+            gp.request(0, st.ccx + o.dx, st.ccz + o.dz);
+            next += 1;
+        }
+        self.pregen_lock.lock();
+        if (self.pregen.active and !self.pregen.paused and self.pregen.epoch == st.epoch) {
+            // Monotonic: concurrent 1Hz/10Hz top-ups must never regress
+            // a cursor a newer poll already advanced (re-requests are
+            // deduped, but the cursor must not move backwards).
+            self.pregen.next_idx = @max(self.pregen.next_idx, next);
+        }
+        self.pregen_lock.unlock();
+    }
+
+    /// 1Hz driver (called from tickOnce): advance the completion cursor,
+    /// refresh the XP bar, heartbeat/milestone chats. Top-up lives in
+    /// topupPregen (10Hz) so the fill cadence never gates throughput.
+    /// Lock discipline: pregen_lock for cursor snapshots only; pool + LSM
+    /// + conn work all happens unlocked (leaf order preserved).
+    pub fn pollPregen(self: *Server, now_ms: i64) void {
+        self.pregen_lock.lock();
+        if (!self.pregen.active) {
+            self.pregen_lock.unlock();
+            return;
+        }
+        const st = self.pregen;
+        self.pregen_lock.unlock();
+        if (st.paused) {
+            // Frozen bar only (no top-up, no cursor, no chat): keeps the
+            // client's 100-tick BossStatus alive across long pauses.
+            const frozen: f64 = if (st.total == 0) 1 else @as(f64, @floatFromInt(st.done_idx)) / @as(f64, @floatFromInt(st.total));
+            self.refreshBossBar(st, frozen, true);
+            return;
+        }
+        const gp = self.gen_pool orelse return;
+        // Keep the queue full first (10Hz helper, same epoch guard), then
+        // re-read the cursor it committed for the advance bound below.
+        self.topupPregen();
+        self.pregen_lock.lock();
+        const next = if (self.pregen.epoch == st.epoch) self.pregen.next_idx else st.next_idx;
+        self.pregen_lock.unlock();
+        // Advance: head leaves in-flight exactly when its worker finishes.
+        var done = st.done_idx;
+        var guard: usize = 0;
+        while (guard < pregen_advance_cap and done < next) : (guard += 1) {
+            const o = pregenOffset(done);
+            if (gp.isInflight(0, st.ccx + o.dx, st.ccz + o.dz)) break;
+            done += 1;
+        }
+        // Hit the raised cap with more backlog pending: the concentric
+        // cursor is now the bottleneck, not generation. Independent pool
+        // counters below discriminate this (completed keeps climbing while
+        // done stalls at +cap). Keep the cursor (order matters for ETA)
+        // but report the true rate separately.
+        const capped = (guard >= pregen_advance_cap and done < next);
+        _ = capped;
+        // Rate (EMA) + failures (pool-wide delta, includes view-driven gen).
+        const dt_ms = now_ms - st.last_ms;
+        var rate = st.rate;
+        if (dt_ms > 0 and done >= st.last_done) {
+            const inst = @as(f64, @floatFromInt(done - st.last_done)) * 1000.0 / @as(f64, @floatFromInt(dt_ms));
+            rate = if (st.last_done == 0 and st.rate == 0) inst else st.rate * 0.7 + inst * 0.3;
+        }
+        // Single snapshot feeds failures + GPU/cache counters below.
+        const gs = gp.snapshotStats();
+        const failed = gs.failed -| st.fail_base;
+        // Independent throughput: fresh completions + store hits since the
+        // last poll. Unaffected by the concentric-cursor cap above, so it
+        // discriminates CPU/store caps from progress-counter caps.
+        var rate_true = st.rate_true;
+        var rate_total = st.rate_total;
+        if (dt_ms > 0) {
+            const d_comp: u64 = gs.completed -| st.last_completed;
+            const d_hit: u64 = gs.store_hits -| st.last_store_hits;
+            const inst_true = @as(f64, @floatFromInt(d_comp)) * 1000.0 / @as(f64, @floatFromInt(dt_ms));
+            const inst_total = @as(f64, @floatFromInt(d_comp + d_hit)) * 1000.0 / @as(f64, @floatFromInt(dt_ms));
+            rate_true = if (st.rate_true == 0) inst_true else st.rate_true * 0.7 + inst_true * 0.3;
+            rate_total = if (st.rate_total == 0) inst_total else st.rate_total * 0.7 + inst_total * 0.3;
+        }
+        const finished = done >= st.total;
+        const pct01: f64 = if (st.total == 0) 1 else @as(f64, @floatFromInt(done)) / @as(f64, @floatFromInt(st.total));
+        // Commit cursors.
+        self.pregen_lock.lock();
+        // Task may have been stopped/paused/restarted mid-poll: commit only
+        // into the same generation (epoch match implies params match).
+        if (self.pregen.active and !self.pregen.paused and self.pregen.epoch == st.epoch) {
+            // next_idx monotonic (see topupPregen); done_idx only moves
+            // here, on the single 1Hz poller.
+            self.pregen.next_idx = @max(self.pregen.next_idx, next);
+            self.pregen.done_idx = done;
+            self.pregen.last_ms = now_ms;
+            self.pregen.last_done = done;
+            self.pregen.rate = rate;
+            self.pregen.last_completed = gs.completed;
+            self.pregen.last_store_hits = gs.store_hits;
+            self.pregen.rate_true = rate_true;
+            self.pregen.rate_total = rate_total;
+            self.pregen.gpu_fill = gs.gpu_fill;
+            self.pregen.gpu_fallback = gs.gpu_fallback;
+            self.pregen.gpu_batches = gs.gpu_batches;
+            self.pregen.cache_hits = gs.cache_hits;
+            self.pregen.cache_misses = gs.cache_misses;
+            self.pregen.cache_dup_misses = gs.cache_dup_misses;
+            self.pregen.cache_single_flight_hits = gs.cache_single_flight_hits;
+            self.pregen.ore_hits = gs.ore_hits;
+            self.pregen.ore_misses = gs.ore_misses;
+            if (finished) self.pregen.active = false;
+        }
+        const cur = self.pregen;
+        const still_us = cur.active and !cur.paused and cur.epoch == st.epoch;
+        var owner: [perms_mod.max_name_len]u8 = undefined;
+        const owner_len = st.owner_len;
+        @memcpy(owner[0..owner_len], st.owner[0..owner_len]);
+        self.pregen_lock.unlock();
+        // Display + milestones (unlocked).
+        self.refreshBossBar(st, pct01, false);
+        var line: [384]u8 = undefined;
+        var inner: [256]u8 = undefined;
+        if (finished) {
+            const el_s: i64 = @divFloor(now_ms - st.t_start_ms, 1000);
+            const avg: f64 = if (el_s > 0) @as(f64, @floatFromInt(st.total)) / @as(f64, @floatFromInt(el_s)) else 0;
+            const msg = std.fmt.bufPrint(&line, "Pregeneration complete: {d} chunks in {s} ({d:.1}/s avg, {d} pool failures)", .{
+                st.total, mmss(el_s, &inner), avg, failed,
+            }) catch "Pregeneration complete";
+            self.pregenTell(if (owner_len > 0) owner[0..owner_len] else "", msg);
+            self.pregen_lock.lock();
+            const same_epoch = self.pregen.epoch == st.epoch;
+            if (same_epoch) self.pregen.bar_spawned = false;
+            self.pregen_lock.unlock();
+            if (same_epoch) self.destroyBossBar(if (owner_len > 0) owner[0..owner_len] else "");
+            return;
+        }
+        if (!still_us) return;
+        // Milestones at 25/50/75 (+ periodic heartbeat).
+        const marks = [_]struct { bit: u3, pct: f64, label: []const u8 }{
+            .{ .bit = 0, .pct = 25, .label = "25%" },
+            .{ .bit = 1, .pct = 50, .label = "50%" },
+            .{ .bit = 2, .pct = 75, .label = "75%" },
+        };
+        for (marks) |m| {
+            if (pct01 * 100.0 >= m.pct and st.milestones & (@as(u8, 1) << m.bit) == 0) {
+                self.pregen_lock.lock();
+                if (self.pregen.active and self.pregen.epoch == st.epoch) self.pregen.milestones |= @as(u8, 1) << m.bit;
+                self.pregen_lock.unlock();
+                const msg = std.fmt.bufPrint(&line, "Pregeneration {s}: {s}", .{ m.label, formatPregenLine(cur, memstat_mod.rssBytes(self.io), memstat_mod.peakRssBytes(self.io), &inner) }) catch "Pregeneration milestone";
+                self.pregenTell(if (owner_len > 0) owner[0..owner_len] else "", msg);
+                break;
+            }
+        }
+        if (now_ms - st.last_chat_ms >= pregen_chat_ms) {
+            self.pregen_lock.lock();
+            if (self.pregen.active and self.pregen.epoch == st.epoch) self.pregen.last_chat_ms = now_ms;
+            self.pregen_lock.unlock();
+            const msg = std.fmt.bufPrint(&line, "Pregenerating: {s}", .{formatPregenLine(cur, memstat_mod.rssBytes(self.io), memstat_mod.peakRssBytes(self.io), &inner)}) catch "Pregenerating...";
+            self.pregenTell(if (owner_len > 0) owner[0..owner_len] else "", msg);
+        }
+    }
+
     // ---- potion effects ----
 
     /// Give (or refresh) an effect; replaces same-id, 8-slot cap.
     /// False when the player isn't online.
     pub fn effectGive(self: *Server, name: []const u8, id: u8, seconds: i32, amp: u8) bool {
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         const c = findInSnap(snap, name) orelse return false;
@@ -2625,17 +3588,24 @@ pub const Server = struct {
         }
         const si = slot orelse return true; // full: still success, vanilla drops extras silently? no — vanilla has no cap; ours holds 8 (documented)
         c.effects[si] = .{ .id = id, .amplifier = amp, .ticks = ticks };
-        var eb: [16]u8 = undefined;
-        if (packets.frameEntityEffect(c.eid, id, amp, ticks, &eb)) |f| {
-            c.queueFramed(f) catch {};
-        } else |_| {}
+        var eb: [perms_mod.max_name_len]u8 = undefined;
+        queueBuilt(c, packets.frameEntityEffect(c.eid, id, amp, ticks, &eb));
         return true;
     }
 
     /// Clear one effect (null id = all). Returns removed count, or null
     /// when the player isn't online.
+    /// S1E remove-effect frame scratch (id + length + eid varints + id byte).
+    const effect_remove_buf: usize = 8;
+
+    /// Send one S1E effect removal (best-effort; drops when it won't fit).
+    fn sendEffectRemove(conn: *Conn, eid: i32, id: u8) void {
+        var eb: [effect_remove_buf]u8 = undefined;
+        queueBuilt(conn, packets.frameRemoveEntityEffect(eid, id, &eb));
+    }
+
     pub fn effectClear(self: *Server, name: []const u8, id: ?u8) ?usize {
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         const c = findInSnap(snap, name) orelse return null;
@@ -2644,23 +3614,18 @@ pub const Server = struct {
         if (c.state != .play) return null;
         var n: usize = 0;
         for (&c.effects) |*s| {
-            if (s.*) |e| {
-                if (id == null or e.id == id.?) {
-                    var eb: [16]u8 = undefined;
-                    if (packets.frameRemoveEntityEffect(c.eid, e.id, &eb)) |f| {
-                        c.queueFramed(f) catch {};
-                    } else |_| {}
-                    s.* = null;
-                    n += 1;
-                }
-            }
+            const e = s.* orelse continue;
+            if (id != null and e.id != id.?) continue;
+            sendEffectRemove(c, c.eid, e.id);
+            s.* = null;
+            n += 1;
         }
         return n;
     }
 
     /// Tick down effects (20 units per 1Hz tick); expiry sends S1E.
     fn tickEffects(self: *Server) void {
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         for (snap) |e| {
@@ -2681,38 +3646,85 @@ pub const Server = struct {
                     }
                 }
             }
-            for (expired[0..n_exp]) |id| {
-                var eb: [16]u8 = undefined;
-                if (packets.frameRemoveEntityEffect(e.conn.eid, id, &eb)) |f| {
-                    e.conn.queueFramed(f) catch {};
-                } else |_| {}
-            }
+            for (expired[0..n_exp]) |id| sendEffectRemove(e.conn, e.conn.eid, id);
             e.conn.lock.unlock();
         }
     }
 
     // ---- raw-NBT `ench` list helpers (wire format is uncompressed NBT) ----
 
+    /// NBT tag numbers (the ench-list code reads/writes raw tags).
+    const nbt_end: u8 = 0;
+    const nbt_short: u8 = 3;
+    const nbt_string: u8 = 8;
+    const nbt_list: u8 = 9;
+    const nbt_compound: u8 = 10;
+
+    /// One `ench`-list compound entry ({id: short, lvl: short}, 16 bytes).
+    const ench_entry_bytes: usize = 16;
+
+    /// Write one ench entry at `w.*`, advancing it by ench_entry_bytes.
+    /// Caller guarantees room (sized by the list_bytes checks below).
+    fn writeEnchEntry(out: []u8, w: *usize, id: u8, lvl: u8) void {
+        out[w.*] = nbt_short;
+        w.* += 1;
+        std.mem.writeInt(u16, out[w.*..][0..2], 2, .big);
+        w.* += 2;
+        out[w.*] = 'i';
+        out[w.* + 1] = 'd';
+        w.* += 2;
+        std.mem.writeInt(i16, out[w.*..][0..2], id, .big);
+        w.* += 2;
+        out[w.*] = nbt_short;
+        w.* += 1;
+        std.mem.writeInt(u16, out[w.*..][0..2], 3, .big);
+        w.* += 2;
+        out[w.*] = 'l';
+        out[w.* + 1] = 'v';
+        out[w.* + 2] = 'l';
+        w.* += 3;
+        std.mem.writeInt(i16, out[w.*..][0..2], lvl, .big);
+        w.* += 2;
+        out[w.*] = nbt_end;
+        w.* += 1;
+    }
+
+    /// Write the `ench` list header (tag + name + compound-list marker).
+    /// Caller guarantees room.
+    fn writeEnchListHead(out: []u8, w: *usize) void {
+        out[w.*] = nbt_list;
+        w.* += 1;
+        std.mem.writeInt(u16, out[w.*..][0..2], 4, .big);
+        w.* += 2;
+        out[w.*] = 'e';
+        out[w.* + 1] = 'n';
+        out[w.* + 2] = 'c';
+        out[w.* + 3] = 'h';
+        w.* += 4;
+        out[w.*] = nbt_compound;
+        w.* += 1;
+    }
+
+    /// Skip one NBT payload; false on truncation/unknown tag.
+    fn nbtNeed(buf: []const u8, i: *usize, n: usize) bool {
+        if (i.* + n > buf.len) return false;
+        i.* += n;
+        return true;
+    }
+
     /// Skip one NBT payload; false on truncation/unknown tag.
     fn nbtSkip(tag: u8, buf: []const u8, i: *usize) bool {
-        const need = struct {
-            fn f(buf_: []const u8, i_: *usize, n: usize) bool {
-                if (i_.* + n > buf_.len) return false;
-                i_.* += n;
-                return true;
-            }
-        }.f;
         switch (tag) {
             0 => return true,
-            1, 7 => return need(buf, i, 1),
-            2 => return need(buf, i, 2),
-            3, 5 => return need(buf, i, 4),
-            4, 6 => return need(buf, i, 8),
+            1, 7 => return nbtNeed(buf, i, 1),
+            2 => return nbtNeed(buf, i, 2),
+            3, 5 => return nbtNeed(buf, i, 4),
+            4, 6 => return nbtNeed(buf, i, 8),
             8 => {
                 if (i.* + 2 > buf.len) return false;
                 const l = std.mem.readInt(u16, buf[i.*..][0..2], .big);
                 i.* += 2;
-                return need(buf, i, l);
+                return nbtNeed(buf, i, l);
             },
             9 => {
                 if (i.* + 5 > buf.len) return false;
@@ -2735,10 +3747,32 @@ pub const Server = struct {
                 const n = std.mem.readInt(i32, buf[i.*..][0..4], .big);
                 i.* += 4;
                 if (n < 0 or n > 100000) return false;
-                return need(buf, i, @as(usize, @intCast(n)) * 4);
+                return nbtNeed(buf, i, @as(usize, @intCast(n)) * 4);
             },
             else => return false,
         }
+    }
+
+    /// Bounds-checked u16 read advancing the cursor (null = truncated).
+    fn takeU16(raw: []const u8, i: *usize) ?u16 {
+        if (i.* + 2 > raw.len) return null;
+        const v = std.mem.readInt(u16, raw[i.*..][0..2], .big);
+        i.* += 2;
+        return v;
+    }
+
+    /// Bounds-checked slice read advancing the cursor (null = truncated).
+    fn takeSlice(raw: []const u8, i: *usize, n: usize) ?[]const u8 {
+        if (i.* + n > raw.len) return null;
+        const s = raw[i.* .. i.* + n];
+        i.* += n;
+        return s;
+    }
+
+    /// Bounds-checked NBT string (u16 length + bytes).
+    fn takeNbtString(raw: []const u8, i: *usize) ?[]const u8 {
+        const n = takeU16(raw, i) orelse return null;
+        return takeSlice(raw, i, n);
     }
 
     /// Walk a compound's named tags; false on truncation. When `ids_out` is
@@ -2750,11 +3784,8 @@ pub const Server = struct {
             const tag = buf[i.*];
             i.* += 1;
             if (tag == 0) return true;
-            if (i.* + 2 > buf.len) return false;
-            const nl = std.mem.readInt(u16, buf[i.*..][0..2], .big);
-            i.* += 2;
-            if (i.* + nl > buf.len) return false;
-            i.* += nl;
+            const nl = takeU16(buf, i) orelse return false;
+            if (takeSlice(buf, i, nl) == null) return false;
             if (!nbtSkip(tag, buf, i)) return false;
         }
     }
@@ -2774,11 +3805,7 @@ pub const Server = struct {
         if (raw[0] != 10) return r; // root compound
         var i: usize = 1;
         // Root name (usually empty u16).
-        if (i + 2 > raw.len) return r;
-        const nl0 = std.mem.readInt(u16, raw[i..][0..2], .big);
-        i += 2;
-        if (i + nl0 > raw.len) return r;
-        i += nl0;
+        if (takeNbtString(raw, &i) == null) return r;
         while (true) {
             if (i + 1 > raw.len) return r;
             const tag = raw[i];
@@ -2787,12 +3814,7 @@ pub const Server = struct {
                 r.valid = i == raw.len;
                 return r;
             }
-            if (i + 2 > raw.len) return r;
-            const nl = std.mem.readInt(u16, raw[i..][0..2], .big);
-            i += 2;
-            if (i + nl > raw.len) return r;
-            const name = raw[i .. i + nl];
-            i += nl;
+            const name = takeNbtString(raw, &i) orelse return r;
             if (tag == 9 and std.mem.eql(u8, name, "ench")) {
                 r.list_at = i; // points at element-type byte
                 if (i + 5 > raw.len) return r;
@@ -2803,33 +3825,10 @@ pub const Server = struct {
                 if (n < 0 or n > 64) return r;
                 var k: i32 = 0;
                 while (k < n) : (k += 1) {
-                    var id: ?u8 = null;
-                    var lvl: ?u8 = null;
-                    while (true) {
-                        if (i + 1 > raw.len) return r;
-                        const et = raw[i];
-                        i += 1;
-                        if (et == 0) break;
-                        if (i + 2 > raw.len) return r;
-                        const el = std.mem.readInt(u16, raw[i..][0..2], .big);
-                        i += 2;
-                        if (i + el > raw.len) return r;
-                        const ename = raw[i .. i + el];
-                        i += el;
-                        if (et == 3 and i + 2 <= raw.len) {
-                            const v = std.mem.readInt(i16, raw[i..][0..2], .big);
-                            if (std.mem.eql(u8, ename, "id")) id = @truncate(@max(0, v));
-                            if (std.mem.eql(u8, ename, "lvl")) lvl = @truncate(@max(0, v));
-                            i += 2;
-                        } else {
-                            var j = i;
-                            if (!nbtSkip(et, raw, &j)) return r;
-                            i = j;
-                        }
-                    }
+                    const pair = parseEnchEntry(raw, &i) orelse return r;
                     if (r.n < 8) {
-                        ench_ids[r.n] = id orelse 0;
-                        ench_lvls[r.n] = lvl orelse 0;
+                        ench_ids[r.n] = pair.id;
+                        ench_lvls[r.n] = pair.lvl;
                         r.n += 1;
                     }
                 }
@@ -2840,6 +3839,33 @@ pub const Server = struct {
                 i = j;
             }
         }
+    }
+
+    /// One `ench`-list compound entry: (id, lvl) shorts (missing → 0).
+    /// Null when the entry is truncated (caller abandons the parse).
+    const EnchPair = struct { id: u8, lvl: u8 };
+
+    fn parseEnchEntry(raw: []const u8, i: *usize) ?EnchPair {
+        var id: ?u8 = null;
+        var lvl: ?u8 = null;
+        while (true) {
+            if (i.* + 1 > raw.len) return null;
+            const et = raw[i.*];
+            i.* += 1;
+            if (et == 0) break;
+            const ename = takeNbtString(raw, i) orelse return null;
+            if (et == 3) {
+                const v = takeSlice(raw, i, 2) orelse return null;
+                const short = std.mem.readInt(i16, v[0..2], .big);
+                if (std.mem.eql(u8, ename, "id")) id = @truncate(@max(0, short));
+                if (std.mem.eql(u8, ename, "lvl")) lvl = @truncate(@max(0, short));
+            } else {
+                var j = i.*;
+                if (!nbtSkip(et, raw, &j)) return null;
+                i.* = j;
+            }
+        }
+        return .{ .id = id orelse 0, .lvl = lvl orelse 0 };
     }
 
     /// Build merged NBT: existing `ench` list updated (or appended before the
@@ -2872,130 +3898,49 @@ pub const Server = struct {
                     if (w + pre.len > out.len) return null;
                     @memcpy(out[w..][0..pre.len], pre);
                     w += pre.len;
-                    const list_bytes = 1 + 4 + n * 16; // 0A + count + entries
+                    const list_bytes = 1 + 4 + n * ench_entry_bytes; // 0A + count + entries
                     if (w + list_bytes + (raw.len - p.list_end) > out.len) return null;
-                    out[w] = 10;
+                    out[w] = nbt_compound;
                     w += 1;
                     std.mem.writeInt(i32, out[w..][0..4], @intCast(n), .big);
                     w += 4;
-                    for (have[0..n], have_lvls[0..n]) |id, lvl| {
-                        out[w] = 3;
-                        w += 1;
-                        std.mem.writeInt(u16, out[w..][0..2], 2, .big);
-                        w += 2;
-                        out[w] = 'i';
-                        out[w + 1] = 'd';
-                        w += 2;
-                        std.mem.writeInt(i16, out[w..][0..2], id, .big);
-                        w += 2;
-                        out[w] = 3;
-                        w += 1;
-                        std.mem.writeInt(u16, out[w..][0..2], 3, .big);
-                        w += 2;
-                        out[w] = 'l';
-                        out[w + 1] = 'v';
-                        out[w + 2] = 'l';
-                        w += 3;
-                        std.mem.writeInt(i16, out[w..][0..2], lvl, .big);
-                        w += 2;
-                        out[w] = 0;
-                        w += 1;
-                    }
+                    for (have[0..n], have_lvls[0..n]) |id, lvl| writeEnchEntry(out, &w, id, lvl);
                     const post = raw[p.list_end..];
                     @memcpy(out[w..][0..post.len], post);
                     w += post.len;
                     return out[0..w];
                 }
                 // No ench list (valid compound without one): append before end.
-                if (raw.len < 1 or raw[raw.len - 1] != 0) return null;
-                const list_bytes = 1 + 2 + 4 + 1 + 4 + 16; // tag+name+count+entry
+                if (raw.len < 1 or raw[raw.len - 1] != nbt_end) return null;
+                const list_bytes = 1 + 2 + 4 + 1 + 4 + ench_entry_bytes; // tag+name+count+entry
                 if (raw.len - 1 + list_bytes + 1 > out.len) return null;
                 var w: usize = 0;
                 @memcpy(out[w..][0 .. raw.len - 1], raw[0 .. raw.len - 1]);
                 w += raw.len - 1;
-                out[w] = 9;
-                w += 1;
-                std.mem.writeInt(u16, out[w..][0..2], 4, .big);
-                w += 2;
-                out[w] = 'e';
-                out[w + 1] = 'n';
-                out[w + 2] = 'c';
-                out[w + 3] = 'h';
-                w += 4;
-                out[w] = 10;
-                w += 1;
+                writeEnchListHead(out, &w);
                 std.mem.writeInt(i32, out[w..][0..4], 1, .big);
                 w += 4;
-                out[w] = 3;
-                w += 1;
-                std.mem.writeInt(u16, out[w..][0..2], 2, .big);
-                w += 2;
-                out[w] = 'i';
-                out[w + 1] = 'd';
-                w += 2;
-                std.mem.writeInt(i16, out[w..][0..2], ench_id, .big);
-                w += 2;
-                out[w] = 3;
-                w += 1;
-                std.mem.writeInt(u16, out[w..][0..2], 3, .big);
-                w += 2;
-                out[w] = 'l';
-                out[w + 1] = 'v';
-                out[w + 2] = 'l';
-                w += 3;
-                std.mem.writeInt(i16, out[w..][0..2], level, .big);
-                w += 2;
-                out[w] = 0;
-                w += 1;
-                out[w] = 0;
+                writeEnchEntry(out, &w, ench_id, level);
+                out[w] = nbt_end;
                 w += 1;
                 return out[0..w];
             }
         }
-        // Fresh compound with a single-entry ench list (23 bytes).
-        if (out.len < 23) return null;
+        // Fresh compound with a single-entry ench list:
+        // root(1) + name(2) + list head(7) + count(4) + entry(16) + ends(2).
+        const fresh_bytes: usize = 1 + 2 + 7 + 4 + ench_entry_bytes + 2;
+        if (out.len < fresh_bytes) return null;
         var w: usize = 0;
-        out[w] = 10;
+        out[w] = nbt_compound;
         w += 1; // root compound, empty name
         out[w] = 0;
         out[w + 1] = 0;
         w += 2;
-        out[w] = 9;
-        w += 1; // ench list
-        out[w] = 0;
-        out[w + 1] = 4;
-        w += 2;
-        out[w] = 'e';
-        out[w + 1] = 'n';
-        out[w + 2] = 'c';
-        out[w + 3] = 'h';
-        w += 4;
-        out[w] = 10;
-        w += 1;
+        writeEnchListHead(out, &w); // ench list
         std.mem.writeInt(i32, out[w..][0..4], 1, .big);
         w += 4;
-        out[w] = 3;
-        w += 1;
-        std.mem.writeInt(u16, out[w..][0..2], 2, .big);
-        w += 2;
-        out[w] = 'i';
-        out[w + 1] = 'd';
-        w += 2;
-        std.mem.writeInt(i16, out[w..][0..2], ench_id, .big);
-        w += 2;
-        out[w] = 3;
-        w += 1;
-        std.mem.writeInt(u16, out[w..][0..2], 3, .big);
-        w += 2;
-        out[w] = 'l';
-        out[w + 1] = 'v';
-        out[w + 2] = 'l';
-        w += 3;
-        std.mem.writeInt(i16, out[w..][0..2], level, .big);
-        w += 2;
-        out[w] = 0;
-        w += 1; // entry end
-        out[w] = 0;
+        writeEnchEntry(out, &w, ench_id, level);
+        out[w] = nbt_end;
         w += 1; // root end
         return out[0..w];
     }
@@ -3021,7 +3966,7 @@ pub const Server = struct {
     }
     pub fn enchantHeld(self: *Server, name: []const u8, ench_id: u8, level: u8) ?EnchantResult {
         const ench = cmd_data.enchantById(ench_id) orelse return .cant_enchant;
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         const c = findInSnap(snap, name) orelse return null;
@@ -3051,10 +3996,20 @@ pub const Server = struct {
         return .ok;
     }
 
+    /// Clear one cell when `match` holds; returns units removed.
+    fn clearCell(alloc: std.mem.Allocator, cell: *?item_mod.Stack, match: bool) usize {
+        if (!match) return 0;
+        const st = cell.* orelse return 0;
+        const n: usize = @intCast(st.count);
+        item_mod.freeStack(alloc, cell);
+        cell.* = null;
+        return n;
+    }
+
     /// Clear matching stacks (item + data(-1 = any), or everything).
     /// Returns removed item count, or null when offline.
     pub fn clearInventory(self: *Server, name: []const u8, wire_id: ?u16, data: i16) ?usize {
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         const c = findInSnap(snap, name) orelse return null;
@@ -3067,52 +4022,35 @@ pub const Server = struct {
         if (wire_id) |w| {
             // Unmapped wire ids (air, gaps) match nothing: vanilla reports
             // clear.failure, not a parse error.
-            const id = wire.fromWire(w) orelse return 0;
+            const id = wire.fromWire(w) orelse {
+                c.lock.unlock();
+                return 0;
+            };
             for (&c.inv) |*s| {
-                if (s.*) |st| {
-                    if (st.id == id and (data < 0 or st.damage == data)) {
-                        removed += @intCast(st.count);
-                        item_mod.freeStack(c.allocator, s);
-                        s.* = null;
-                    }
-                }
+                const keep = if (s.*) |st| st.id == id and (data < 0 or st.damage == data) else false;
+                removed += clearCell(c.allocator, s, keep);
             }
-            if (c.cursor) |st| {
-                if (st.id == id and (data < 0 or st.damage == data)) {
-                    removed += @intCast(st.count);
-                    item_mod.freeStack(c.allocator, &c.cursor);
-                    c.cursor = null;
-                }
-            }
+            const cmatch = if (c.cursor) |st| st.id == id and (data < 0 or st.damage == data) else false;
+            removed += clearCell(c.allocator, &c.cursor, cmatch);
         } else {
-            for (&c.inv) |*s| {
-                if (s.*) |st| {
-                    removed += @intCast(st.count);
-                    item_mod.freeStack(c.allocator, s);
-                    s.* = null;
-                }
-            }
-            if (c.cursor) |st| {
-                removed += @intCast(st.count);
-                item_mod.freeStack(c.allocator, &c.cursor);
-                c.cursor = null;
-            }
+            for (&c.inv) |*s| removed += clearCell(c.allocator, s, true);
+            removed += clearCell(c.allocator, &c.cursor, true);
         }
         // Full-window resync (vanilla detectAndSendChanges).
         const wf = packets.frameWindowItemsAlloc(self.gpa, 0, &c.inv) catch null;
         const cf = if (wf != null) packets.frameSetSlotAlloc(self.gpa, -1, -1, c.cursor) catch null else null;
         c.lock.unlock();
-        if (wf) |f| {
-            defer self.gpa.free(f);
+        if (wf != null or cf != null) {
             c.lock.lock();
-            c.queueFramed(f) catch {};
-            c.lock.unlock();
-        }
-        if (cf) |f| {
-            defer self.gpa.free(f);
-            c.lock.lock();
-            c.queueFramed(f) catch {};
-            c.lock.unlock();
+            defer c.lock.unlock();
+            if (wf) |f| {
+                defer self.gpa.free(f);
+                c.queueFramed(f) catch {};
+            }
+            if (cf) |f| {
+                defer self.gpa.free(f);
+                c.queueFramed(f) catch {};
+            }
         }
         return removed;
     }
@@ -3124,7 +4062,9 @@ pub const Server = struct {
     }
 
     /// Read one block (wire id + meta). Null without a world / missing chunk.
-    pub fn getBlockAt(self: *Server, x: i32, y: i32, z: i32) ?struct { wire: u16, meta: u4 } {
+    // ---- world editing, ops, stats ----
+
+    pub fn getBlockAt(self: *Server, x: i32, y: i32, z: i32) ?BlockWire {
         const pool = self.world orelse return null;
         if (y < 0 or y > 255) return null;
         self.world_lock.lock();
@@ -3146,19 +4086,12 @@ pub const Server = struct {
         defer self.world_lock.unlock();
         const cur = (view.peekBlock(pool, self.gpa, x, @intCast(y), z) catch return .no_world) orelse return .out_of_world;
         switch (mode) {
-            .replace => {
+            .replace, .destroy => {
                 if (cur.id == id and cur.meta == meta) return .no_change;
             },
             .keep => {
                 if (cur.id != game_ids.air) return .no_change;
             },
-            .destroy => {
-                if (cur.id == id and cur.meta == meta) return .no_change;
-            },
-        }
-        if (mode == .destroy and cur.id != game_ids.air) {
-            // Break particles + survival-style drop handled by the caller
-            // (drops need gamerule state, checked outside world_lock).
         }
         const touched: u8 = view.applyBlock(pool, self.gpa, x, @intCast(y), z, id, meta) catch return .no_world;
         self.broadcastBlockChange(null, x, @intCast(y), z, id, meta) catch {};
@@ -3186,8 +4119,8 @@ pub const Server = struct {
         if (!self.tileDrops()) return;
         const id = wire.fromWire(old_wire) orelse return;
         if (id == game_ids.air) return;
-        const pool = self.world orelse return;
-        self.spawnBreakDrops(pool, self.gpa, x, @intCast(y), z, id, 0);
+        if (self.world == null) return;
+        self.spawnBreakDrops(x, @intCast(y), z, id, 0);
     }
 
     /// Summon a living entity (ticker broadcasts it like any other mob).
@@ -3231,7 +4164,7 @@ pub const Server = struct {
     pub const HearResult = enum { heard, too_far, offline };
 
     pub fn playSoundTo(self: *Server, name: []const u8, sound: []const u8, x: f64, y: f64, z: f64, volume: f32, pitch: f32, min_volume: f32) HearResult {
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         const c = findInSnap(snap, name) orelse return .offline;
@@ -3244,9 +4177,7 @@ pub const Server = struct {
         const dz = z - c.pos_z;
         if (dx * dx + dy * dy + dz * dz > range * range) return .too_far;
         var sb: [512]u8 = undefined;
-        if (packets.frameSoundEffect(sound, x, y, z, volume, pitch, &sb)) |f| {
-            c.queueFramed(f) catch {};
-        } else |_| {}
+        queueBuilt(c, packets.frameSoundEffect(sound, x, y, z, volume, pitch, &sb));
         return .heard;
     }
 
@@ -3292,7 +4223,7 @@ pub const Server = struct {
     }
 
     /// Returns elapsed seconds + ticks, or null when not profiling.
-    pub fn debugStop(self: *Server, now_ms: i64) ?struct { secs: f64, ticks: u64 } {
+    pub fn debugStop(self: *Server, now_ms: i64) ?DebugSpan {
         self.state_lock.lock();
         defer self.state_lock.unlock();
         const start = self.debug_start_ms orelse return null;
@@ -3328,7 +4259,7 @@ pub const Server = struct {
 
     /// Personal spawn (`/spawnpoint`): empty name = sender handled by caller.
     pub fn setSpawn(self: *Server, name: []const u8, x: i32, y: i32, z: i32) bool {
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         const c = findInSnap(snap, name) orelse return false;
@@ -3353,7 +4284,7 @@ pub const Server = struct {
             self.cfg.store(c);
         }
         self.state_lock.unlock();
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         for (snap) |e| {
@@ -3371,7 +4302,7 @@ pub const Server = struct {
     /// `chat.type.achievement`); stats just succeed. Unknown -> null.
     pub fn awardStat(self: *Server, name: []const u8, stat: []const u8) ?bool {
         if (!cmd_data.validStatName(stat)) return null;
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         const c = findInSnap(snap, name) orelse return false;
@@ -3452,6 +4383,8 @@ pub const Server = struct {
     /// Vanilla `getPossibleCommands` + per-command `addTabCompletion`.
     /// Null = suppress (unknown command); otherwise S3A with candidates
     /// (possibly empty). Caller holds no locks; conn queued under its lock.
+    // ---- tab completion ----
+
     pub fn handleTabComplete(self: *Server, sender: *Conn, text: []const u8) void {
         var cands: [128][]const u8 = undefined;
         var owned: [128][64]u8 = undefined; // player-name / id copies
@@ -3508,7 +4441,7 @@ pub const Server = struct {
     }
 
     fn completePlayers(self: *Server, prefix: []const u8, out: [][]const u8, owned: [][64]u8) usize {
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         var n: usize = 0;
@@ -3543,34 +4476,9 @@ pub const Server = struct {
         for (self.cmds[0..self.n_cmds]) |e| {
             const d = e.def;
             const ok = if (sender == null) true else self.commandAllowed(sender, d);
-            if (ok) {
-                if (cmd_spec.startsWithIgnoreCase(d.name, prefix)) {
-                    if (n < out.len and on < owned.len) {
-                        const s = std.fmt.bufPrint(&owned[on], "/{s}", .{d.name}) catch null;
-                        if (s) |cand| {
-                            if (!containsName(out[0..n], cand)) {
-                                out[n] = cand;
-                                n += 1;
-                            }
-                            on += 1;
-                        }
-                    }
-                }
-                for (d.aliases) |a| {
-                    if (cmd_spec.startsWithIgnoreCase(a, prefix)) {
-                        if (n < out.len and on < owned.len) {
-                            const s = std.fmt.bufPrint(&owned[on], "/{s}", .{a}) catch null;
-                            if (s) |cand| {
-                                if (!containsName(out[0..n], cand)) {
-                                    out[n] = cand;
-                                    n += 1;
-                                }
-                                on += 1;
-                            }
-                        }
-                    }
-                }
-            }
+            if (!ok) continue;
+            offerCommand(out, owned, &n, &on, d.name, prefix);
+            for (d.aliases) |a| offerCommand(out, owned, &n, &on, a, prefix);
         }
         return n;
     }
@@ -3578,6 +4486,39 @@ pub const Server = struct {
     fn containsName(hay: [][]const u8, needle: []const u8) bool {
         for (hay) |e| if (std.mem.eql(u8, e, needle)) return true;
         return false;
+    }
+
+    /// Offer one completion candidate (prefix-filtered, capacity-checked).
+    fn offerStatic(out: [][]const u8, n: *usize, s: []const u8, prefix: []const u8) void {
+        if (n.* >= out.len) return;
+        if (!cmd_spec.startsWithIgnoreCase(s, prefix)) return;
+        out[n.*] = s;
+        n.* += 1;
+    }
+
+    /// Offer every string in `list` (prefix-filtered, capacity-checked).
+    fn offerList(out: [][]const u8, n: *usize, list: []const []const u8, prefix: []const u8) void {
+        for (list) |v| offerStatic(out, n, v, prefix);
+    }
+
+    /// Append one candidate unless already listed (capacity-checked).
+    fn appendUnique(out: [][]const u8, n: *usize, c: []const u8) void {
+        if (n.* >= out.len) return;
+        if (containsName(out[0..n.*], c)) return;
+        out[n.*] = c;
+        n.* += 1;
+    }
+
+    /// Offer one "/name" command candidate (prefix-filtered, deduped;
+    /// consumes an owned slot on every render, dup or not).
+    fn offerCommand(out: [][]const u8, owned: [][64]u8, n: *usize, on: *usize, word: []const u8, prefix: []const u8) void {
+        if (!cmd_spec.startsWithIgnoreCase(word, prefix)) return;
+        if (n.* >= out.len or on.* >= owned.len) return;
+        const s = std.fmt.bufPrint(&owned[on.*], "/{s}", .{word}) catch return;
+        on.* += 1;
+        if (containsName(out[0..n.*], s)) return;
+        out[n.*] = s;
+        n.* += 1;
     }
 
     fn completeArgs(self: *Server, def: *const perms_mod.Command, toks: [][]const u8, out: [][]const u8, owned: [][64]u8) usize {
@@ -3618,18 +4559,7 @@ pub const Server = struct {
                 },
                 else => {},
             }
-            for (tmp[0..m]) |c| {
-                if (n >= out.len) break;
-                var dup = false;
-                for (out[0..n]) |e| if (std.mem.eql(u8, e, c)) {
-                    dup = true;
-                    break;
-                };
-                if (!dup) {
-                    out[n] = c;
-                    n += 1;
-                }
-            }
+            for (tmp[0..m]) |c| appendUnique(out, &n, c);
         }
         // Command-specific dynamic sets (items, gamerules, mobs...).
         n += self.completeExtra(def, toks, prefix, out[n..], owned);
@@ -3648,80 +4578,41 @@ pub const Server = struct {
             if (arg_index == 3) n = completeWireNames(prefix, out);
         } else if (std.mem.eql(u8, def.name, "gamerule")) {
             if (arg_index == 0) {
-                for (cmd_data.gamerules) |g| {
-                    if (n >= out.len) break;
-                    if (cmd_spec.startsWithIgnoreCase(g.name, prefix)) {
-                        out[n] = g.name;
-                        n += 1;
-                    }
-                }
+                for (cmd_data.gamerules) |g| offerStatic(out, &n, g.name, prefix);
             } else if (arg_index == 1) {
-                for ([_][]const u8{ "true", "false" }) |b| {
-                    if (n >= out.len) break;
-                    if (cmd_spec.startsWithIgnoreCase(b, prefix)) {
-                        out[n] = b;
-                        n += 1;
-                    }
-                }
+                offerList(out, &n, &.{ "true", "false" }, prefix);
             }
         } else if (std.mem.eql(u8, def.name, "effect")) {
             if (arg_index == 2 and n < out.len) {
                 // effect names are numeric; offer 1..23 by prefix
                 var id: u8 = 1;
                 while (id <= 23) : (id += 1) {
-                    if (n >= out.len or n >= owned.len) break;
+                    if (n >= owned.len) break;
                     const s = std.fmt.bufPrint(&owned[n], "{d}", .{id}) catch break;
-                    if (cmd_spec.startsWithIgnoreCase(s, prefix)) {
-                        out[n] = s;
-                        n += 1;
-                    }
+                    offerStatic(out, &n, s, prefix);
                 }
             } else if (arg_index == 1 and (std.mem.eql(u8, toks[0], "clear") or toks.len > 0)) {
-                if (cmd_spec.startsWithIgnoreCase("clear", prefix) and n < out.len) {
-                    out[n] = "clear";
-                    n += 1;
-                }
+                offerStatic(out, &n, "clear", prefix);
             }
         } else if (std.mem.eql(u8, def.name, "enchant")) {
             if (arg_index == 1) {
                 for (cmd_data.enchants) |e| {
-                    if (n >= out.len or n >= owned.len) break;
+                    if (n >= owned.len) break;
                     const s = std.fmt.bufPrint(&owned[n], "{d}", .{e.id}) catch break;
-                    if (cmd_spec.startsWithIgnoreCase(s, prefix)) {
-                        out[n] = s;
-                        n += 1;
-                    }
+                    offerStatic(out, &n, s, prefix);
                 }
             }
         } else if (std.mem.eql(u8, def.name, "summon")) {
             if (arg_index == 0) {
-                for (cmd_data.mobs) |m| {
-                    if (n >= out.len) break;
-                    if (cmd_spec.startsWithIgnoreCase(m.name, prefix)) {
-                        out[n] = m.name;
-                        n += 1;
-                    }
-                }
+                for (cmd_data.mobs) |m| offerStatic(out, &n, m.name, prefix);
             }
         } else if (std.mem.eql(u8, def.name, "difficulty")) {
             if (arg_index == 0) {
-                for (difficulty_complete_names ++ [_][]const u8{ "p", "e", "n", "h", "0", "1", "2", "3" }) |v| {
-                    if (n >= out.len) break;
-                    if (cmd_spec.startsWithIgnoreCase(v, prefix)) {
-                        out[n] = v;
-                        n += 1;
-                    }
-                }
+                offerList(out, &n, &(difficulty_complete_names ++ [_][]const u8{ "p", "e", "n", "h", "0", "1", "2", "3" }), prefix);
             }
         } else if (std.mem.eql(u8, def.name, "gamemode") or std.mem.eql(u8, def.name, "defaultgamemode")) {
             if (arg_index == 0) {
-                for (gamemode_complete_names ++ [_][]const u8{ "s", "c", "a", "0", "1", "2" }) |v| {
-                    if (n >= out.len) break;
-                    if (cmd_spec.startsWithIgnoreCase(v, prefix)) {
-                        out[n] = v;
-                        n += 1;
-                    }
-                }
+                offerList(out, &n, &(gamemode_complete_names ++ [_][]const u8{ "s", "c", "a", "0", "1", "2" }), prefix);
             }
         } else if (std.mem.eql(u8, def.name, "scoreboard")) {
             n = self.completeScoreboard(toks, prefix, out, owned);
@@ -3735,38 +4626,27 @@ pub const Server = struct {
         _ = self;
         _ = owned;
         var n: usize = 0;
-        const put = struct {
-            fn f(list: []const []const u8, prefix_: []const u8, o: [][]const u8, nn: *usize) void {
-                for (list) |v| {
-                    if (nn.* >= o.len) break;
-                    if (cmd_spec.startsWithIgnoreCase(v, prefix_)) {
-                        o[nn.*] = v;
-                        nn.* += 1;
-                    }
-                }
-            }
-        }.f;
         if (toks.len == 1) {
-            put(&.{ "objectives", "players", "teams" }, prefix, out, &n);
+            offerList(out, &n, &.{ "objectives", "players", "teams" }, prefix);
             return n;
         }
         if (std.mem.eql(u8, toks[0], "objectives")) {
             if (toks.len == 2) {
-                put(&.{ "list", "add", "remove", "setdisplay" }, prefix, out, &n);
+                offerList(out, &n, &.{ "list", "add", "remove", "setdisplay" }, prefix);
             } else if (toks.len == 3 and std.mem.eql(u8, toks[1], "add")) {
-                put(&cmd_data.criteria, prefix, out, &n);
+                offerList(out, &n, &cmd_data.criteria, prefix);
             } else if (toks.len == 3 and std.mem.eql(u8, toks[1], "setdisplay")) {
-                put(&.{ "list", "sidebar", "belowName" }, prefix, out, &n);
+                offerList(out, &n, &.{ "list", "sidebar", "belowName" }, prefix);
             }
         } else if (std.mem.eql(u8, toks[0], "players")) {
-            if (toks.len == 2) put(&.{ "set", "add", "remove", "reset", "list" }, prefix, out, &n);
+            if (toks.len == 2) offerList(out, &n, &.{ "set", "add", "remove", "reset", "list" }, prefix);
         } else if (std.mem.eql(u8, toks[0], "teams")) {
             if (toks.len == 2) {
-                put(&.{ "list", "add", "remove", "empty", "join", "leave", "option" }, prefix, out, &n);
+                offerList(out, &n, &.{ "list", "add", "remove", "empty", "join", "leave", "option" }, prefix);
             } else if (toks.len == 4 and std.mem.eql(u8, toks[1], "option")) {
-                put(&.{ "friendlyfire", "color", "seeFriendlyInvisibles" }, prefix, out, &n);
+                offerList(out, &n, &.{ "friendlyfire", "color", "seeFriendlyInvisibles" }, prefix);
             } else if (toks.len == 5 and std.mem.eql(u8, toks[1], "option") and std.mem.eql(u8, toks[3], "color")) {
-                put(&cmd_data.team_colors, prefix, out, &n);
+                offerList(out, &n, &cmd_data.team_colors, prefix);
             }
         }
         return n;
@@ -3775,13 +4655,7 @@ pub const Server = struct {
     /// All registered item/block names (canonical snake_case) for /give etc.
     fn completeWireNames(prefix: []const u8, out: [][]const u8) usize {
         var n: usize = 0;
-        inline for (@typeInfo(game_ids.Id).@"enum".fields) |f| {
-            if (n >= out.len) break;
-            if (cmd_spec.startsWithIgnoreCase(f.name, prefix)) {
-                out[n] = f.name;
-                n += 1;
-            }
-        }
+        inline for (@typeInfo(game_ids.Id).@"enum".fields) |f| offerStatic(out, &n, f.name, prefix);
         return n;
     }
 
@@ -3823,6 +4697,8 @@ pub const Server = struct {
     }
 
     // ---- scoreboard backends (store + broadcast) ----
+
+    // ---- scoreboard ----
 
     fn sbBroadcastObjective(self: *Server, name: []const u8, display: []const u8, action: u8) void {
         var b: [512]u8 = undefined;
@@ -4039,7 +4915,7 @@ pub const Server = struct {
         return n;
     }
 
-    pub fn sbTrackedPlayers(self: *Server, out: [][16]u8) usize {
+    pub fn sbTrackedPlayers(self: *Server, out: [][perms_mod.max_name_len]u8) usize {
         const sb = self.sbDb();
         self.sb_lock.lock();
         defer self.sb_lock.unlock();
@@ -4270,29 +5146,34 @@ pub const Server = struct {
     // ---- connection helpers for the login path ----
 
     /// Peer IP capture from the accepted socket (called once per conn).
+    // ---- tick regions (Phase C) ----
+
     pub fn captureIp(conn: *Conn, stream: std.Io.net.Stream) void {
         switch (stream.socket.address) {
             .ip4 => |a| {
                 const s = std.fmt.bufPrint(&conn.ip, "{d}.{d}.{d}.{d}", .{ a.bytes[0], a.bytes[1], a.bytes[2], a.bytes[3] }) catch return;
                 conn.ip_len = s.len;
             },
-            .ip6 => |a| {
-                var w: usize = 0;
-                for (a.bytes, 0..) |b, i| {
-                    if (i % 2 == 0) {
-                        if (i > 0) {
-                            if (w + 1 > conn.ip.len) return;
-                            conn.ip[w] = ':';
-                            w += 1;
-                        }
-                        const v: u16 = @as(u16, b) << 8 | a.bytes[i + 1];
-                        const s = std.fmt.bufPrint(conn.ip[w..], "{x}", .{v}) catch return;
-                        w += s.len;
-                    }
-                }
-                conn.ip_len = w;
-            },
+            .ip6 => |a| formatIp6(conn, &a.bytes),
         }
+    }
+
+    /// Render an IPv6 address as 8 hex groups (no zero compression —
+    /// ban matching compares text, and the login path stores this form).
+    fn formatIp6(conn: *Conn, bytes: *const [16]u8) void {
+        var w: usize = 0;
+        var i: usize = 0;
+        while (i < bytes.len) : (i += 2) {
+            if (i > 0) {
+                if (w + 1 > conn.ip.len) return;
+                conn.ip[w] = ':';
+                w += 1;
+            }
+            const v: u16 = @as(u16, bytes[i]) << 8 | bytes[i + 1];
+            const s = std.fmt.bufPrint(conn.ip[w..], "{x}", .{v}) catch return;
+            w += s.len;
+        }
+        conn.ip_len = w;
     }
 
     /// One server tick: advance clock, queue per-conn tick packets, flush,
@@ -4311,9 +5192,20 @@ pub const Server = struct {
         out: ?item_mod.Stack = null,
     };
 
+    /// One brewing-stand row snapshot for viewer sync (progress property 0
+    /// rides alongside like the furnace props; see tickOnce).
+    const BrewSnap = struct {
+        x: i32,
+        y: u8,
+        z: i32,
+        brew: u32,
+        bottles: [3]?item_mod.Stack = [_]?item_mod.Stack{null} ** 3,
+        ingredient: ?item_mod.Stack = null,
+    };
+
     /// Per-player environmental flags for the hazard tick (computed once
     /// per tick from pure store reads, consumed per viewer).
-    const EnvFlag = struct { water: bool = false, lava: bool = false, suff: bool = false, cactus: bool = false };
+    const EnvFlag = struct { water: bool = false, lava: bool = false, suff: bool = false, cactus: bool = false, in_fluid: bool = false };
 
     /// Phase C: one tick-region's share of the viewer pass.
     const RegionGroup = struct {
@@ -4352,8 +5244,10 @@ pub const Server = struct {
         players: []entity.PlayerSnap,
         mobs: []entity.MobSnap,
         items: []entity.ItemSnap,
+        potions: []entity.PotionSnap,
         envs: []EnvFlag,
         furn_snaps: []FurnSnap,
+        brew_snaps: []BrewSnap,
         now_ms: i64,
         age: i64,
         cpu: ?usize,
@@ -4377,8 +5271,10 @@ pub const Server = struct {
         players: []entity.PlayerSnap,
         mobs: []entity.MobSnap,
         items: []entity.ItemSnap,
+        potions: []entity.PotionSnap,
         envs: []EnvFlag,
         furn_snaps: []FurnSnap,
+        brew_snaps: []BrewSnap,
         now_ms: i64,
         age: i64,
         out_deaths: []std.ArrayList(DeathInfo),
@@ -4399,8 +5295,10 @@ pub const Server = struct {
             .players = players,
             .mobs = if (shed) mobs[0..0] else mobs,
             .items = if (shed) items[0..0] else items,
+            .potions = if (shed) potions[0..0] else potions,
             .envs = envs,
             .furn_snaps = if (shed) furn_snaps[0..0] else furn_snaps,
+            .brew_snaps = if (shed) brew_snaps[0..0] else brew_snaps,
             .deaths = &deaths,
             .claims = &claims,
             .reconcile_ns = &rns,
@@ -4438,8 +5336,10 @@ pub const Server = struct {
                 w.players,
                 w.mobs,
                 w.items,
+                w.potions,
                 w.envs,
                 w.furn_snaps,
+                w.brew_snaps,
                 w.now_ms,
                 w.age,
                 w.out_deaths,
@@ -4465,8 +5365,10 @@ pub const Server = struct {
         players: []entity.PlayerSnap,
         mobs: []entity.MobSnap,
         items: []entity.ItemSnap,
+        potions: []entity.PotionSnap,
         envs: []EnvFlag,
         furn_snaps: []FurnSnap,
+        brew_snaps: []BrewSnap,
         now_ms: i64,
         age: i64,
         out_deaths: []std.ArrayList(DeathInfo),
@@ -4492,8 +5394,10 @@ pub const Server = struct {
                 d.players,
                 d.mobs,
                 d.items,
+                d.potions,
                 d.envs,
                 d.furn_snaps,
+                d.brew_snaps,
                 d.now_ms,
                 d.age,
                 d.out_deaths,
@@ -4588,6 +5492,13 @@ pub const Server = struct {
         var entry_group: [256]usize = undefined;
         var group_counts: [256]usize = undefined;
         var grouped: [256]bool = [_]bool{false} ** 256;
+        // Side arrays are fixed at 256 slots (stack discipline for the
+        // 1Hz tick — no per-tick heap). Viewers past the cap skip
+        // grouping and tick inline through the legacy body (same as group
+        // overflow below and non-play conns): correct, just unbatched.
+        // (Unbounded indexing here smashed the stack past 256 viewers:
+        // ReleaseFast has no bounds checks, so it crashed wild.)
+        const cap = grouped.len;
         out.n_groups = 0;
         out.n_cross = 0;
         for (snap, 0..) |e, si| {
@@ -4606,6 +5517,11 @@ pub const Server = struct {
             }
             e.conn.lock.unlock();
             if (!is_play) {
+                self.tickViewerOne(legacy_vc, e);
+                continue;
+            }
+            if (si >= cap) {
+                // Past the side arrays: legacy inline (see cap note).
                 self.tickViewerOne(legacy_vc, e);
                 continue;
             }
@@ -4662,7 +5578,9 @@ pub const Server = struct {
         }
         out.n_ordered = start;
         var filled: [256]usize = [_]usize{0} ** 256;
-        for (snap, 0..) |_, si| {
+        // Only indices the classify pass could mark (si < cap above);
+        // reading grouped past the arrays was the other half of the smash.
+        for (snap[0..@min(snap.len, cap)], 0..) |_, si| {
             if (!grouped[si]) continue;
             const gi = entry_group[si];
             out.order[out.groups[gi].start + filled[gi]] = si;
@@ -4681,13 +5599,38 @@ pub const Server = struct {
         players: []entity.PlayerSnap,
         mobs: []entity.MobSnap,
         items: []entity.ItemSnap,
+        potions: []entity.PotionSnap,
         envs: []EnvFlag,
         furn_snaps: []FurnSnap,
+        brew_snaps: []BrewSnap,
         deaths: *std.ArrayList(DeathInfo),
         claims: *entity.ClaimSet,
         reconcile_ns: *u64,
         send_ns: *u64,
     };
+
+    /// Milliseconds per minute (idle-timeout conversion).
+    const ms_per_min: i64 = 60000;
+
+    /// Seal a dead conn: mark dead-after-flush, unlock, flush once, close.
+    /// Caller holds e.conn.lock.
+    fn sealConn(e: RegistryEntry, io: std.Io) void {
+        e.conn.dead = true;
+        e.conn.close_after_flush = true;
+        e.conn.lock.unlock();
+        // One output path (blocking: to the socket; async: the worker).
+        flushEntry(e, io);
+        closeEntry(e, io);
+    }
+
+    /// This viewer's env flags (null when absent from the player snapshot).
+    fn envFor(vc: *ViewerCtx, eid: i32) ?EnvFlag {
+        for (vc.players, 0..) |p, i| {
+            if (p.eid != eid or i >= vc.envs.len) continue;
+            return vc.envs[i];
+        }
+        return null;
+    }
 
     /// Phase C: one viewer's tick body (visibility reconcile + output
     /// drain). No locks on entry; takes the viewer's own conn.lock for
@@ -4696,6 +5639,68 @@ pub const Server = struct {
     /// every mutable byte touched belongs to this viewer except the ctx
     /// accumulators (per-worker deaths/claims/timings). Shared reads
     /// (snapshots, seqlock config, atomics) are all lock-free.
+    /// Continuous embedding rescue (per-tick, play conns): if feet AND
+    /// eyes both read opaque in PRESENT columns, nudge up to headroom and
+    /// re-send PosLook. The login rescue is one-shot and hole-blind
+    /// (missing reads as fine); adopted hole falls, away-burials, and
+    /// drifted terrain can all leave a player embedded after it ran.
+    /// Legit players are never embedded (they occupy dug air), and holes
+    /// read as missing (skipped, never "rescued" blindly), so this only
+    /// fires on genuine burial. No headroom within 16 → leave them
+    /// (suffocation proceeds vanilla-style). Caller holds conn.lock.
+    fn rescueEmbedded(self: *Server, conn: *Conn) bool {
+        const pool = self.world orelse return false;
+        const ex: i32 = @intFromFloat(@floor(conn.pos_x));
+        const ez: i32 = @intFromFloat(@floor(conn.pos_z));
+        const feet: i32 = @intFromFloat(@floor(conn.pos_y));
+        if (feet < 0 or feet > 253) return false;
+        const ey_i: i32 = @intFromFloat(@floor(conn.pos_y + 1.62));
+        if (ey_i < 0 or ey_i > 255) return false;
+        const feet_raw = view.peekBlock(pool, self.gpa, ex, @intCast(feet), ez) catch return false;
+        const feet_b = feet_raw orelse return false;
+        if (!view.isOpaqueCube(feet_b.id)) return false;
+        const eyes_raw = view.peekBlock(pool, self.gpa, ex, @intCast(ey_i), ez) catch return false;
+        const eyes_b = eyes_raw orelse return false;
+        if (!view.isOpaqueCube(eyes_b.id)) return false;
+        // Embedded: scan up for two consecutive present+open cells.
+        var y = feet + 1;
+        while (y <= feet + 16 and y <= 253) : (y += 1) {
+            const fy: u8 = @intCast(y);
+            const ey: u8 = @intCast(y + 1);
+            const bf_raw = view.peekBlock(pool, self.gpa, ex, fy, ez) catch return false;
+            const bf = bf_raw orelse continue;
+            if (view.isOpaqueCube(bf.id)) continue;
+            const be_raw = view.peekBlock(pool, self.gpa, ex, ey, ez) catch return false;
+            const be = be_raw orelse continue;
+            if (view.isOpaqueCube(be.id)) continue;
+            conn.pos_y = @floatFromInt(y);
+            conn.queuePlayerPosLook() catch {};
+            // Desync breaker: repeated rescues at one column mean the
+            // client lost the burst column (no NACK exists, and the 10Hz
+            // hole-healer skips `sent` columns). Third rescue inside 10s
+            // drops the column from `sent` so the rescan re-pushes it;
+            // the counter resets so a still-stuck client re-triggers
+            // every third rescue (one column per push, idempotent).
+            // NOTE: `sent` keys are CHUNK coords (see sentKey) while ex/ez
+            // above are block coords — shift, don't reuse directly.
+            const now_ms = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
+            if (conn.rescue_cell_x != ex or conn.rescue_cell_z != ez or now_ms - conn.rescue_window_ms > 10_000) {
+                conn.rescue_cell_x = ex;
+                conn.rescue_cell_z = ez;
+                conn.rescue_n = 1;
+                conn.rescue_window_ms = now_ms;
+            } else {
+                conn.rescue_n += 1;
+                if (conn.rescue_n >= 3) {
+                    conn.rescue_n = 0;
+                    _ = conn.sent.remove(Conn.sentKey(@divFloor(ex, 16), @divFloor(ez, 16)));
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+
     fn tickViewerOne(self: *Server, vc: *ViewerCtx, e: RegistryEntry) void {
         const PresentCtx = struct {
             viewer: *Conn,
@@ -4723,16 +5728,10 @@ pub const Server = struct {
             if (stale and !e.conn.dead) {
                 if (is_login) {
                     var db: [128]u8 = undefined;
-                    const id: i32 = @intFromEnum(ids.LoginClient.disconnect);
-                    var payload: [120]u8 = undefined;
-                    var w = codec.PacketWriter.init(&payload);
-                    w.writeString("{\"text\":\"Login timed out\"}") catch {};
-                    if (codec.framePacket(id, w.written(), &db)) |f| {
-                        e.conn.queueFramed(f) catch {};
-                    } else |_| {}
+                    queueBuilt(e.conn, packets.frameLoginDisconnect("{\"text\":\"Login timed out\"}", &db));
                 }
-                e.conn.dead = true;
-                e.conn.close_after_flush = true;
+                sealConn(e, self.io);
+                return;
             }
             const drop = e.conn.dead;
             e.conn.lock.unlock();
@@ -4747,21 +5746,19 @@ pub const Server = struct {
         const idle_min = self.cfg.load().idle_timeout_min;
         self.state_lock.unlock();
         if (idle_min > 0 and !e.conn.dead and e.conn.last_active_ms > 0 and
-            vc.now_ms - e.conn.last_active_ms > @as(i64, idle_min) * 60000)
+            vc.now_ms - e.conn.last_active_ms > @as(i64, idle_min) * ms_per_min)
         {
             var db: [128]u8 = undefined;
-            var payload: [96]u8 = undefined;
-            var w = codec.PacketWriter.init(&payload);
-            w.writeString("{\"text\":\"You have been idle for too long!\"}") catch {};
-            if (codec.framePacket(@intFromEnum(ids.PlayClient.disconnect), w.written(), &db)) |f| {
-                e.conn.queueFramed(f) catch {};
-            } else |_| {}
-            e.conn.dead = true;
-            e.conn.close_after_flush = true;
+            queueBuilt(e.conn, packets.frameDisconnect("{\"text\":\"You have been idle for too long!\"}", &db));
+            sealConn(e, self.io);
+            return;
+        }
+        // A closing connection (kick/timeout/ping-done) takes no new
+        // queued output: the transport drains its final message(s) and
+        // closes it (flush-then-close). Feeding it here would keep a
+        // closing conn alive forever on async transports.
+        if (e.conn.close_after_flush) {
             e.conn.lock.unlock();
-            // One output path (blocking: to the socket; async: the worker).
-            flushEntry(e, self.io);
-            closeEntry(e, self.io);
             return;
         }
         const tod = self.time_of_day.load(.acquire);
@@ -4771,14 +5768,28 @@ pub const Server = struct {
         };
         const timed_out = action == .timeout;
         if (!timed_out) {
-            // Hunger + hazards before visibility (death gates pickup).
+            // Burial rescue before hunger/hazards read the position: the
+            // login rescue is one-shot and hole-blind, so adopted hole
+            // falls, away-burials, and drifted terrain can leave a player
+            // embedded past it. Returns true on rescue (env scan below is
+            // one tick stale — skip it so a ghost suffocation hit can't
+            // kill a just-freed player).
             var died_cause: ?DeathCause = null;
+            const rescued = self.rescueEmbedded(e.conn);
             if (hungerTick(e.conn, self.config.difficulty)) |c| died_cause = c;
-            if (died_cause == null) {
-                for (vc.players, 0..) |p, i| {
-                    if (p.eid != e.conn.eid or i >= vc.envs.len) continue;
-                    if (envTick(e.conn, vc.envs[i].water, vc.envs[i].lava, vc.envs[i].suff, vc.envs[i].cactus)) |c| died_cause = c;
-                    break;
+            // Food/drink use countdown (32-tick vanilla ItemFood use).
+            e.conn.tickEating();
+            if (died_cause == null and !rescued) {
+                if (envFor(vc, e.conn.eid)) |env| {
+                    // Vanilla resets fallDistance while touching fluid:
+                    // descents while swimming (including surface bobbing
+                    // with eyes out of the water) are not falls, so
+                    // walking out of the water can't cash in phantom
+                    // damage. The serve thread consumes the flag in
+                    // setPos; the tick owns it (same lock as haz_*).
+                    e.conn.in_fluid = env.in_fluid;
+                    if (env.in_fluid) e.conn.fall_acc = 0;
+                    if (envTick(e.conn, env.water, env.lava, env.suff, env.cactus)) |c| died_cause = c;
                 }
             }
             if (died_cause == null and !e.conn.is_dead and e.conn.pos_y < void_kill_y) {
@@ -4786,9 +5797,7 @@ pub const Server = struct {
                 e.conn.health = 0;
                 e.conn.is_dead = true;
                 var hb: [32]u8 = undefined;
-                if (packets.frameUpdateHealth(0, e.conn.food, e.conn.saturation, &hb)) |f| {
-                    e.conn.queueFramed(f) catch {};
-                } else |_| {}
+                queueBuilt(e.conn, packets.frameUpdateHealth(0, e.conn.food, e.conn.saturation, &hb));
                 died_cause = .void;
             }
             if (died_cause) |cause| {
@@ -4813,30 +5822,51 @@ pub const Server = struct {
                         all[0] = fs.in;
                         all[1] = fs.fuel;
                         all[2] = fs.out;
-                        for (9..45) |i| all[i - 6] = e.conn.inv[i];
+                        for (item_mod.main_lo..item_mod.inv_size) |i| all[i - 6] = e.conn.inv[i];
                         const wf = packets.frameWindowItemsAlloc(e.conn.allocator, 2, &all) catch null;
                         if (wf) |f| {
                             defer e.conn.allocator.free(f);
                             e.conn.queueFramed(f) catch {};
                         }
-                        var pb: [16]u8 = undefined;
+                        var pb: [perms_mod.max_name_len]u8 = undefined;
                         const props = [_]struct { p: i16, v: i16 }{
                             .{ .p = 0, .v = @intCast(@min(fs.cook, 32767)) },
                             .{ .p = 1, .v = @intCast(@min(fs.burn, 32767)) },
                             .{ .p = 2, .v = @intCast(@min(fs.total, 32767)) },
                         };
                         for (props) |pr| {
-                            if (packets.frameProgressBar(2, pr.p, pr.v, &pb)) |f| {
-                                e.conn.queueFramed(f) catch {};
-                            } else |_| {}
+                            queueBuilt(e.conn, packets.frameProgressBar(2, pr.p, pr.v, &pb));
                         }
+                        break;
+                    }
+                }
+            }
+            // Brewing-stand window sync (open window 7 at a snapped stand).
+            if (e.conn.open_win) |ow| {
+                if (ow.id == 7) {
+                    for (vc.brew_snaps) |bs| {
+                        if (bs.x != ow.x or bs.y != ow.y or bs.z != ow.z) continue;
+                        // 40 slots: 0-2 bottles, 3 ingredient, 4-39 alias inv 9..44.
+                        var all: [40]?item_mod.Stack = [_]?item_mod.Stack{null} ** 40;
+                        all[0] = bs.bottles[0];
+                        all[1] = bs.bottles[1];
+                        all[2] = bs.bottles[2];
+                        all[3] = bs.ingredient;
+                        for (item_mod.main_lo..item_mod.inv_size) |i| all[i - 5] = e.conn.inv[i];
+                        const wf = packets.frameWindowItemsAlloc(e.conn.allocator, 7, &all) catch null;
+                        if (wf) |f| {
+                            defer e.conn.allocator.free(f);
+                            e.conn.queueFramed(f) catch {};
+                        }
+                        var pb: [perms_mod.max_name_len]u8 = undefined;
+                        queueBuilt(e.conn, packets.frameProgressBar(7, 0, @intCast(@min(bs.brew, 32767)), &pb));
                         break;
                     }
                 }
             }
             var pctx = PresentCtx{ .viewer = e.conn, .range_blocks = @as(f64, @floatFromInt(self.view_distance)) * 16.0 + 16.0 };
             const r0 = std.Io.Timestamp.now(self.io, .awake);
-            entity.reconcileViewer(e.conn, conn_sink.bind(e.conn), vc.players, vc.mobs, vc.items, vc.claims, present, &pctx) catch {};
+            entity.reconcileViewer(e.conn, conn_sink.bind(e.conn), vc.players, vc.mobs, vc.items, vc.potions, vc.claims, present, &pctx) catch {};
             const r1 = std.Io.Timestamp.now(self.io, .awake);
             vc.reconcile_ns.* += @intCast(@max(0, r0.durationTo(r1).nanoseconds));
         }
@@ -4847,14 +5877,26 @@ pub const Server = struct {
         // "flush" the acceptance criteria measure; the entity
         // reconcile above is counted separately (it is O(players^2)
         // and belongs to Phase C's region work).
-        const f0 = std.Io.Timestamp.now(self.io, .awake);
-        flushEntry(e, self.io);
-        const f1 = std.Io.Timestamp.now(self.io, .awake);
-        vc.send_ns.* += @intCast(@max(0, f0.durationTo(f1).nanoseconds));
+        //
+        // Read-timeout kills skip the flush (close-only): the peer is
+        // provably silent (30s, keepalives unanswered), so the "Timed
+        // out" screen has nobody to reach — and flushing a dead
+        // black-hole peer's outbox (mid-burst megabytes) wedges the
+        // ticker in writeAll for TCP-timeout minutes, stalling every
+        // other conn's ticks behind it.
+        if (!timed_out) {
+            const f0 = std.Io.Timestamp.now(self.io, .awake);
+            flushEntry(e, self.io);
+            const f1 = std.Io.Timestamp.now(self.io, .awake);
+            vc.send_ns.* += @intCast(@max(0, f0.durationTo(f1).nanoseconds));
+        }
         if (timed_out) closeEntry(e, self.io);
     }
 
     pub fn tickOnce(self: *Server, now_ms: i64) void {
+        // Batched join fan-out first: one combined player-list + chat
+        // burst per tick instead of one O(players) fan-out per login.
+        self.drainAnnounces();
         const age = self.world_age.fetchAdd(20, .acq_rel) + 20;
         // doDaylightCycle gates the clock (world age always advances).
         self.state_lock.lock();
@@ -4871,8 +5913,9 @@ pub const Server = struct {
         self.tickWeather();
         self.tickLightning();
         self.tickEffects();
+        self.pollPregen(now_ms);
 
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
 
@@ -4891,6 +5934,32 @@ pub const Server = struct {
             p.z = e.conn.pos_z;
             p.yaw = e.conn.yaw;
             p.pitch = e.conn.pitch;
+            // Hazard sweep bookkeeping: the env scan sweeps the movement
+            // bounding box since the last sample, so a cactus crossed —
+            // even a round trip — between 1Hz ticks still hurts. First
+            // sample degenerates to the current position (point check).
+            if (e.conn.haz_set) {
+                p.hx0 = e.conn.haz_min_x;
+                p.hy0 = e.conn.haz_min_y;
+                p.hz0 = e.conn.haz_min_z;
+                p.hx1 = e.conn.haz_max_x;
+                p.hy1 = e.conn.haz_max_y;
+                p.hz1 = e.conn.haz_max_z;
+            } else {
+                p.hx0 = e.conn.pos_x;
+                p.hy0 = e.conn.pos_y;
+                p.hz0 = e.conn.pos_z;
+                p.hx1 = e.conn.pos_x;
+                p.hy1 = e.conn.pos_y;
+                p.hz1 = e.conn.pos_z;
+            }
+            e.conn.haz_min_x = e.conn.pos_x;
+            e.conn.haz_min_y = e.conn.pos_y;
+            e.conn.haz_min_z = e.conn.pos_z;
+            e.conn.haz_max_x = e.conn.pos_x;
+            e.conn.haz_max_y = e.conn.pos_y;
+            e.conn.haz_max_z = e.conn.pos_z;
+            e.conn.haz_set = true;
             e.conn.lock.unlock();
             players[n_players] = p;
             n_players += 1;
@@ -4957,7 +6026,7 @@ pub const Server = struct {
                     self.pig_cooldown -= 1;
                 }
             }
-            if (want_pig) {
+            if (want_pig and self.canSpawnMob(entity.MOB_PIG)) {
                 const id = self.eid_counter.fetchAdd(1, .acq_rel);
                 // Owned by its spawn cell's region from birth.
                 const srid = tick_mod.regionIdFor(0, @as(f64, @floatFromInt(self.config.spawn_x)) + 2.5, @as(f64, @floatFromInt(self.config.spawn_z)) + 2.5);
@@ -5034,6 +6103,31 @@ pub const Server = struct {
             it.age +|= 20;
             if (it.delay >= 20) it.delay -= 20 else it.delay = 0;
         }
+        // Toss physics (vanilla EntityItem arc, jar `xk.onUpdate`): fresh
+        // drops carry motion and integrate 20 substeps per 1Hz tick
+        // (gravity 0.04, drag 0.98, ground bounce -0.5 + 0.7 horizontal
+        // friction, landing on first-solid-top + 0.125). A 0.2 pop lands
+        // within ~10 substeps; settled items go static (no tick work, no
+        // move broadcasts). Over-void items fall until y < -64, then
+        // despawn like vanilla.
+        if (self.world) |pool| {
+            var ii: usize = 0;
+            while (ii < self.items.items.len) {
+                const it = &self.items.items[ii];
+                if (it.vx == 0 and it.vy == 0 and it.vz == 0) {
+                    ii += 1;
+                    continue;
+                }
+                self.integrateItemToss(pool, it) catch {};
+                if (it.y < -64.0) {
+                    const dead = self.items.swapRemove(ii);
+                    var s: ?item_mod.Stack = dead.stack;
+                    item_mod.freeStack(self.gpa, &s);
+                    continue;
+                }
+                ii += 1;
+            }
+        }
         var mi2: usize = 0;
         while (mi2 < self.items.items.len) {
             var mj: usize = mi2 + 1;
@@ -5043,7 +6137,12 @@ pub const Server = struct {
                     const dead = self.items.swapRemove(mj);
                     var s: ?item_mod.Stack = dead.stack;
                     item_mod.freeStack(self.gpa, &s);
+                    // Survivor grew: refresh trackers (see spawnItem).
+                    self.broadcastItemMeta(self.items.items[mi2].id, self.items.items[mi2].stack);
                 } else if (self.items.items[mj].tryMerge(&self.items.items[mi2])) {
+                    // Survivor (mj) grew: refresh trackers before the
+                    // swapRemove below moves it (see spawnItem).
+                    self.broadcastItemMeta(self.items.items[mj].id, self.items.items[mj].stack);
                     const dead = self.items.swapRemove(mi2);
                     var s: ?item_mod.Stack = dead.stack;
                     item_mod.freeStack(self.gpa, &s);
@@ -5054,6 +6153,55 @@ pub const Server = struct {
                 }
             }
             if (!consumed) mi2 += 1;
+        }
+        // Splash potions: age, then arc-integrate on pool worlds (block or
+        // direct-player impact), apply on impact, despawn on void/age.
+        // Impacts fan out after ent_lock releases (conn locks never nest
+        // under ent_lock — the lethal-PvP rule).
+        var impacts: [256]PotionImpact = undefined;
+        var n_impacts: usize = 0;
+        for (self.potions.items) |*pot| pot.age +|= 20;
+        if (self.world) |pool| {
+            var pi: usize = 0;
+            while (pi < self.potions.items.len) {
+                const pot = &self.potions.items[pi];
+                const hit = self.integratePotionArc(pool, pot, players[0..n_players]) catch -2;
+                if (hit == -2) {
+                    if (pot.y < -64.0 or pot.age >= 200) {
+                        _ = self.potions.swapRemove(pi);
+                        continue;
+                    }
+                    pi += 1;
+                    continue;
+                }
+                // Impact: full duration for the direct hit, (1 - d/4)
+                // falloff floored to whole seconds for everyone else in
+                // radius; instant health/harm apply full to the radius.
+                if (profile.game.potion_data.effectFor(pot.damage)) |ap| {
+                    for (players[0..n_players]) |p| {
+                        const dx = pot.x - p.x;
+                        const dy = pot.y - (p.y + 1.0);
+                        const dz = pot.z - p.z;
+                        const d = @sqrt(dx * dx + dy * dy + dz * dz);
+                        const secs = profile.game.potion_data.splashSeconds(ap.seconds, d, hit == p.eid);
+                        if (secs == 0) continue;
+                        if (n_impacts < impacts.len) {
+                            impacts[n_impacts] = .{ .eid = p.eid, .a6 = ap.a6, .seconds = secs, .amp = ap.amp };
+                            n_impacts += 1;
+                        }
+                    }
+                }
+                _ = self.potions.swapRemove(pi);
+            }
+        } else {
+            var pi: usize = 0;
+            while (pi < self.potions.items.len) {
+                if (self.potions.items[pi].age >= 200) {
+                    _ = self.potions.swapRemove(pi);
+                    continue;
+                }
+                pi += 1;
+            }
         }
         var item_snaps: [Server.max_items]entity.ItemSnap = undefined;
         var n_items: usize = 0;
@@ -5077,10 +6225,32 @@ pub const Server = struct {
                 // degrades to tagless metadata rather than dropping the item.
                 .nbt = if (it.stack.nbt) |n| self.gpa.dupe(u8, n) catch null else null,
                 .can_pickup = it.delay == 0,
+                .vx = it.vx,
+                .vy = it.vy,
+                .vz = it.vz,
             };
             n_items += 1;
         }
+        var potion_snaps: [256]entity.PotionSnap = undefined;
+        var n_potions: usize = 0;
+        for (self.potions.items) |pot| {
+            if (n_potions >= potion_snaps.len) break;
+            potion_snaps[n_potions] = .{
+                .id = pot.id,
+                .x = pot.x,
+                .y = pot.y,
+                .z = pot.z,
+                .damage = pot.damage,
+                .vx = pot.vx,
+                .vy = pot.vy,
+                .vz = pot.vz,
+            };
+            n_potions += 1;
+        }
         self.ent_lock.unlock();
+        // Splash impacts fan out with no locks held (conn locks nest
+        // under nothing here; ent_lock already released above).
+        self.applyPotionImpacts(impacts[0..n_impacts]);
         // Mob handoffs ride the target inbox (recorded above, no locks
         // held here). Full-state transfers; the source copy stays until
         // next tick's drain adopts + deletes (delete-at-drain).
@@ -5133,6 +6303,50 @@ pub const Server = struct {
         }
         self.furn_lock.unlock();
 
+        // Brewing stands: 20-tick quanta under brew_lock; snapshot progress
+        // + slots for viewer sync (same NBT-dupe discipline as furnaces).
+        var brew_snaps: [256]BrewSnap = undefined;
+        var n_brew: usize = 0;
+        self.brew_lock.lock();
+        for (self.brews.items) |*b| {
+            var slots = brewing_mod.Slots{ .ingredient = b.ingredient };
+            for (&b.bottles, 0..) |*bt, i| slots.bottles[i] = bt.*;
+            const prev_nbt = [_]?[]const u8{
+                if (b.bottles[0]) |s| s.nbt else null,
+                if (b.bottles[1]) |s| s.nbt else null,
+                if (b.bottles[2]) |s| s.nbt else null,
+                if (b.ingredient) |s| s.nbt else null,
+            };
+            _ = brewing_mod.tick(&slots, &b.brew);
+            for (&b.bottles, 0..) |*bt, i| bt.* = slots.bottles[i];
+            b.ingredient = slots.ingredient;
+            const new_nbt = [_]?[]const u8{
+                if (b.bottles[0]) |s| s.nbt else null,
+                if (b.bottles[1]) |s| s.nbt else null,
+                if (b.bottles[2]) |s| s.nbt else null,
+                if (b.ingredient) |s| s.nbt else null,
+            };
+            for (prev_nbt, new_nbt) |p, n| {
+                const dropped = if (p) |pp| (if (n) |nn| nn.ptr != pp.ptr else true) else false;
+                if (dropped) self.gpa.free(p.?);
+            }
+            if (n_brew >= brew_snaps.len) continue;
+            brew_snaps[n_brew] = .{
+                .x = b.x,
+                .y = b.y,
+                .z = b.z,
+                .brew = b.brew,
+                .bottles = .{
+                    if (b.bottles[0]) |s| .{ .id = s.id, .count = s.count, .damage = s.damage, .nbt = if (s.nbt) |n| self.gpa.dupe(u8, n) catch null else null } else null,
+                    if (b.bottles[1]) |s| .{ .id = s.id, .count = s.count, .damage = s.damage, .nbt = if (s.nbt) |n| self.gpa.dupe(u8, n) catch null else null } else null,
+                    if (b.bottles[2]) |s| .{ .id = s.id, .count = s.count, .damage = s.damage, .nbt = if (s.nbt) |n| self.gpa.dupe(u8, n) catch null else null } else null,
+                },
+                .ingredient = if (b.ingredient) |s| .{ .id = s.id, .count = s.count, .damage = s.damage, .nbt = if (s.nbt) |n| self.gpa.dupe(u8, n) catch null else null } else null,
+            };
+            n_brew += 1;
+        }
+        self.brew_lock.unlock();
+
         // K1 redstone tick: drain scheduled entries (button release,
         // repeater eval, ore fade, torch recheck) + poll pressure plates.
         // World work under world_lock; broadcasts after (furnace pattern).
@@ -5147,6 +6361,7 @@ pub const Server = struct {
             if (self.world) |pool| self.loadRedstone(pool, now_rs);
             if (self.world) |pool| {
                 var w = Server.RsWorld{ .pool = pool, .alloc = self.gpa, .changes = &rs_changes };
+                defer w.deinit();
                 var p_ents: [256]redstone_mod.Ent = undefined;
                 var m_ents: [256]redstone_mod.Ent = undefined;
                 var i_ents: [256]redstone_mod.Ent = undefined;
@@ -5177,8 +6392,8 @@ pub const Server = struct {
                 );
             }
             self.world_lock.unlock();
-            if (self.world) |pool| {
-                self.flushRsBatch(pool, rs_changes, rs_sounds, rs_actions);
+            if (self.world) |_| {
+                self.flushRsBatch(rs_changes, rs_sounds, rs_actions);
             }
         }
 
@@ -5204,13 +6419,26 @@ pub const Server = struct {
                     envs[i].water = b.id == game_ids.flowing_water or b.id == game_ids.water;
                     envs[i].suff = view.isOpaqueCube(b.id);
                     if (b.id == game_ids.flowing_lava or b.id == game_ids.lava) envs[i].lava = true;
+                    // Fluid contact is eyes OR feet (vanilla checks the
+                    // whole body): a surface swimmer breathes air but is
+                    // still in the water for fall-distance purposes.
+                    if (envs[i].water or envs[i].lava) envs[i].in_fluid = true;
                 }
                 if (view.peekBlock(pool, self.gpa, ex, feet, ez) catch null) |b| {
-                    if (b.id == game_ids.flowing_lava or b.id == game_ids.lava) envs[i].lava = true;
+                    if (b.id == game_ids.flowing_water or b.id == game_ids.water or
+                        b.id == game_ids.flowing_lava or b.id == game_ids.lava)
+                    {
+                        if (b.id == game_ids.flowing_lava or b.id == game_ids.lava) envs[i].lava = true;
+                        envs[i].in_fluid = true;
+                    }
                 }
                 // Cactus contact is AABB overlap, not cell identity: brushing
                 // past a neighboring cactus hurts (vanilla collision box).
-                envs[i].cactus = self.touchesCactus(pool, p.x, p.y, p.z);
+                // The segment sweep catches cacti crossed between 1Hz
+                // samples (a sprint covers a cell in ~0.2s); standing
+                // still degenerates to the point check.
+                envs[i].cactus = self.touchesCactus(pool, p.x, p.y, p.z) or
+                    self.segmentTouchesCactus(pool, p.hx0, p.hy0, p.hz0, p.hx1, p.hy1, p.hz1);
             }
         }
         var deaths: std.ArrayList(DeathInfo) = .empty;
@@ -5233,8 +6461,10 @@ pub const Server = struct {
                 .players = players[0..n_players],
                 .mobs = mobs[0..n_mobs],
                 .items = item_snaps[0..n_items],
+                .potions = potion_snaps[0..n_potions],
                 .envs = envs[0..],
                 .furn_snaps = furn_snaps[0..n_furn],
+                .brew_snaps = brew_snaps[0..n_brew],
                 .deaths = &deaths,
                 .claims = &claims,
                 .reconcile_ns = &reconcile_ns,
@@ -5278,8 +6508,10 @@ pub const Server = struct {
                     .players = players[0..n_players],
                     .mobs = mobs[0..n_mobs],
                     .items = item_snaps[0..n_items],
+                    .potions = potion_snaps[0..n_potions],
                     .envs = envs[0..],
                     .furn_snaps = furn_snaps[0..n_furn],
+                    .brew_snaps = brew_snaps[0..n_brew],
                     .now_ms = now_ms,
                     .age = age,
                     .out_deaths = out_deaths[0..build.n_groups],
@@ -5329,8 +6561,10 @@ pub const Server = struct {
                             .players = players[0..n_players],
                             .mobs = mobs[0..n_mobs],
                             .items = item_snaps[0..n_items],
+                            .potions = potion_snaps[0..n_potions],
                             .envs = envs[0..],
                             .furn_snaps = furn_snaps[0..n_furn],
+                            .brew_snaps = brew_snaps[0..n_brew],
                             .now_ms = now_ms,
                             .age = age,
                             .cpu = if (n_workers >= 2) cpus[spawned] else null,
@@ -5394,7 +6628,7 @@ pub const Server = struct {
                 const f = packets.frameDestroyEntitiesFramed(&[_]i32{id}, &fb) catch continue;
                 self.broadcastToTrackers(id, f);
             }
-            var cb: [16]u8 = undefined;
+            var cb: [perms_mod.max_name_len]u8 = undefined;
             var i: usize = 0;
             while (i < claims.n) : (i += 1) {
                 const id = claims.ids[i];
@@ -5458,6 +6692,9 @@ pub const Server = struct {
         }
         for (deaths.items) |di| self.savePlayer(di.conn);
         deaths.deinit(self.gpa);
+        // Chest rows: flush click-dirty chests every tick (<=1 s crash
+        // window; the row writes are a few hundred bytes each).
+        self.flushDirtyChests();
         // Periodic autosave (WAL-durable; save-all/stop flush SSTs on top).
         // Counter rolls over naturally; the modulo stays aligned.
         self.tick_counter += 1;
@@ -5473,6 +6710,8 @@ pub const Server = struct {
     /// Material approximation of per-block `stepSound`: wood, grass
     /// (leaves use grass in vanilla), gravel, sand, glass (ice breaks
     /// like glass), cloth, snow, stone default.
+    // ---- entity broadcasts, combat, survival ----
+
     fn isLiquid(id: game_ids.Id) bool {
         return id == .water or id == .flowing_water or id == .lava or id == .flowing_lava;
     }
@@ -5503,7 +6742,7 @@ pub const Server = struct {
     pub fn broadcastSound(self: *Server, exclude: ?*Conn, sound: []const u8, x: f64, y: f64, z: f64, volume: f32, pitch: f32) void {
         var sb: [512]u8 = undefined;
         const f = packets.frameSoundEffect(sound, x, y, z, volume, pitch, &sb) catch return;
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         for (snap) |e| {
@@ -5513,7 +6752,7 @@ pub const Server = struct {
             const dx = x - e.conn.pos_x;
             const dy = y - e.conn.pos_y;
             const dz = z - e.conn.pos_z;
-            const near = dx * dx + dy * dy + dz * dz <= 256.0;
+            const near = dx * dx + dy * dy + dz * dz <= hear_radius_sq;
             if (play and near) e.conn.queueFramed(f) catch {};
             e.conn.lock.unlock();
         }
@@ -5524,9 +6763,9 @@ pub const Server = struct {
     /// vanilla client's own piston animation + derived final blocks.
     pub fn broadcastBlockAction(self: *Server, x: i32, y: u16, z: i32, byte1: u8, byte2: u8, id: game_ids.Id) void {
         var fb: [24]u8 = undefined;
-        const f = packets.frameBlockAction(x, y, z, byte1, byte2, wire.toWire(id), &fb) catch return;
+        const f = packets.frameBlockAction(x, y, z, byte1, byte2, id, &fb) catch return;
         const key = Conn.sentKey(@divFloor(x, 16), @divFloor(z, 16));
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         for (snap) |e| {
@@ -5544,7 +6783,7 @@ pub const Server = struct {
         var fb: [32]u8 = undefined;
         const f = try packets.frameBlockChange(x, y, z, id, meta, &fb);
         const key = Conn.sentKey(@divFloor(x, 16), @divFloor(z, 16));
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         for (snap) |e| {
@@ -5556,6 +6795,53 @@ pub const Server = struct {
             }
             e.conn.lock.unlock();
             flushEntry(e, self.io);
+        }
+    }
+
+    /// Targeted 0x23 truth to one viewer (dig negative-ack): the serve
+    /// thread re-read a refused dig's cell and it is still solid, so send
+    /// the digger the true cell. Same sent-set gate as the broadcast (a
+    /// viewer that never got the column holds no stale prediction), plus
+    /// the play-state check from sendJsonPlayer. Queued + flushed at once:
+    /// the correction must not wait for the next tick behind bulks.
+    fn sendBlockChangeTo(self: *Server, conn: *Conn, x: i32, y: u8, z: i32, id: game_ids.Id, meta: u4) void {
+        var fb: [32]u8 = undefined;
+        const f = packets.frameBlockChange(x, y, z, id, meta, &fb) catch return;
+        const key = Conn.sentKey(@divFloor(x, 16), @divFloor(z, 16));
+        var batch: [max_fanout]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        for (snap) |e| {
+            if (e.conn != conn) continue;
+            e.conn.lock.lock();
+            const ok = e.conn.state == .play and !e.conn.dead and e.conn.sent.contains(key);
+            if (ok) e.conn.queueFramed(f) catch {};
+            e.conn.lock.unlock();
+            if (ok) flushEntry(e, self.io);
+            return;
+        }
+    }
+
+    /// Targeted 0x23 truth to the ACTING viewer, bypassing the sent-set
+    /// gate. Placement NACKs must reach the placer even when the column
+    /// never completed streaming (missing-chunk / teleport edge): the
+    /// click packet itself proves a prediction exists to clear, while the
+    /// gate's rationale (a viewer that never got the column holds nothing
+    /// stale) only covers bystanders. Play-state/dead checks stay.
+    fn sendBlockChangeToActor(self: *Server, conn: *Conn, x: i32, y: u8, z: i32, id: game_ids.Id, meta: u4) void {
+        var fb: [32]u8 = undefined;
+        const f = packets.frameBlockChange(x, y, z, id, meta, &fb) catch return;
+        var batch: [max_fanout]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        for (snap) |e| {
+            if (e.conn != conn) continue;
+            e.conn.lock.lock();
+            const ok = e.conn.state == .play and !e.conn.dead;
+            if (ok) e.conn.queueFramed(f) catch {};
+            e.conn.lock.unlock();
+            if (ok) flushEntry(e, self.io);
+            return;
         }
     }
 
@@ -5571,7 +6857,7 @@ pub const Server = struct {
         if (mask == 0) return;
         const cx = @divFloor(x, 16);
         const cz = @divFloor(z, 16);
-        const offs = [_]struct { dx: i32, dz: i32 }{
+        const offs = [_]ColOffset{
             .{ .dx = -1, .dz = 0 },
             .{ .dx = 1, .dz = 0 },
             .{ .dx = 0, .dz = -1 },
@@ -5581,7 +6867,7 @@ pub const Server = struct {
             .{ .dx = -1, .dz = 1 },
             .{ .dx = 1, .dz = 1 },
         };
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         for (offs, 0..) |o, i| {
@@ -5602,10 +6888,10 @@ pub const Server = struct {
 
     /// Broadcast an arm-swing 0x0B to viewers of (cx,cz), excluding originator.
     pub fn broadcastArmSwing(self: *Server, exclude: ?*Conn, cx: i32, cz: i32, eid: i32, anim: i8) !void {
-        var fb: [16]u8 = undefined;
+        var fb: [24]u8 = undefined;
         const f = try packets.frameAnimation(eid, @bitCast(anim), &fb);
         const key = Conn.sentKey(cx, cz);
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         for (snap) |e| {
@@ -5639,10 +6925,69 @@ pub const Server = struct {
             conn.is_dead = true;
         }
         var hb: [32]u8 = undefined;
-        if (packets.frameUpdateHealth(conn.health, conn.food, conn.saturation, &hb)) |f| {
-            conn.queueFramed(f) catch {};
-        } else |_| {}
+        queueBuilt(conn, packets.frameUpdateHealth(conn.health, conn.food, conn.saturation, &hb));
         return conn.is_dead;
+    }
+
+    /// Blockable damage (melee, fire, lava, cactus): equipped armor
+    /// absorbs per the vanilla formula, then protection EPF (capped at 20),
+    /// then resistance. Equipped pieces wear with the incoming hit and can
+    /// break mid-call (0x2F syncs both). Bypassing sources
+    /// (starve/drown/suffocate/fall/void) call applyPlayerDamage directly.
+    /// Caller holds conn.lock.
+    fn applyBlockedDamage(conn: *Conn, amount: f32, source: profile.game.item_data.EpfSource) bool {
+        const tables = profile.game.item_data;
+        // Dead/creative victims take no damage and wear nothing (vanilla
+        // never reaches damageEntity for them); keep the exact old path.
+        if (conn.is_dead or conn.config.gamemode.isCreative()) return applyPlayerDamage(conn, amount);
+        wearArmor(conn, amount);
+        var dmg = tables.reduceDamage(amount, tables.armorPoints(&conn.inv));
+        var epf: u16 = 0;
+        for (5..9) |s| {
+            const st = conn.inv[s] orelse continue;
+            const nbt = st.nbt orelse continue;
+            var eids: [8]u8 = undefined;
+            var elvls: [8]u8 = undefined;
+            const found = parseEnchList(nbt, &eids, &elvls);
+            for (eids[0..found.n], elvls[0..found.n]) |eid, elvl| {
+                epf += tables.protectionEpf(eid, elvl, source);
+            }
+        }
+        if (epf > 0) dmg = tables.reduceDamage(dmg, @intCast(@min(epf, tables.max_epf)));
+        if (resistanceAmp(conn)) |amp| dmg = tables.reduceDamage(dmg, tables.resistancePoints(amp));
+        return applyPlayerDamage(conn, dmg);
+    }
+
+    /// Resistance (effect 11) amplifier active on the conn, if any.
+    fn resistanceAmp(conn: *Conn) ?u8 {
+        for (conn.effects) |maybe| {
+            const e = maybe orelse continue;
+            if (e.id == 11) return e.amplifier;
+        }
+        return null;
+    }
+
+    /// Vanilla damageArmor: every equipped piece loses wearForHit(incoming)
+    /// durability; pieces past maxDurability break (slot cleared). Worn and
+    /// broken pieces re-sync their 0x2F bar. Caller holds conn.lock.
+    fn wearArmor(conn: *Conn, amount: f32) void {
+        const tables = profile.game.item_data;
+        const w = tables.wearForHit(amount);
+        for (5..9) |s| {
+            const st = conn.inv[s] orelse continue;
+            if (tables.armorSlot(st.id) == null) continue;
+            const worn: i32 = @as(i32, st.damage) + w;
+            if (worn > @as(i32, tables.maxDurability(st.id))) {
+                var gone = conn.inv[s];
+                item_mod.freeStack(conn.allocator, &gone);
+                conn.inv[s] = null;
+            } else {
+                conn.inv[s].?.damage = @intCast(worn);
+            }
+            const f = packets.frameSetSlotAlloc(conn.allocator, 0, @intCast(s), conn.inv[s]) catch continue;
+            defer conn.allocator.free(f);
+            conn.queueFramed(f) catch {};
+        }
     }
 
     /// Owned death-drop payload (inv 45 + cursor; NBT moved, not cloned).
@@ -5660,7 +7005,7 @@ pub const Server = struct {
         dd: ?DeathDrop,
         cause: DeathCause,
         killer_len: usize = 0,
-        killer: [16]u8 = [_]u8{0} ** 16,
+        killer: [perms_mod.max_name_len]u8 = [_]u8{0} ** 16,
         x: f64,
         y: f64,
         z: f64,
@@ -5681,6 +7026,14 @@ pub const Server = struct {
             } else if (difficulty != .peaceful) {
                 conn.food = @max(conn.food - 1, 0);
             }
+            // Hunger audit: per-drumstick income attribution (counters
+            // reset here, so each line accounts exactly one drop). INFO
+            // (not debug): release builds compile debug logs out, and this
+            // line is the only witness for drain-rate reports.
+            std.log.info("hunger drop eid={d}: food={d} sat={d:.1} income(move={d:.1} jump={d:.1} regen={d:.1})", .{ conn.eid, conn.food, conn.saturation, conn.exh_move, conn.exh_jump, conn.exh_regen });
+            conn.exh_move = 0;
+            conn.exh_jump = 0;
+            conn.exh_regen = 0;
             dirty = true;
         }
         var died: ?DeathCause = null;
@@ -5689,6 +7042,7 @@ pub const Server = struct {
                 conn.food_timer = 0;
                 conn.health = @min(conn.health + 1.0, 20.0);
                 conn.addExhaustion(3.0);
+                conn.exh_regen += 3.0;
                 dirty = true;
             }
         } else if (conn.food <= 0) {
@@ -5705,9 +7059,7 @@ pub const Server = struct {
         }
         if (dirty and died == null) {
             var hb: [32]u8 = undefined;
-            if (packets.frameUpdateHealth(conn.health, conn.food, conn.saturation, &hb)) |f| {
-                conn.queueFramed(f) catch {};
-            } else |_| {}
+            queueBuilt(conn, packets.frameUpdateHealth(conn.health, conn.food, conn.saturation, &hb));
         }
         return died;
     }
@@ -5718,61 +7070,132 @@ pub const Server = struct {
     /// once (the old feet/eyes identity check decoded the same chunk twice
     /// and missed every brush-past). Pure pool reads, no world_lock (same
     /// discipline as the eyes/feet checks in the tick env scan).
+    /// Chunk coords pair (cactus-scan dedup list).
+    const ChunkRef = struct { cx: i32, cz: i32 };
+
     fn touchesCactus(self: *Server, pool: *shard_mod.ShardPool, px: f64, py: f64, pz: f64) bool {
         const ex: i32 = @intFromFloat(@floor(px));
         const ez: i32 = @intFromFloat(@floor(pz));
         const feet: i32 = @intFromFloat(@floor(py));
-        var chunks: [4]struct { cx: i32, cz: i32 } = undefined;
+        var chunks: [4]ChunkRef = undefined;
         var n_chunks: usize = 0;
         for ([_]i32{ -1, 0, 1 }) |dx| {
             for ([_]i32{ -1, 0, 1 }) |dz| {
                 const cx = @divFloor(ex + dx, 16);
                 const cz = @divFloor(ez + dz, 16);
-                var seen = false;
-                for (chunks[0..n_chunks]) |c| {
-                    if (c.cx == cx and c.cz == cz) {
-                        seen = true;
-                        break;
-                    }
-                }
-                if (seen) continue;
+                if (haveChunk(chunks[0..n_chunks], cx, cz)) continue;
                 if (n_chunks >= chunks.len) continue; // unreachable (≤4), fail closed
                 chunks[n_chunks] = .{ .cx = cx, .cz = cz };
                 n_chunks += 1;
+                if (self.chunkTouchesCactus(pool, cx, cz, ex, ez, feet, px, py, pz)) return true;
+            }
+        }
+        return false;
+    }
+
+    /// True when the chunk list already holds (cx,cz).
+    fn haveChunk(chunks: []const ChunkRef, cx: i32, cz: i32) bool {
+        for (chunks) |c| if (c.cx == cx and c.cz == cz) return true;
+        return false;
+    }
+
+    /// Scan one chunk's 3x3x2 column neighborhood for a touching cactus.
+    fn chunkTouchesCactus(self: *Server, pool: *shard_mod.ShardPool, cx: i32, cz: i32, ex: i32, ez: i32, feet: i32, px: f64, py: f64, pz: f64) bool {
+        const raw = pool.get(self.gpa, store_mod.encodeKey(0, cx, cz)) catch return false;
+        if (raw == null) return false;
+        defer self.gpa.free(raw.?);
+        const ch = chunk_mod.Chunk.decode(self.gpa, raw.?) catch return false;
+        defer ch.destroy(self.gpa);
+        var ddx: i32 = -1;
+        while (ddx <= 1) : (ddx += 1) {
+            var ddz: i32 = -1;
+            while (ddz <= 1) : (ddz += 1) {
+                const bx = ex + ddx;
+                const bz = ez + ddz;
+                if (@divFloor(bx, 16) != cx or @divFloor(bz, 16) != cz) continue;
+                var dy: i32 = 0;
+                while (dy <= 1) : (dy += 1) {
+                    if (cellTouchesCactus(ch, bx, feet + dy, bz, px, py, pz)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// True when the cell holds a cactus overlapping the player.
+    fn cellTouchesCactus(ch: *chunk_mod.Chunk, bx: i32, by: i32, bz: i32, px: f64, py: f64, pz: f64) bool {
+        if (by < 0 or by > 255) return false;
+        const yu: u8 = @intCast(by);
+        const s = ch.sections[@as(usize, yu) >> 4] orelse return false;
+        const li: usize = chunk_mod.Section.index(chunk_mod.Chunk.localCoord(bx), @truncate(yu & 15), chunk_mod.Chunk.localCoord(bz));
+        if (s.blocks[li] != game_ids.cactus) return false;
+        return interaction_mod.cactusOverlapsPlayer(bx, by, bz, px, py, pz);
+    }
+
+    /// Swept cactus check: the union of the player AABB at the previous
+    /// and current hazard sample. Vanilla collides every 1/20s; our 1Hz
+    /// tick samples positions a sprint moves ~5 blocks apart, so a
+    /// point check misses most brush-pasts (crossing a cactus cell takes
+    /// ~0.2s). Segments over 10 blocks (teleport/respawn/login jumps)
+    /// fall back to the endpoint check — landing inside a cactus is
+    /// caught by the point check and the ticks after it.
+    fn segmentTouchesCactus(self: *Server, pool: *shard_mod.ShardPool, x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64) bool {
+        const dx = x1 - x0;
+        const dy = y1 - y0;
+        const dz = z1 - z0;
+        if (dx * dx + dy * dy + dz * dz > 100.0) return self.touchesCactus(pool, x1, y1, z1);
+        const hw = interaction_mod.player_half_width;
+        const ph = interaction_mod.player_height;
+        const lo_x = @min(x0, x1) - hw;
+        const hi_x = @max(x0, x1) + hw;
+        const lo_y = @min(y0, y1);
+        const hi_y = @max(y0, y1) + ph;
+        const lo_z = @min(z0, z1) - hw;
+        const hi_z = @max(z0, z1) + hw;
+        // Candidate cells: swept box grown by one cell (the cactus box
+        // is inset inside its cell; the exact test below filters).
+        // Spans stay small (≤10-block segments); clamp defensively so a
+        // corrupt/NaN sample can't turn this into a world scan.
+        const bx0 = @as(i32, @intFromFloat(@floor(lo_x))) - 1;
+        const bx1 = @as(i32, @intFromFloat(@floor(hi_x))) + 1;
+        var by0 = @as(i32, @intFromFloat(@floor(lo_y))) - 1;
+        var by1 = @as(i32, @intFromFloat(@floor(hi_y))) + 1;
+        const bz0 = @as(i32, @intFromFloat(@floor(lo_z))) - 1;
+        const bz1 = @as(i32, @intFromFloat(@floor(hi_z))) + 1;
+        if (bx1 - bx0 > 24 or by1 - by0 > 24 or bz1 - bz0 > 24) return self.touchesCactus(pool, x1, y1, z1);
+        if (by0 < 0) by0 = 0;
+        if (by1 > 255) by1 = 255;
+        // One decode per overlapped chunk (same discipline as the
+        // per-tick chunk reads: pool.get + decode, freed after use).
+        var cx = @divFloor(bx0, 16);
+        while (cx <= @divFloor(bx1, 16)) : (cx += 1) {
+            var cz = @divFloor(bz0, 16);
+            while (cz <= @divFloor(bz1, 16)) : (cz += 1) {
                 const raw = pool.get(self.gpa, store_mod.encodeKey(0, cx, cz)) catch continue;
                 if (raw == null) continue;
-                const ch = chunk_mod.Chunk.decode(self.gpa, raw.?) catch {
-                    self.gpa.free(raw.?);
-                    continue;
-                };
-                var hit = false;
-                var ddx: i32 = -1;
-                while (ddx <= 1 and !hit) : (ddx += 1) {
-                    var ddz: i32 = -1;
-                    while (ddz <= 1 and !hit) : (ddz += 1) {
-                        const bx = ex + ddx;
-                        const bz = ez + ddz;
-                        if (@divFloor(bx, 16) != cx or @divFloor(bz, 16) != cz) continue;
-                        var dy: i32 = 0;
-                        while (dy <= 1 and !hit) : (dy += 1) {
-                            const by = feet + dy;
-                            if (by < 0 or by > 255) continue;
+                defer self.gpa.free(raw.?);
+                const ch = chunk_mod.Chunk.decode(self.gpa, raw.?) catch continue;
+                defer ch.destroy(self.gpa);
+                var bx = bx0;
+                while (bx <= bx1) : (bx += 1) {
+                    if (@divFloor(bx, 16) != cx) continue;
+                    var bz = bz0;
+                    while (bz <= bz1) : (bz += 1) {
+                        if (@divFloor(bz, 16) != cz) continue;
+                        var by = by0;
+                        while (by <= by1) : (by += 1) {
+                            // Exact segment narrowphase: the union box above
+                            // is only the broadphase (it over-approximates
+                            // diagonal paths). A diagonal walk-by must not
+                            // flag a cactus in the unvisited corner.
+                            if (!interaction_mod.segmentHitsCactus(bx, by, bz, x0, y0, z0, x1, y1, z1)) continue;
                             const yu: u8 = @intCast(by);
-                            const si: usize = @as(usize, yu) >> 4;
-                            const s = ch.sections[si] orelse continue;
-                            const li: usize = chunk_mod.Section.index(
-                                @intCast(@as(u4, @truncate(@as(u32, @bitCast(bx & 15))))),
-                                @truncate(yu & 15),
-                                @intCast(@as(u4, @truncate(@as(u32, @bitCast(bz & 15))))),
-                            );
-                            if (s.blocks[li] != game_ids.cactus) continue;
-                            if (interaction_mod.cactusOverlapsPlayer(bx, by, bz, px, py, pz)) hit = true;
+                            const s = ch.sections[@as(usize, yu) >> 4] orelse continue;
+                            const li: usize = chunk_mod.Section.index(chunk_mod.Chunk.localCoord(bx), @truncate(yu & 15), chunk_mod.Chunk.localCoord(bz));
+                            if (s.blocks[li] == game_ids.cactus) return true;
                         }
                     }
                 }
-                ch.destroy(self.gpa);
-                self.gpa.free(raw.?);
-                if (hit) return true;
             }
         }
         return false;
@@ -5797,21 +7220,23 @@ pub const Server = struct {
             conn.air = 300;
             if (!lava and conn.fire_ticks > 0) {
                 conn.fire_ticks -|= 20;
-                if (died == null and applyPlayerDamage(conn, 1.0)) died = .fire; // 1/s burning
+                if (died == null and applyBlockedDamage(conn, 1.0, .fire)) died = .fire; // 1/s burning
             }
         }
         if (died == null and lava and !conn.config.gamemode.isCreative()) {
             conn.fire_ticks = 300; // 15s of fire after the bath
-            if (applyPlayerDamage(conn, 4.0)) died = .lava; // lenient: vanilla is 4/tick
+            if (applyBlockedDamage(conn, 4.0, .fire)) died = .lava; // lenient: vanilla is 4/tick
         }
         if (died == null and suff) {
-            if (applyPlayerDamage(conn, 4.0)) died = .suffocate; // lenient: vanilla is 1/tick
+            // Vanilla is 1.0/hit behind hurt immunity (~2 hits/s), i.e.
+            // ~2 dps; at our 1Hz tick that is 2.0 (4.0 was double).
+            if (applyPlayerDamage(conn, 2.0)) died = .suffocate;
         }
         if (conn.cactus_cd > 0) conn.cactus_cd -= 1;
         if (died == null and cactus and !conn.config.gamemode.isCreative() and conn.cactus_cd == 0) {
             conn.cactus_cd = 1; // 1Hz tick: hit every touching tick (~1/s;
             // vanilla hurt-resistance gates to ~1/0.5s, quantized here)
-            if (applyPlayerDamage(conn, 1.0)) died = .cactus;
+            if (applyBlockedDamage(conn, 1.0, .general)) died = .cactus;
         }
         return died;
     }
@@ -5841,9 +7266,12 @@ pub const Server = struct {
     /// Move every stack out of the victim's inventory + cursor (clears both).
     /// Caller MUST hold conn.lock. Always call on death (vanilla drops all).
     fn collectDeathDrops(conn: *Conn) DeathDrop {
+        // A drag in progress dies with its owner (the cursor is dropped
+        // below; a stale paint set must not survive respawn).
+        conn.drag.reset();
         var dd = DeathDrop{ .eid = conn.eid };
         for (&conn.inv, 0..) |*slot, i| {
-            if (i < 9 or i > 44) continue; // main 9..44 only (craft/armor vanish)
+            if (i < 5 or i > 44) continue; // armor 5..8 + main 9..44 drop (crafting 0..4 vanishes)
             if (slot.*) |_| {
                 dd.stacks[dd.n] = slot.*;
                 slot.* = null;
@@ -5891,10 +7319,11 @@ pub const Server = struct {
             const o = offs[oi];
             oi += 1;
             // NBT duped into server ownership (victim row keeps none).
-            // spawnItemLive owns locking + instant visibility.
+            // spawnItemLive owns locking + instant visibility. Death drops
+            // pop like break drops (vanilla EntityItem motion, toss stream).
             const owned_nbt: ?[]const u8 = if (st.nbt) |bytes| self.gpa.dupe(u8, bytes) catch null else null;
             const stored = item_mod.Stack{ .id = st.id, .count = st.count, .damage = st.damage, .nbt = owned_nbt };
-            self.spawnItemLive(stored, x + o[0], y + 0.1, z + o[2], 10);
+            self.spawnItemLive(stored, x + o[0], y + 0.1, z + o[2], 10, self.tossPopMotion());
             if (st.nbt) |n| self.gpa.free(n);
             maybe.* = null;
         }
@@ -5921,7 +7350,12 @@ pub const Server = struct {
             if (blk) |b| water = b.id == game_ids.flowing_water or b.id == game_ids.water;
         }
         if (water) return; // splash landing: vanilla resets fallDistance
-        const dmg = @ceil(fall.dist - 3.0);
+        // 1e-3 epsilon: fall distance arrives as f32-summed network steps,
+        // so an exact 5.0-block fall can measure 5.0000005 and ceil() would
+        // flip a whole extra heart at integer boundaries. Vanilla sums its
+        // own physics and never sees this dust; the epsilon restores its
+        // effective thresholds (sub-packet, invisible in real falls).
+        const dmg = @ceil(fall.dist - 3.0 - 1e-3);
         conn.lock.lock();
         const died = applyPlayerDamage(conn, dmg);
         const hp = conn.health;
@@ -5954,7 +7388,222 @@ pub const Server = struct {
         cook: u32 = 0,
     };
 
+    /// Brewing-stand tile entity (server-owned shared state; slots OWNED).
+    /// 400-tick countdown while valid (see brewing_mod); no fuel, no
+    /// output slot (bottles convert in place).
+    const BrewEnt = struct {
+        x: i32,
+        y: u8,
+        z: i32,
+        bottles: [3]?item_mod.Stack = [_]?item_mod.Stack{null} ** 3,
+        ingredient: ?item_mod.Stack = null,
+        brew: u32 = brewing_mod.brew_target,
+    };
+
+    /// Find a brew-stand by block pos. Caller MUST hold brew_lock.
+    fn findBrew(self: *Server, x: i32, y: u8, z: i32) ?*BrewEnt {
+        for (self.brews.items) |*b| {
+            if (b.x == x and b.y == y and b.z == z) return b;
+        }
+        return null;
+    }
+
+    /// Ensure brew-stand state exists (placement + first open). Caller holds brew_lock.
+    fn ensureBrew(self: *Server, x: i32, y: u8, z: i32) void {
+        if (self.findBrew(x, y, z) != null) return;
+        self.brews.append(self.gpa, .{ .x = x, .y = y, .z = z }) catch {};
+    }
+
+    /// Remove brew-stand state, returning owned contents (block break).
+    /// Caller MUST hold brew_lock.
+    fn removeBrew(self: *Server, x: i32, y: u8, z: i32) BrewEnt {
+        var i: usize = 0;
+        while (i < self.brews.items.len) : (i += 1) {
+            const b = &self.brews.items[i];
+            if (b.x == x and b.y == y and b.z == z) {
+                return self.brews.swapRemove(i);
+            }
+        }
+        return .{ .x = x, .y = y, .z = z };
+    }
+
+    /// Chest column (no y lane needed for pair matching).
+    const ChestCol = struct { x: i32, z: i32 };
+    /// Chest cell pos (named: anonymous structs are distinct types per
+    /// scope and can't cross fn boundaries).
+    const ChestPos = struct { x: i32, y: u8, z: i32 };
+    /// Chest tile entity: one entry per chest BLOCK (double halves keep
+    /// their own 27 slots; join/split is logical, moves no data). Slots
+    /// OWNED (gpa). `dirty` marks rows needing the 1 Hz ticker flush.
+    /// `id` is the chest kind (chest vs trapped — pairs only join same
+    /// kind, matched without re-peeking the world).
+    const ChestEnt = struct {
+        x: i32,
+        y: u8,
+        z: i32,
+        id: game_ids.Id,
+        slots: [chest_mod.chest_size]?item_mod.Stack = [_]?item_mod.Stack{null} ** chest_mod.chest_size,
+        dirty: bool = false,
+    };
+
+    /// Find a chest entry by block pos. Caller MUST hold chest_lock.
+    fn findChest(self: *Server, x: i32, y: u8, z: i32) ?*ChestEnt {
+        for (self.chests.items) |*c| {
+            if (c.x == x and c.y == y and c.z == z) return c;
+        }
+        return null;
+    }
+
+    /// Ensure chest state exists (first open): adopt the persisted row,
+    /// else start empty. Caller holds chest_lock; pool reads need no
+    /// world_lock (same discipline as player load). Corrupt rows fail
+    /// closed to empty (chunk-ban posture, see chest.zig).
+    fn ensureChest(self: *Server, pool: *shard_mod.ShardPool, x: i32, y: u8, z: i32, id: game_ids.Id) void {
+        if (self.findChest(x, y, z) != null) return;
+        var ent = ChestEnt{ .x = x, .y = y, .z = z, .id = id };
+        if (chest_mod.loadRow(pool, self.gpa, x, y, z) catch null) |row| {
+            ent.slots = row.slots;
+        }
+        self.chests.append(self.gpa, ent) catch {};
+    }
+
+    /// Remove chest state, returning owned contents (block break).
+    /// Caller MUST hold chest_lock.
+    fn removeChest(self: *Server, x: i32, y: u8, z: i32) ?[chest_mod.chest_size]?item_mod.Stack {
+        var i: usize = 0;
+        while (i < self.chests.items.len) : (i += 1) {
+            const c = &self.chests.items[i];
+            if (c.x == x and c.y == y and c.z == z) {
+                const ent = self.chests.swapRemove(i);
+                return ent.slots;
+            }
+        }
+        return null;
+    }
+
+    /// Chest kind at a cell (air on hole/error/non-chest): lock-free peek
+    /// for close/power paths that only have coords. Pairs only join same
+    /// kind, so a wrong kind simply yields no mate (never a misjoin).
+    fn chestKindAt(self: *Server, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, x: i32, y: u8, z: i32) game_ids.Id {
+        _ = self;
+        const pb = view.peekBlock(pool, allocator, x, y, z) catch return game_ids.air;
+        return (pb orelse return game_ids.air).id;
+    }
+
+    /// Double-chest pair: the exactly-one same-id horizontal neighbor, if
+    /// any (vanilla joins at most one; a sandwiched chest stays single).
+    /// Returns the neighbor coords, or null for a single chest. Caller
+    /// holds world_lock (peekBlock, like the UI routing below).
+    fn chestPair(self: *Server, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, x: i32, y: u8, z: i32, id: game_ids.Id) ?ChestCol {
+        _ = self;
+        var found: ?ChestCol = null;
+        var n: usize = 0;
+        const nb = [_]ChestCol{
+            .{ .x = x - 1, .z = z }, .{ .x = x + 1, .z = z },
+            .{ .x = x, .z = z - 1 }, .{ .x = x, .z = z + 1 },
+        };
+        for (nb) |c| {
+            const pb = view.peekBlock(pool, allocator, c.x, y, c.z) catch continue;
+            const b = pb orelse continue;
+            if (b.id != id) continue;
+            n += 1;
+            found = c;
+        }
+        if (n != 1) return null;
+        return found;
+    }
+
+    /// Live viewer count for a chest cell (conns with an open chest window
+    /// at the pos). Derived per call, never stored — disconnects can't
+    /// leak it. Powers trapped-chest queries and lid-sound edges.
+    fn countChestViewers(self: *Server, x: i32, y: u8, z: i32) usize {
+        var batch: [max_fanout]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        var n: usize = 0;
+        for (snap) |e| {
+            if (!e.conn.lock.tryLock()) continue;
+            const ow = e.conn.open_win;
+            e.conn.lock.unlock();
+            if (ow) |o| {
+                if ((o.id == 5 or o.id == 6) and o.x == x and o.y == y and o.z == z) n += 1;
+            }
+        }
+        return n;
+    }
+
+    /// Live viewer count for an ender-chest block (window 3). Same derived
+    /// discipline as chests (the lid is per-block while contents are
+    /// per-player, exactly like vanilla's shared TE + EnderItems).
+    fn countEnderViewers(self: *Server, x: i32, y: u8, z: i32) usize {
+        var batch: [max_fanout]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        var n: usize = 0;
+        for (snap) |e| {
+            if (!e.conn.lock.tryLock()) continue;
+            const ow = e.conn.open_win;
+            e.conn.lock.unlock();
+            if (ow) |o| {
+                if (o.id == 3 and o.x == x and o.y == y and o.z == z) n += 1;
+            }
+        }
+        return n;
+    }
+
+    /// Trapped-chest power level for redstone (vanilla: 15 while any viewer
+    /// has it open). Counts the PAIR total (jar `ra.f` increments both
+    /// halves on any double open, so dust on either half sees power).
+    /// READ-ONLY query for the redstone owner to call; the chest side
+    /// never pushes power itself (engine boundary). Pool reads need no
+    /// world_lock (same discipline as player load).
+    pub fn trappedPower(self: *Server, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, x: i32, y: u8, z: i32) u4 {
+        var total = self.countChestViewers(x, y, z);
+        if (view.peekBlock(pool, allocator, x, y, z) catch null) |b| {
+            if (b.id == game_ids.chest or b.id == game_ids.trapped_chest) {
+                if (self.chestPair(pool, allocator, x, y, z, b.id)) |mate| {
+                    total += self.countChestViewers(mate.x, y, mate.z);
+                }
+            }
+        }
+        return if (total > 0) 15 else 0;
+    }
+
+    /// Flush dirty chest rows to the store (1 Hz ticker + stop path).
+    /// Takes world_lock then chest_lock (never nested outward); encodes
+    /// borrowed stacks like saveRedstone (no clones). Emptied chests
+    /// delete their row instead of writing an empty one (store-compact).
+    fn flushDirtyChests(self: *Server) void {
+        const pool = self.world orelse return;
+        self.world_lock.lock();
+        defer self.world_lock.unlock();
+        self.chest_lock.lock();
+        defer self.chest_lock.unlock();
+        for (self.chests.items) |*c| {
+            if (!c.dirty) continue;
+            c.dirty = false;
+            var empty = true;
+            for (c.slots) |s| {
+                if (s != null) {
+                    empty = false;
+                    break;
+                }
+            }
+            if (empty) {
+                chest_mod.deleteRow(pool, c.x, c.y, c.z) catch {
+                    c.dirty = true;
+                };
+            } else {
+                chest_mod.saveRow(pool, c.x, c.y, c.z, &c.slots) catch {
+                    c.dirty = true;
+                };
+            }
+        }
+    }
+
     /// Find a furnace by block pos. Caller MUST hold furn_lock.
+    // ---- items, interaction, containers, redstone glue ----
+
     fn findFurnace(self: *Server, x: i32, y: u8, z: i32) ?*FurnaceEnt {
         for (self.furnaces.items) |*f| {
             if (f.x == x and f.y == y and f.z == z) return f;
@@ -5995,21 +7644,263 @@ pub const Server = struct {
         }
     }
 
+    /// One 1Hz tick of vanilla item-toss physics (20 substeps of the
+    /// 20tps EntityItem.onUpdate, jar `xk`): gravity 0.04, drag 0.98,
+    /// ground bounce -0.5 with 0.7 horizontal friction. The resting
+    /// height is first-solid-top + 0.125 (the convention drops spawn
+    /// at); without ground the item keeps falling (void removal is the
+    /// caller's). Pure pool reads (leaf, like the env scan).
+    fn integrateItemToss(self: *Server, pool: *shard_mod.ShardPool, it: *entity.ItemEnt) !void {
+        var last_cx: i32 = @intFromFloat(@floor(it.x));
+        var last_cz: i32 = @intFromFloat(@floor(it.z));
+        var rest: ?f64 = try self.tossRest(pool, it.x, it.y, it.z);
+        var n: u8 = 0;
+        while (n < 20) : (n += 1) {
+            it.vy -= 0.04;
+            const px = it.x;
+            const pz = it.z;
+            it.x += it.vx;
+            it.y += it.vy;
+            it.z += it.vz;
+            it.vx *= 0.98;
+            it.vy *= 0.98;
+            it.vz *= 0.98;
+            // Landing surface is per-column, not per-tick: a toss crosses
+            // several columns per tick, and a stale height lands the item
+            // on air (or buries it) blocks from where the client's own
+            // sim puts it — the next 1Hz correction then reads as a
+            // mid-air teleport onto distant ground. Refresh on column
+            // change only (a decode per fresh column, not per substep).
+            const cx: i32 = @intFromFloat(@floor(it.x));
+            const cz: i32 = @intFromFloat(@floor(it.z));
+            if (cx != last_cx or cz != last_cz) {
+                if (try self.tossRest(pool, it.x, it.y, it.z)) |r| {
+                    if (r > it.y) {
+                        // Flew into a wall (surface above the feet): vanilla
+                        // stops horizontal motion at the face and drops.
+                        // Revert the horizontal step, kill horizontal
+                        // velocity, keep the old column's rest so it falls
+                        // to that base instead of embedding or floating.
+                        it.x = px;
+                        it.z = pz;
+                        it.vx = 0;
+                        it.vz = 0;
+                    } else {
+                        last_cx = cx;
+                        last_cz = cz;
+                        rest = r;
+                    }
+                } else {
+                    last_cx = cx;
+                    last_cz = cz;
+                    rest = null;
+                }
+            }
+            if (rest) |r| {
+                if (it.y <= r) {
+                    it.y = r;
+                    it.vx *= 0.7;
+                    it.vz *= 0.7;
+                    it.vy *= -0.5;
+                    if (@abs(it.vy) < 0.08 and it.vx * it.vx + it.vz * it.vz < 0.0025) {
+                        it.vx = 0;
+                        it.vy = 0;
+                        it.vz = 0;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Landing surface under an item (first-solid-top + 0.125 item rest):
+    /// null over void/unknown columns (keeps falling). Search starts just
+    /// above the item so a wall column reads its top (handled by the
+    /// caller), not the rock around the item.
+    fn tossRest(self: *Server, pool: *shard_mod.ShardPool, x: f64, y: f64, z: f64) !?f64 {
+        const from_y: u8 = @intCast(@min(255, @max(0, @as(i32, @intFromFloat(@ceil(y))) + 1)));
+        if (try view.groundBlockY(pool, self.gpa, @intFromFloat(@floor(x)), @intFromFloat(@floor(z)), from_y)) |g|
+            return @as(f64, @floatFromInt(g)) + 1.125;
+        return null;
+    }
+
+    /// Splash-potion impact fan-out (no ent_lock held; mirrors the
+    /// effectGive slot logic per victim). The directly-hit player takes the
+    /// full duration; everyone else within 4 blocks scales by (1 - dist/4),
+    /// floored to whole seconds (1Hz quantization). Instant health/harm
+    /// apply full to the whole radius. No HP changes (L2 owns those) —
+    /// delivery is S1D only.
+    const PotionImpact = struct { eid: i32, a6: u8, seconds: u32, amp: u8 };
+    fn applyPotionImpacts(self: *Server, impacts: []const PotionImpact) void {
+        if (impacts.len == 0) return;
+        var batch: [max_fanout]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        for (impacts) |im| {
+            for (snap) |e| {
+                if (e.conn.eid != im.eid) continue;
+                e.conn.lock.lock();
+                if (e.conn.state == .play and !e.conn.is_dead) {
+                    var slot: ?usize = null;
+                    for (&e.conn.effects, 0..) |*s, i| {
+                        if (s.*) |fx| {
+                            if (fx.id == im.a6) {
+                                slot = i;
+                                break;
+                            }
+                        } else if (slot == null) {
+                            slot = i;
+                        }
+                    }
+                    if (slot) |si| {
+                        const ticks: i32 = @as(i32, @intCast(im.seconds)) * 20;
+                        e.conn.effects[si] = .{ .id = im.a6, .amplifier = im.amp, .ticks = ticks };
+                        var eb: [64]u8 = undefined;
+                        queueBuilt(e.conn, packets.frameEntityEffect(e.conn.eid, im.a6, im.amp, ticks, &eb));
+                    }
+                }
+                e.conn.lock.unlock();
+                break;
+            }
+        }
+    }
+
+    /// One 1Hz tick of a thrown splash potion (20 substeps of the vanilla
+    /// EntityThrowable arc, jar `uo`: drag 0.99, gravity 0.03). Direct
+    /// player contact (within 1.75 blocks of the player center) wins over
+    /// block collision; blocks collide unless replaceable (the placement
+    /// refusal set doubles as the no-collision-box set). Missing chunks
+    /// read as air (keep flying). Returns the directly-hit eid, -1 on
+    /// block impact, -2 to keep flying (void/age handled by the caller).
+    fn integratePotionArc(self: *Server, pool: *shard_mod.ShardPool, pot: *entity.PotionEnt, players: []const entity.PlayerSnap) !i32 {
+        var n: u8 = 0;
+        while (n < 20) : (n += 1) {
+            pot.vx *= 0.99;
+            pot.vy = pot.vy * 0.99 - 0.03;
+            pot.vz *= 0.99;
+            pot.x += pot.vx;
+            pot.y += pot.vy;
+            pot.z += pot.vz;
+            for (players) |p| {
+                const dx = pot.x - p.x;
+                const dy = pot.y - (p.y + 1.0);
+                const dz = pot.z - p.z;
+                if (dx * dx + dy * dy + dz * dz < 1.75 * 1.75) return p.eid;
+            }
+            const by: i32 = @intFromFloat(@floor(pot.y));
+            if (by >= 0 and by <= 255) {
+                const pb = view.peekBlock(pool, self.gpa, @intFromFloat(@floor(pot.x)), @intCast(by), @intFromFloat(@floor(pot.z))) catch null;
+                if (pb) |b| {
+                    if (!replaceableForPlace(b.id)) return -1;
+                }
+            }
+        }
+        return -2;
+    }
+
+    /// Right-click splash throw: validate the held stack, spawn the arc
+    /// entity from eye height along the vanilla look vector (speed 1.5),
+    /// consume one (creative keeps). No wind-up unlike drinking. Lock
+    /// order: conn, then ent_lock, then conn again (never nested — the
+    /// non-recursive SpinLock would self-deadlock, see the PvP note).
+    fn throwPotion(self: *Server, conn: *Conn, tp: ThrowPotionEvent) void {
+        conn.lock.lock();
+        if (conn.state != .play or conn.is_dead) {
+            conn.lock.unlock();
+            return;
+        }
+        const st = conn.inv[tp.slot] orelse {
+            conn.lock.unlock();
+            return;
+        };
+        if (st.id != game_ids.potion or st.damage != tp.damage or
+            !profile.game.potion_data.isThrowable(st.id, st.damage))
+        {
+            conn.lock.unlock();
+            return;
+        }
+        const yaw: f64 = @as(f64, conn.yaw) * std.math.pi / 180.0;
+        const pitch: f64 = @as(f64, conn.pitch) * std.math.pi / 180.0;
+        const dmg = st.damage;
+        const sx = conn.pos_x - @sin(yaw) * 0.5;
+        const sy = conn.pos_y + 1.62;
+        const sz = conn.pos_z + @cos(yaw) * 0.5;
+        const cp = @cos(pitch);
+        const vx = -@sin(yaw) * cp * 1.5;
+        const vy = -@sin(pitch) * 1.5;
+        const vz = @cos(yaw) * cp * 1.5;
+        const creative = conn.config.gamemode.isCreative();
+        conn.lock.unlock();
+        const eid = self.eid_counter.fetchAdd(1, .acq_rel);
+        self.ent_lock.lock();
+        const ok = self.potions.items.len < Server.max_items;
+        if (ok) self.potions.append(self.gpa, .{ .id = eid, .x = sx, .y = sy, .z = sz, .damage = dmg, .vx = vx, .vy = vy, .vz = vz }) catch {};
+        self.ent_lock.unlock();
+        if (!ok) return;
+        // Consume only what is still the same stack (a concurrent click
+        // may have moved it — then roll back the entity instead).
+        conn.lock.lock();
+        defer conn.lock.unlock();
+        const cur = conn.inv[tp.slot] orelse {
+            self.removePotionById(eid);
+            return;
+        };
+        if (cur.id != game_ids.potion or cur.damage != dmg) {
+            self.removePotionById(eid);
+            return;
+        }
+        if (!creative) {
+            if (cur.count <= 1) {
+                item_mod.freeStack(conn.allocator, &conn.inv[tp.slot]);
+                conn.inv[tp.slot] = null;
+            } else {
+                conn.inv[tp.slot].?.count -= 1;
+            }
+        }
+        const sf = packets.frameSetSlotAlloc(conn.allocator, 0, @intCast(tp.slot), conn.inv[tp.slot]) catch null;
+        if (sf) |f| {
+            defer conn.allocator.free(f);
+            conn.queueFramed(f) catch {};
+        }
+    }
+
+    /// Remove one potion entity by id (throw rollback). Caller holds no
+    /// locks (takes ent_lock alone).
+    fn removePotionById(self: *Server, id: i32) void {
+        self.ent_lock.lock();
+        defer self.ent_lock.unlock();
+        var k: usize = 0;
+        while (k < self.potions.items.len) : (k += 1) {
+            if (self.potions.items[k].id == id) {
+                _ = self.potions.swapRemove(k);
+                return;
+            }
+        }
+    }
+
     /// Store an OWNED stack as a live item entity (always consumes `stack`:
     /// merged into a neighbor, appended, or freed on cap-hit). Merge-on-spawn
     /// mirrors the tick merge (same id/damage/NBT, centers within 1 block,
     /// combined count within max stack; survivor keeps max delay).
     /// Caller MUST hold ent_lock. Returns the new entity id, or null when
     /// the stack merged into an existing entity or the cap dropped it.
-    fn spawnItem(self: *Server, stack: item_mod.Stack, x: f64, y: f64, z: f64, delay: u32) ?i32 {
+    fn spawnItem(self: *Server, stack: item_mod.Stack, x: f64, y: f64, z: f64, delay: u32, motion: [3]f64) ?i32 {
         for (self.items.items) |*it| {
             const dx = it.x - x;
             const dz = it.z - z;
             if (dx * dx + dz * dz > 1.0) continue;
+            // 3D proximity like vanilla (jar `xk.k` expands XZ only):
+            // same-column drops a block+ apart (pillar mining) stay separate.
+            if (@abs(it.y - y) > 0.5) continue;
             if (!item_mod.canMerge(it.stack, stack)) continue;
-            if (@as(u16, @intCast(it.stack.count)) + @as(u16, @intCast(stack.count)) > item_mod.maxStackSize(it.stack.id)) continue;
+            if (@as(u16, @intCast(it.stack.count)) + @as(u16, @intCast(stack.count)) > profile.game.item_data.maxStackSize(it.stack.id)) continue;
             it.stack.count += stack.count;
             it.delay = @max(it.delay, delay);
+            // The survivor's count grew: viewers already tracking it must
+            // see a 0x1C metadata refresh (vanilla DataWatcher update on
+            // merge). Without this the extra drops stay invisible until a
+            // relog re-snapshots the stack.
+            self.broadcastItemMeta(it.id, it.stack);
             var s: ?item_mod.Stack = stack;
             item_mod.freeStack(self.gpa, &s);
             return null;
@@ -6025,6 +7916,9 @@ pub const Server = struct {
             .x = x,
             .y = y,
             .z = z,
+            .vx = motion[0],
+            .vy = motion[1],
+            .vz = motion[2],
             .stack = stack,
             .delay = delay,
         }) catch {
@@ -6046,8 +7940,8 @@ pub const Server = struct {
     /// one viewer conn lock at a time. No opposite order exists: the tick
     /// never holds ent_lock while taking conn locks, and no broadcast
     /// takes ent_lock.
-    fn broadcastItemSpawn(self: *Server, id: i32, item_id: game_ids.Id, count: i8, damage: i16, nbt: ?[]const u8, x: f64, y: f64, z: f64) void {
-        var batch: [256]RegistryEntry = undefined;
+    fn broadcastItemSpawn(self: *Server, id: i32, item_id: game_ids.Id, count: i8, damage: i16, nbt: ?[]const u8, x: f64, y: f64, z: f64, motion: [3]f64) void {
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         const range = @as(f64, @floatFromInt(self.view_distance)) * 16.0 + 16.0;
@@ -6063,7 +7957,7 @@ pub const Server = struct {
             var queued = false;
             if (in_range and loaded and !e.conn.tracked.contains(id)) {
                 const stack = item_mod.Stack{ .id = item_id, .count = count, .damage = damage, .nbt = nbt };
-                var spawn = sink_mod.ItemSpawn{ .eid = id, .stack = stack, .x = x, .y = y, .z = z };
+                var spawn = sink_mod.ItemSpawn{ .eid = id, .stack = stack, .x = x, .y = y, .z = z, .vx = motion[0], .vy = motion[1], .vz = motion[2] };
                 conn_sink.bind(e.conn).spawnItem(&spawn) catch {};
                 e.conn.tracked.put(id, .{ .x = x, .y = y, .z = z, .yaw = 0, .pitch = 0 }) catch {};
                 queued = true;
@@ -6075,11 +7969,36 @@ pub const Server = struct {
         }
     }
 
+    /// Broadcast a 0x1C metadata refresh for a live item entity to every
+    /// viewer already tracking it. Merge paths (spawn-time and the tick
+    /// scan) grow the survivor's count without spawning anything new, so
+    /// without this the extra drops stay invisible until a relog
+    /// re-snapshots the stack (vanilla sends the DataWatcher update).
+    /// Caller must hold ent_lock (same order as spawnItemLive: no other
+    /// locks held when the snapshot drops to the registry lock).
+    fn broadcastItemMeta(self: *Server, id: i32, stack: item_mod.Stack) void {
+        var mb: [1024]u8 = undefined;
+        const meta = packets.frameItemMetadata(id, stack, &mb) catch return;
+        var batch: [max_fanout]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        for (snap) |e| {
+            if (e.conn.state != .play or e.conn.is_dead) continue;
+            e.conn.lock.lock();
+            const tracked = e.conn.tracked.contains(id);
+            if (tracked) e.conn.queueFramed(meta) catch {};
+            e.conn.lock.unlock();
+            if (tracked) flushEntry(e, self.io);
+        }
+    }
+
     /// Serve-thread item spawn with instant visibility (see
     /// broadcastItemSpawn). Consumes `stack` exactly like spawnItem.
-    fn spawnItemLive(self: *Server, stack: item_mod.Stack, x: f64, y: f64, z: f64, delay: u32) void {
+    /// `motion` is the vanilla EntityItem toss velocity (blocks per
+    /// 20tps tick); the 1Hz tick integrates it until the item settles.
+    fn spawnItemLive(self: *Server, stack: item_mod.Stack, x: f64, y: f64, z: f64, delay: u32, motion: [3]f64) void {
         self.ent_lock.lock();
-        const id = self.spawnItem(stack, x, y, z, delay);
+        const id = self.spawnItem(stack, x, y, z, delay, motion);
         var nbt: ?[]u8 = null;
         var item_id: game_ids.Id = undefined;
         var count: i8 = 0;
@@ -6094,16 +8013,44 @@ pub const Server = struct {
         self.ent_lock.unlock();
         const eid = id orelse return; // merged or capped: nothing new to show
         defer if (nbt) |n| self.gpa.free(n);
-        self.broadcastItemSpawn(eid, item_id, count, damage, nbt, x, y, z);
+        self.broadcastItemSpawn(eid, item_id, count, damage, nbt, x, y, z, motion);
     }
 
-    /// Roll + spawn vanilla drops for a survival break. Caller holds world_lock
-    /// (ground scan reads the pool); takes rand_lock then ent_lock, in order.
+    /// Roll + spawn vanilla drops for a survival break. Takes rand_lock
+    /// then ent_lock, in order.
     /// Per-single draw order mirrors harvestBlock: chance float (always 1.0
     /// for player breaks, drawn anyway), then 3 position offsets
-    /// (rand*0.7+0.15 per axis, CFR `aji`/`alo` drop path). Resting y is the
-    /// first solid top + 0.125 (no per-tick physics in the 1Hz model).
-    fn spawnBreakDrops(self: *Server, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, x: i32, y: u8, z: i32, old_id: game_ids.Id, old_meta: u4) void {
+    /// (rand*0.7+0.15 per axis, CFR `aji`/`alo` drop path). Spawn position
+    /// is inside the broken cell (vanilla dropBlockAsItem_do); the 1Hz
+    /// tick integrates the toss arc down to first-solid-top + 0.125.
+    /// Toss motion comes from the dedicated toss stream (jar `xk`: motion
+    /// (rand*0.2-0.1, 0.2, rand*0.2-0.1) via Math.random(), NOT world.rand).
+    /// Wake settled drops resting at/above a freshly broken block.
+    /// Settled items park with zero velocity (no per-tick work); without
+    /// this, digging out from under them would leave them hovering where
+    /// the block was (vanilla items keep falling: gravity applies every
+    /// tick). A small downward nudge re-arms integration; the ground scan
+    /// settles them on whatever is actually below. Harmless when nothing
+    /// rests there (one extra integrate that re-settles in place).
+    /// Called with world_lock held (same as spawnBreakDrops below);
+    /// takes ent_lock only, matching the established lock order.
+    fn wakeItemsAbove(self: *Server, x: i32, y: u8, z: i32) void {
+        self.ent_lock.lock();
+        defer self.ent_lock.unlock();
+        const cx = @as(f64, @floatFromInt(x)) + 0.5;
+        const cz = @as(f64, @floatFromInt(z)) + 0.5;
+        const top = @as(f64, @floatFromInt(y));
+        for (self.items.items) |*it| {
+            if (it.vx != 0 or it.vy != 0 or it.vz != 0) continue; // already live
+            const dx = it.x - cx;
+            const dz = it.z - cz;
+            if (dx * dx + dz * dz > 1.0) continue;
+            if (it.y < top) continue;
+            it.vy = -0.05;
+        }
+    }
+
+    fn spawnBreakDrops(self: *Server, x: i32, y: u8, z: i32, old_id: game_ids.Id, old_meta: u4) void {
         self.rand_lock.lock();
         if (self.drop_rand == null) self.drop_rand = java_random.JavaRandom.init(self.drop_seed);
         var rng = self.drop_rand.?;
@@ -6131,10 +8078,8 @@ pub const Server = struct {
         // Re-walk rolls in order, consuming the materialized offsets.
         // (Truncation at 8 is unreachable per the table bound above, and the
         // chance draw never skips at 1.0 — oi always drains n_spawn.)
-        // Resting y is resolved once: first solid top + 0.125 (the 1Hz model
-        // has no per-tick physics; entities never move post-spawn).
-        const gy = view.groundBlockY(pool, allocator, x, z, y) catch null;
-        const ry: f64 = if (gy) |g| @as(f64, @floatFromInt(g)) + 1.125 else 0.125;
+        // Each single pops with vanilla EntityItem motion from the toss
+        // stream (never drop_rand — randar); the tick settles the arc.
         var oi: usize = 0;
         var ri: usize = 0;
         while (ri < n_rolls) : (ri += 1) {
@@ -6144,7 +8089,7 @@ pub const Server = struct {
                 const o = offs[oi];
                 oi += 1;
                 const stack = item_mod.Stack{ .id = r.item_id, .count = 1, .damage = r.damage, .nbt = null };
-                self.spawnItemLive(stack, @as(f64, @floatFromInt(x)) + o[0], ry, @as(f64, @floatFromInt(z)) + o[2], 10);
+                self.spawnItemLive(stack, @as(f64, @floatFromInt(x)) + o[0], @as(f64, @floatFromInt(y)) + o[1], @as(f64, @floatFromInt(z)) + o[2], 10, self.tossPopMotion());
             }
         }
     }
@@ -6158,8 +8103,14 @@ pub const Server = struct {
         const sy = conn.pos_y + 1.32;
         const sz = conn.pos_z + fz * 0.5;
         // Live broadcast: the dropper sees the entity immediately; the tick
-        // still owns pickup (tracked-gate) and merge/despawn.
-        self.spawnItemLive(q.stack, sx, sy, sz, 40);
+        // still owns pickup (tracked-gate) and merge/despawn. Thrown
+        // forward like vanilla (facing * 0.3, up 0.1, toss-stream jitter)
+        // so the drop arcs to the ground instead of hovering at eye height.
+        self.spawnItemLive(q.stack, sx, sy, sz, 40, .{
+            fx * 0.3 + self.nextToss() * 0.04 - 0.02,
+            0.15,
+            fz * 0.3 + self.nextToss() * 0.04 - 0.02,
+        });
         conn.lock.lock();
         const cur = conn.inv[@intCast(q.slot)];
         const f = packets.frameSetSlotAlloc(conn.allocator, 0, q.slot, cur) catch null;
@@ -6176,8 +8127,139 @@ pub const Server = struct {
     /// a UI open (serve loop must skip placement + broadcast for the event).
     /// `sneaking` is the clicker's sneak state (sneak + held block places
     /// against the table instead); the serve loop reads it once per event.
-    fn tryOpenTable(self: *Server, conn: *Conn, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, b: *BlockEvent, sneaking: bool) bool {
-        _ = self;
+    /// Right-click UI routing (crafting table / furnace / enchanting
+    /// table / ender chest / chest open instead of placing/toggling). Shared by the block_set
+    /// arm (sneak-aware) and the empty-hand interact arm (sneak=false).
+    fn tryOpenAnyUI(self: *Server, conn: *Conn, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, b: *BlockEvent, sneak: bool) bool {
+        if (self.tryOpenTable(conn, pool, allocator, b, sneak)) return true;
+        if (self.tryOpenFurnace(conn, pool, allocator, b, sneak)) return true;
+        if (self.tryOpenBrew(conn, pool, allocator, b, sneak)) return true;
+        if (self.tryOpenEnder(conn, pool, allocator, b, sneak)) return true;
+        if (self.tryOpenChest(conn, pool, allocator, b, sneak)) return true;
+        return self.tryOpenEnchant(conn, pool, allocator, b, sneak);
+    }
+
+    /// Block-place/break sound (S29 to nearby viewers; volume 1.0, pitch
+    /// 0.8 like vanilla). Liquids splash for everyone (no client
+    /// prediction); solid-block sounds skip the placer (they predicted it).
+    fn soundForEdit(self: *Server, conn: *Conn, id: game_ids.Id, sx: f64, sy: f64, sz: f64) void {
+        if (id == game_ids.air) return;
+        const v = Server.placeSound(id);
+        const excl: ?*Conn = if (Server.isLiquid(id)) null else conn;
+        self.broadcastSound(excl, v.name, sx, sy, sz, 1.0, v.pitch);
+    }
+
+    /// Plate registry follows place/break (add on plate-place, remove when
+    /// a plate cell stops being one).
+    fn trackPlates(self: *Server, b: *BlockEvent, old: ?view.PeekBlock) void {
+        const new_plate = b.id != game_ids.air and redstone_mod.isPlate(&profile.game.blocks, .{ .id = b.id, .meta = b.meta });
+        if (new_plate) self.rs_plates.add(b.x, b.y, b.z);
+        if (old) |o| {
+            const was_plate = redstone_mod.isPlate(&profile.game.blocks, .{ .id = o.id, .meta = o.meta });
+            if (was_plate and !new_plate) self.rs_plates.remove(b.x, b.y, b.z);
+        }
+    }
+
+    /// Survival-break follow-ups for one broken block: break sound,
+    /// vanilla drops (creative drops nothing; missing chunks peek null
+    /// and stay dropless), plus window cleanup for breaks with viewers.
+    /// Null olds and air-to-air edits are no-ops.
+    fn breakAftermath(self: *Server, conn: *Conn, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, b: *BlockEvent, old: ?view.PeekBlock, sx: f64, sy: f64, sz: f64) void {
+        const o = old orelse return;
+        if (o.id != game_ids.air) self.soundForEdit(conn, o.id, sx, sy, sz);
+        if (Server.shouldDropBreak(conn.config.gamemode, o.id, self.tileDrops())) {
+            self.spawnBreakDrops(b.x, b.y, b.z, o.id, o.meta);
+        }
+        // Re-arm settled drops resting at/above the broken cell (see
+        // wakeItemsAbove): runs for every break, creative included, since
+        // floating items are wrong in every mode.
+        self.wakeItemsAbove(b.x, b.y, b.z);
+        // Breaks with viewers: drop grids + close windows (tables,
+        // enchanting, furnaces).
+        self.breakWindowsFor(pool, allocator, b, o.id);
+    }
+
+    /// Window cleanup on break (table/enchant grids drop + close; furnace
+    /// input/fuel/output drop as entities; ender chests just close — the
+    /// contents are per-player and never drop; chests close both halves'
+    /// viewers (stale sizes resolve only on reopen) and drop the broken
+    /// half's contents). Shared by every break path.
+    fn breakWindowsFor(self: *Server, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, b: *BlockEvent, old_id: game_ids.Id) void {
+        if (old_id == game_ids.crafting_table or old_id == game_ids.enchanting_table) {
+            self.closeWindowsAt(pool, allocator, b.x, b.y, b.z);
+            return;
+        }
+        if (old_id == game_ids.ender_chest) {
+            self.closeWindowsAt(pool, allocator, b.x, b.y, b.z);
+            return;
+        }
+        if (old_id == game_ids.chest or old_id == game_ids.trapped_chest) {
+            // Pair mate first (still intact): its viewers go stale too.
+            const mate = self.chestPair(pool, allocator, b.x, b.y, b.z, old_id);
+            self.closeWindowsAt(pool, allocator, b.x, b.y, b.z);
+            if (mate) |m| self.closeWindowsAt(pool, allocator, m.x, b.y, m.z);
+            // Drop THIS half's contents (both modes, like table grids; the
+            // block itself drops only in survival via spawnBreakDrops
+            // above). The surviving half keeps its row (now single).
+            // Never-opened chests have no entry/row: skip drops+delete.
+            self.chest_lock.lock();
+            var dropped = self.removeChest(b.x, b.y, b.z);
+            self.chest_lock.unlock();
+            if (dropped) |*slots| {
+                for (slots) |*st| {
+                    const s = st.* orelse continue;
+                    st.* = null;
+                    self.spawnItemLive(s, @as(f64, @floatFromInt(b.x)) + 0.5, @as(f64, @floatFromInt(b.y)) + 0.5, @as(f64, @floatFromInt(b.z)) + 0.5, 10, self.tossPopMotion());
+                }
+                // Caller holds world_lock (same discipline as applyBlock).
+                chest_mod.deleteRow(pool, b.x, b.y, b.z) catch {};
+            }
+            return;
+        }
+        if (old_id != game_ids.furnace and old_id != game_ids.lit_furnace) {
+            if (old_id != game_ids.brewing_stand_block) return;
+            // Brewing-stand break: close viewer windows and drop bottles +
+            // ingredient as entities (both modes; the stand itself drops
+            // only in survival via spawnBreakDrops above).
+            self.closeWindowsAt(pool, allocator, b.x, b.y, b.z);
+            var removed = self.removeBrew(b.x, b.y, b.z);
+            const bstacks = [_]*?item_mod.Stack{ &removed.bottles[0], &removed.bottles[1], &removed.bottles[2], &removed.ingredient };
+            for (bstacks) |st| {
+                const s = st.* orelse continue;
+                st.* = null;
+                self.spawnItemLive(s, @as(f64, @floatFromInt(b.x)) + 0.5, @as(f64, @floatFromInt(b.y)) + 0.5, @as(f64, @floatFromInt(b.z)) + 0.5, 10, self.tossPopMotion());
+            }
+            return;
+        }
+        // Furnace break: close viewer windows and drop input/fuel/output
+        // as entities (both modes, like table grids; the block itself
+        // drops only in survival via spawnBreakDrops above).
+        self.closeWindowsAt(pool, allocator, b.x, b.y, b.z);
+        var removed = self.removeFurnace(b.x, b.y, b.z);
+        const fstacks = [_]*?item_mod.Stack{ &removed.input, &removed.fuel, &removed.output };
+        for (fstacks) |st| {
+            const s = st.* orelse continue;
+            st.* = null;
+            self.spawnItemLive(s, @as(f64, @floatFromInt(b.x)) + 0.5, @as(f64, @floatFromInt(b.y)) + 0.5, @as(f64, @floatFromInt(b.z)) + 0.5, 10, self.tossPopMotion());
+        }
+    }
+
+    /// Placement-target rule (jar `abi` ItemBlock + `canPlaceEntityOnSide`):
+    /// only air and replaceable materials accept blocks. Overwriting
+    /// anything else silently destroys tile entities (chest/furnace
+    /// contents lost, rows orphaned) and desyncs the client's prediction,
+    /// so the block_set arm refuses with a resync instead. Vanilla set
+    /// (Material.isReplaceable, jar-probed per block id): air, water,
+    /// lava, fire, snow layers, tall grass, dead bushes, vines. Flowers /
+    /// mushrooms / saplings are NOT replaceable (refused, vanilla-exact).
+    fn replaceableForPlace(id: game_ids.Id) bool {
+        return switch (id) {
+            .air, .water, .flowing_water, .lava, .flowing_lava, .fire, .snow_layer, .tallgrass, .deadbush, .vine => true,
+            else => false,
+        };
+    }
+
+    fn tryOpenTable(self: *Server, conn: *Conn, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, b: *BlockEvent, sneaking: bool) bool {        _ = self;
         var cx = b.x;
         var cy: i32 = b.y;
         var cz = b.z;
@@ -6232,8 +8314,9 @@ pub const Server = struct {
         self.furn_lock.unlock();
         conn.lock.lock();
         conn.open_win = .{ .id = 2, .x = cx, .y = @intCast(cy), .z = cz };
+        conn.resetClickSeq(2); // fresh client container: action numbers restart
         var ob: [128]u8 = undefined;
-        if (packets.frameOpenWindow(2, 2, "container.furnace", 3, &ob)) |of| {
+        if (packets.frameOpenWindow(2, 2, "container.furnace", 3, false, &ob)) |of| {
             conn.queueFramed(of) catch {};
         } else |_| {}
         // Window 2 has 39 slots: 0-2 furnace, 3-38 alias inv 9..44.
@@ -6242,7 +8325,7 @@ pub const Server = struct {
         all[0] = fin;
         all[1] = ffu;
         all[2] = fout;
-        for (9..45) |i| all[i - 6] = conn.inv[i];
+        for (item_mod.main_lo..item_mod.inv_size) |i| all[i - 6] = conn.inv[i];
         const wf = packets.frameWindowItemsAlloc(conn.allocator, 2, &all) catch null;
         if (wf) |wfr| {
             defer conn.allocator.free(wfr);
@@ -6258,35 +8341,336 @@ pub const Server = struct {
         return true;
     }
 
+    /// Right-click routing: brewing stand (117) + not sneaking opens
+    /// window 7 (type 5). Ensures server state, then queues 0x2D + full
+    /// 0x30. Same locking as tryOpenFurnace. Returns true when the click
+    /// became a UI open.
+    fn tryOpenBrew(self: *Server, conn: *Conn, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, b: *BlockEvent, sneaking: bool) bool {
+        var cx = b.x;
+        var cy: i32 = b.y;
+        var cz = b.z;
+        switch (b.face) {
+            0 => cy += 1,
+            1 => cy -= 1,
+            2 => cz += 1,
+            3 => cz -= 1,
+            4 => cx += 1,
+            5 => cx -= 1,
+            else => return false,
+        }
+        if (cy < 0 or cy > 255) return false;
+        const clicked = view.peekBlock(pool, allocator, cx, @intCast(cy), cz) catch null;
+        if (clicked == null or clicked.?.id != game_ids.brewing_stand_block) return false;
+        if (sneaking) return false;
+        self.brew_lock.lock();
+        self.ensureBrew(cx, @intCast(cy), cz);
+        const br = self.findBrew(cx, @intCast(cy), cz).?;
+        // Dupe NBT under the lock (states can be removed concurrently).
+        const bb: [3]?item_mod.Stack = .{
+            if (br.bottles[0]) |s| item_mod.cloneStack(self.gpa, s) catch null else null,
+            if (br.bottles[1]) |s| item_mod.cloneStack(self.gpa, s) catch null else null,
+            if (br.bottles[2]) |s| item_mod.cloneStack(self.gpa, s) catch null else null,
+        };
+        const bi: ?item_mod.Stack = if (br.ingredient) |s| item_mod.cloneStack(self.gpa, s) catch null else null;
+        self.brew_lock.unlock();
+        conn.lock.lock();
+        conn.open_win = .{ .id = 7, .x = cx, .y = @intCast(cy), .z = cz };
+        conn.resetClickSeq(7); // fresh client container: action numbers restart
+        var ob: [128]u8 = undefined;
+        if (packets.frameOpenWindow(7, 5, "container.brewing", 4, false, &ob)) |of| {
+            conn.queueFramed(of) catch {};
+        } else |_| {}
+        // Window 7 has 40 slots: 0-2 bottles, 3 ingredient, 4-39 alias
+        // inv 9..44.
+        var all: [40]?item_mod.Stack = [_]?item_mod.Stack{null} ** 40;
+        all[0] = bb[0];
+        all[1] = bb[1];
+        all[2] = bb[2];
+        all[3] = bi;
+        for (item_mod.main_lo..item_mod.inv_size) |i| all[i - 5] = conn.inv[i];
+        const wf = packets.frameWindowItemsAlloc(conn.allocator, 7, &all) catch null;
+        if (wf) |wfr| {
+            defer conn.allocator.free(wfr);
+            conn.queueFramed(wfr) catch {};
+        }
+        conn.lock.unlock();
+        var f0: ?item_mod.Stack = bb[0];
+        item_mod.freeStack(self.gpa, &f0);
+        var f1: ?item_mod.Stack = bb[1];
+        item_mod.freeStack(self.gpa, &f1);
+        var f2: ?item_mod.Stack = bb[2];
+        item_mod.freeStack(self.gpa, &f2);
+        var fi: ?item_mod.Stack = bi;
+        item_mod.freeStack(self.gpa, &fi);
+        return true;
+    }
+
+    /// Right-click routing: ender chest (130) + not sneaking opens window 3.
+    /// Contents are per-player (conn.ender, UUID-bound in the player row) —
+    /// no per-block state to ensure, unlike the furnace. Same locking as
+    /// tryOpenTable. Returns true when the click became a UI open.
+    fn tryOpenEnder(self: *Server, conn: *Conn, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, b: *BlockEvent, sneaking: bool) bool {
+        var cx = b.x;
+        var cy: i32 = b.y;
+        var cz = b.z;
+        switch (b.face) {
+            0 => cy += 1,
+            1 => cy -= 1,
+            2 => cz += 1,
+            3 => cz -= 1,
+            4 => cx += 1,
+            5 => cx -= 1,
+            else => return false,
+        }
+        if (cy < 0 or cy > 255) return false;
+        const clicked = view.peekBlock(pool, allocator, cx, @intCast(cy), cz) catch null;
+        if (clicked == null or clicked.?.id != game_ids.ender_chest) return false;
+        if (sneaking) return false; // sneak+held-block places against the chest
+        const cyu: u8 = @intCast(cy);
+        // Viewers before self (open_win not set yet): jar `ape.h` plays
+        // the lid sound on the tick after 0 -> 1, like regular chests.
+        const viewers_before = self.countEnderViewers(cx, cyu, cz);
+        // Open UI (leaf conn lock; world_lock held by caller: world->conn).
+        conn.lock.lock();
+        conn.openEnderUI(cx, cyu, cz);
+        conn.lock.unlock();
+        // Vanilla lid sound at the chest (volume 0.5, pitch randomized
+        // 0.9-1.0 there; fixed mid here — no gameplay-RNG draws for audio).
+        if (viewers_before == 0) {
+            self.broadcastSound(null, "random.chestopen", @as(f64, @floatFromInt(cx)) + 0.5, @as(f64, @floatFromInt(cy)) + 0.5, @as(f64, @floatFromInt(cz)) + 0.5, 0.5, 0.95);
+        }
+        const n: u8 = @intCast(@min(self.countEnderViewers(cx, cyu, cz), 255));
+        self.broadcastBlockAction(cx, cyu, cz, 1, n, game_ids.ender_chest);
+        return true;
+    }
+
+    /// Right-click routing: chest / trapped chest + not sneaking opens
+    /// window 5 (single, 27 slots) or 6 (double, 54 slots). Contents are
+    /// server-owned (multi-viewer); clicks resolve on the serve thread.
+    /// Same locking shape as tryOpenFurnace (sequential chest -> conn,
+    /// never nested). Returns true when the click became a UI open.
+    fn tryOpenChest(self: *Server, conn: *Conn, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, b: *BlockEvent, sneaking: bool) bool {
+        var cx = b.x;
+        var cy: i32 = b.y;
+        var cz = b.z;
+        switch (b.face) {
+            0 => cy += 1,
+            1 => cy -= 1,
+            2 => cz += 1,
+            3 => cz -= 1,
+            4 => cx += 1,
+            5 => cx -= 1,
+            else => return false,
+        }
+        if (cy < 0 or cy > 255) return false;
+        const cyu: u8 = @intCast(cy);
+        const clicked = view.peekBlock(pool, allocator, cx, cyu, cz) catch null;
+        if (clicked == null or (clicked.?.id != game_ids.chest and clicked.?.id != game_ids.trapped_chest)) return false;
+        if (sneaking) return false; // sneak+held-block places against the chest
+        // Lid blocked by an opaque block above (vanilla chest rule).
+        if (cy < 255) {
+            const above = view.peekBlock(pool, allocator, cx, cyu + 1, cz) catch null;
+            if (above) |a| {
+                if (view.isOpaqueCube(a.id)) return false;
+            }
+        }
+        const id = clicked.?.id;
+        // Pair halves, sorted for a deterministic slot order (documented
+        // deviation: vanilla orders by facing; all our contents originate
+        // here so the order is self-consistent).
+        const mate = self.chestPair(pool, allocator, cx, cyu, cz, id);
+        const second: ?ChestPos = if (mate) |m| .{ .x = m.x, .y = cyu, .z = m.z } else null;
+        const is_double = second != null;
+        const win: u8 = if (is_double) 6 else 5;
+        const nchest: usize = if (is_double) 54 else 27;
+        self.chest_lock.lock();
+        self.ensureChest(pool, cx, cyu, cz, id);
+        if (second) |s| self.ensureChest(pool, s.x, s.y, s.z, id);
+        // Viewers before self (open_win not set yet): jar `aow.h` plays
+        // the lid sound on the tick after 0 -> 1, silent otherwise.
+        const viewers_before = self.countChestViewers(cx, cyu, cz);
+        // Clone under chest_lock (conn.lock not held yet); the frame
+        // borrows the clones, freed after queue like the furnace path.
+        var cbuf: [54]?item_mod.Stack = [_]?item_mod.Stack{null} ** 54;
+        var halves: [2]?*ChestEnt = [_]?*ChestEnt{ self.findChest(cx, cyu, cz).?, null };
+        if (second) |s| {
+            const other = self.findChest(s.x, s.y, s.z).?;
+            // Sorted halves: lexicographic (x, z).
+            if (s.x < cx or (s.x == cx and s.z < cz)) {
+                halves = [_]?*ChestEnt{ other, halves[0] };
+            } else {
+                halves[1] = other;
+            }
+        }
+        var ci: usize = 0;
+        for (halves) |h| {
+            const e = h orelse continue;
+            for (e.slots) |st| {
+                cbuf[ci] = item_mod.cloneStack(conn.allocator, st) catch null;
+                ci += 1;
+            }
+        }
+        self.chest_lock.unlock();
+        conn.lock.lock();
+        conn.open_win = .{ .id = win, .x = cx, .y = cyu, .z = cz };
+        conn.resetClickSeq(win); // fresh client container: action numbers restart
+        var ob: [128]u8 = undefined;
+        if (packets.frameOpenWindow(win, 0, if (is_double) "container.chestDouble" else "container.chest", @intCast(nchest), false, &ob)) |of| {
+            conn.queueFramed(of) catch {};
+        } else |_| {}
+        // Window N chest slots + 36 player alias (inv 9..44), vanilla
+        // 27/54-slot chest container shape.
+        var all: [90]?item_mod.Stack = [_]?item_mod.Stack{null} ** 90;
+        for (cbuf[0..nchest], 0..) |st, i| all[i] = st;
+        for (item_mod.main_lo..item_mod.inv_size) |i| all[i + nchest - 9] = conn.inv[i];
+        const wf = packets.frameWindowItemsAlloc(conn.allocator, win, all[0 .. nchest + 36]) catch null;
+        if (wf) |wfr| {
+            defer conn.allocator.free(wfr);
+            conn.queueFramed(wfr) catch {};
+        }
+        conn.lock.unlock();
+        for (cbuf[0..nchest]) |*st| item_mod.freeStack(conn.allocator, st);
+        // Lid sound on first open only (0 -> 1 viewers; re-opens find self
+        // already counted). S24 lid events carry the PAIR total to both
+        // halves (jar `ra.f` increments both TEs on any double open, so a
+        // viewer on either half lifts both lids); singles trivially match.
+        // Counts include self (open_win is set).
+        if (viewers_before == 0) {
+            self.broadcastSound(null, "random.chestopen", @as(f64, @floatFromInt(cx)) + 0.5, @as(f64, @floatFromInt(cy)) + 0.5, @as(f64, @floatFromInt(cz)) + 0.5, 0.5, 0.95);
+        }
+        var total: usize = self.countChestViewers(cx, cyu, cz);
+        if (second) |s| total += self.countChestViewers(s.x, s.y, s.z);
+        const n: u8 = @intCast(@min(total, 255));
+        self.broadcastBlockAction(cx, cyu, cz, 1, n, id);
+        if (second) |s| self.broadcastBlockAction(s.x, s.y, s.z, 1, n, id);
+        return true;
+    }
+
     /// LSM-backed redstone world adapter (caller holds world_lock).
     /// Holes read as air and reject writes (no store, no broadcast).
     const RsWorld = struct {
         pool: *shard_mod.ShardPool,
         alloc: std.mem.Allocator,
         changes: *redstone_mod.ChangeList,
+        /// Single-chunk MRU: redstone fan-out reads ~14 neighbors per edit
+        /// plus recompute re-reads, almost always in one chunk; without
+        /// this every read is a full store fetch + decode (~0.5ms each).
+        /// Doubles as the write workspace (see set): light-neutral cell
+        /// writes mutate the cached chunk directly and persist once at
+        /// flush, instead of a full decode+relight+encode+put per cell.
+        /// Store cannot change under us within one op (world lock held;
+        /// all writes go through set/pop), so the cache needs no
+        /// generation checks — flush + free in deinit at the end of the op.
+        cached: ?*chunk_mod.Chunk = null,
+        cached_cx: i32 = 0,
+        cached_cz: i32 = 0,
+        dirty: bool = false,
+
+        pub fn deinit(self: *@This()) void {
+            self.flushCache();
+            self.invalidate();
+        }
+
+        fn invalidate(self: *@This()) void {
+            if (self.cached) |ch| {
+                ch.destroy(self.alloc);
+                self.cached = null;
+            }
+            self.dirty = false;
+        }
+
+        /// Persist a dirty cached chunk (single encode+put for the whole
+        /// op's writes to that chunk). Keeps the cached copy (it still
+        /// matches the store).
+        fn flushCache(self: *@This()) void {
+            const ch = self.cached orelse return;
+            if (!self.dirty) return;
+            const enc = ch.encode(self.alloc) catch return;
+            defer self.alloc.free(enc);
+            const key = store_mod.encodeKey(0, self.cached_cx, self.cached_cz);
+            self.pool.put(key, enc) catch {};
+            self.dirty = false;
+        }
+
+        /// Cached chunk for (x,z), loading + caching on miss (flushing a
+        /// dirty previous chunk first). Null on holes/corrupt rows.
+        fn chunkFor(self: *@This(), x: i32, z: i32) ?*chunk_mod.Chunk {
+            const cx = @divFloor(x, 16);
+            const cz = @divFloor(z, 16);
+            if (self.cached == null or self.cached_cx != cx or self.cached_cz != cz) {
+                self.flushCache();
+                self.invalidate();
+                const ch = view.loadChunk(self.pool, self.alloc, x, z) catch return null;
+                if (ch == null) return null;
+                self.cached = ch;
+                self.cached_cx = cx;
+                self.cached_cz = cz;
+            }
+            return self.cached;
+        }
 
         pub fn get(self: *@This(), x: i32, y: i32, z: i32) ?redstone_mod.Block {
             if (y < 0 or y > 255) return null;
-            const pb = view.peekBlock(self.pool, self.alloc, x, @intCast(y), z) catch return null;
-            const b = pb orelse return null;
-            return .{ .id = b.id, .meta = b.meta };
+            const ch = self.chunkFor(x, z) orelse return null;
+            const yu: u8 = @intCast(y);
+            const s = ch.sections[@as(usize, yu) >> 4] orelse return null;
+            const li = chunk_mod.Section.index(chunk_mod.Chunk.localCoord(x), @truncate(yu & 15), chunk_mod.Chunk.localCoord(z));
+            return .{ .id = s.blocks[li], .meta = chunk_mod.Section.getNibble(&s.meta, li) };
         }
 
         /// Raw write: no change recording — the staged commit owns ChangeList
         /// entries for sim paths, and the piston/door helpers append their
-        /// own (so a cell is never double-recorded).
+        /// own (so a cell is never double-recorded). Light-neutral writes
+        /// mutate the cached chunk and persist once at deinit; writes that
+        /// change emission/opacity (or need a new section) flush first and
+        /// take the immediate applyBlock path, exactly as before.
         pub fn set(self: *@This(), x: i32, y: i32, z: i32, id: game_ids.Id, meta: u4) void {
             if (y < 0 or y > 255) return;
-            if ((view.peekBlock(self.pool, self.alloc, x, @intCast(y), z) catch null) == null) return;
-            _ = view.applyBlock(self.pool, self.alloc, x, @intCast(y), z, id, meta) catch 0;
+            const ch = self.chunkFor(x, z) orelse return;
+            const yu: u8 = @intCast(y);
+            const s = &(ch.sections[@as(usize, yu) >> 4] orelse return);
+            const li = chunk_mod.Section.index(chunk_mod.Chunk.localCoord(x), @truncate(yu & 15), chunk_mod.Chunk.localCoord(z));
+            const old_id = s.blocks[li];
+            if (old_id == id and chunk_mod.Section.getNibble(&s.meta, li) == meta) return;
+            const e_old = chunk_mod.emitLight(old_id);
+            const e_new = chunk_mod.emitLight(id);
+            const op_old = chunk_mod.lightOpacity(old_id);
+            const op_new = chunk_mod.lightOpacity(id);
+            if (e_new != e_old or op_new != op_old) {
+                self.flushCache();
+                _ = view.applyBlock(self.pool, self.alloc, x, @intCast(y), z, id, meta) catch 0;
+                self.invalidate();
+                return;
+            }
+            s.blocks[li] = id;
+            chunk_mod.Section.setNibble(&s.meta, li, meta);
+            self.dirty = true;
         }
 
         /// Raw pop-write + its change record (single place for pop semantics).
+        /// Light-neutral pops ride the write cache like set.
         pub fn pop(self: *@This(), x: i32, y: i32, z: i32, old_id: game_ids.Id, old_meta: u4) void {
             if (y < 0 or y > 255) return;
-            if ((view.peekBlock(self.pool, self.alloc, x, @intCast(y), z) catch null) == null) return;
             self.changes.append(.{ .x = x, .y = y, .z = z, .id = game_ids.air, .meta = 0, .old_id = old_id, .old_meta = old_meta, .popped = true });
-            _ = view.applyBlock(self.pool, self.alloc, x, @intCast(y), z, game_ids.air, 0) catch 0;
+            const ch = self.chunkFor(x, z) orelse return;
+            const yu: u8 = @intCast(y);
+            const s = &(ch.sections[@as(usize, yu) >> 4] orelse return);
+            const li = chunk_mod.Section.index(chunk_mod.Chunk.localCoord(x), @truncate(yu & 15), chunk_mod.Chunk.localCoord(z));
+            const cur_id = s.blocks[li];
+            if (cur_id == game_ids.air) return;
+            const e_old = chunk_mod.emitLight(cur_id);
+            const e_new = chunk_mod.emitLight(game_ids.air);
+            const op_old = chunk_mod.lightOpacity(cur_id);
+            const op_new = chunk_mod.lightOpacity(game_ids.air);
+            if (e_new != e_old or op_new != op_old) {
+                self.flushCache();
+                _ = view.applyBlock(self.pool, self.alloc, x, @intCast(y), z, game_ids.air, 0) catch 0;
+                self.invalidate();
+                return;
+            }
+            s.blocks[li] = game_ids.air;
+            chunk_mod.Section.setNibble(&s.meta, li, 0);
+            self.dirty = true;
         }
 
         /// Typed redstone boundary: profile data travels with the adapter.
@@ -6328,6 +8712,7 @@ pub const Server = struct {
         }
         self.loadRedstone(pool, now);
         var w = Server.RsWorld{ .pool = pool, .alloc = allocator, .changes = changes };
+        defer w.deinit();
         redstone_mod.interact(w.rsView(), &self.rs_sched, &self.rs_burn, changes, sounds, cx, cy, cz, now);
         return true;
     }
@@ -6347,6 +8732,7 @@ pub const Server = struct {
     ) void {
         self.loadRedstone(pool, now);
         var w = Server.RsWorld{ .pool = pool, .alloc = allocator, .changes = changes };
+        defer w.deinit();
         redstone_mod.onEdit(w.rsView(), &self.rs_sched, &self.rs_burn, changes, sounds, x, y, z, now);
     }
 
@@ -6354,8 +8740,6 @@ pub const Server = struct {
     /// No locks held (furnace-swap pattern: world work done, then broadcast).
     fn flushRsChange(
         self: *Server,
-        pool: *shard_mod.ShardPool,
-        allocator: std.mem.Allocator,
         gamemode: rules_mod.GameMode,
         c: redstone_mod.Change,
     ) void {
@@ -6368,7 +8752,7 @@ pub const Server = struct {
             const sz: f64 = @as(f64, @floatFromInt(c.z)) + 0.5;
             self.broadcastSound(null, Server.stepSound(c.old_id), sx, sy, sz, 1.0, 0.8);
             if (Server.shouldDropBreak(gamemode, c.old_id, self.tileDrops())) {
-                self.spawnBreakDrops(pool, allocator, c.x, @intCast(c.y), c.z, c.old_id, c.old_meta);
+                self.spawnBreakDrops(c.x, @intCast(c.y), c.z, c.old_id, c.old_meta);
             }
         }
     }
@@ -6403,6 +8787,7 @@ pub const Server = struct {
         if (y >= 255) return;
         // Vanilla `ach.placeDoorBlock`: upper = 8 | hinge bit.
         var w = Server.RsWorld{ .pool = pool, .alloc = allocator, .changes = changes };
+        defer w.deinit();
         const um: u4 = redstone_mod.doorUpperMeta(w.rsView(), x, y, z, @truncate(lower_meta & 3), id);
         const ay: u8 = y + 1;
         const above = view.peekBlock(pool, allocator, x, ay, z) catch null;
@@ -6428,6 +8813,7 @@ pub const Server = struct {
     ) void {
         if (old_id != game_ids.wooden_door_block and old_id != game_ids.iron_door_block) return;
         var w = Server.RsWorld{ .pool = pool, .alloc = allocator, .changes = changes };
+        defer w.deinit();
         if (redstone_mod.doorIsUpper(old_meta)) {
             if (y == 0) return;
             const below = view.peekBlock(pool, allocator, x, y - 1, z) catch null;
@@ -6448,6 +8834,21 @@ pub const Server = struct {
     /// ticker never nests. Documented exception to one-lock-at-a-time.)
     /// Mode-0 merges reuse Conn.clickPickupImplCell (same rules as window 0);
     /// shift/number-key moves are inlined below with item primitives.
+    /// Full furnace Window Items (window 2: 3 furnace slots + 36 player
+    /// alias) for resyncs that touch many cells at once (drag-spread,
+    /// cancel). Mirrors the mode-1 tail below (borrowed stacks, no frees).
+    fn queueFurnaceWindowFull(self: *Server, conn: *Conn, f: *FurnaceEnt) void {
+        _ = self;
+        var all: [39]?item_mod.Stack = [_]?item_mod.Stack{null} ** 39;
+        all[0] = f.input;
+        all[1] = f.fuel;
+        all[2] = f.output;
+        for (item_mod.main_lo..item_mod.inv_size) |i| all[i - 6] = conn.inv[i];
+        const wf = packets.frameWindowItemsAlloc(conn.allocator, 2, &all) catch return;
+        defer conn.allocator.free(wf);
+        conn.queueFramed(wf) catch {};
+    }
+
     fn applyFurnaceClick(self: *Server, conn: *Conn, fc: FurnaceClick) void {
         conn.lock.lock();
         defer conn.lock.unlock();
@@ -6456,38 +8857,34 @@ pub const Server = struct {
         self.furn_lock.lock();
         defer self.furn_lock.unlock();
         const f = self.findFurnace(ow.x, ow.y, ow.z) orelse return;
+        if (fc.mode <= 1 and fc.button != 0 and fc.button != 1) return;
+        // Drag-spread cancel: a non-drag click drops an in-flight paint.
+        // The click below resyncs its own slot; the full window here
+        // snaps back any other painted slots.
+        if (fc.mode != 5 and conn.drag.active and conn.drag.win == 2) {
+            conn.drag.reset();
+            self.queueFurnaceWindowFull(conn, f);
+            echoCursor(conn);
+        }
         switch (fc.mode) {
             0 => {
-                if (fc.button != 0 and fc.button != 1) return;
                 if (fc.slot == 2) {
                     if (!container_mod.takeOutput(&conn.cursor, &f.output)) return;
-                    const sf = packets.frameSetSlotAlloc(conn.allocator, 2, 2, null) catch return;
-                    defer conn.allocator.free(sf);
-                    conn.queueFramed(sf) catch {};
-                    const cf = packets.frameSetSlotAlloc(conn.allocator, -1, -1, conn.cursor) catch return;
-                    defer conn.allocator.free(cf);
-                    conn.queueFramed(cf) catch {};
+                    echoSlotCursor(conn, 2, 2, null);
                     return;
                 }
-                const cell: *?item_mod.Stack = if (fc.slot == 0) &f.input else if (fc.slot == 1) &f.fuel else if (fc.slot >= 3 and fc.slot <= 38) &conn.inv[@as(usize, @intCast(fc.slot)) - 3 + 9] else return;
+                const cell: *?item_mod.Stack = if (fc.slot == 0) &f.input else if (fc.slot == 1) &f.fuel else if (furnInvSlot(fc.slot)) |islot| &conn.inv[islot] else return;
                 if (!(container_mod.pickup(conn.allocator, cell, &conn.cursor, fc.button) catch return)) return;
-                const sf = packets.frameSetSlotAlloc(conn.allocator, 2, fc.slot, cell.*) catch return;
-                defer conn.allocator.free(sf);
-                conn.queueFramed(sf) catch {};
-                const cf = packets.frameSetSlotAlloc(conn.allocator, -1, -1, conn.cursor) catch return;
-                defer conn.allocator.free(cf);
-                conn.queueFramed(cf) catch {};
+                echoSlotCursor(conn, 2, fc.slot, cell.*);
             },
             1 => {
                 // Shift-click: output/input/fuel -> player inv; player inv ->
                 // smeltable to input, fuel to fuel, else hotbar<->main.
-                if (fc.button != 0 and fc.button != 1) return;
                 var changed = false;
                 if (fc.slot == 2 or fc.slot == 0 or fc.slot == 1) {
                     const cell: *?item_mod.Stack = if (fc.slot == 2) &f.output else if (fc.slot == 0) &f.input else &f.fuel;
-                    changed = container_mod.quickMove(conn.allocator, cell, &conn.inv, 9, 44, null);
-                } else if (fc.slot >= 3 and fc.slot <= 38) {
-                    const islot: usize = @as(usize, @intCast(fc.slot)) - 3 + 9;
+                    changed = container_mod.quickMove(conn.allocator, cell, &conn.inv, 9, 44, null, true);
+                } else if (furnInvSlot(fc.slot)) |islot| {
                     const st = conn.inv[islot] orelse return;
                     if (smelting_mod.findResult(st.id, st.damage) != null) {
                         changed = container_mod.mergeInto(conn.allocator, &conn.inv[islot], &f.input);
@@ -6497,7 +8894,7 @@ pub const Server = struct {
                         const in_hotbar = islot >= 36;
                         const lo: usize = if (in_hotbar) 9 else 36;
                         const hi: usize = if (in_hotbar) 35 else 44;
-                        changed = container_mod.quickMove(conn.allocator, &conn.inv[islot], &conn.inv, lo, hi, islot);
+                        changed = container_mod.quickMove(conn.allocator, &conn.inv[islot], &conn.inv, lo, hi, islot, !in_hotbar);
                     }
                 } else return;
                 if (!changed) return;
@@ -6505,7 +8902,7 @@ pub const Server = struct {
                 all[0] = f.input;
                 all[1] = f.fuel;
                 all[2] = f.output;
-                for (9..45) |i| all[i - 6] = conn.inv[i];
+                for (item_mod.main_lo..item_mod.inv_size) |i| all[i - 6] = conn.inv[i];
                 const wf = packets.frameWindowItemsAlloc(conn.allocator, 2, &all) catch return;
                 defer conn.allocator.free(wf);
                 conn.queueFramed(wf) catch {};
@@ -6518,26 +8915,670 @@ pub const Server = struct {
                 if (fc.slot >= 0 and fc.slot <= 1) {
                     const cell: *?item_mod.Stack = if (fc.slot == 0) &f.input else &f.fuel;
                     if (!container_mod.swap(cell, &conn.inv[h])) return;
-                    const sfa = packets.frameSetSlotAlloc(conn.allocator, 2, fc.slot, cell.*) catch return;
-                    defer conn.allocator.free(sfa);
-                    conn.queueFramed(sfa) catch {};
-                    const sfb = packets.frameSetSlotAlloc(conn.allocator, 2, @as(i16, @intCast(h - 6)), conn.inv[h]) catch return;
-                    defer conn.allocator.free(sfb);
-                    conn.queueFramed(sfb) catch {};
-                } else if (fc.slot >= 3 and fc.slot <= 38) {
-                    const islot: usize = @as(usize, @intCast(fc.slot)) - 3 + 9;
+                    echoFurnaceSwap(conn, fc.slot, cell.*, furnWinSlot(h), conn.inv[h]);
+                } else if (furnInvSlot(fc.slot)) |islot| {
                     if (!container_mod.swap(&conn.inv[islot], &conn.inv[h])) return;
-                    const sfa = packets.frameSetSlotAlloc(conn.allocator, 2, fc.slot, conn.inv[islot]) catch return;
-                    defer conn.allocator.free(sfa);
-                    conn.queueFramed(sfa) catch {};
-                    const sfb = packets.frameSetSlotAlloc(conn.allocator, 2, @as(i16, @intCast(h - 6)), conn.inv[h]) catch return;
-                    defer conn.allocator.free(sfb);
-                    conn.queueFramed(sfb) catch {};
+                    echoFurnaceSwap(conn, fc.slot, conn.inv[islot], furnWinSlot(h), conn.inv[h]);
                 }
+            },
+            5 => {
+                // Drag-spread (paint): start/add/end per shared conn state.
+                const is_start = fc.button == 0 or fc.button == 4;
+                const is_add = fc.button == 1 or fc.button == 5;
+                if (!is_start and !is_add and fc.button != 2 and fc.button != 6) return;
+                if (is_start) {
+                    conn.drag.reset();
+                    if (fc.slot != -999 or conn.cursor == null) return;
+                    conn.drag.begin(2, fc.button == 4);
+                    return;
+                }
+                if (!conn.drag.active or conn.drag.win != 2) {
+                    conn.drag.reset();
+                    self.queueFurnaceWindowFull(conn, f);
+                    echoCursor(conn);
+                    return;
+                }
+                if (is_add) {
+                    if (fc.slot < 0) return;
+                    if (self.furnDragCell(f, conn, @intCast(fc.slot)) == null) return;
+                    _ = conn.drag.add(2, @intCast(fc.slot));
+                    return;
+                }
+                var buf: [90]*?item_mod.Stack = undefined;
+                var nbuf: usize = 0;
+                for (conn.drag.slots[0..conn.drag.n]) |ws| {
+                    const cell = self.furnDragCell(f, conn, ws) orelse continue;
+                    if (nbuf < buf.len) {
+                        buf[nbuf] = cell;
+                        nbuf += 1;
+                    }
+                }
+                _ = container_mod.dragDistribute(conn.allocator, &conn.cursor, buf[0..nbuf], conn.drag.right);
+                conn.drag.reset();
+                self.queueFurnaceWindowFull(conn, f);
+                echoCursor(conn);
             },
             else => {},
         }
         _ = fc.action;
+    }
+
+    /// Window-2 slot (3..38) to player-inv index (9..44); null outside.
+    fn furnInvSlot(fc_slot: i16) ?usize {
+        if (fc_slot < 3 or fc_slot > 38) return null;
+        return @as(usize, @intCast(fc_slot)) - 3 + 9;
+    }
+
+    /// Player hotbar index (36..44) to window-2 slot (30..38).
+    fn furnWinSlot(inv: usize) i16 {
+        return @intCast(inv - 6);
+    }
+
+    /// Resolve a drag slot to its furnace-window cell with validity.
+    /// Input takes smeltables, fuel takes burnables, the output never
+    /// accepts; player alias cells take mergeable-or-empty.
+    fn furnDragCell(self: *Server, f: *FurnaceEnt, conn: *Conn, slot: u8) ?*?item_mod.Stack {
+        _ = self;
+        const cur = conn.cursor orelse return null;
+        if (slot <= 2) {
+            if (slot == 2) return null;
+            if (slot == 0 and smelting_mod.findResult(cur.id, cur.damage) == null) return null;
+            if (slot == 1 and smelting_mod.burnTime(cur.id) == 0) return null;
+            const cell: *?item_mod.Stack = if (slot == 0) &f.input else &f.fuel;
+            if (cell.*) |have| {
+                if (!item_mod.canMerge(have, cur)) return null;
+            }
+            return cell;
+        }
+        const islot = furnInvSlot(@intCast(slot)) orelse return null;
+        const cell = &conn.inv[islot];
+        if (cell.*) |have| {
+            if (!item_mod.canMerge(have, cur)) return null;
+        }
+        return cell;
+    }
+
+
+    /// Window-7 slot (4..39) to player-inv index (9..44); null outside.
+    fn brewInvSlot(bc_slot: i16) ?usize {
+        if (bc_slot < 4 or bc_slot > 39) return null;
+        return @as(usize, @intCast(bc_slot)) - 4 + 9;
+    }
+
+    /// Player hotbar index (36..44) to window-7 slot (31..39).
+    fn brewWinSlot(inv: usize) i16 {
+        return @intCast(inv - 5);
+    }
+
+    /// Resolve a drag slot to its brew-window cell with validity.
+    /// Bottle slots take potions only (any damage — water through splash);
+    /// the ingredient slot takes brewing ingredients; glass bottles never
+    /// enter the stand. Player alias cells take mergeable-or-empty.
+    fn brewDragCell(self: *Server, b: *BrewEnt, conn: *Conn, slot: u8) ?*?item_mod.Stack {
+        _ = self;
+        const cur = conn.cursor orelse return null;
+        if (slot <= 3) {
+            if (slot == 3 and !profile.game.potion_data.isIngredient(cur.id)) return null;
+            if (slot < 3 and cur.id != game_ids.potion) return null;
+            const cell: *?item_mod.Stack = if (slot == 3) &b.ingredient else &b.bottles[slot];
+            if (cell.*) |have| {
+                if (!item_mod.canMerge(have, cur)) return null;
+            }
+            return cell;
+        }
+        const islot = brewInvSlot(@intCast(slot)) orelse return null;
+        const cell = &conn.inv[islot];
+        if (cell.*) |have| {
+            if (!item_mod.canMerge(have, cur)) return null;
+        }
+        return cell;
+    }
+
+    /// Full brew window (window 7: 4 brew slots + 36 player alias) for
+    /// resyncs that touch many cells at once (drag-spread, cancel).
+    /// Mirrors queueFurnaceWindowFull (borrowed stacks, no frees).
+    fn queueBrewWindowFull(self: *Server, conn: *Conn, b: *BrewEnt) void {
+        _ = self;
+        var all: [40]?item_mod.Stack = [_]?item_mod.Stack{null} ** 40;
+        all[0] = b.bottles[0];
+        all[1] = b.bottles[1];
+        all[2] = b.bottles[2];
+        all[3] = b.ingredient;
+        for (item_mod.main_lo..item_mod.inv_size) |i| all[i - 5] = conn.inv[i];
+        const wf = packets.frameWindowItemsAlloc(conn.allocator, 7, &all) catch return;
+        defer conn.allocator.free(wf);
+        conn.queueFramed(wf) catch {};
+    }
+
+    /// Echo a mode-2 number-key swap (both window slots, window 7).
+    fn echoBrewSwap(conn: *Conn, slot_a: i16, a: ?item_mod.Stack, slot_b: i16, b: ?item_mod.Stack) void {
+        const sfa = packets.frameSetSlotAlloc(conn.allocator, 7, slot_a, a) catch return;
+        defer conn.allocator.free(sfa);
+        conn.queueFramed(sfa) catch {};
+        const sfb = packets.frameSetSlotAlloc(conn.allocator, 7, slot_b, b) catch return;
+        defer conn.allocator.free(sfb);
+        conn.queueFramed(sfb) catch {};
+    }
+
+    /// Window-7 click (slots 0-2 bottles, 3 ingredient, 4-39 alias inv
+    /// 9..44). Runs on the serve thread with conn.lock held, taking
+    /// brew_lock nested inside (same leaf discipline as furn_lock: brew
+    /// is never held while acquiring conn anywhere).
+    /// Mode-0 merges reuse Conn.clickPickupImplCell (same rules as window
+    /// 0); shift/number-key moves are inlined below with item primitives.
+    fn applyBrewClick(self: *Server, conn: *Conn, bc: BrewClick) void {
+        conn.lock.lock();
+        defer conn.lock.unlock();
+        const ow = conn.open_win orelse return;
+        if (ow.id != 7) return;
+        self.brew_lock.lock();
+        defer self.brew_lock.unlock();
+        const b = self.findBrew(ow.x, ow.y, ow.z) orelse return;
+        if (bc.mode <= 1 and bc.button != 0 and bc.button != 1) return;
+        // Drag-spread cancel: a non-drag click drops an in-flight paint.
+        if (bc.mode != 5 and conn.drag.active and conn.drag.win == 7) {
+            conn.drag.reset();
+            self.queueBrewWindowFull(conn, b);
+            echoCursor(conn);
+        }
+        switch (bc.mode) {
+            0 => {
+                const cell: *?item_mod.Stack = if (bc.slot <= 3) blk: {
+                    if (bc.slot < 0) return;
+                    break :blk if (bc.slot == 3) &b.ingredient else &b.bottles[@intCast(bc.slot)];
+                } else if (brewInvSlot(bc.slot)) |islot| &conn.inv[islot] else return;
+                if (!(container_mod.pickup(conn.allocator, cell, &conn.cursor, bc.button) catch return)) return;
+                echoSlotCursor(conn, 7, bc.slot, cell.*);
+            },
+            1 => {
+                // Shift-click: bottles/ingredient -> player inv; player
+                // inv -> bottle slots for potions, ingredient slot for
+                // brewing ingredients, else hotbar<->main.
+                var changed = false;
+                if (bc.slot >= 0 and bc.slot <= 3) {
+                    const cell: *?item_mod.Stack = if (bc.slot == 3) &b.ingredient else &b.bottles[@intCast(bc.slot)];
+                    changed = container_mod.quickMove(conn.allocator, cell, &conn.inv, 9, 44, null, true);
+                } else if (brewInvSlot(bc.slot)) |islot| {
+                    const st = conn.inv[islot] orelse return;
+                    if (st.id == game_ids.potion) {
+                        // Bottles fill first, in slot order (vanilla
+                        // transferStack order for the brewing GUI).
+                        for (&b.bottles) |*bt| {
+                            if (container_mod.mergeInto(conn.allocator, &conn.inv[islot], bt)) {
+                                changed = true;
+                                break;
+                            }
+                        }
+                    } else if (profile.game.potion_data.isIngredient(st.id)) {
+                        changed = container_mod.mergeInto(conn.allocator, &conn.inv[islot], &b.ingredient);
+                    } else {
+                        const in_hotbar = islot >= 36;
+                        const lo: usize = if (in_hotbar) 9 else 36;
+                        const hi: usize = if (in_hotbar) 35 else 44;
+                        changed = container_mod.quickMove(conn.allocator, &conn.inv[islot], &conn.inv, lo, hi, islot, !in_hotbar);
+                    }
+                } else return;
+                if (!changed) return;
+                self.queueBrewWindowFull(conn, b);
+            },
+            2 => {
+                if (bc.button < 0 or bc.button > 8) return;
+                if (conn.cursor != null) return;
+                const h: usize = 36 + @as(usize, @intCast(bc.button));
+                if (bc.slot >= 0 and bc.slot <= 3) {
+                    const cell: *?item_mod.Stack = if (bc.slot == 3) &b.ingredient else &b.bottles[@intCast(bc.slot)];
+                    if (!container_mod.swap(cell, &conn.inv[h])) return;
+                    echoBrewSwap(conn, bc.slot, cell.*, brewWinSlot(h), conn.inv[h]);
+                } else if (brewInvSlot(bc.slot)) |islot| {
+                    if (!container_mod.swap(&conn.inv[islot], &conn.inv[h])) return;
+                    echoBrewSwap(conn, bc.slot, conn.inv[islot], brewWinSlot(h), conn.inv[h]);
+                }
+            },
+            5 => {
+                // Drag-spread (paint): start/add/end per shared conn state.
+                const is_start = bc.button == 0 or bc.button == 4;
+                const is_add = bc.button == 1 or bc.button == 5;
+                if (!is_start and !is_add and bc.button != 2 and bc.button != 6) return;
+                if (is_start) {
+                    conn.drag.reset();
+                    if (bc.slot != -999 or conn.cursor == null) return;
+                    conn.drag.begin(7, bc.button == 4);
+                    return;
+                }
+                if (!conn.drag.active or conn.drag.win != 7) {
+                    conn.drag.reset();
+                    self.queueBrewWindowFull(conn, b);
+                    echoCursor(conn);
+                    return;
+                }
+                if (is_add) {
+                    if (bc.slot < 0) return;
+                    if (self.brewDragCell(b, conn, @intCast(bc.slot)) == null) return;
+                    _ = conn.drag.add(7, @intCast(bc.slot));
+                    return;
+                }
+                var buf: [90]*?item_mod.Stack = undefined;
+                var nbuf: usize = 0;
+                for (conn.drag.slots[0..conn.drag.n]) |ws| {
+                    const cell = self.brewDragCell(b, conn, ws) orelse continue;
+                    if (nbuf < buf.len) {
+                        buf[nbuf] = cell;
+                        nbuf += 1;
+                    }
+                }
+                _ = container_mod.dragDistribute(conn.allocator, &conn.cursor, buf[0..nbuf], conn.drag.right);
+                conn.drag.reset();
+                self.queueBrewWindowFull(conn, b);
+                echoCursor(conn);
+            },
+            else => {},
+        }
+        _ = bc.action;
+    }
+
+    /// Echo a mode-2 number-key swap (both window slots).
+    fn echoFurnaceSwap(conn: *Conn, slot_a: i16, a: ?item_mod.Stack, slot_b: i16, b: ?item_mod.Stack) void {
+        const sfa = packets.frameSetSlotAlloc(conn.allocator, 2, slot_a, a) catch return;
+        defer conn.allocator.free(sfa);
+        conn.queueFramed(sfa) catch {};
+        const sfb = packets.frameSetSlotAlloc(conn.allocator, 2, slot_b, b) catch return;
+        defer conn.allocator.free(sfb);
+        conn.queueFramed(sfb) catch {};
+    }
+
+    /// Echo a chest mode-2 number-key swap (both window slots, window-aware).
+    fn echoChestSwap(conn: *Conn, win: i8, slot_a: i16, a: ?item_mod.Stack, slot_b: i16, b: ?item_mod.Stack) void {
+        const sfa = packets.frameSetSlotAlloc(conn.allocator, win, slot_a, a) catch return;
+        defer conn.allocator.free(sfa);
+        conn.queueFramed(sfa) catch {};
+        const sfb = packets.frameSetSlotAlloc(conn.allocator, win, slot_b, b) catch return;
+        defer conn.allocator.free(sfb);
+        conn.queueFramed(sfb) catch {};
+    }
+
+    /// Window slot to player-inv index, or null outside the alias range.
+    /// Single (5): 27-62 alias inv 9-44. Double (6): 54-89 alias inv 9-44.
+    fn chestInvSlot(win_slot: i16, is_double: bool) ?usize {
+        if (!is_double) {
+            if (win_slot < 27 or win_slot > 62) return null;
+            return @as(usize, @intCast(win_slot)) - 18;
+        }
+        if (win_slot < 54 or win_slot > 89) return null;
+        return @as(usize, @intCast(win_slot)) - 45;
+    }
+
+    /// Player-inv index (36..44 hotbar) to chest-window slot.
+    fn chestWinSlot(inv: usize, is_double: bool) i16 {
+        return @intCast(inv + (if (is_double) @as(usize, 45) else 18));
+    }
+
+    /// Resolve a drag slot to its cell for chest windows (single: 0-26
+    /// chest, 27-62 player alias; double: 0-53, 54-89). Returns null for
+    /// out-of-range slots. Validity mirrors mode-0 placement gating:
+    /// chest cells need the cursor's NBT to fit the row cap, player cells
+    /// take anything mergeable-or-empty.
+    fn chestDragCell(self: *Server, halves: []?*ChestEnt, nchest: usize, conn: *Conn, slot: u8) ?*?item_mod.Stack {
+        _ = self;
+        const cur = conn.cursor orelse return null;
+        if (slot < nchest) {
+            if (!chest_mod.slotFitsChest(cur)) return null;
+            const s: usize = slot;
+            const cell = if (nchest == 54) &halves[s / 27].?.slots[s % 27] else &halves[0].?.slots[s];
+            if (cell.*) |have| {
+                if (!item_mod.canMerge(have, cur)) return null;
+            }
+            return cell;
+        }
+        if (slot >= nchest + 36) return null;
+        const islot: usize = slot - nchest + 9;
+        if (islot >= item_mod.inv_size) return null;
+        const cell = &conn.inv[islot];
+        if (cell.*) |have| {
+            if (!item_mod.canMerge(have, cur)) return null;
+        }
+        return cell;
+    }
+
+    /// Shift-click helper: move a source cell across chest halves (merge
+    /// first across everything, then first empty). Same two-phase shape
+    /// as container_mod.quickMove (which needs one contiguous range).
+    fn quickMoveToChest(alloc: std.mem.Allocator, src: *?item_mod.Stack, halves: []const []?item_mod.Stack) bool {
+        if (src.* == null) return false;
+        var moved = false;
+        for (halves) |lst| {
+            for (lst) |*cell| {
+                if (src.* == null) break;
+                if (container_mod.mergeInto(alloc, src, cell)) moved = true;
+            }
+            if (src.* == null) break;
+        }
+        if (src.* != null) {
+            for (halves) |lst| {
+                for (lst) |*cell| {
+                    if (cell.* != null) continue;
+                    cell.* = src.*;
+                    src.* = null;
+                    moved = true;
+                    break;
+                }
+                if (src.* == null) break;
+            }
+        }
+        return moved;
+    }
+
+    /// Chest click (windows 5/6). Runs on the serve thread: conn.lock,
+    /// then chest_lock (leaf-ward, like conn->furn). Shared rows mutate
+    /// under chest_lock; the actor syncs before release; other viewers
+    /// refresh after (their locks only — never nested under chest_lock).
+    fn applyChestClick(self: *Server, conn: *Conn, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, cc: ChestClick) void {
+        const sync = self.mutateChestClick(conn, pool, allocator, cc) orelse return;
+        defer {
+            var cbuf = sync.cbuf;
+            for (cbuf[0..sync.nchest]) |*st| item_mod.freeStack(conn.allocator, st);
+        }
+        self.refreshChestViewers(sync, conn);
+    }
+
+    const ChestSync = struct {
+        halves_pos: [2]?ChestPos,
+        nhalf: usize,
+        cbuf: [54]?item_mod.Stack,
+        nchest: usize,
+        win: i8,
+    };
+
+    fn mutateChestClick(self: *Server, conn: *Conn, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, cc: ChestClick) ?ChestSync {
+        conn.lock.lock();
+        defer conn.lock.unlock();
+        const ow = conn.open_win orelse return null;
+        if (ow.id != 5 and ow.id != 6) return null;
+        if (cc.mode < 0 or (cc.mode > 2 and cc.mode != 5)) return null;
+        if (cc.mode <= 1 and cc.button != 0 and cc.button != 1) return null;
+        const win: i8 = @intCast(ow.id);
+        const is_double_open = ow.id == 6;
+        self.chest_lock.lock();
+        defer self.chest_lock.unlock();
+        const anchor = self.findChest(ow.x, ow.y, ow.z) orelse return null;
+        // Current pair, sorted (same order as open). A double UI whose
+        // pair dissolved (break closes viewers first, so unreachable in
+        // practice) resolves to nothing — never misroutes.
+        var halves: [2]?*ChestEnt = [_]?*ChestEnt{ anchor, null };
+        var hpos: [2]?ChestPos = [_]?ChestPos{ .{ .x = ow.x, .y = ow.y, .z = ow.z }, null };
+        var nhalf: usize = 1;
+        if (is_double_open) {
+            const mate = self.chestPair(pool, allocator, ow.x, ow.y, ow.z, anchor.id) orelse return null;
+            const me = self.findChest(mate.x, ow.y, mate.z) orelse return null;
+            nhalf = 2;
+            if (mate.x < ow.x or (mate.x == ow.x and mate.z < ow.z)) {
+                halves = [_]?*ChestEnt{ me, anchor };
+                hpos = [_]?ChestPos{ .{ .x = mate.x, .y = ow.y, .z = mate.z }, .{ .x = ow.x, .y = ow.y, .z = ow.z } };
+            } else {
+                halves = [_]?*ChestEnt{ anchor, me };
+                hpos = [_]?ChestPos{ .{ .x = ow.x, .y = ow.y, .z = ow.z }, .{ .x = mate.x, .y = ow.y, .z = mate.z } };
+            }
+        }
+        const nchest: usize = if (is_double_open) 54 else 27;
+        // Resolve the clicked cell (size comes from the OPEN id, never the
+        // live pair — a pair forming/dissolving under an open UI must not
+        // reroute clicks into the wrong region).
+        var chest_half: ?usize = null;
+        var cell: *?item_mod.Stack = undefined;
+        var have_cell = false;
+        if (!is_double_open) {
+            if (cc.slot >= 0 and cc.slot <= 26) {
+                cell = &halves[0].?.slots[@intCast(cc.slot)];
+                chest_half = 0;
+                have_cell = true;
+            }
+        } else {
+            if (cc.slot >= 0 and cc.slot <= 53) {
+                const s: usize = @intCast(cc.slot);
+                cell = &halves[s / 27].?.slots[s % 27];
+                chest_half = s / 27;
+                have_cell = true;
+            }
+        }
+        const islot = chestInvSlot(cc.slot, is_double_open);
+        // Drag-spread start/end ride slot -999 (no cell): let them through
+        // to the mode-5 arm below; adds need real cells like other clicks.
+        const is_drag_edge = cc.mode == 5 and cc.slot == -999;
+        if (!have_cell and islot == null and !is_drag_edge) return null; // out of range: ignore
+        // Drag-spread cancel: a non-drag click drops an in-flight paint;
+        // resync first so the client's predicted paint snaps back, then
+        // the click below processes normally.
+        if (cc.mode != 5 and conn.drag.active and conn.drag.win == win) {
+            conn.drag.reset();
+            self.queueChestWindow(conn, halves[0..nhalf], win, nchest);
+            echoCursor(conn);
+        }
+        switch (cc.mode) {
+            0 => {
+                if (have_cell) {
+                    // Gate the incoming stack (placing): oversize NBT would
+                    // persist an unopenable row. Echo snaps back (no ghost).
+                    if (conn.cursor != null and !chest_mod.slotFitsChest(conn.cursor)) {
+                        echoSlotCursor(conn, win, cc.slot, cell.*);
+                        return null;
+                    }
+                    if (!(container_mod.pickup(conn.allocator, cell, &conn.cursor, cc.button) catch return null)) return null;
+                    echoSlotCursor(conn, win, cc.slot, cell.*);
+                    halves[chest_half.?].?.dirty = true;
+                } else {
+                    const ii = islot.?;
+                    if (!(container_mod.pickup(conn.allocator, &conn.inv[ii], &conn.cursor, cc.button) catch return null)) return null;
+                    echoSlotCursor(conn, win, cc.slot, conn.inv[ii]);
+                }
+            },
+            1 => {
+                if (have_cell) {
+                    if (cell.* == null) return null;
+                    if (!container_mod.quickMove(conn.allocator, cell, &conn.inv, 9, 44, null, true)) return null;
+                    halves[chest_half.?].?.dirty = true;
+                } else {
+                    const ii = islot.?;
+                    if (conn.inv[ii] == null) return null;
+                    if (!chest_mod.slotFitsChest(conn.inv[ii])) {
+                        // Oversize in: full refresh snaps back (no ghost,
+                        // no dirty, no viewer traffic — nothing changed).
+                        self.queueChestWindow(conn, halves[0..nhalf], win, nchest);
+                        echoCursor(conn);
+                        return null;
+                    }
+                    var lists: [2][]?item_mod.Stack = undefined;
+                    var nl: usize = 0;
+                    for (halves[0..nhalf]) |h| {
+                        lists[nl] = h.?.slots[0..];
+                        nl += 1;
+                    }
+                    if (!container_mod.quickMoveLists(conn.allocator, &conn.inv[ii], lists[0..nl], false)) return null;
+                    halves[0].?.dirty = true;
+                    if (nhalf > 1) halves[1].?.dirty = true;
+                }
+                self.queueChestWindow(conn, halves[0..nhalf], win, nchest);
+                echoCursor(conn);
+            },
+            2 => {
+                if (cc.button < 0 or cc.button > 8) return null;
+                if (conn.cursor != null) return null;
+                const h: usize = 36 + @as(usize, @intCast(cc.button));
+                if (have_cell) {
+                    // Gate the hotbar side (it enters the chest on swap).
+                    if (!chest_mod.slotFitsChest(conn.inv[h])) {
+                        echoChestSwap(conn, win, cc.slot, cell.*, chestWinSlot(h, is_double_open), conn.inv[h]);
+                        return null;
+                    }
+                    if (!container_mod.swap(cell, &conn.inv[h])) return null;
+                    halves[chest_half.?].?.dirty = true;
+                    self.queueChestWindow(conn, halves[0..nhalf], win, nchest);
+                    echoCursor(conn);
+                } else {
+                    const ii = islot.?;
+                    if (ii == h) return null;
+                    if (!container_mod.swap(&conn.inv[ii], &conn.inv[h])) return null;
+                    echoChestSwap(conn, win, cc.slot, conn.inv[ii], chestWinSlot(h, is_double_open), conn.inv[h]);
+                }
+            },
+            5 => {
+                // Drag-spread (paint): start/add/end per shared conn state.
+                const is_start = cc.button == 0 or cc.button == 4;
+                const is_add = cc.button == 1 or cc.button == 5;
+                if (!is_start and !is_add and cc.button != 2 and cc.button != 6) return null;
+                if (is_start) {
+                    conn.drag.reset();
+                    if (cc.slot != -999 or conn.cursor == null) return null;
+                    conn.drag.begin(win, cc.button == 4);
+                    return null;
+                }
+                if (!conn.drag.active or conn.drag.win != win) {
+                    conn.drag.reset();
+                    self.queueChestWindow(conn, halves[0..nhalf], win, nchest);
+                    echoCursor(conn);
+                    return null;
+                }
+                if (is_add) {
+                    if (cc.slot < 0) return null;
+                    if (self.chestDragCell(halves[0..nhalf], nchest, conn, @intCast(cc.slot)) == null) return null;
+                    _ = conn.drag.add(win, @intCast(cc.slot));
+                    return null;
+                }
+                // End: resolve every dragged slot against CURRENT state,
+                // spread the cursor, mark touched halves, full-resync the
+                // actor (viewers refresh from the returned sync below).
+                var buf: [90]*?item_mod.Stack = undefined;
+                var nbuf: usize = 0;
+                for (conn.drag.slots[0..conn.drag.n]) |ws| {
+                    const dcell = self.chestDragCell(halves[0..nhalf], nchest, conn, ws) orelse continue;
+                    if (nbuf < buf.len) {
+                        buf[nbuf] = dcell;
+                        nbuf += 1;
+                    }
+                }
+                const is_right = conn.drag.right;
+                if (container_mod.dragDistribute(conn.allocator, &conn.cursor, buf[0..nbuf], is_right)) {
+                    for (conn.drag.slots[0..conn.drag.n]) |ws| {
+                        if (ws < nchest) halves[ws / 27].?.dirty = true;
+                    }
+                }
+                conn.drag.reset();
+                self.queueChestWindow(conn, halves[0..nhalf], win, nchest);
+                echoCursor(conn);
+            },
+            else => return null,
+        }
+        // Snapshot for viewer refresh (cloned; chest_lock released on
+        // return via defer, viewers sync lock-free of chest state).
+        var cbuf: [54]?item_mod.Stack = [_]?item_mod.Stack{null} ** 54;
+        var ci: usize = 0;
+        for (halves[0..nhalf]) |e| {
+            for (e.?.slots) |st| {
+                cbuf[ci] = item_mod.cloneStack(conn.allocator, st) catch null;
+                ci += 1;
+            }
+        }
+        return ChestSync{ .halves_pos = hpos, .nhalf = nhalf, .cbuf = cbuf, .nchest = nchest, .win = win };
+    }
+
+    /// Assemble + queue a full chest Window Items for the ACTOR (caller
+    /// holds conn.lock and chest_lock; borrows entry stacks + conn inv).
+    fn queueChestWindow(self: *Server, conn: *Conn, halves: []?*ChestEnt, win: i8, nchest: usize) void {
+        _ = self;
+        var all: [90]?item_mod.Stack = [_]?item_mod.Stack{null} ** 90;
+        var ci: usize = 0;
+        for (halves) |h| {
+            for (h.?.slots) |st| {
+                all[ci] = st;
+                ci += 1;
+            }
+        }
+        for (item_mod.main_lo..item_mod.inv_size) |i| all[nchest + (i - item_mod.main_lo)] = conn.inv[i];
+        const wf = packets.frameWindowItemsAlloc(conn.allocator, @intCast(win), all[0 .. nchest + 36]) catch return;
+        defer conn.allocator.free(wf);
+        conn.queueFramed(wf) catch {};
+    }
+
+    /// Refresh other viewers after a chest mutation (no locks held on
+    /// entry; chest state arrives as clones). Skips the actor and any
+    /// viewer whose UI size no longer matches (stale sizes resolve on
+    /// reopen; their clicks stay safe via id-bound routing).
+    fn refreshChestViewers(self: *Server, sync: ChestSync, actor: *Conn) void {
+        var batch: [max_fanout]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        for (snap) |e| {
+            if (e.conn == actor) continue;
+            if (!e.conn.lock.tryLock()) continue;
+            const ow = e.conn.open_win;
+            if (ow == null or ow.?.id != @as(u8, @intCast(sync.win))) {
+                e.conn.lock.unlock();
+                continue;
+            }
+            // Locate the viewer's half in the snapshot order.
+            var hidx: ?usize = null;
+            for (sync.halves_pos[0..sync.nhalf], 0..) |hp, i| {
+                if (hp) |p| {
+                    if (p.x == ow.?.x and p.y == ow.?.y and p.z == ow.?.z) hidx = i;
+                }
+            }
+            const hi = hidx orelse {
+                e.conn.lock.unlock();
+                continue;
+            };
+            const vnchest: usize = if (ow.?.id == 6) 54 else 27;
+            if (ow.?.id == 6 and sync.nhalf < 2) {
+                e.conn.lock.unlock();
+                continue;
+            }
+            var all: [90]?item_mod.Stack = [_]?item_mod.Stack{null} ** 90;
+            if (ow.?.id == 6) {
+                for (sync.cbuf[0..54], 0..) |st, i| all[i] = st;
+            } else {
+                for (sync.cbuf[hi * 27 .. hi * 27 + 27], 0..) |st, i| all[i] = st;
+            }
+            for (item_mod.main_lo..item_mod.inv_size) |i| all[vnchest + (i - item_mod.main_lo)] = e.conn.inv[i];
+            const wf = packets.frameWindowItemsAlloc(e.conn.allocator, ow.?.id, all[0 .. vnchest + 36]) catch {
+                e.conn.lock.unlock();
+                continue;
+            };
+            defer e.conn.allocator.free(wf);
+            e.conn.queueFramed(wf) catch {};
+            e.conn.lock.unlock();
+            flushEntry(e, self.io);
+        }
+    }
+
+    /// Client-initiated chest close (0x0D): lid sound + S24 lid events when
+    /// the last viewer leaves (conn already cleared its window, so counts
+    /// are the true remainder). Pair totals to both halves (see open).
+    /// Contents persist; nothing drops. Look-don't-touch closes (empty,
+    /// clean, alone) evict the entry entirely — zero footprint for
+    /// opened-but-unused chests.
+    fn spawnChestClose(self: *Server, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, cc: ChestClose) void {
+        if (cc.window != 5 and cc.window != 6) return;
+        var total = self.countChestViewers(cc.x, cc.y, cc.z);
+        const mate = if (cc.window == 6)
+            self.chestPair(pool, allocator, cc.x, cc.y, cc.z, self.chestKindAt(pool, allocator, cc.x, cc.y, cc.z))
+        else
+            null;
+        if (mate) |m| total += self.countChestViewers(m.x, cc.y, m.z);
+        if (total == 0) {
+            self.broadcastSound(null, "random.chestclosed", @as(f64, @floatFromInt(cc.x)) + 0.5, @as(f64, @floatFromInt(cc.y)) + 0.5, @as(f64, @floatFromInt(cc.z)) + 0.5, 0.5, 0.95);
+        }
+        const n: u8 = @intCast(@min(total, 255));
+        const kind = self.chestKindAt(pool, allocator, cc.x, cc.y, cc.z);
+        self.broadcastBlockAction(cc.x, cc.y, cc.z, 1, n, kind);
+        if (mate) |m| self.broadcastBlockAction(m.x, cc.y, m.z, 1, n, kind);
+        self.chest_lock.lock();
+        defer self.chest_lock.unlock();
+        const e = self.findChest(cc.x, cc.y, cc.z) orelse return;
+        if (e.dirty) return;
+        for (e.slots) |s| {
+            if (s != null) return;
+        }
+        // Empty, clean, alone: evict (a concurrent break already removed
+        // it -> removeChest misses -> nothing to do).
+        var gone = self.removeChest(cc.x, cc.y, cc.z) orelse return;
+        chest_mod.freeSlots(self.gpa, &gone);
     }
 
     /// Next enchanting seed from the shared drop rand (leaf rand_lock only).
@@ -6546,6 +9587,24 @@ pub const Server = struct {
         defer self.rand_lock.unlock();
         if (self.drop_rand == null) self.drop_rand = java_random.JavaRandom.init(self.drop_seed);
         return self.drop_rand.?.nextInt();
+    }
+
+    /// Next item-toss uniform in [0,1) from the DEDICATED toss stream
+    /// (leaf rand_lock only). Never draws from drop_rand: toss motion is
+    /// player-visible every break, and sharing the world-seeded stream
+    /// would expose worldgen RNG state (randar). Matches vanilla shape,
+    /// where EntityItem motion comes from Math.random(), not world.rand.
+    fn nextToss(self: *Server) f32 {
+        self.rand_lock.lock();
+        defer self.rand_lock.unlock();
+        if (self.toss_rand == null) self.toss_rand = java_random.JavaRandom.init(self.toss_seed);
+        return self.toss_rand.?.nextFloat();
+    }
+
+    /// Vanilla break/drop pop motion (jar `xk` EntityItem ctor): XZ in
+    /// [-0.1, 0.1], Y 0.2 — drawn from the toss stream, never drop_rand.
+    fn tossPopMotion(self: *Server) [3]f64 {
+        return .{ self.nextToss() * 0.2 - 0.1, 0.2, self.nextToss() * 0.2 - 0.1 };
     }
 
     /// Count bookshelves around an enchanting table (vanilla air-gap rule).
@@ -6560,9 +9619,12 @@ pub const Server = struct {
         tz: i32,
     ) u8 {
         _ = self;
+        // Thread-local pool binding: serve threads share this function
+        // (thread-per-conn), and the shelf callback takes no context —
+        // globals here would race across conns.
         const S = struct {
-            var p: *shard_mod.ShardPool = undefined;
-            var a: std.mem.Allocator = undefined;
+            threadlocal var p: *shard_mod.ShardPool = undefined;
+            threadlocal var a: std.mem.Allocator = undefined;
             fn get(x: i32, y: i32, z: i32) ?game_ids.Id {
                 if (y < 0 or y > 255) return null;
                 const pb = view.peekBlock(p, a, x, @intCast(y), z) catch return null;
@@ -6573,6 +9635,11 @@ pub const Server = struct {
         S.p = pool;
         S.a = allocator;
         return enchanting_mod.countBookshelves(tx, ty, tz, &S.get);
+    }
+
+    /// Zero all three offer levels (unenchantable / missing / stacked item).
+    fn zeroEnchantLevels(conn: *Conn) void {
+        conn.enchant_levels = .{ 0, 0, 0 };
     }
 
     /// Recompute the three offer levels for the open enchant UI.
@@ -6587,25 +9654,15 @@ pub const Server = struct {
         tz: i32,
     ) void {
         const shelves = Server.countShelves(self, pool, allocator, tx, ty, tz);
-        const st = conn.enchant_item;
-        if (st == null) {
-            conn.enchant_levels = .{ 0, 0, 0 };
-            return;
-        }
+        const st = conn.enchant_item orelse return zeroEnchantLevels(conn);
         var has_ench = false;
-        if (st.?.nbt) |raw| {
+        if (st.nbt) |raw| {
             var have: [8]u8 = undefined;
             if (parseEnchIds(raw, &have) > 0) has_ench = true;
         }
-        if (!enchanting_mod.isEnchantableId(st.?.id, has_ench)) {
-            conn.enchant_levels = .{ 0, 0, 0 };
-            return;
-        }
-        if (st.?.count != 1) {
-            conn.enchant_levels = .{ 0, 0, 0 };
-            return;
-        }
-        const ench = profile.game.enchanting_data.enchantabilityForId(st.?.id);
+        if (!enchanting_mod.isEnchantableId(st.id, has_ench)) return zeroEnchantLevels(conn);
+        if (st.count != 1) return zeroEnchantLevels(conn);
+        const ench = profile.game.enchanting_data.enchantabilityForId(st.id);
         var rng = java_random.JavaRandom.init(conn.enchant_seed);
         conn.enchant_levels = enchanting_mod.calcLevels(&rng, shelves, ench);
     }
@@ -6648,6 +9705,51 @@ pub const Server = struct {
         return true;
     }
 
+    /// Split one unit off a stack (dupes NBT, decrements the source,
+    /// frees it at zero). Null on empty/OOM. Shared by the enchant
+    /// single-slot paths (place-one / shift-take-one).
+    fn splitOne(alloc: std.mem.Allocator, src: *?item_mod.Stack) ?item_mod.Stack {
+        const s = src.* orelse return null;
+        if (s.count <= 0) return null;
+        const one = item_mod.Stack{
+            .id = s.id,
+            .count = 1,
+            .damage = s.damage,
+            .nbt = if (s.nbt) |n| alloc.dupe(u8, n) catch return null else null,
+        };
+        src.*.?.count -= 1;
+        if (src.*.?.count <= 0) item_mod.freeStack(alloc, src);
+        return one;
+    }
+
+    /// Window-4 slot (1..36) to player-inv index (9..44); null outside.
+    fn enchantInvSlot(ec_slot: i16) ?usize {
+        if (ec_slot < 1 or ec_slot > 36) return null;
+        return @as(usize, @intCast(ec_slot)) - 1 + 9;
+    }
+
+    /// Echo a window click: the touched slot plus the cursor (-1).
+    fn echoSlotCursor(conn: *Conn, window: i8, slot: i16, cell: ?item_mod.Stack) void {
+        const sf = packets.frameSetSlotAlloc(conn.allocator, window, slot, cell) catch return;
+        defer conn.allocator.free(sf);
+        conn.queueFramed(sf) catch {};
+        const cf = packets.frameSetSlotAlloc(conn.allocator, -1, -1, conn.cursor) catch return;
+        defer conn.allocator.free(cf);
+        conn.queueFramed(cf) catch {};
+    }
+
+    /// Echo the cursor alone (slot state already synced).
+    fn echoCursor(conn: *Conn) void {
+        const cf = packets.frameSetSlotAlloc(conn.allocator, -1, -1, conn.cursor) catch return;
+        defer conn.allocator.free(cf);
+        conn.queueFramed(cf) catch {};
+    }
+
+    /// Recompute offers + sync the open enchant window.
+    fn resyncEnchant(self: *Server, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, conn: *Conn, x: i32, y: u8, z: i32) void {
+        self.recomputeEnchantLevels(pool, allocator, conn, x, y, z);
+        self.syncEnchantWindow(conn);
+    }
     /// Window-4 click (slots 0 = item, 1-36 alias inv 9-44). Runs on the
     /// serve thread with conn.lock held; pool reads need no world_lock.
     /// Mode-0 enforces the single-item slot limit (vanilla Slot limit 1);
@@ -6665,17 +9767,7 @@ pub const Server = struct {
                     if (conn.enchant_item == null and conn.cursor == null) return;
                     if (conn.enchant_item == null) {
                         // Place from cursor: move exactly one.
-                        const c = conn.cursor.?; // checked above
-                        if (c.count <= 0) return;
-                        const one = item_mod.Stack{
-                            .id = c.id,
-                            .count = 1,
-                            .damage = c.damage,
-                            .nbt = if (c.nbt) |n| conn.allocator.dupe(u8, n) catch return else null,
-                        };
-                        conn.enchant_item = one;
-                        conn.cursor.?.count -= 1;
-                        if (conn.cursor.?.count <= 0) item_mod.freeStack(conn.allocator, &conn.cursor);
+                        conn.enchant_item = splitOne(conn.allocator, &conn.cursor) orelse return;
                     } else if (conn.cursor == null) {
                         // Pick up the single item.
                         conn.cursor = conn.enchant_item;
@@ -6687,24 +9779,15 @@ pub const Server = struct {
                         const c = conn.cursor.?;
                         if (e.count != 1 or c.count != 1) return;
                         // NBT-merge would break conservation; swap ownership.
-                        const t = conn.enchant_item;
+                        const tmp = conn.enchant_item;
                         conn.enchant_item = conn.cursor;
-                        conn.cursor = t;
+                        conn.cursor = tmp;
                     }
-                    self.recomputeEnchantLevels(pool, allocator, conn, ow.x, ow.y, ow.z);
-                    self.syncEnchantWindow(conn);
-                    const cf = packets.frameSetSlotAlloc(conn.allocator, -1, -1, conn.cursor) catch return;
-                    defer conn.allocator.free(cf);
-                    conn.queueFramed(cf) catch {};
-                } else if (ec.slot >= 1 and ec.slot <= 36) {
-                    const islot: usize = @as(usize, @intCast(ec.slot)) - 1 + 9;
+                    self.resyncEnchant(pool, allocator, conn, ow.x, ow.y, ow.z);
+                    echoCursor(conn);
+                } else if (enchantInvSlot(ec.slot)) |islot| {
                     if (!(container_mod.pickup(conn.allocator, &conn.inv[islot], &conn.cursor, ec.button) catch return)) return;
-                    const sf = packets.frameSetSlotAlloc(conn.allocator, 4, ec.slot, conn.inv[islot]) catch return;
-                    defer conn.allocator.free(sf);
-                    conn.queueFramed(sf) catch {};
-                    const cf = packets.frameSetSlotAlloc(conn.allocator, -1, -1, conn.cursor) catch return;
-                    defer conn.allocator.free(cf);
-                    conn.queueFramed(cf) catch {};
+                    echoSlotCursor(conn, 4, ec.slot, conn.inv[islot]);
                 } else return;
             },
             1 => {
@@ -6712,42 +9795,19 @@ pub const Server = struct {
                 // enchant slot (exactly one, when empty and enchantable).
                 if (ec.button != 0 and ec.button != 1) return;
                 if (ec.slot == 0) {
-                    const st = conn.enchant_item orelse return;
-                    // Merge into player range 9..44, then first empty.
-                    var src: ?item_mod.Stack = st;
-                    const moved = container_mod.quickMove(conn.allocator, &src, &conn.inv, 9, 44, null);
-                    if (!moved) return;
-                    // quickMove took ownership on success (src nulled) or
-                    // left it; either way clear the enchant slot on move.
-                    if (src == null) {
-                        item_mod.freeStack(conn.allocator, &conn.enchant_item);
-                        conn.enchant_item = null;
-                    } else {
-                        // Partial move should not happen for count-1, but
-                        // keep the remainder rather than duplicating.
-                        item_mod.freeStack(conn.allocator, &conn.enchant_item);
-                        conn.enchant_item = src;
-                        return;
-                    }
-                    self.recomputeEnchantLevels(pool, allocator, conn, ow.x, ow.y, ow.z);
-                    self.syncEnchantWindow(conn);
-                } else if (ec.slot >= 1 and ec.slot <= 36) {
-                    const islot: usize = @as(usize, @intCast(ec.slot)) - 1 + 9;
+                    // Enchant slot -> player inv (the slot holds exactly
+                    // one; operate on it directly so NBT ownership is exact
+                    // — copying the stack first would double-free it).
+                    if (conn.enchant_item == null) return;
+                    if (!container_mod.quickMove(conn.allocator, &conn.enchant_item, &conn.inv, 9, 44, null, true)) return;
+                    self.resyncEnchant(pool, allocator, conn, ow.x, ow.y, ow.z);
+                } else if (enchantInvSlot(ec.slot)) |islot| {
                     const st = conn.inv[islot] orelse return;
                     if (conn.enchant_item != null) return;
                     if (st.count <= 0) return;
                     // Take exactly one (vanilla transferStackInSlot takes 1).
-                    const one = item_mod.Stack{
-                        .id = st.id,
-                        .count = 1,
-                        .damage = st.damage,
-                        .nbt = if (st.nbt) |n| conn.allocator.dupe(u8, n) catch return else null,
-                    };
-                    conn.enchant_item = one;
-                    conn.inv[islot].?.count -= 1;
-                    if (conn.inv[islot].?.count <= 0) item_mod.freeStack(conn.allocator, &conn.inv[islot]);
-                    self.recomputeEnchantLevels(pool, allocator, conn, ow.x, ow.y, ow.z);
-                    self.syncEnchantWindow(conn);
+                    conn.enchant_item = splitOne(conn.allocator, &conn.inv[islot]) orelse return;
+                    self.resyncEnchant(pool, allocator, conn, ow.x, ow.y, ow.z);
                 } else return;
             },
             2 => {
@@ -6764,10 +9824,8 @@ pub const Server = struct {
                     }
                     conn.enchant_item = conn.inv[h];
                     conn.inv[h] = t;
-                    self.recomputeEnchantLevels(pool, allocator, conn, ow.x, ow.y, ow.z);
-                    self.syncEnchantWindow(conn);
-                } else if (ec.slot >= 1 and ec.slot <= 36) {
-                    const islot: usize = @as(usize, @intCast(ec.slot)) - 1 + 9;
+                    self.resyncEnchant(pool, allocator, conn, ow.x, ow.y, ow.z);
+                } else if (enchantInvSlot(ec.slot)) |islot| {
                     if (!container_mod.swap(&conn.inv[islot], &conn.inv[h])) return;
                     self.syncEnchantWindow(conn);
                 }
@@ -6856,7 +9914,7 @@ pub const Server = struct {
     fn closeWindowsAt(self: *Server, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, x: i32, y: u8, z: i32) void {
         _ = pool;
         _ = allocator;
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         for (snap) |e| {
@@ -6871,9 +9929,30 @@ pub const Server = struct {
             }
             var stacks: [9]?item_mod.Stack = [_]?item_mod.Stack{null} ** 9;
             if (ow.id == 1) stacks = e.conn.takeTableGrid();
-            if (ow.id == 2) e.conn.open_win = null;
+            if (ow.id == 2) {
+                e.conn.open_win = null;
+                e.conn.resetClickSeq(2);
+            }
+            if (ow.id == 7) {
+                // Brewing stand: contents persist server-side (break drops
+                // them separately) — close the window, drop nothing.
+                e.conn.open_win = null;
+                e.conn.resetClickSeq(7);
+            }
+            if (ow.id == 3) {
+                // Ender chest: contents persist per player — close the
+                // window, drop nothing.
+                e.conn.open_win = null;
+                e.conn.resetClickSeq(3);
+            }
             if (ow.id == 4) {
                 if (e.conn.takeEnchantItem()) |owned| stacks[0] = owned;
+            }
+            if (ow.id == 5 or ow.id == 6) {
+                // Chest: contents persist server-side (break drops them
+                // separately) — close the window, drop nothing.
+                e.conn.open_win = null;
+                e.conn.resetClickSeq(ow.id);
             }
             const px = e.conn.pos_x;
             const py = e.conn.pos_y;
@@ -6885,15 +9964,27 @@ pub const Server = struct {
             for (stacks[0..]) |*st| {
                 const s = st.* orelse continue;
                 st.* = null;
-                self.spawnItemLive(s, px + 0.5, py + 1.0, pz + 0.5, 10);
+                self.spawnItemLive(s, px + 0.5, py + 1.0, pz + 0.5, 10, self.tossPopMotion());
             }
             flushEntry(e, self.io);
         }
     }
 
+    /// Client-initiated ender-chest close (0x0D): lid sound at the chest +
+    /// S24 lid event when the last viewer leaves (jar `ape.h`, same
+    /// edge-gating as regular chests). Contents persist per player.
+    fn spawnEnderClose(self: *Server, cc: EnderClose) void {
+        const n: u8 = @intCast(@min(self.countEnderViewers(cc.x, cc.y, cc.z), 255));
+        if (n == 0) {
+            self.broadcastSound(null, "random.chestclosed", @as(f64, @floatFromInt(cc.x)) + 0.5, @as(f64, @floatFromInt(cc.y)) + 0.5, @as(f64, @floatFromInt(cc.z)) + 0.5, 0.5, 0.95);
+        }
+        self.broadcastBlockAction(cc.x, cc.y, cc.z, 1, n, game_ids.ender_chest);
+    }
+
     /// Client-initiated close (0x0D): drop the crafting grid / enchant item in
     /// front of the player. Furnace closes drop nothing (contents persist
-    /// server-side). No 0x2E ack — the client already closed locally.
+    /// server-side). Ender/chest closes arrive as their own pos-carrying
+    /// events. No 0x2E ack — the client already closed locally.
     fn spawnTableClose(self: *Server, conn: *Conn, tc: TableClose) void {
         if (tc.window != 1 and tc.window != 4) return;
         var stacks = tc.stacks;
@@ -6908,15 +9999,21 @@ pub const Server = struct {
         for (stacks[0..]) |*st| {
             const s = st.* orelse continue;
             st.* = null;
-            self.spawnItemLive(s, px + fx * 0.5 + 0.5, py + 1.32, pz + fz * 0.5 + 0.5, 10);
+            self.spawnItemLive(s, px + fx * 0.5 + 0.5, py + 1.32, pz + fz * 0.5 + 0.5, 10, .{
+                fx * 0.2 + self.nextToss() * 0.02 - 0.01,
+                0.1,
+                fz * 0.2 + self.nextToss() * 0.02 - 0.01,
+            });
         }
     }
 
     /// Queue one framed packet on every conn tracking `eid` (attacker
     /// included — the attacker gets no client-side prediction for damage).
     /// One conn lock at a time; never nested with ent_lock/world_lock.
+    // ---- attack resolution, tick loops, stats, serve ----
+
     fn broadcastToTrackers(self: *Server, eid: i32, framed: []const u8) void {
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         for (snap) |e| {
@@ -6935,6 +10032,21 @@ pub const Server = struct {
     /// Death: mobs are removed + Destroy broadcast (pig respawns on a
     /// 30s timer); players get Update Health 0 + death screen, and walk
     /// back via Client Status 0 (conn.zig resets + heals there).
+    /// Vanilla per-landed-hit exhaustion charge (caller holds no locks).
+    fn chargeHit(attacker: *Conn) void {
+        attacker.lock.lock();
+        attacker.addExhaustion(0.3); // vanilla: charged per landed hit
+        attacker.lock.unlock();
+    }
+
+    /// Broadcast a just-built frame to an entity's trackers (drops on build
+    /// failure — same discipline as queueBuilt for direct queues).
+    fn broadcastBuilt(self: *Server, eid: i32, r: anytype) void {
+        if (r) |f| {
+            self.broadcastToTrackers(eid, f);
+        } else |_| {}
+    }
+
     fn resolveAttack(self: *Server, attacker: *Conn, ev: AttackEvent) void {
         // --- mobs (region-owned; ent_lock throughout, registry nests
         // innermost per the Registry lock-order rule) ---
@@ -6954,7 +10066,7 @@ pub const Server = struct {
                     const dead_kind = found.region.mobs.kinds.items[found.index];
                     found.region.mobs.removeAt(found.index);
                     mob_dead_id = dead_id;
-                    if (dead_kind == entity.MOB_PIG) self.pig_cooldown = 30;
+                    if (dead_kind == entity.MOB_PIG and self.canSpawnMob(entity.MOB_PIG)) self.pig_cooldown = 30;
                 } else {
                     mob_hp = found.region.mobs.health.items[found.index];
                 }
@@ -6962,66 +10074,69 @@ pub const Server = struct {
         }
         self.ent_lock.unlock();
         if (mob_dead_id) |id| {
-            var db: [8]u8 = undefined;
-            if (packets.frameDestroyEntitiesFramed(&[_]i32{id}, &db)) |f| {
-                self.broadcastToTrackers(id, f);
-            } else |_| {}
-            attacker.lock.lock();
-            attacker.addExhaustion(0.3); // vanilla: charged per landed hit
-            attacker.lock.unlock();
+            var db: [tiny_frame_buf]u8 = undefined;
+            broadcastBuilt(self, id, packets.frameDestroyEntitiesFramed(&[_]i32{id}, &db));
+            chargeHit(attacker);
             return;
         }
         if (mob_hit) {
             var mb: [32]u8 = undefined;
-            if (packets.frameEntityMetadata(ev.target_eid, mob_hp, &mb)) |f| {
-                self.broadcastToTrackers(ev.target_eid, f);
-            } else |_| {}
-            attacker.lock.lock();
-            attacker.addExhaustion(0.3); // vanilla: charged per landed hit
-            attacker.lock.unlock();
+            broadcastBuilt(self, ev.target_eid, packets.frameEntityMetadata(ev.target_eid, mob_hp, &mb));
+            chargeHit(attacker);
             return;
         }
         // --- players ---
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
+        var victim: ?RegistryEntry = null;
         for (snap) |e| {
             if (e.conn == attacker or e.conn.eid != ev.target_eid) continue;
-            e.conn.lock.lock();
-            if (e.conn.state != .play or e.conn.is_dead) {
-                e.conn.lock.unlock();
-                return;
-            }
-            if (!attackInReach(ev.ax, ev.ay, ev.az, e.conn.pos_x, e.conn.pos_y + 1.0, e.conn.pos_z)) {
-                e.conn.lock.unlock();
-                return;
-            }
-            const died = applyPlayerDamage(e.conn, ev.dmg);
-            const hp = e.conn.health;
-            var dd: ?DeathDrop = if (died and !self.keepInv()) collectDeathDrops(e.conn) else null;
-            const px = e.conn.pos_x;
-            const py = e.conn.pos_y;
-            const pz = e.conn.pos_z;
+            victim = e;
+            break;
+        }
+        const v = victim orelse return;
+        // Vanilla pvp=false: player swings at players fizzle (mobs above
+        // are unaffected). Bare return like a miss: no damage, no packets.
+        if (!self.cfg.load().pvp) return;
+        self.resolvePvpVictim(v, attacker, ev);
+    }
+
+    /// PvP hit on one victim (found by eid): reach check, damage, drops,
+    /// death broadcast. Single victim per eid — no loop.
+    fn resolvePvpVictim(self: *Server, e: RegistryEntry, attacker: *Conn, ev: AttackEvent) void {
+        e.conn.lock.lock();
+        if (e.conn.state != .play or e.conn.is_dead) {
             e.conn.lock.unlock();
-            var vnm: [perms_mod.max_name_len]u8 = undefined;
-            const vnm_len = if (died) copyUsername(e.conn, &vnm) else 0;
-            attacker.lock.lock();
-            attacker.addExhaustion(0.3); // vanilla: charged per landed hit
-            var anm: [perms_mod.max_name_len]u8 = undefined;
-            const anm_len = if (died) copyUsername(attacker, &anm) else 0;
-            attacker.lock.unlock();
-            flushEntry(e, self.io);
-            // Show the new health on every tracker (attacker included).
-            var mdb: [32]u8 = undefined;
-            if (packets.frameEntityMetadata(ev.target_eid, if (died) 0 else hp, &mdb)) |f| {
-                self.broadcastToTrackers(ev.target_eid, f);
-            } else |_| {}
-            if (died) self.broadcastDeath(vnm[0..vnm_len], .player, anm[0..anm_len]);
-            if (dd) |*d| {
-                self.spawnDeathDrops(d, px, py, pz);
-                self.savePlayer(e.conn);
-            }
             return;
+        }
+        if (!attackInReach(ev.ax, ev.ay, ev.az, e.conn.pos_x, e.conn.pos_y + 1.0, e.conn.pos_z)) {
+            e.conn.lock.unlock();
+            return;
+        }
+        const died = applyBlockedDamage(e.conn, ev.dmg, .general);
+        const hp = e.conn.health;
+        var dd: ?DeathDrop = if (died and !self.keepInv()) collectDeathDrops(e.conn) else null;
+        const px = e.conn.pos_x;
+        const py = e.conn.pos_y;
+        const pz = e.conn.pos_z;
+        e.conn.lock.unlock();
+        var vnm: [perms_mod.max_name_len]u8 = undefined;
+        const vnm_len = if (died) copyUsername(e.conn, &vnm) else 0;
+        // Attacker name before its lock: copyUsername takes the conn
+        // lock itself, so copying under attacker.lock self-deadlocks
+        // the non-recursive SpinLock (lethal-PvP hang).
+        var anm: [perms_mod.max_name_len]u8 = undefined;
+        const anm_len = if (died) copyUsername(attacker, &anm) else 0;
+        chargeHit(attacker);
+        flushEntry(e, self.io);
+        // Show the new health on every tracker (attacker included).
+        var mdb: [32]u8 = undefined;
+        broadcastBuilt(self, ev.target_eid, packets.frameEntityMetadata(ev.target_eid, if (died) 0 else hp, &mdb));
+        if (died) self.broadcastDeath(vnm[0..vnm_len], .player, anm[0..anm_len]);
+        if (dd) |*d| {
+            self.spawnDeathDrops(d, px, py, pz);
+            self.savePlayer(e.conn);
         }
     }
 
@@ -7063,12 +10178,16 @@ pub const Server = struct {
             };
             if (shutdown_mod.isRequested()) self.finishStop();
             if (self.world == null) continue;
+            // Pregen queue top-up at 10Hz (advance/rate/bar/chat stay 1Hz
+            // in pollPregen): keeps in-flight at the cap so the 1Hz fill
+            // cadence never caps throughput at ~cap chunks/s.
+            self.topupPregen();
             // Read-only entity snapshots for plate occupancy (no mutation,
             // no nesting: conn locks one at a time, then ent_lock alone).
             var p_ents: [256]redstone_mod.Ent = undefined;
             var n_p: usize = 0;
             {
-                var batch: [256]RegistryEntry = undefined;
+                var batch: [max_fanout]RegistryEntry = undefined;
                 const snap = self.snapshot(&batch);
                 for (snap) |e| {
                     if (n_p >= p_ents.len) break;
@@ -7117,13 +10236,14 @@ pub const Server = struct {
             var rs_actions: redstone_mod.ActionList = .{};
             if (self.world) |pool| {
                 var w = Server.RsWorld{ .pool = pool, .alloc = self.gpa, .changes = &rs_changes };
+                defer w.deinit();
                 redstone_mod.drainScheduled(w.rsView(), &self.rs_sched, &self.rs_burn, &rs_changes, &rs_sounds, self.rs_tick, &rs_actions);
                 redstone_mod.pollPlates(w.rsView(), &self.rs_sched, &self.rs_burn, &self.rs_plates, &rs_changes, &rs_sounds, self.rs_tick, p_ents[0..n_p], m_ents[0..n_m], i_ents[0..n_i], false);
             }
             self.world_lock.unlock();
             if (rs_changes.n > 0 or rs_sounds.n > 0 or rs_actions.n > 0) {
-                if (self.world) |pool| {
-                    self.flushRsBatch(pool, rs_changes, rs_sounds, rs_actions);
+                if (self.world) |_| {
+                    self.flushRsBatch(rs_changes, rs_sounds, rs_actions);
                 }
             }
         }
@@ -7131,14 +10251,14 @@ pub const Server = struct {
 
     /// Flush one drained batch: block actions (S24, piston animation) first,
     /// then silent-aware change flush + sounds.
-    fn flushRsBatch(self: *Server, pool: *shard_mod.ShardPool, rs_changes: redstone_mod.ChangeList, rs_sounds: redstone_mod.SoundList, rs_actions: redstone_mod.ActionList) void {
+    fn flushRsBatch(self: *Server, rs_changes: redstone_mod.ChangeList, rs_sounds: redstone_mod.SoundList, rs_actions: redstone_mod.ActionList) void {
         for (rs_actions.items[0..rs_actions.n]) |a| {
             self.broadcastBlockAction(a.x, @intCast(a.y), a.z, a.event_id, a.facing, a.id);
         }
         for (rs_changes.items[0..rs_changes.n]) |c| {
             // No actor here (redstone loop, not a player break): vanilla
             // drops as if survival (creative no-drops needs a creative hand).
-            self.flushRsChange(pool, self.gpa, .survival, c);
+            self.flushRsChange(.survival, c);
         }
         for (rs_sounds.evs[0..rs_sounds.n]) |s| self.flushRsSound(s);
     }
@@ -7177,7 +10297,7 @@ pub const Server = struct {
         // Snapshot first: holding the registry lock while taking a conn
         // lock would nest the two (ABBA deadlock with the tick path,
         // which holds a conn lock and then snapshots the registry).
-        var batch: [256]RegistryEntry = undefined;
+        var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
         for (snap) |e| {
@@ -7239,7 +10359,14 @@ pub const Server = struct {
         var rss_buf: [32]u8 = undefined;
         const rss = memstat_mod.formatBytes(self.rss_bytes, &rss_buf);
         const ts = self.transport_stats();
-        return std.fmt.bufPrint(buf, "stats tick_p50={d}us tick_p99={d}us out_p50={d}us out_p99={d}us send={d}us reconcile={d}us players={d} mobs={d} items={d} ssts={d} rss={s} outbox={s} sent={s} ents={s} ring={s} conns={d} zc={d} copy={d} flushes={d} starved={d} armfail={d} regions={d} region_shed={d} sp={s}", .{
+        var gpu_fill: u64 = 0;
+        var gpu_fallback: u64 = 0;
+        if (self.gen_pool) |gp| {
+            const gs = gp.snapshotStats();
+            gpu_fill = gs.gpu_fill;
+            gpu_fallback = gs.gpu_fallback;
+        }
+        return std.fmt.bufPrint(buf, "stats tick_p50={d}us tick_p99={d}us out_p50={d}us out_p99={d}us send={d}us reconcile={d}us players={d} mobs={d} items={d} ssts={d} rss={s} outbox={s} sent={s} ents={s} ring={s} conns={d} zc={d} copy={d} flushes={d} starved={d} armfail={d} regions={d} region_shed={d} sp={s} gpu={d}/{d}", .{
             @divFloor(p50, 1_000),
             @divFloor(p99, 1_000),
             @divFloor(f50, 1_000),
@@ -7267,6 +10394,8 @@ pub const Server = struct {
             self.region_reg.count(),
             self.region_shed_total,
             self.storage_profile_name,
+            gpu_fill,
+            gpu_fallback,
         }) catch buf[0..0];
     }
 
@@ -7517,7 +10646,7 @@ pub const Server = struct {
             return;
         }
         if (res.announce) {
-            self.announceJoin(c) catch {};
+            self.queueAnnounce(c);
         }
         if (res.stop) {
             // The reply is in the outbox; give the worker a moment to send
@@ -7590,10 +10719,17 @@ pub const Server = struct {
     }
 
     /// Stop the server: save the players, flush the store, exit.
-    pub fn finishStop(self: *Server) noreturn {
+    /// Persist everything before a halt (players, redstone, world flush).
+    /// Shared by every stop path (console/RCON/in-game/shutdown).
+    pub fn saveForHalt(self: *Server) void {
         _ = self.saveAllPlayers();
         self.saveRedstone();
+        self.flushDirtyChests();
         if (self.world) |pool| pool.flushAll() catch {};
+    }
+
+    pub fn finishStop(self: *Server) noreturn {
+        self.saveForHalt();
         std.log.info("stop: saved players, flushed. bye.", .{});
         // exit() skips the console thread's restore defer: without this an
         // in-game /stop leaves the operator's terminal without echo.
@@ -7602,11 +10738,14 @@ pub const Server = struct {
     }
 
     /// Bind on all interfaces (production entry).
-    pub fn bindAny(io: std.Io, port: u16, config: Config) !Server {
-        const addr = try std.Io.net.IpAddress.parse("0.0.0.0", port);
+    /// Bind + listen on an explicit address (config bind_address) with a
+    /// configured kernel backlog. (The localhost-only bind() next to this
+    /// stays for tests; production boot goes through here.)
+    pub fn bindConfigured(io: std.Io, addr_text: []const u8, port: u16, backlog: u31, config: Config) !Server {
+        const addr = try std.Io.net.IpAddress.parse(addr_text, port);
         // A deep accept backlog: a server-list ping or a login burst
         // must not be refused while the transport is busy.
-        var srv = Server{ .net = try addr.listen(io, .{ .reuse_address = true, .kernel_backlog = 4096 }), .io = io, .config = config };
+        var srv = Server{ .net = try addr.listen(io, .{ .reuse_address = true, .kernel_backlog = backlog }), .io = io, .config = config };
         {
             var c = srv.cfg.load();
             c.world_spawn = .{ config.spawn_x, config.spawn_y, config.spawn_z };
@@ -7620,6 +10759,8 @@ pub const Server = struct {
 ///
 /// The blocking transport keeps it on the serve thread's stack; the
 /// io_uring transport keeps one per connection (the worker owns it).
+// ---- async-transport session state ----
+
 pub const SessionState = struct {
     /// Actions queued by the frame handlers; applied to the world after
     /// the frame batch is parsed.
@@ -7673,12 +10814,29 @@ fn sessionLocked(
         // at accept time. Refresh under conn.lock (held here); status
         // pings are rare so the atomic load is free.
         if (conn.state == .status and f.id == @as(i32, @intFromEnum(ids.StatusServer.request))) {
-            conn.config.online_count = @intCast(@min(server.play_count.load(.acquire), 255));
+            conn.config.online_count = @intCast(@min(server.play_count.load(.acquire), std.math.maxInt(u16)));
+        }
+        // Global packets-per-second flood gate (config
+        // max_packets_per_second, 0 = off): every frame counts against a
+        // 1s rolling window. Tripping queues the same spam kick as the
+        // other gates and stops the batch; the kick flushes on the normal
+        // output path and close_after_flush finishes the session below.
+        if (conn.config.max_packets_per_second > 0) {
+            const now_ms = std.Io.Timestamp.now(conn.io, .awake).toMilliseconds();
+            if (now_ms - conn.pps_window_ms >= 1000) {
+                conn.pps_window_ms = now_ms;
+                conn.pps_count = 0;
+            }
+            conn.pps_count += 1;
+            if (conn.pps_count > conn.config.max_packets_per_second) {
+                _ = conn.disconnect("{\"text\":\"Kicked for spamming\"}") catch {};
+                break;
+            }
         }
         const action = try conn.handleFrame(f);
         if (action == .entered_play) entered.* = true;
         switch (action) {
-            .block_set, .interact, .arm_swing, .chat, .attack, .command, .tab_complete, .qdrop, .table_close, .furnace_click, .enchant_click, .enchant => try events.append(allocator, action),
+            .block_set, .block_resync, .place_deny, .interact, .arm_swing, .chat, .attack, .command, .tab_complete, .qdrop, .table_close, .furnace_click, .brew_click, .chest_click, .chest_close, .ender_close, .enchant_click, .enchant, .equip_armor, .eat, .throw_potion => try events.append(allocator, action),
             else => {},
         }
     }
@@ -7758,6 +10916,25 @@ fn sessionLocked(
                     }
                 }
             }
+            // Login audit: one line per join with the settled position and
+            // the feet/eyes blocks behind it (proves placement vs burial;
+            // use it before reporting spawn-in-ground).
+            {
+                const ex: i32 = @intFromFloat(@floor(conn.pos_x));
+                const ez: i32 = @intFromFloat(@floor(conn.pos_z));
+                const feet: i32 = @intFromFloat(@floor(conn.pos_y));
+                const feet_id: i16 = if (feet >= 0 and feet <= 255)
+                    if (view.peekBlock(pool, allocator, ex, @intCast(feet), ez) catch null) |b| @intCast(@intFromEnum(b.id)) else -1
+                else
+                    -2;
+                const ey_i: i32 = @intFromFloat(@floor(conn.pos_y + 1.62));
+                const eyes_id: i16 = if (ey_i >= 0 and ey_i <= 255)
+                    if (view.peekBlock(pool, allocator, ex, @intCast(ey_i), ez) catch null) |b| @intCast(@intFromEnum(b.id)) else -1
+                else
+                    -2;
+                const nm = conn.username[0..conn.username_len];
+                std.log.info("login {s} at {d:.1},{d:.1},{d:.1} feet={d} eyes={d}", .{ nm, conn.pos_x, conn.pos_y, conn.pos_z, feet_id, eyes_id });
+            }
             // Hold pure falls below the login teleport until the client
             // proves it is synced (exact PosLook echo), moves horizontally
             // (it is live), or the grace times out.
@@ -7773,9 +10950,13 @@ fn sessionLocked(
         const srv_spawn = cfg.world_spawn;
         const srv_spawn_set = cfg.world_spawn_set;
         conn.config.difficulty = srv_diff;
+        // Fresh logins inherit the default gamemode; force_gamemode
+        // (vanilla server.properties) also re-applies it to returning
+        // players. Spawn placement below stays fresh-only: forced players
+        // keep their saved position (only the mode is overridden).
+        if (fresh or cfg.force_gamemode) conn.config.gamemode = srv_gm;
         if (fresh) {
             const was_forced = conn.spawn_forced;
-            conn.config.gamemode = srv_gm;
             if (srv_spawn_set and !was_forced) {
                 conn.config.spawn_x = srv_spawn[0];
                 conn.config.spawn_y = srv_spawn[1];
@@ -7788,7 +10969,7 @@ fn sessionLocked(
         // Ban/whitelist gate (jar-hardcoded screens). Runs before any
         // join packets: rejected logins get a play disconnect + close.
         var login_rejected = false;
-        if (server.loginRejected(conn.username[0..conn.username_len], conn.ip[0..conn.ip_len])) |rej| {
+        if (server.loginRejected(conn.ip[0..conn.ip_len], &conn.uuid_str)) |rej| {
             server.rejectLogin(conn, rej);
             login_rejected = true;
         }
@@ -7797,10 +10978,26 @@ fn sessionLocked(
             login_rejected = true;
         }
         if (!login_rejected) {
-            // Own this player row from here on: bump the save epoch so
-            // any older session's delayed save (quit/rejoin race, ghost
-            // autosave) is dropped instead of overwriting us.
-            conn.save_epoch = server.bumpSaveEpoch(conn.username[0..conn.username_len]);
+            // Remember the row epoch for the straggler fence below (a
+            // side-effect-free read — the bump waits until announce, so a
+            // login that never completes can't poison the live session's
+            // row ownership with a newer epoch).
+            conn.login_epoch_seen = server.epochFor(conn.username[0..conn.username_len]);
+            // Straggler fence (first check): a newer login for this name
+            // bumped the row while WE were wedged mid-login (chunk burst,
+            // gen stalls) — the live session owns the row now. Abort our
+            // login instead of kicking THEM ("logged in from another
+            // location" on the live client) and instead of bumping the
+            // epoch over them. The abort unwinds via close_after_flush
+            // (finished=true); our death-rattle save is dropped by the
+            // epoch guard, the live row untouched.
+            {
+                const nm = conn.username[0..conn.username_len];
+                if (server.epochFor(nm) != conn.login_epoch_seen) {
+                    server.abortStaleLogin(conn) catch {};
+                    return;
+                }
+            }
             // Duplicate login (vanilla `initializeConnection`): kick any
             // OTHER fully-joined same-name conn. Without this, ghost
             // sessions linger in the registry and `findInSnap` (first
@@ -7808,9 +11005,11 @@ fn sessionLocked(
             // the live session keeps its old gamemode and saves it back
             // on quit ("gamemode not saved"). Only announced targets:
             // a racing newcomer isn't announced yet, so two simultaneous
-            // logins can't kick each other.
+            // logins can't kick each other. Already-dying targets are
+            // skipped (their row/save is decided; re-flushing a dead
+            // peer's outbox is the write that wedges kickers).
             {
-                var batch: [256]RegistryEntry = undefined;
+                var batch: [max_fanout]RegistryEntry = undefined;
                 const snap = server.snapshot(&batch);
                 defer Server.releaseSnap(snap);
                 const nm = conn.username[0..conn.username_len];
@@ -7822,9 +11021,17 @@ fn sessionLocked(
                     // conn is skipped: the save epoch still keeps the newer
                     // session's row authoritative.
                     if (!e.conn.lock.tryLock()) continue;
-                    const dup = e.conn.state == .play and e.conn.announced and std.ascii.eqlIgnoreCase(e.conn.username[0..e.conn.username_len], nm);
+                    const dup = e.conn.state == .play and e.conn.announced and !e.conn.dead and !e.conn.close_after_flush and std.ascii.eqlIgnoreCase(e.conn.username[0..e.conn.username_len], nm);
                     e.conn.lock.unlock();
                     if (dup) server.kickEntry(e, "You logged in from another location!");
+                }
+                // Straggler fence (second check): a racing login announced
+                // and bumped between our first check and our kick scan
+                // (µs window, reconnect storms). Same abort — first to
+                // announce wins, exactly one session survives.
+                if (server.epochFor(nm) != conn.login_epoch_seen) {
+                    server.abortStaleLogin(conn) catch {};
+                    return;
                 }
             }
             const tod = server.time_of_day.load(.acquire);
@@ -7835,14 +11042,12 @@ fn sessionLocked(
             // returning survival player keeps the creative JoinGame value
             // while the server deals survival damage.
             if (!conn.config.gamemode.isCreative()) {
-                var gb: [16]u8 = undefined;
-                if (packets.frameGameState(packets.game_state_change_gamemode, @floatFromInt(conn.config.gamemode.wire()), &gb)) |f| {
-                    conn.queueFramed(f) catch {};
-                } else |_| {}
+                var gb: [tiny_frame_buf]u8 = undefined;
+                queueBuilt(conn, packets.frameGameState(packets.game_state_change_gamemode, @floatFromInt(conn.config.gamemode.wire()), &gb));
             }
             try conn.queueJoinPackets(age, tod);
             // Current XP (vanilla re-sends S1F on login).
-            var eb: [16]u8 = undefined;
+            var eb: [small_frame_buf]u8 = undefined;
             const xtotal: i16 = @truncate(conn.xp_total);
             if (packets.frameSetExperience(conn.xp_bar, @truncate(conn.xp_level), xtotal, &eb)) |xf| {
                 try conn.queueFramed(xf);
@@ -7852,7 +11057,7 @@ fn sessionLocked(
             server.syncWeatherTo(conn);
         }
         // Login completion: inventory sync, chunks, PosLook last.
-        // (announceJoin runs after unlock — it takes conn.lock itself).
+        // (queueAnnounce runs after unlock — the drain takes conn.lock itself).
         if (!login_rejected) {
             if (server.world) |pool| {
                 // Persisted inventory (or empty for fresh players): full
@@ -7864,11 +11069,70 @@ fn sessionLocked(
                 defer allocator.free(cf);
                 try conn.queueFramed(cf);
                 const cc = conn.playerChunk();
-                try view.completeLogin(conn, conn_sink.bind(conn), server.chunkSource(pool), 0, cc.cx, cc.cz, server.view_distance, true);
+                // Drop conn.lock across the burst: resyncDisk holds it
+                // for seconds (worldgen + 289-column zlib) while the
+                // tick and every join fan-out queued behind it. Refs pin
+                // the conn (unregister spins instead of freeing); the
+                // liveness re-check below aborts logins that died
+                // mid-burst instead of completing them.
+                _ = conn.refs.fetchAdd(1, .acq_rel);
+                conn.lock.unlock();
+                var collect = view.BurstCollect{};
+                runBurstShared(server, allocator, pool, 0, cc.cx, cc.cz, server.view_distance, true, &collect) catch |err| {
+                    collect.deinit(allocator);
+                    conn.lock.lock();
+                    _ = conn.refs.fetchSub(1, .acq_rel);
+                    return err;
+                };
+                conn.lock.lock();
+                // Liveness: kicked, timed out, or closed mid-burst (a
+                // racing disconnect ran unregister while we were
+                // unlocked) — do not complete a dead login: no PosLook,
+                // no announce, no epoch bump. unregister spins on our ref
+                // and destroys the conn once we drop it below. Lock order:
+                // conn-lock only here, never reg_lock (playNames nests
+                // reg_lock -> conn locks; the reverse ABBA-deadlocked the
+                // server under a join storm).
+                const alive = !conn.dead and !conn.close_after_flush and !conn.closed;
+                // From here every exit drops the ref and frees the
+                // collect (frames were copied into the outbox below).
+                defer collect.deinit(allocator);
+                defer _ = conn.refs.fetchSub(1, .acq_rel);
+                if (!alive) return;
+                for (collect.frames.items) |f| try conn.queueFramed(f);
+                var sit = collect.sent.iterator();
+                while (sit.next()) |e| try conn.sent.put(e.key_ptr.*, {});
+                // PosLook closes the login (was completeLogin's tail).
+                try conn.queuePlayerPosLook();
+                const cc2 = conn.playerChunk();
+                conn.sent_center = .{ .cx = cc2.cx, .cz = cc2.cz };
+                conn.baseline_sent = true;
+                conn.chunks_dirty = false;
+                conn.force_resync = false;
             } else {
                 try conn.queuePlayerPosLook();
             }
+            // Straggler fence (final check): a racing login announced and
+            // bumped during our long tail (chunk burst, gen waits) after
+            // our kick scan ran — it owns the row now, abort instead of
+            // bumping over it. First to announce wins, exactly one session
+            // survives.
+            if (server.epochFor(conn.username[0..conn.username_len]) != conn.login_epoch_seen) {
+                server.abortStaleLogin(conn) catch {};
+                return;
+            }
             state.need_announce = true;
+            // Own this player row from here on: bump the save epoch so any
+            // older session's delayed save (quit/rejoin race, ghost
+            // autosave) is dropped instead of overwriting us. Bumped at
+            // announce — not login start — so a login that never completes
+            // can't steal ownership: failed rejoins used to bump past the
+            // still-live ghost, whose final save was then dropped as
+            // stale, losing the leave position with no live session to
+            // replace it. Our own pre-announce saves are dropped (epoch 0
+            // never matches a bumped row), which is correct: until we
+            // announce, the previous session (or nobody) owns the row.
+            conn.save_epoch = server.bumpSaveEpoch(conn.username[0..conn.username_len]);
         }
     }
     if (conn.chunks_dirty) {
@@ -7883,19 +11147,22 @@ fn sessionLocked(
     }
     // Async gen follow-up: holes requested earlier may have landed on
     // worker threads since. Gated on the pool sequence (idle = one atomic
-    // load) and rate-limited to 1Hz: the rescan re-reads the view disk,
+    // load) and rate-limited to 10Hz: the rescan re-reads the view disk,
     // and a gen storm would otherwise redo 1k+ store reads every frame.
-    // Capped at 16 pool reads per tick (spiral order => nearest holes
+    // Capped at 16 pool reads per rescan (spiral order => nearest holes
     // heal first) plus outbox backpressure: without the cap a serve
     // thread stalls in store reads while generation is active and
     // stops noticing disconnects (quit->save lands minutes late).
+    // 10Hz x 16 reads outruns worker completion (~80/s), so holes heal
+    // within ~100ms of landing instead of queueing a full second behind;
+    // per-call work is unchanged (same 16-read budget as the old 1Hz).
     if (server.world) |pool| {
         if (server.gen_pool) |gp| {
             if (conn.baseline_sent and conn.out.items.len < 262144) {
                 const s = gp.sequence();
                 if (s != conn.last_gen_seq) {
                     const now_ms = std.Io.Timestamp.now(server.io, .awake).toMilliseconds();
-                    if (now_ms - conn.last_gen_retry_ms >= 1000) {
+                    if (now_ms - conn.last_gen_retry_ms >= 100) {
                         conn.last_gen_seq = s;
                         conn.last_gen_retry_ms = now_ms;
                         const radius: u8 = @min(conn.client_view orelse server.view_distance, server.view_distance);
@@ -7909,6 +11176,157 @@ fn sessionLocked(
     const pc = conn.playerChunk();
     cc_now.* = .{ .cx = pc.cx, .cz = pc.cz };
 }
+
+    /// Login-burst singleflight: concurrent logins for the same chunk disk
+    /// share one worldgen/read/zlib pass instead of each paying the full
+    /// ~289-column burst. Only in-flight work is shared (never cached), so
+    /// there is no invalidation story: a late joiner whose key misses just
+    /// runs its own burst. Waiters park on the flight condvar (futex sleep,
+    /// never spin); the executor always publishes or fails, so waits always
+    /// terminate. Locking: flight mutex only, never nested with conn locks
+    /// (same ABBA rule as everywhere else). Caller must hold no locks (the
+    /// wait blocks) and must already hold a conn ref for liveness.
+    /// Login-burst singleflight: concurrent logins for the same chunk disk
+    /// share one worldgen/read/zlib pass instead of each paying the full
+    /// ~289-column burst. Only in-flight work is shared (never cached), so
+    /// there is no invalidation story: a late joiner whose key misses just
+    /// runs its own burst. Waiters park on the flight condvar (futex sleep,
+    /// never spin); the executor always publishes or fails, so waits always
+    /// terminate (spurious wakeups re-check). Locking: flight mutex only,
+    /// never nested with conn locks (same ABBA rule as everywhere else).
+    /// Caller must hold no locks (the wait blocks) and must already hold a
+    /// conn ref for liveness (freed only after the ref drops).
+    fn runBurstShared(
+        self: *Server,
+        alloc: std.mem.Allocator,
+        pool: *shard_mod.ShardPool,
+        dim: u8,
+        cx: i32,
+        cz: i32,
+        radius: u8,
+        sky: bool,
+        out: *view.BurstCollect,
+    ) !void {
+        const key = Server.BurstKey{ .dim = dim, .cx = cx, .cz = cz, .radius = radius, .sky = sky };
+        // Join, execute, or run solo.
+        var executor = false;
+        var solo = false;
+        var mygen: u64 = 0;
+        {
+            self.burst_flight.mutex.lockUncancelable(self.io);
+            defer self.burst_flight.mutex.unlock(self.io);
+            const f = &self.burst_flight;
+            if (f.key.eql(key) and !f.failed and (f.active or f.done)) {
+                // Attach (running: wait below; published: grab immediately).
+                f.refs += 1;
+                mygen = f.gen;
+            } else if (!f.active and f.refs == 0) {
+                // Claim a fresh flight (resetting any stale remnant first).
+                if (f.done or f.failed) burstFlightReset(self, f);
+                f.active = true;
+                f.key = key;
+                f.gen +%= 1;
+                f.done = false;
+                f.failed = false;
+                f.refs = 1;
+                f.alloc = alloc;
+                mygen = f.gen;
+                executor = true;
+            } else {
+                // A different disk is in flight, or a stale published flight
+                // is still draining: run solo (correct, just unshared).
+                // Decided here, executed below WITHOUT the flight lock.
+                solo = true;
+            }
+        }
+        if (solo) {
+            return view.collectLoginBurst(alloc, self.chunkSource(pool), dim, cx, cz, radius, sky, out);
+        }
+        if (executor) {
+            // Own the burst, then publish for attached waiters. The flight
+            // lock is NOT held across the run (same discipline as conn.lock).
+            var tmp = view.BurstCollect{};
+            view.collectLoginBurst(alloc, self.chunkSource(pool), dim, cx, cz, radius, sky, &tmp) catch |err| {
+                tmp.deinit(alloc);
+                burstFlightFail(self);
+                return err;
+            };
+            self.burst_flight.mutex.lockUncancelable(self.io);
+            // Move ownership (no copies): tmp becomes the flight payload.
+            self.burst_flight.frames = tmp.frames;
+            tmp.frames = .empty;
+            var sit = tmp.sent.iterator();
+            while (sit.next()) |e| {
+                std.debug.assert(self.burst_flight.sent_n < self.burst_flight.sent_keys.len);
+                self.burst_flight.sent_keys[self.burst_flight.sent_n] = e.key_ptr.*;
+                self.burst_flight.sent_n += 1;
+            }
+            tmp.deinit(alloc);
+            self.burst_flight.done = true;
+            self.burst_flight.active = false;
+            self.burst_flight.cond.broadcast(self.io);
+            self.burst_flight.mutex.unlock(self.io);
+            // Fall through to the shared grab below (we hold a ref).
+        }
+        // Grab our share (executor post-publish and waiters alike).
+        // The fallback solo run happens OUTSIDE the lock (a full burst
+        // under the flight lock would serialize every join behind it).
+        var solo_fallback = false;
+        {
+            self.burst_flight.mutex.lockUncancelable(self.io);
+            defer self.burst_flight.mutex.unlock(self.io);
+            const f = &self.burst_flight;
+            while (!f.done and !f.failed and f.gen == mygen) {
+                f.cond.waitUncancelable(self.io, &f.mutex);
+            }
+            if (f.failed or f.gen != mygen) {
+                // Executor failed (or the flight recycled under us, which
+                // cannot happen with a held ref — defensive).
+                if (f.refs > 0) f.refs -= 1;
+                if (f.refs == 0 and !f.active) burstFlightReset(self, f);
+                solo_fallback = true;
+            } else {
+                // Copy failure (OOM) must still release our ref, or the
+                // flight leaks pinned forever (the caller's collect
+                // owns the partial copy and frees it).
+                errdefer {
+                    if (f.refs > 0) f.refs -= 1;
+                    if (f.refs == 0 and !f.active) burstFlightReset(self, f);
+                }
+                for (f.frames.items) |fr| try out.frames.append(alloc, try alloc.dupe(u8, fr));
+                for (f.sent_keys[0..f.sent_n]) |k| try out.sent.put(alloc, k, {});
+                if (f.refs > 0) f.refs -= 1;
+                if (f.refs == 0 and !f.active) burstFlightReset(self, f);
+            }
+        }
+        if (solo_fallback) {
+            return view.collectLoginBurst(alloc, self.chunkSource(pool), dim, cx, cz, radius, sky, out);
+        }
+    }
+
+    /// Fail the current flight (executor OOM or abort): waiters fall back
+    /// to solo bursts. Flight lock NOT held on entry.
+    fn burstFlightFail(self: *Server) void {
+        self.burst_flight.mutex.lockUncancelable(self.io);
+        defer self.burst_flight.mutex.unlock(self.io);
+        const f = &self.burst_flight;
+        f.failed = true;
+        f.done = true;
+        f.active = false;
+        f.cond.broadcast(self.io);
+        if (f.refs > 0) f.refs -= 1; // executor's own share
+        if (f.refs == 0) burstFlightReset(self, f);
+    }
+
+    /// Reset an idle flight (caller holds the flight lock, refs == 0).
+    fn burstFlightReset(self: *Server, f: *Server.BurstFlight) void {
+        _ = self;
+        for (f.frames.items) |fr| f.alloc.free(fr);
+        f.frames = .empty;
+        f.sent_n = 0;
+        f.done = false;
+        f.failed = false;
+    }
 
 /// One protocol step: feed inbound bytes, parse frames, run the handlers,
 /// apply the queued world actions and leave the answer in the conn's
@@ -7956,26 +11374,14 @@ pub fn sessionStep(
                 switch (ev.*) {
                     .block_set => |*b| {
                         // Right-click routing (not sneaking with a held
-                        // item): crafting table / furnace UIs open, K1
+                        // item): table/furnace/enchant UIs open, K1
                         // lever-door-repeater-ore clicks toggle instead
                         // of placing.
                         conn.lock.lock();
                         const sneak = conn.sneaking;
                         conn.lock.unlock();
                         if (b.id != game_ids.air) {
-                            if (server.tryOpenTable(conn, pool, allocator, b, sneak)) {
-                                events.items[i] = .none;
-                                continue;
-                            }
-                            // Right-click on a furnace (not sneaking)
-                            // opens window 2 instead of placing.
-                            if (server.tryOpenFurnace(conn, pool, allocator, b, sneak)) {
-                                events.items[i] = .none;
-                                continue;
-                            }
-                            // Right-click on an enchanting table (not
-                            // sneaking) opens window 4 instead of placing.
-                            if (server.tryOpenEnchant(conn, pool, allocator, b, sneak)) {
+                            if (server.tryOpenAnyUI(conn, pool, allocator, b, sneak)) {
                                 events.items[i] = .none;
                                 continue;
                             }
@@ -7985,16 +11391,90 @@ pub fn sessionStep(
                             }
                         }
                         const old = view.peekBlock(pool, allocator, b.x, b.y, b.z) catch null;
-                        touched[i] = view.applyBlock(pool, allocator, b.x, b.y, b.z, b.id, b.meta) catch 0;
-                        // K1: plate registry follows place/break.
-                        if (b.id != game_ids.air and redstone_mod.isPlate(&profile.game.blocks, .{ .id = b.id, .meta = b.meta })) {
-                            server.rs_plates.add(b.x, b.y, b.z);
-                        }
-                        if (old) |o| {
-                            if (redstone_mod.isPlate(&profile.game.blocks, .{ .id = o.id, .meta = o.meta }) and (b.id == game_ids.air or !redstone_mod.isPlate(&profile.game.blocks, .{ .id = b.id, .meta = b.meta }))) {
-                                server.rs_plates.remove(b.x, b.y, b.z);
+                        // Placement into an occupied non-replaceable cell is
+                        // refused (see replaceableForPlace): silently
+                        // overwriting tile entities loses contents and
+                        // orphans rows. Resync the client's prediction with
+                        // the true cell (breaks bypass: b.id == air).
+                        if (b.id != game_ids.air) {
+                            if (old) |o| {
+                                if (o.id != game_ids.air and !Server.replaceableForPlace(o.id)) {
+                                    // Broadcast BEFORE nulling: `b` aliases
+                                    // items[i], and the .none write clobbers
+                                    // the payload (use-after-clobber sent
+                                    // garbage coords, so nobody was resynced
+                                    // and the client hung on its prediction).
+                                    server.broadcastBlockChange(null, b.x, b.y, b.z, o.id, o.meta) catch {};
+                                    events.items[i] = .none;
+                                    continue;
+                                }
+                            } else {
+                                // No peek and no section: the chunk itself
+                                // is absent (section-absent is fine —
+                                // applyBlock creates it). The edit cannot
+                                // land (applyBlock no-ops on missing
+                                // chunks); NACK air instead of echoing a
+                                // lie below. Breaks (air) keep the old
+                                // path: the echo agrees with the client.
+                                const ch = view.loadChunk(pool, allocator, b.x, b.z) catch null;
+                                if (ch == null) {
+                                    server.sendBlockChangeToActor(conn, b.x, b.y, b.z, game_ids.air, 0);
+                                    events.items[i] = .none;
+                                    continue;
+                                }
+                                ch.?.destroy(allocator);
+                            }
+                            // Vanilla canPlaceEntityOnSide: refuse when the
+                            // target cell intersects a player. Applying
+                            // there sticks the vanilla client inside solid
+                            // (sudden stop + stuck jitter until broken).
+                            // Placer first, then everyone else in the snap
+                            // (mobs/items don't refuse: documented gap).
+                            conn.lock.lock();
+                            const px = conn.pos_x;
+                            const py = conn.pos_y;
+                            const pz = conn.pos_z;
+                            conn.lock.unlock();
+                            var blocked = interaction_mod.blockIntersectsPlayer(b.x, b.y, b.z, px, py, pz);
+                            if (!blocked) {
+                                var batch: [max_fanout]RegistryEntry = undefined;
+                                const snap = server.snapshot(&batch);
+                                defer Server.releaseSnap(snap);
+                                for (snap) |e| {
+                                    if (e.conn == conn) continue;
+                                    e.conn.lock.lock();
+                                    const st = e.conn.state == .play and !e.conn.dead and !e.conn.is_dead;
+                                    const ex = e.conn.pos_x;
+                                    const ey = e.conn.pos_y;
+                                    const ez = e.conn.pos_z;
+                                    e.conn.lock.unlock();
+                                    if (st and interaction_mod.blockIntersectsPlayer(b.x, b.y, b.z, ex, ey, ez)) {
+                                        blocked = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (blocked) {
+                                if (old) |o| {
+                                    server.sendBlockChangeToActor(conn, b.x, b.y, b.z, o.id, o.meta);
+                                } else {
+                                    server.sendBlockChangeToActor(conn, b.x, b.y, b.z, game_ids.air, 0);
+                                }
+                                events.items[i] = .none;
+                                continue;
                             }
                         }
+                        touched[i] = view.applyBlock(pool, allocator, b.x, b.y, b.z, b.id, b.meta) catch {
+                            // The edit did NOT land (store/alloc failure):
+                            // broadcasting the requested id would lie to
+                            // every viewer (ghost), and aftermath drops for
+                            // an unbroken block would dupe. Drop the event;
+                            // a later resync/heal carries truth.
+                            events.items[i] = .none;
+                            continue;
+                        };
+                        // K1: plate registry follows place/break.
+                        server.trackPlates(b, old);
                         // Door halves: placing a door also sets the upper
                         // half (air above only); breaking one half clears
                         // the partner (no extra drop — the main half
@@ -8006,71 +11486,75 @@ pub fn sessionStep(
                         }
                         // K1: recompute + neighbor fan-out for the edit.
                         server.redstoneOnEdit(pool, allocator, b.x, b.y, b.z, now_ticks, &rs_changes, &rs_sounds);
-                        // Block sounds (S29 to nearby viewers; volume
-                        // 1.0, pitch 0.8 like vanilla break/place).
+                        // Block sounds (S29 to nearby viewers).
                         const sx: f64 = @as(f64, @floatFromInt(b.x)) + 0.5;
                         const sy: f64 = @as(f64, @floatFromInt(b.y)) + 0.5;
                         const sz: f64 = @as(f64, @floatFromInt(b.z)) + 0.5;
-                        if (b.id != game_ids.air) {
-                            const v = Server.placeSound(b.id);
-                            // Liquids splash for everyone (no client prediction);
-                            // solid-block sounds skip the placer (they predicted it).
-                            const excl: ?*Conn = if (Server.isLiquid(b.id)) null else conn;
-                            server.broadcastSound(excl, v.name, sx, sy, sz, 1.0, v.pitch);
-                        }
+                        server.soundForEdit(conn, b.id, sx, sy, sz);
                         // Survival break of a real block: vanilla drops.
                         // (Creative breaks drop nothing; missing chunks
                         // peek null and stay dropless.)
                         if (b.id == game_ids.air) {
-                            if (old) |o| {
-                                if (o.id != game_ids.air) {
-                                    const v = Server.placeSound(o.id);
-                                    const excl: ?*Conn = if (Server.isLiquid(o.id)) null else conn;
-                                    server.broadcastSound(excl, v.name, sx, sy, sz, 1.0, v.pitch);
-                                }
-                                if (Server.shouldDropBreak(conn.config.gamemode, o.id, server.tileDrops())) {
-                                    server.spawnBreakDrops(pool, allocator, b.x, b.y, b.z, o.id, o.meta);
-                                }
-                                // Table break with viewers: drop their
-                                // grids + close the windows.
-                                if (o.id == game_ids.crafting_table) server.closeWindowsAt(pool, allocator, b.x, b.y, b.z);
-                                // Enchanting-table break: close viewer windows
-                                // and drop their held item (like table grids).
-                                if (o.id == game_ids.enchanting_table) server.closeWindowsAt(pool, allocator, b.x, b.y, b.z);
-                                // Furnace break: close viewer windows and
-                                // drop input/fuel/output as entities
-                                // (both modes, like table grids; the
-                                // block itself drops only in survival
-                                // via spawnBreakDrops above).
-                                if (o.id == game_ids.furnace or o.id == game_ids.lit_furnace) {
-                                    server.closeWindowsAt(pool, allocator, b.x, b.y, b.z);
-                                    var removed = server.removeFurnace(b.x, b.y, b.z);
-                                    const fstacks = [_]*?item_mod.Stack{ &removed.input, &removed.fuel, &removed.output };
-                                    for (fstacks) |st| {
-                                        const s = st.* orelse continue;
-                                        st.* = null;
-                                        server.spawnItemLive(s, @as(f64, @floatFromInt(b.x)) + 0.5, @as(f64, @floatFromInt(b.y)) + 0.5, @as(f64, @floatFromInt(b.z)) + 0.5, 10);
-                                    }
-                                }
-                            }
+                            server.breakAftermath(conn, pool, allocator, b, old, sx, sy, sz);
                         }
                     },
                     .interact => |*b| {
                         // Empty-hand right-click: UI opens + K1 toggles
                         // only (sneak is irrelevant with nothing held).
-                        if (server.tryOpenTable(conn, pool, allocator, b, false)) {
-                            events.items[i] = .none;
-                            continue;
-                        }
-                        if (server.tryOpenFurnace(conn, pool, allocator, b, false)) {
-                            events.items[i] = .none;
-                            continue;
-                        }
-                        if (server.tryOpenEnchant(conn, pool, allocator, b, false)) {
+                        if (server.tryOpenAnyUI(conn, pool, allocator, b, false)) {
                             events.items[i] = .none;
                             continue;
                         }
                         _ = server.tryInteract(pool, allocator, b, now_ticks, &rs_changes, &rs_sounds);
+                        events.items[i] = .none;
+                    },
+                    .eat => |e| {
+                        // Right-click eat/drink: UI opens win first (tables,
+                        // furnaces, chests — like vanilla), K1 toggles win
+                        // when not sneaking; otherwise start the 32-tick
+                        // use. Air clicks (face -1) skip routing.
+                        conn.lock.lock();
+                        const sneak = conn.sneaking;
+                        const food_now = conn.food;
+                        conn.lock.unlock();
+                        var ui_b = BlockEvent{ .x = e.x, .y = e.y, .z = e.z, .id = e.id, .meta = 0, .face = e.face };
+                        if (e.face != -1) {
+                            if (server.tryOpenAnyUI(conn, pool, allocator, &ui_b, sneak)) {
+                                events.items[i] = .none;
+                                continue;
+                            }
+                            if (!sneak and server.tryInteract(pool, allocator, &ui_b, now_ticks, &rs_changes, &rs_sounds)) {
+                                events.items[i] = .none;
+                                continue;
+                            }
+                        }
+                        // Validate the held stack is still the clicked food
+                        // (it may have moved between parse and resolve).
+                        conn.lock.lock();
+                        defer conn.lock.unlock();
+                        const st = conn.inv[e.slot] orelse {
+                            events.items[i] = .none;
+                            continue;
+                        };
+                        if (st.id != e.id or st.damage != e.damage) {
+                            events.items[i] = .none;
+                            continue;
+                        }
+                        const food = profile.game.item_data.foodFor(st.id, st.damage);
+                        const potion = profile.game.potion_data.isDrinkable(st.id, st.damage);
+                        if (food == null and !potion) {
+                            events.items[i] = .none;
+                            continue;
+                        }
+                        // Full hunger refuses food (except always-edible golden
+                        // apples); potions always drink. Dead conns never eat.
+                        // Restarting (already eating) just re-arms the timer.
+                        const edible = if (food) |f| f.always_edible else true;
+                        if (conn.is_dead or (food_now >= 20 and !edible)) {
+                            events.items[i] = .none;
+                            continue;
+                        }
+                        conn.eating = .{ .slot = e.slot, .id = e.id, .damage = e.damage, .ticks = profile.game.item_data.eat_ticks };
                         events.items[i] = .none;
                     },
                     else => {},
@@ -8084,13 +11568,44 @@ pub fn sessionStep(
                 const gm = conn.config.gamemode;
                 conn.lock.unlock();
                 for (rs_changes.items[0..rs_changes.n]) |c| {
-                    server.flushRsChange(pool, allocator, gm, c);
+                    server.flushRsChange(gm, c);
                 }
                 for (rs_sounds.evs[0..rs_sounds.n]) |s| server.flushRsSound(s);
             }
         }
         for (events.items, 0..) |ev, i| {
             switch (ev) {
+                .block_resync => |r| {
+                    // Dig negative-ack: re-read the refused cell and send
+                    // the digger truth when it is still solid (vanilla
+                    // S23-iff-solid). Reads post-unlock like the neighbor
+                    // resends below, so a racing edit only makes the
+                    // correction fresher, never staler.
+                    if (server.world) |pool| {
+                        const cur = view.peekBlock(pool, allocator, r.x, r.y, r.z) catch null;
+                        if (cur) |cell| {
+                            if (cell.id != game_ids.air) server.sendBlockChangeTo(conn, r.x, r.y, r.z, cell.id, cell.meta);
+                        }
+                    }
+                },
+                .place_deny => |d| {
+                    // Placement negative-ack: conn-side refusal (reach, bad
+                    // face, side rule). The client predicted the block at
+                    // the target, so truth goes out EVEN WHEN AIR (unlike
+                    // dig-NACK: there the client removed and silence means
+                    // agreement). Missing chunks peek null: air is truth
+                    // (the edit never landed and generation won't include
+                    // it). Same sent-set gate as dig-NACK (a viewer that
+                    // never got the column holds no prediction to clear).
+                    if (server.world) |pool| {
+                        const cur = view.peekBlock(pool, allocator, d.x, d.y, d.z) catch null;
+                        if (cur) |cell| {
+                            server.sendBlockChangeToActor(conn, d.x, d.y, d.z, cell.id, cell.meta);
+                        } else {
+                            server.sendBlockChangeToActor(conn, d.x, d.y, d.z, game_ids.air, 0);
+                        }
+                    }
+                },
                 .block_set => |b| {
                     // Vanilla echoes placements/breaks to the actor too
                     // (PlayerManager marks every tracker; client prediction
@@ -8110,8 +11625,22 @@ pub fn sessionStep(
                     }
                 },
                 .qdrop => |q| server.spawnQDrop(conn, q),
+                .throw_potion => |t| server.throwPotion(conn, t),
+                .equip_armor => {
+                    conn.lock.lock();
+                    defer conn.lock.unlock();
+                    _ = conn.applyEquipArmor();
+                },
                 .table_close => |t| server.spawnTableClose(conn, t),
                 .furnace_click => |f| server.applyFurnaceClick(conn, f),
+                .brew_click => |bc| server.applyBrewClick(conn, bc),
+                .chest_click => |c| {
+                    if (server.world) |pool| server.applyChestClick(conn, pool, allocator, c);
+                },
+                .chest_close => |c| {
+                    if (server.world) |pool| server.spawnChestClose(pool, allocator, c);
+                },
+                .ender_close => |c| server.spawnEnderClose(c),
                 .enchant_click => |ec| {
                     if (server.world) |pool| server.applyEnchantClick(conn, pool, allocator, ec);
                 },
@@ -8156,9 +11685,10 @@ pub fn sessionStep(
                 var rs_sounds: redstone_mod.SoundList = .{};
                 server.world_lock.lock();
                 var w = Server.RsWorld{ .pool = pool, .alloc = allocator, .changes = &rs_changes };
+                defer w.deinit();
                 redstone_mod.pollPlates(w.rsView(), &server.rs_sched, &server.rs_burn, &server.rs_plates, &rs_changes, &rs_sounds, server.rs_tick, &[1]redstone_mod.Ent{mover}, &.{}, &.{}, true);
                 server.world_lock.unlock();
-                for (rs_changes.items[0..rs_changes.n]) |c| server.flushRsChange(pool, allocator, conn.config.gamemode, c);
+                for (rs_changes.items[0..rs_changes.n]) |c| server.flushRsChange(conn.config.gamemode, c);
                 for (rs_sounds.evs[0..rs_sounds.n]) |sv| server.flushRsSound(sv);
             }
         }
@@ -8192,14 +11722,18 @@ pub fn serveConn(
     const conn = try allocator.create(Conn);
     conn.* = Conn.init(allocator, io, server.config, eid);
     Server.captureIp(conn, stream);
+    // Same socket tuning as the async accept paths (notably SO_SNDTIMEO:
+    // without it a write to a black-hole peer wedges this thread for
+    // TCP-timeout minutes instead of failing fast).
+    transport_mod.applySocketOpts(stream.socket.handle, server.transport_opts);
     server.register(conn, stream) catch {
         conn.deinit();
         allocator.destroy(conn);
         return error.RegistryFull;
     };
     defer server.unregister(conn);
-    var rbuf: [4096]u8 = undefined;
-    var wbuf: [4096]u8 = undefined;
+    var rbuf: [io_buf_len]u8 = undefined;
+    var wbuf: [io_buf_len]u8 = undefined;
     var reader = stream.reader(io, &rbuf);
     var writer = stream.writer(io, &wbuf);
     const rin = &reader.interface;
@@ -8210,7 +11744,7 @@ pub fn serveConn(
         // Read whatever the client sent (the conn does its own frame
         // reassembly, so a partial frame is fine). `readVec` returns after
         // one socket read: it never waits for the buffer to fill.
-        var chunk: [4096]u8 = undefined;
+        var chunk: [io_buf_len]u8 = undefined;
         var bufs: [1][]u8 = .{&chunk};
         const n = rin.readVec(&bufs) catch |err| switch (err) {
             error.EndOfStream => return, // client closed
@@ -8225,26 +11759,24 @@ pub fn serveConn(
         if (pending.len > 0) {
             conn.wlock.lock();
             defer conn.wlock.unlock();
-            wout.writeAll(pending) catch {
-                conn.allocator.free(pending);
-                return;
-            };
-            wout.flush() catch {
-                conn.allocator.free(pending);
-                return;
-            };
+            defer conn.allocator.free(pending);
+            wout.writeAll(pending) catch return;
+            wout.flush() catch return;
+        } else {
+            conn.allocator.free(pending);
         }
-        conn.allocator.free(pending);
         if (res.stop) server.finishStop();
         if (res.finished) return;
         if (res.announce) {
-            server.announceJoin(conn) catch {};
+            server.queueAnnounce(conn);
         }
     }
 }
 
 /// Read one framed packet body from a client-side reader (test helper).
-fn readFrame(r: *std.Io.Reader, buf: []u8) !struct { id: i32, body: []u8 } {
+const TestFrame = struct { id: i32, body: []u8 };
+
+fn readFrame(r: *std.Io.Reader, buf: []u8) !TestFrame {
     var len: i32 = 0;
     var shift: u32 = 0;
     while (true) {
@@ -8262,6 +11794,8 @@ fn readFrame(r: *std.Io.Reader, buf: []u8) !struct { id: i32, body: []u8 } {
     const body = buf[pr.index..ulen];
     return .{ .id = id, .body = body };
 }
+
+// ---- tests ----
 
 test "loopback status flow over real TCP" {
     const io = std.testing.io;
@@ -8366,12 +11900,17 @@ test "play_count tracks announces and unregisters for the list ping" {
     try srv.register(bob.conn, bob.srv_stream);
     // Registered but not announced: not counted yet.
     try std.testing.expectEqual(@as(u32, 0), srv.play_count.load(.acquire));
-    try srv.announceJoin(alice.conn);
+    // Batched announce: queueing alone changes nothing; the drain counts.
+    srv.queueAnnounce(alice.conn);
+    try std.testing.expectEqual(@as(u32, 0), srv.play_count.load(.acquire));
+    srv.drainAnnounces();
     try std.testing.expectEqual(@as(u32, 1), srv.play_count.load(.acquire));
-    try srv.announceJoin(bob.conn);
+    srv.queueAnnounce(bob.conn);
+    srv.drainAnnounces();
     try std.testing.expectEqual(@as(u32, 2), srv.play_count.load(.acquire));
     // Re-announce is idempotent for the count.
-    try srv.announceJoin(bob.conn);
+    srv.queueAnnounce(bob.conn);
+    srv.drainAnnounces();
     try std.testing.expectEqual(@as(u32, 2), srv.play_count.load(.acquire));
     srv.unregister(bob.conn);
     try std.testing.expectEqual(@as(u32, 1), srv.play_count.load(.acquire));
@@ -8428,10 +11967,11 @@ test "registry join/leave broadcast + tickOnce keepalive over loopback" {
 
     try srv.register(alice.conn, alice.srv_stream);
     try srv.register(bob.conn, bob.srv_stream);
-    // announce both (each conn announces itself on login, like serveConn does).
+    // announce both (each conn queues itself on login, like serveConn does).
     // Duplicates are harmless (idempotent player list); drain both copies.
-    try srv.announceJoin(alice.conn);
-    try srv.announceJoin(bob.conn);
+    srv.queueAnnounce(alice.conn);
+    srv.queueAnnounce(bob.conn);
+    srv.drainAnnounces();
     // Alice learns Bob; Bob learns Alice (persistent readers: fresh ones
     // would drop coalesced bytes buffered by a previous reader)
     var arb: [128]u8 = undefined;
@@ -8439,16 +11979,15 @@ test "registry join/leave broadcast + tickOnce keepalive over loopback" {
     var arr = alice.cli_stream.reader(io, &arb);
     var brb: [128]u8 = undefined;
     var brr = bob.cli_stream.reader(io, &brb);
-    // two join frames per side (one per announceJoin call), each followed
-    // by that player's yellow join chat
+    // Batched announce: ONE drain fans out everything — each side gets one
+    // list-add for the other, then BOTH yellow join lines in queue order.
     for ([2]struct { r: *std.Io.net.Stream.Reader, want: []const u8 }{ .{ .r = &arr, .want = "Bob" }, .{ .r = &brr, .want = "Alice" } }) |side| {
-        var n: usize = 0;
-        while (n < 2) : (n += 1) {
-            const f = try readFrame(&side.r.interface, &afb);
-            try std.testing.expectEqual(@as(i32, 0x38), f.id);
-            var pr = codec.PacketReader.init(f.body);
-            try std.testing.expectEqualStrings(side.want, try pr.readString());
-            try std.testing.expect(try pr.readBool());
+        const f = try readFrame(&side.r.interface, &afb);
+        try std.testing.expectEqual(@as(i32, 0x38), f.id);
+        var pr = codec.PacketReader.init(f.body);
+        try std.testing.expectEqualStrings(side.want, try pr.readString());
+        try std.testing.expect(try pr.readBool());
+        for ([2]u8{ 0, 1 }) |_| {
             const c = try readFrame(&side.r.interface, &afb);
             try std.testing.expectEqual(@as(i32, 0x02), c.id);
         }
@@ -8512,8 +12051,11 @@ test "K1 glue: piston extend/retract through the LSM pool + S24 action" {
     try std.testing.expectEqual(@as(u4, 13), (try view.peekBlock(pool, a, 7, 64, 8)).?.meta); // lever ON
     // Drain the scheduled event (due at now+2).
     srv.world_lock.lock();
-    var w = Server.RsWorld{ .pool = pool, .alloc = a, .changes = &changes };
-    redstone_mod.drainScheduled(w.rsView(), &srv.rs_sched, &srv.rs_burn, &changes, &sounds, 2, &actions);
+    {
+        var w = Server.RsWorld{ .pool = pool, .alloc = a, .changes = &changes };
+        defer w.deinit();
+        redstone_mod.drainScheduled(w.rsView(), &srv.rs_sched, &srv.rs_burn, &changes, &sounds, 2, &actions);
+    }
     srv.world_lock.unlock();
     try std.testing.expectEqual(game_ids.piston_head, (try view.peekBlock(pool, a, 9, 64, 8)).?.id);
     try std.testing.expectEqual(@as(u4, 5), (try view.peekBlock(pool, a, 9, 64, 8)).?.meta); // non-sticky head
@@ -8528,9 +12070,12 @@ test "K1 glue: piston extend/retract through the LSM pool + S24 action" {
     var evt2 = BlockEvent{ .x = 7, .y = 65, .z = 8, .id = game_ids.air, .meta = 0, .face = 1 };
     srv.world_lock.lock();
     _ = srv.tryInteract(pool, a, &evt2, 4, &changes, &sounds);
-    var w2 = Server.RsWorld{ .pool = pool, .alloc = a, .changes = &changes };
     var actions2: redstone_mod.ActionList = .{};
-    redstone_mod.drainScheduled(w2.rsView(), &srv.rs_sched, &srv.rs_burn, &changes, &sounds, 6, &actions2);
+    {
+        var w2 = Server.RsWorld{ .pool = pool, .alloc = a, .changes = &changes };
+        defer w2.deinit();
+        redstone_mod.drainScheduled(w2.rsView(), &srv.rs_sched, &srv.rs_burn, &changes, &sounds, 6, &actions2);
+    }
     srv.world_lock.unlock();
     try std.testing.expectEqual(game_ids.air, (try view.peekBlock(pool, a, 9, 64, 8)).?.id); // head gone
     try std.testing.expectEqual(game_ids.stone, (try view.peekBlock(pool, a, 10, 64, 8)).?.id); // stone stays
@@ -8564,9 +12109,12 @@ test "K1 glue: sticky piston pulls its adjacent block on retract" {
     var evt = BlockEvent{ .x = 7, .y = 65, .z = 8, .id = game_ids.air, .meta = 0, .face = 1 };
     srv.world_lock.lock();
     _ = srv.tryInteract(pool, a, &evt, 0, &changes, &sounds);
-    var w = Server.RsWorld{ .pool = pool, .alloc = a, .changes = &changes };
-    var actions: redstone_mod.ActionList = .{};
-    redstone_mod.drainScheduled(w.rsView(), &srv.rs_sched, &srv.rs_burn, &changes, &sounds, 2, &actions);
+    {
+        var w = Server.RsWorld{ .pool = pool, .alloc = a, .changes = &changes };
+        defer w.deinit();
+        var actions: redstone_mod.ActionList = .{};
+        redstone_mod.drainScheduled(w.rsView(), &srv.rs_sched, &srv.rs_burn, &changes, &sounds, 2, &actions);
+    }
     srv.world_lock.unlock();
     // Extended: head at 9, dirt pushed to 10.
     try std.testing.expectEqual(game_ids.piston_head, (try view.peekBlock(pool, a, 9, 64, 8)).?.id);
@@ -8576,9 +12124,12 @@ test "K1 glue: sticky piston pulls its adjacent block on retract" {
     var evt2 = BlockEvent{ .x = 7, .y = 65, .z = 8, .id = game_ids.air, .meta = 0, .face = 1 };
     srv.world_lock.lock();
     _ = srv.tryInteract(pool, a, &evt2, 4, &changes, &sounds);
-    var w2 = Server.RsWorld{ .pool = pool, .alloc = a, .changes = &changes };
-    var actions2: redstone_mod.ActionList = .{};
-    redstone_mod.drainScheduled(w2.rsView(), &srv.rs_sched, &srv.rs_burn, &changes, &sounds, 6, &actions2);
+    {
+        var w2 = Server.RsWorld{ .pool = pool, .alloc = a, .changes = &changes };
+        defer w2.deinit();
+        var actions2: redstone_mod.ActionList = .{};
+        redstone_mod.drainScheduled(w2.rsView(), &srv.rs_sched, &srv.rs_burn, &changes, &sounds, 6, &actions2);
+    }
     srv.world_lock.unlock();
     try std.testing.expectEqual(game_ids.dirt, (try view.peekBlock(pool, a, 9, 64, 8)).?.id);
     try std.testing.expectEqual(game_ids.air, (try view.peekBlock(pool, a, 10, 64, 8)).?.id);
@@ -8738,8 +12289,10 @@ test "Phase C: grouping covers each viewer exactly once (interleaved regions)" {
         .players = &players,
         .mobs = &mobs,
         .items = &items,
+        .potions = &[_]entity.PotionSnap{},
         .envs = &envs,
         .furn_snaps = &furn,
+        .brew_snaps = &[_]Server.BrewSnap{},
         .deaths = &deaths,
         .claims = &claims,
         .reconcile_ns = &rns,
@@ -8768,6 +12321,99 @@ test "Phase C: grouping covers each viewer exactly once (interleaved regions)" {
     try std.testing.expectEqualSlices(usize, &[_]usize{ 0, 2 }, build.order[build.groups[0].start..build.groups[0].end]);
     try std.testing.expectEqual(@as(i32, 3), build.groups[1].region.id.rx);
     try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 3 }, build.order[build.groups[1].start..build.groups[1].end]);
+}
+
+test "Phase C: >256 viewers spill to legacy without smashing the stack" {
+    // Regression: the grouping side arrays are fixed [256] but
+    // max_players allows 1024 — past 256 viewers the old code indexed
+    // them out of bounds (ReleaseFast: no panic, smashed stack, wild
+    // crash under the 600-conn load). Viewers past the cap must tick
+    // inline via the legacy body; the grouped prefix stays exact.
+    const a = std.heap.page_allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    const n = 260;
+    // Loopback pairs: spill viewers tick inline through tickViewerOne,
+    // which flushes their outbox — that needs real fds (undefined
+    // streams abort on flush, like the live server would on a dead fd).
+    var port: u16 = 37801;
+    var listener: std.Io.net.Server = while (true) {
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+        break addr.listen(io, .{}) catch |err| switch (err) {
+            error.AddressInUse => {
+                port += 1;
+                if (port > 37860) return err;
+                continue;
+            },
+            else => return err,
+        };
+    };
+    defer listener.deinit(io);
+    var conns: [n]*Conn = undefined;
+    var clis: [n]std.Io.net.Stream = undefined;
+    var srvs: [n]std.Io.net.Stream = undefined;
+    for (&conns, &clis, &srvs) |*slot, *cli, *sv| {
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+        cli.* = try addr.connect(io, .{ .mode = .stream });
+        sv.* = try listener.accept(io);
+        const c = try a.create(Conn);
+        c.* = Conn.init(a, io, .{}, 1);
+        c.state = .play;
+        c.pos_x = 8.5;
+        c.pos_z = 8.5;
+        slot.* = c;
+    }
+    defer {
+        for (conns) |c| {
+            c.deinit();
+            a.destroy(c);
+        }
+        for (&clis) |*s| s.close(io);
+        for (&srvs) |*s| s.close(io);
+    }
+    var snap: [n]RegistryEntry = undefined;
+    for (&snap, conns, srvs) |*e, c, s| e.* = .{ .conn = c, .stream = s };
+    var deaths = std.ArrayList(Server.DeathInfo).empty;
+    defer deaths.deinit(a);
+    var claims = entity.ClaimSet{};
+    var rns: u64 = 0;
+    var sns: u64 = 0;
+    var players: [0]entity.PlayerSnap = .{};
+    var mobs: [0]entity.MobSnap = .{};
+    var items: [0]entity.ItemSnap = .{};
+    var envs: [0]Server.EnvFlag = .{};
+    var furn: [0]Server.FurnSnap = .{};
+    var vc = Server.ViewerCtx{
+        .now_ms = 1000,
+        .age = 20,
+        .players = &players,
+        .mobs = &mobs,
+        .items = &items,
+        .potions = &[_]entity.PotionSnap{},
+        .envs = &envs,
+        .furn_snaps = &furn,
+        .brew_snaps = &[_]Server.BrewSnap{},
+        .deaths = &deaths,
+        .claims = &claims,
+        .reconcile_ns = &rns,
+        .send_ns = &sns,
+    };
+    var build = Server.GroupBuild{};
+    srv.buildRegionGroups(&snap, &vc, &build);
+    // One region, first 256 grouped, last 4 legacy-inline.
+    try std.testing.expectEqual(@as(usize, 1), build.n_groups);
+    try std.testing.expectEqual(@as(usize, 256), build.n_ordered);
+    var seen: [n]u32 = [_]u32{0} ** n;
+    for (build.groups[0..build.n_groups]) |g| {
+        try std.testing.expect(g.end <= build.n_ordered);
+        for (build.order[g.start..g.end]) |si| {
+            try std.testing.expect(si < 256); // only the capped prefix
+            seen[si] += 1;
+        }
+    }
+    for (seen[0..256]) |c| try std.testing.expectEqual(@as(u32, 1), c);
+    for (seen[256..]) |c| try std.testing.expectEqual(@as(u32, 0), c);
 }
 
 test "Phase C follow-up: mob crossing adopts into target, source empties, never gaps or dups" {
@@ -8964,6 +12610,8 @@ test "statsLine renders per-subsystem memory independently (no buffer aliasing)"
     try std.testing.expect(std.mem.indexOf(u8, line, "ring=0 B") != null);
     // Live conns (blocking transport has no counters: registry size).
     try std.testing.expect(std.mem.indexOf(u8, line, "conns=1") != null);
+    // No gen pool in this harness: GPU counters render zeroed.
+    try std.testing.expect(std.mem.indexOf(u8, line, "gpu=0/0") != null);
     conn.deinit();
     a.destroy(conn);
 }
@@ -9060,8 +12708,9 @@ test "broadcastBlockChange/ArmSwing target sent-set viewers only" {
     try bob.conn.sent.put(Conn.sentKey(5, 0), {});
     try srv.register(alice.conn, alice.srv_stream);
     try srv.register(bob.conn, bob.srv_stream);
-    // register is silent; one announceJoin drives the join broadcast both ways.
-    try srv.announceJoin(alice.conn);
+    // register is silent; one queued announce + drain drives the join broadcast both ways.
+    srv.queueAnnounce(alice.conn);
+    srv.drainAnnounces();
     // (One persistent reader per stream: fresh readers would drop coalesced bytes.)
     var arb: [128]u8 = undefined;
     var afb: [128]u8 = undefined;
@@ -9121,6 +12770,16 @@ test "hunger: exhaustion drain, regen, starvation gates" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), c.exhaustion, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), c.saturation, 1e-6);
     try std.testing.expectEqual(@as(i16, 20), c.food);
+    // audit counters reset on every visible drop (each log line accounts
+    // exactly one drumstick/saturation point)
+    c.exhaustion = 5.0;
+    c.exh_move = 2.5;
+    c.exh_jump = 0.8;
+    c.exh_regen = 0.7;
+    try std.testing.expect(Server.hungerTick(&c, .normal) == null);
+    try std.testing.expectEqual(@as(f32, 0), c.exh_move);
+    try std.testing.expectEqual(@as(f32, 0), c.exh_jump);
+    try std.testing.expectEqual(@as(f32, 0), c.exh_regen);
     // saturation 0 -> food drops (peaceful exempts)
     c.exhaustion = 5.0;
     c.saturation = 0;
@@ -9137,6 +12796,7 @@ test "hunger: exhaustion drain, regen, starvation gates" {
     try std.testing.expect(Server.hungerTick(&c, .normal) == null);
     try std.testing.expectApproxEqAbs(@as(f32, 11.0), c.health, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), c.exhaustion, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), c.exh_regen, 1e-6);
     // starve: normal hits at hp>1, spares hp==1; hard always hits
     c.health = 2.0;
     c.food = 0;
@@ -9181,32 +12841,37 @@ test "env: drown countdown, lava+fire, suffocate; fall resolution" {
     c.fire_ticks = 100;
     try std.testing.expect(Server.envTick(&c, true, false, false, false) == null);
     try std.testing.expectEqual(@as(u32, 0), c.fire_ticks);
-    // suffocate: 4 per tick
+    // suffocate: 2 per tick (vanilla 1.0/hit behind ~0.5s hurt immunity)
     try std.testing.expect(Server.envTick(&c, false, false, true, false) == null);
-    try std.testing.expectApproxEqAbs(@as(f32, 9.0), c.health, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 11.0), c.health, 1e-6);
     // cactus: 1.0 per touching tick (1Hz model hits ~1/s; vanilla
     // hurt-resistance gates to ~1/0.5s, quantized to whole ticks here)
     try std.testing.expect(Server.envTick(&c, false, false, false, true) == null);
-    try std.testing.expectApproxEqAbs(@as(f32, 8.0), c.health, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), c.health, 1e-6);
     try std.testing.expect(Server.envTick(&c, false, false, false, true) == null);
-    try std.testing.expectApproxEqAbs(@as(f32, 7.0), c.health, 1e-6); // next tick hits again
+    try std.testing.expectApproxEqAbs(@as(f32, 9.0), c.health, 1e-6); // next tick hits again
     // creative is immune to cactus
     c.config.gamemode = .creative;
     c.cactus_cd = 0;
     try std.testing.expect(Server.envTick(&c, false, false, false, true) == null);
-    try std.testing.expectApproxEqAbs(@as(f32, 7.0), c.health, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 9.0), c.health, 1e-6);
     c.config.gamemode = .survival;
     // fall: ceil(dist-3) without a world (no water to save us)
     c.pending_fall = .{ .dist = 5.5, .x = 0, .y = 64, .z = 0 };
     var srv = Server{ .net = undefined, .io = std.testing.io, .config = .{}, .gpa = a };
     defer srv.registry.deinit(a);
     srv.resolvePendingFall(&c);
-    try std.testing.expectApproxEqAbs(@as(f32, 4.0), c.health, 1e-6); // 7-3
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), c.health, 1e-6); // 9-3
     try std.testing.expect(c.pending_fall == null);
     // short falls are free
     c.pending_fall = .{ .dist = 3.0, .x = 0, .y = 64, .z = 0 };
     srv.resolvePendingFall(&c);
-    try std.testing.expectApproxEqAbs(@as(f32, 4.0), c.health, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), c.health, 1e-6);
+    // f32 dust at an integer boundary (5.0000005 from summed network
+    // steps) must not flip a whole extra heart: ceil(2.0000005) = 3.
+    c.pending_fall = .{ .dist = 5.0000005, .x = 0, .y = 64, .z = 0 };
+    srv.resolvePendingFall(&c);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), c.health, 1e-6); // 6-2
     {
         const o = try c.takeOutput();
         defer a.free(o);
@@ -9261,7 +12926,7 @@ test "live drop spawn: instant 0x0E/0x1C, no tick re-spawn, tick pickup grants" 
     var cfb: [2048]u8 = undefined;
     var cread = cli.reader(io, &crb);
     // Serve-thread spawn: visible immediately, no tick wait.
-    srv.spawnItemLive(.{ .id = game_ids.dirt, .count = 1, .damage = 0, .nbt = null }, 8.5, 65.1, 8.5, 10);
+    srv.spawnItemLive(.{ .id = game_ids.dirt, .count = 1, .damage = 0, .nbt = null }, 8.5, 65.1, 8.5, 10, .{ 0, 0, 0 });
     const eid = blk: {
         srv.ent_lock.lock();
         defer srv.ent_lock.unlock();
@@ -9295,7 +12960,7 @@ test "live drop spawn: instant 0x0E/0x1C, no tick re-spawn, tick pickup grants" 
             }
         }.f;
         var ctx: u8 = 0;
-        try entity.reconcileViewer(c, conn_sink.bind(c), &[_]entity.PlayerSnap{}, &[_]entity.MobSnap{}, &snap, &claims, Always, &ctx);
+        try entity.reconcileViewer(c, conn_sink.bind(c), &[_]entity.PlayerSnap{}, &[_]entity.MobSnap{}, &snap, &[_]entity.PotionSnap{}, &claims, Always, &ctx);
         try std.testing.expect(!claims.contains(eid));
         try std.testing.expect(c.tracked.contains(eid));
         c.lock.lock();
@@ -9324,11 +12989,11 @@ test "live drop spawn: instant 0x0E/0x1C, no tick re-spawn, tick pickup grants" 
             }
         }.f;
         var ctx: u8 = 0;
-        try entity.reconcileViewer(c, conn_sink.bind(c), &[_]entity.PlayerSnap{}, &[_]entity.MobSnap{}, &snap, &claims, Always, &ctx);
+        try entity.reconcileViewer(c, conn_sink.bind(c), &[_]entity.PlayerSnap{}, &[_]entity.MobSnap{}, &snap, &[_]entity.PotionSnap{}, &claims, Always, &ctx);
         try std.testing.expect(claims.contains(eid));
         try std.testing.expect(!c.tracked.contains(eid));
-        try std.testing.expect(c.inv[9] != null);
-        try std.testing.expectEqual(game_ids.dirt, c.inv[9].?.id);
+        try std.testing.expect(c.inv[36] != null);
+        try std.testing.expectEqual(game_ids.dirt, c.inv[36].?.id);
         c.lock.lock();
         const out = try c.takeOutput();
         c.lock.unlock();
@@ -9397,12 +13062,167 @@ test "login landing disk: ensureLanding fills the 5x5 around the player" {
     }
 }
 
+test "login landing wait is scoped to the 5x5, not the whole backlog" {
+    // Regression: ensureLanding used gp.drain(), which parks the serve
+    // thread behind the ENTIRE pool backlog — under /pregen a fresh login
+    // hung until the whole task finished. landingInflight scopes the wait
+    // to our own 25 columns (bounded; leftovers stay holes under grace).
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    var lock: spin.SpinLock = .{};
+    var gp = try v5genpool.GenPool.create(a, io, pool, &lock, 42, false, false, 1, .{});
+    defer {
+        gp.destroy();
+        a.destroy(gp);
+    }
+    // Unrelated backlog far away (stands in for a pregen backlog).
+    gp.request(0, 100, 100);
+    // Our disk is clean: nothing inflight (request adds synchronously, the
+    // worker needs ~100ms of noise math to clear it — no race here).
+    try std.testing.expect(!srv.landingInflight(gp, 0, 0));
+    // The backlogged column reads inflight from its own disk...
+    try std.testing.expect(srv.landingInflight(gp, 100, 100));
+    // ...but not from ours (a global drain would wait for it anyway).
+    try std.testing.expect(!srv.landingInflight(gp, 0, 0));
+    gp.drain();
+    try std.testing.expect(!srv.landingInflight(gp, 100, 100));
+}
+
+test "login lapse resolves on generation state, not blindly" {
+    // Regression for login-embedded joins: a fall held past the grace
+    // deadline must not adopt into an undelivered column (terrain
+    // generates solid around it and the player wakes up suffocating).
+    // The tick re-arms while the column is a hole and releases once
+    // ground exists.
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    srv.world = pool;
+    const c = try a.create(Conn);
+    defer {
+        c.deinit();
+        a.destroy(c);
+    }
+    c.* = Conn.init(a, io, .{}, 7);
+    c.state = .play;
+    c.pos_x = 0.5;
+    c.pos_y = 69.0;
+    c.pos_z = 0.5;
+    // Lapsed with the column missing: re-arm (deadline in the future),
+    // keep holding, allow a fresh snap on delivery.
+    c.login_grace_lapsed = true;
+    c.login_fell = true;
+    c.login_resynced = true;
+    srv.maybeLoginResync(c);
+    try std.testing.expect(c.login_grace_ms != 0);
+    try std.testing.expect(!c.login_grace_lapsed);
+    try std.testing.expect(!c.login_resynced);
+    // Column lands: the next resolve releases instead of re-arming.
+    var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
+    defer ch.destroy(a);
+    try pool.putChunk(a, ch);
+    c.login_grace_lapsed = true;
+    srv.maybeLoginResync(c);
+    try std.testing.expect(c.login_grace_ms == 0);
+    try std.testing.expect(!c.login_grace_lapsed);
+}
+
+test "tick rescue lifts embedded players to headroom" {
+    // The one-shot login rescue is hole-blind; burial after it (adopted
+    // hole falls, away-edits, drift) must not stick. Per-tick rescue
+    // lifts fully-embedded players in present columns; open air and
+    // holes are no-ops.
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    srv.world = pool;
+    // Solid pillar y 60..67 at column (8,*,8).
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
+        defer ch.destroy(a);
+        var y: u8 = 60;
+        while (y <= 67) : (y += 1) {
+            const si: usize = @as(usize, y) >> 4;
+            if (ch.sections[si] == null) ch.sections[si] = chunk_mod.Section{};
+            ch.sections[si].?.setBlock(8, @truncate(y & 15), 8, .stone);
+        }
+        try pool.putChunk(a, ch);
+    }
+    const c = try a.create(Conn);
+    defer {
+        c.deinit();
+        a.destroy(c);
+    }
+    c.* = Conn.init(a, io, .{}, 7);
+    c.state = .play;
+    // Embedded (feet 62 + eyes 63 both stone): lifted to 68.
+    c.pos_x = 8.5;
+    c.pos_y = 62.0;
+    c.pos_z = 8.5;
+    try std.testing.expect(srv.rescueEmbedded(c));
+    try std.testing.expectApproxEqAbs(@as(f64, 68.0), c.pos_y, 1e-9);
+    // Open air: no-op.
+    c.pos_y = 70.0;
+    try std.testing.expect(!srv.rescueEmbedded(c));
+    try std.testing.expectApproxEqAbs(@as(f64, 70.0), c.pos_y, 1e-9);
+    // Missing column (holes read as missing, never "rescued" blindly).
+    c.pos_x = 80.5;
+    c.pos_z = 80.5;
+    c.pos_y = 62.0;
+    try std.testing.expect(!srv.rescueEmbedded(c));
+    try std.testing.expectApproxEqAbs(@as(f64, 62.0), c.pos_y, 1e-9);
+    // Desync breaker: three rescues at one column drop it from `sent`
+    // (lost burst column — the 10Hz hole-healer skips sent columns, so
+    // without this a client-side hole loops adopt/rescue forever).
+    c.pos_x = 8.5;
+    c.pos_z = 8.5;
+    c.rescue_n = 0; // earlier rescues above already counted this cell
+    try c.sent.put(Conn.sentKey(0, 0), {});
+    c.pos_y = 62.0;
+    try std.testing.expect(srv.rescueEmbedded(c));
+    try std.testing.expect(c.sent.contains(Conn.sentKey(0, 0)));
+    c.pos_y = 62.0;
+    try std.testing.expect(srv.rescueEmbedded(c));
+    try std.testing.expect(c.sent.contains(Conn.sentKey(0, 0)));
+    c.pos_y = 62.0;
+    try std.testing.expect(srv.rescueEmbedded(c));
+    try std.testing.expect(!c.sent.contains(Conn.sentKey(0, 0)));
+    {
+        const o = try c.takeOutput();
+        defer a.free(o);
+    }
+}
+
 test "resolveAttack: mob damage/death/destroy, PvP, reach, pig respawn timer" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
     defer srv.deinitRegions();
     defer srv.registry.deinit(a);
+    defer {
+        srv.ent_lock.lock();
+        srv.items.deinit(a);
+        srv.ent_lock.unlock();
+    }
     var port: u16 = 37971;
     var listener: std.Io.net.Server = while (true) {
         const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
@@ -9442,7 +13262,7 @@ test "resolveAttack: mob damage/death/destroy, PvP, reach, pig respawn timer" {
     defer bob.srv_stream.close(io);
     try srv.register(alice.conn, alice.srv_stream);
     try srv.register(bob.conn, bob.srv_stream);
-    // No announceJoin: streams stay clean for deterministic reads.
+    // No queued announce: streams stay clean for deterministic reads.
     var arb: [128]u8 = undefined;
     var afb: [512]u8 = undefined;
     var arr = alice.cli_stream.reader(io, &arb);
@@ -9504,6 +13324,21 @@ test "resolveAttack: mob damage/death/destroy, PvP, reach, pig respawn timer" {
     try alice.conn.tracked.put(2, .{ .x = 0, .y = 0, .z = 0, .yaw = 0, .pitch = 0 });
     srv.resolveAttack(alice.conn, .{ .target_eid = 2, .dmg = 3, .ax = 20, .ay = 64, .az = 20 });
     try std.testing.expectApproxEqAbs(@as(f32, 17.0), bob.conn.health, 1e-6);
+    // PvP disabled (config "pvp": false): the same swing fizzles —
+    // health unchanged, nothing queued (frame alignment below depends
+    // on the silence).
+    {
+        var c = srv.cfg.load();
+        c.pvp = false;
+        srv.cfg.store(c);
+    }
+    srv.resolveAttack(alice.conn, .{ .target_eid = 2, .dmg = 3, .ax = 20, .ay = 64, .az = 20 });
+    try std.testing.expectApproxEqAbs(@as(f32, 17.0), bob.conn.health, 1e-6);
+    {
+        var c = srv.cfg.load();
+        c.pvp = true;
+        srv.cfg.store(c);
+    }
     {
         const f = try readFrame(&brr.interface, &bfb);
         try std.testing.expectEqual(@as(i32, 0x06), f.id);
@@ -9516,10 +13351,63 @@ test "resolveAttack: mob damage/death/destroy, PvP, reach, pig respawn timer" {
         var pr = codec.PacketReader.init(f.body);
         try std.testing.expectEqual(@as(i32, 2), try pr.readInt());
     }
+    // Armored PvP: iron chestplate (6 points) cuts dmg 10 -> ~7.6.
+    bob.conn.inv[6] = .{ .id = game_ids.iron_chestplate, .count = 1, .damage = 0, .nbt = null };
+    srv.resolveAttack(alice.conn, .{ .target_eid = 2, .dmg = 10, .ax = 20, .ay = 64, .az = 20 });
+    try std.testing.expectApproxEqAbs(@as(f32, 9.4), bob.conn.health, 1e-4);
+    try std.testing.expectEqual(@as(i16, 3), bob.conn.inv[6].?.damage); // wear scales with the hit
+    {
+        // wear 0x2F lands before the health update (same outbox order).
+        const f = try readFrame(&brr.interface, &bfb);
+        try std.testing.expectEqual(@as(i32, 0x2F), f.id);
+        var pr = codec.PacketReader.init(f.body);
+        _ = try pr.readByte(); // window 0
+        try std.testing.expectEqual(@as(i16, 6), try pr.readShort());
+    }
+    {
+        const f = try readFrame(&brr.interface, &bfb);
+        try std.testing.expectEqual(@as(i32, 0x06), f.id);
+        var pr = codec.PacketReader.init(f.body);
+        try std.testing.expectApproxEqAbs(@as(f32, 9.4), try pr.readFloat(), 1e-4);
+    }
+    {
+        const f = try readFrame(&arr.interface, &afb);
+        try std.testing.expectEqual(@as(i32, 0x1C), f.id);
+    }
+    // Protection II on the chest (EPF 3) stacks after armor: 10 -> ~6.69.
+    {
+        var nb: [256]u8 = undefined;
+        const ench_raw = Server.buildEnchNbt(null, 0, 2, &nb).?;
+        bob.conn.inv[6].?.nbt = try a.dupe(u8, ench_raw);
+    }
+    srv.resolveAttack(alice.conn, .{ .target_eid = 2, .dmg = 10, .ax = 20, .ay = 64, .az = 20 });
+    try std.testing.expectApproxEqAbs(@as(f32, 2.712), bob.conn.health, 1e-3);
+    {
+        const f = try readFrame(&brr.interface, &bfb);
+        try std.testing.expectEqual(@as(i32, 0x2F), f.id);
+    }
+    {
+        const f = try readFrame(&brr.interface, &bfb);
+        try std.testing.expectEqual(@as(i32, 0x06), f.id);
+        var pr = codec.PacketReader.init(f.body);
+        try std.testing.expectApproxEqAbs(@as(f32, 2.712), try pr.readFloat(), 1e-3);
+    }
+    {
+        const f = try readFrame(&arr.interface, &afb);
+        try std.testing.expectEqual(@as(i32, 0x1C), f.id);
+    }
+    if (bob.conn.inv[6].?.nbt) |n| {
+        a.free(n);
+        bob.conn.inv[6].?.nbt = null;
+    }
     // Lethal PvP: death screen + dead flag; further hits ignored.
     srv.resolveAttack(alice.conn, .{ .target_eid = 2, .dmg = 30, .ax = 20, .ay = 64, .az = 20 });
     try std.testing.expect(bob.conn.is_dead);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), bob.conn.health, 1e-6);
+    {
+        const f = try readFrame(&brr.interface, &bfb);
+        try std.testing.expectEqual(@as(i32, 0x2F), f.id); // final wear sync
+    }
     {
         const f = try readFrame(&brr.interface, &bfb);
         try std.testing.expectEqual(@as(i32, 0x06), f.id);
@@ -9551,6 +13439,59 @@ test "resolveAttack: mob damage/death/destroy, PvP, reach, pig respawn timer" {
         }
     }
     try std.testing.expect(found_pig);
+    // Lethal PvP above left death drops in srv.items (no viewer picks them
+    // up and 31 ticks don't despawn them): free them like the live-drop
+    // test does, or the ArrayList buffer leaks.
+    while (srv.items.items.len > 0) {
+        const dead = srv.items.swapRemove(0);
+        var s: ?item_mod.Stack = dead.stack;
+        item_mod.freeStack(a, &s);
+    }
+}
+
+test "death drops include armor, crafting vanishes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var c = Conn.init(a, io, .{}, 7);
+    defer c.deinit();
+    c.inv[0] = .{ .id = game_ids.stick, .count = 4, .damage = 0, .nbt = null };
+    c.inv[5] = .{ .id = game_ids.iron_helmet, .count = 1, .damage = 0, .nbt = null };
+    c.inv[9] = .{ .id = game_ids.dirt, .count = 3, .damage = 0, .nbt = null };
+    c.cursor = .{ .id = game_ids.stone, .count = 2, .damage = 0, .nbt = null };
+    c.lock.lock();
+    var dd = Server.collectDeathDrops(&c);
+    c.lock.unlock();
+    defer {
+        for (dd.stacks[0..dd.n]) |*s| {
+            var tmp: ?item_mod.Stack = s.*;
+            item_mod.freeStack(a, &tmp);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), dd.n);
+    try std.testing.expectEqual(game_ids.iron_helmet, dd.stacks[0].?.id);
+    try std.testing.expectEqual(game_ids.dirt, dd.stacks[1].?.id);
+    try std.testing.expectEqual(game_ids.stone, dd.stacks[2].?.id);
+    try std.testing.expect(c.inv[5] == null and c.inv[9] == null and c.cursor == null);
+    try std.testing.expect(c.inv[0] != null); // crafting result stays behind (vanishes)
+}
+
+test "resistance cuts fire damage 20% per level" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var c = Conn.init(a, io, .{ .gamemode = .survival }, 7);
+    defer c.deinit();
+    c.state = .play;
+    c.fire_ticks = 40;
+    c.effects[0] = .{ .id = 11, .amplifier = 0, .ticks = 100 };
+    c.lock.lock();
+    const cause = Server.envTick(&c, false, false, false, false);
+    c.lock.unlock();
+    try std.testing.expect(cause == null);
+    try std.testing.expectApproxEqAbs(@as(f32, 19.2), c.health, 1e-4);
+    {
+        const o = try c.takeOutput();
+        defer a.free(o);
+    }
 }
 
 test "deathMessage: vanilla English lines for every cause" {
@@ -9861,6 +13802,55 @@ test "broadcastChat reaches all play conns; login timeout kicks stale logins" {
     try std.testing.expectEqual(@as(usize, 0), srv.registry.items.len);
 }
 
+test "read timeout kills without flushing the dead outbox" {
+    // A peer silent for 30s (keepalives unanswered) is closed, not
+    // flushed: draining a black-hole peer's outbox (mid-burst megabytes)
+    // wedges the ticker in writeAll, stalling every conn behind it.
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    var port: u16 = 38021;
+    var listener: std.Io.net.Server = while (true) {
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+        break addr.listen(io, .{}) catch |err| switch (err) {
+            error.AddressInUse => {
+                port += 1;
+                if (port > 38050) return err;
+                continue;
+            },
+            else => return err,
+        };
+    };
+    defer listener.deinit(io);
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    var cli = try addr.connect(io, .{ .mode = .stream });
+    defer cli.close(io);
+    const sv = try listener.accept(io);
+    const c = try a.create(Conn);
+    c.* = Conn.init(a, io, .{}, 1);
+    c.state = .play;
+    @memcpy(c.username[0.."Ghost".len], "Ghost");
+    c.username_len = 5;
+    try srv.register(c, sv);
+    // First tick arms the keepalive (no reply ever comes); far-future
+    // tick trips the 30s silence timeout.
+    srv.tickOnce(1_000_000);
+    try std.testing.expect(!c.dead);
+    var kb: [16]u8 = undefined;
+    try c.queueFramed(try packets.frameKeepAlive(9, &kb));
+    const seeded = c.out.items.len;
+    try std.testing.expect(seeded > 0);
+    srv.tickOnce(1_000_000 + 31_000);
+    try std.testing.expect(c.dead);
+    try std.testing.expect(c.close_after_flush);
+    // Skipped flush: our seeded bytes were never drained to the socket.
+    try std.testing.expect(c.out.items.len > seeded);
+    srv.unregister(c);
+    try std.testing.expectEqual(@as(usize, 0), srv.registry.items.len);
+}
+
 test "player save/load roundtrip via pool (pos/health/inv/NBT)" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -9878,6 +13868,10 @@ test "player save/load roundtrip via pool (pos/health/inv/NBT)" {
     c.state = .play;
     @memcpy(c.username[0.."Bo".len], "Bo");
     c.username_len = 2;
+    // Distinct identities: rows are UUID-keyed, so the two test conns need
+    // distinct UUIDs (Conn.init zeroes the field; production sets it from
+    // the login handshake before loadPlayer ever runs).
+    @memcpy(&c.uuid_str, "00000000-0000-4000-8000-00000000000b");
     c.pos_x = -12.5;
     c.pos_y = 70.0;
     c.pos_z = 44.25;
@@ -9896,6 +13890,8 @@ test "player save/load roundtrip via pool (pos/health/inv/NBT)" {
     c.inv[36] = .{ .id = game_ids.diamond_sword, .count = 1, .damage = 0, .nbt = owned };
     c.inv[10] = .{ .id = game_ids.stone, .count = 64, .damage = 0, .nbt = null };
     c.cursor = .{ .id = game_ids.dirt, .count = 5, .damage = 0, .nbt = null };
+    c.ender[0] = .{ .id = game_ids.obsidian, .count = 8, .damage = 0, .nbt = null };
+    c.ender[26] = .{ .id = game_ids.dirt, .count = 16, .damage = 0, .nbt = null };
     srv.savePlayer(c);
     // Mutate everything; load must restore.
     c.pos_x = 999;
@@ -9904,6 +13900,9 @@ test "player save/load roundtrip via pool (pos/health/inv/NBT)" {
     c.inv[36] = null;
     c.inv[10] = null;
     c.cursor = null;
+    item_mod.freeStack(a, &c.ender[0]);
+    c.ender[0] = null;
+    c.ender[26] = null;
     c.selected = 0;
     c.config.gamemode = .creative;
     c.lock.lock();
@@ -9920,6 +13919,10 @@ test "player save/load roundtrip via pool (pos/health/inv/NBT)" {
     try std.testing.expectEqual(game_ids.stone, c.inv[10].?.id);
     try std.testing.expectEqual(game_ids.dirt, c.cursor.?.id);
     try std.testing.expectEqual(@as(i32, 8), c.config.spawn_x);
+    try std.testing.expectEqual(game_ids.obsidian, c.ender[0].?.id);
+    try std.testing.expectEqual(@as(i8, 8), c.ender[0].?.count);
+    try std.testing.expectEqual(game_ids.dirt, c.ender[26].?.id);
+    try std.testing.expect(c.ender[1] == null);
     // No save -> false. Corrupt row -> false (treated as fresh spawn).
     const c2 = try a.create(Conn);
     defer a.destroy(c2);
@@ -9927,6 +13930,7 @@ test "player save/load roundtrip via pool (pos/health/inv/NBT)" {
     c2.state = .play;
     @memcpy(c2.username[0.."Al".len], "Al");
     c2.username_len = 2;
+    @memcpy(&c2.uuid_str, "00000000-0000-4000-8000-0000000000a1");
     c2.lock.lock();
     try std.testing.expect(!srv.loadPlayer(c2));
     c2.lock.unlock();
@@ -9942,6 +13946,1353 @@ test "player save/load roundtrip via pool (pos/health/inv/NBT)" {
     try std.testing.expectEqualStrings("junk-bytes", still.?);
     c.deinit();
     c2.deinit();
+}
+
+// Test-only wire asserts (readFrame-based): broadcast sounds queue to
+// outboxes while S24 lid events flush synchronously, so socket reads
+// observe send order. Bodies never escape these helpers.
+// NOTE: callers keep ONE persistent buffered reader per stream (a fresh
+// reader per frame would drop buffered read-ahead and misalign it).
+const expectWire = struct {
+    fn id(rr: anytype, want: i32) !void {
+        var fb: [2048]u8 = undefined;
+        const f = try readFrame(&rr.interface, &fb);
+        try std.testing.expectEqual(want, f.id);
+    }
+    fn lid(rr: anytype, n: u8) !void {
+        var fb: [256]u8 = undefined;
+        const f = try readFrame(&rr.interface, &fb);
+        try std.testing.expectEqual(@as(i32, 0x24), f.id);
+        var pr = codec.PacketReader.init(f.body);
+        _ = try pr.readInt(); // x
+        _ = try pr.readShort(); // y
+        _ = try pr.readInt(); // z
+        try std.testing.expectEqual(@as(u8, 1), try pr.readByte()); // lid event
+        try std.testing.expectEqual(n, try pr.readByte()); // viewer count
+        _ = try pr.readVarInt(); // block id (jar `gg`)
+        try std.testing.expectEqual(@as(usize, 0), pr.remaining());
+    }
+    fn winItems(rr: anytype, win: u8, count: i16) !void {
+        var fb: [4096]u8 = undefined;
+        const f = try readFrame(&rr.interface, &fb);
+        try std.testing.expectEqual(@as(i32, 0x30), f.id);
+        var pr = codec.PacketReader.init(f.body);
+        try std.testing.expectEqual(win, try pr.readByte());
+        try std.testing.expectEqual(count, try pr.readShort());
+    }
+};
+
+test "chest: open/click/close/persist single chest" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    defer srv.items.deinit(a);
+    defer srv.chests.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    srv.world = pool;
+    const c = try a.create(Conn);
+    defer {
+        c.deinit();
+        a.destroy(c);
+    }
+    c.* = Conn.init(a, io, .{}, 7);
+    c.state = .play;
+    // Materialize chunk (0,0): applyBlock is a no-op on missing columns.
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+    }
+    _ = try view.applyBlock(pool, a, 8, 64, 8, game_ids.chest, 2);
+    var bev = BlockEvent{ .x = 8, .y = 65, .z = 8, .id = game_ids.air, .meta = 0, .face = 1 };
+    // Sneak places against the chest instead of opening.
+    try std.testing.expect(!srv.tryOpenChest(c, pool, a, &bev, true));
+    try std.testing.expect(c.open_win == null);
+    // Blocked lid (opaque above) refuses the open.
+    _ = try view.applyBlock(pool, a, 8, 65, 8, game_ids.stone, 0);
+    try std.testing.expect(!srv.tryOpenChest(c, pool, a, &bev, false));
+    _ = try view.applyBlock(pool, a, 8, 65, 8, game_ids.air, 0);
+    // Open: window 5, empty chest.
+    try std.testing.expect(srv.tryOpenChest(c, pool, a, &bev, false));
+    try std.testing.expect(c.open_win != null);
+    try std.testing.expectEqual(@as(u8, 5), c.open_win.?.id);
+    {
+        srv.chest_lock.lock();
+        defer srv.chest_lock.unlock();
+        const e = srv.findChest(8, 64, 8).?;
+        for (e.slots) |s| try std.testing.expect(s == null);
+    }
+    // Shift player inv[9] (window slot 27) into the chest.
+    c.inv[9] = .{ .id = game_ids.stone, .count = 16, .damage = 0, .nbt = null };
+    srv.applyChestClick(c, pool, a, .{ .slot = 27, .button = 0, .action = 1, .mode = 1 });
+    try std.testing.expect(c.inv[9] == null);
+    {
+        srv.chest_lock.lock();
+        defer srv.chest_lock.unlock();
+        const e = srv.findChest(8, 64, 8).?;
+        try std.testing.expectEqual(game_ids.stone, e.slots[0].?.id);
+        try std.testing.expectEqual(@as(i8, 16), e.slots[0].?.count);
+        try std.testing.expect(e.dirty);
+    }
+    // Pickup back out (window slot 0, mode 0).
+    srv.applyChestClick(c, pool, a, .{ .slot = 0, .button = 0, .action = 2, .mode = 0 });
+    try std.testing.expectEqual(game_ids.stone, c.cursor.?.id);
+    {
+        srv.chest_lock.lock();
+        defer srv.chest_lock.unlock();
+        try std.testing.expect(srv.findChest(8, 64, 8).?.slots[0] == null);
+    }
+    // Put it back for the persistence + break legs.
+    srv.applyChestClick(c, pool, a, .{ .slot = 0, .button = 0, .action = 3, .mode = 0 });
+    try std.testing.expect(c.cursor == null);
+    // Persist: ticker flush writes the row; reload reads it back.
+    srv.flushDirtyChests();
+    {
+        var row = try chest_mod.loadRow(pool, a, 8, 64, 8);
+        defer {
+            if (row) |*r| chest_mod.freeSlots(a, &r.slots);
+        }
+        try std.testing.expect(row != null);
+        try std.testing.expectEqual(game_ids.stone, row.?.slots[0].?.id);
+    }
+    {
+        srv.chest_lock.lock();
+        defer srv.chest_lock.unlock();
+        try std.testing.expect(!srv.findChest(8, 64, 8).?.dirty);
+    }
+    // Client close (0x0D): window cleared, contents stay, close sound path
+    // runs (no viewers left; broadcast to an empty registry is a no-op).
+    {
+        var cb: [8]u8 = undefined;
+        var w = codec.PacketWriter.init(&cb);
+        try w.writeByte(5);
+        var f: [64]u8 = undefined;
+        try c.feedData(try codec.framePacket(0x0D, w.written(), &f));
+        const fr = (try c.poll()).?;
+        const act = try c.handleFrame(fr);
+        try std.testing.expect(act == .chest_close);
+        try std.testing.expectEqual(@as(u8, 5), act.chest_close.window);
+        try std.testing.expect(c.open_win == null);
+        srv.spawnChestClose(pool, a, act.chest_close);
+    }
+    // Break: viewers closed (none), THIS half's contents drop as an
+    // entity, row deleted, entry gone.
+    _ = try view.applyBlock(pool, a, 8, 64, 8, game_ids.air, 0);
+    var bbreak = BlockEvent{ .x = 8, .y = 64, .z = 8, .id = game_ids.chest, .meta = 2, .face = 1 };
+    srv.breakWindowsFor(pool, a, &bbreak, game_ids.chest);
+    {
+        srv.chest_lock.lock();
+        defer srv.chest_lock.unlock();
+        try std.testing.expect(srv.findChest(8, 64, 8) == null);
+    }
+    {
+        const gone = try chest_mod.loadRow(pool, a, 8, 64, 8);
+        try std.testing.expect(gone == null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), srv.items.items.len);
+    try std.testing.expectEqual(game_ids.stone, srv.items.items[0].stack.id);
+    {
+        const o = try c.takeOutput();
+        defer a.free(o);
+    }
+    // Second chest (isolated, no pair): look-don't-touch open + close
+    // evicts the entry (zero footprint); dirty-then-emptied flush deletes
+    // the row instead of writing an empty one.
+    _ = try view.applyBlock(pool, a, 12, 64, 8, game_ids.chest, 2);
+    var bev2 = BlockEvent{ .x = 12, .y = 65, .z = 8, .id = game_ids.air, .meta = 0, .face = 1 };
+    try std.testing.expect(srv.tryOpenChest(c, pool, a, &bev2, false));
+    try std.testing.expectEqual(@as(u8, 5), c.open_win.?.id);
+    {
+        var cb: [8]u8 = undefined;
+        var w = codec.PacketWriter.init(&cb);
+        try w.writeByte(5);
+        var f: [64]u8 = undefined;
+        try c.feedData(try codec.framePacket(0x0D, w.written(), &f));
+        const fr = (try c.poll()).?;
+        const act = try c.handleFrame(fr);
+        try std.testing.expect(act == .chest_close);
+        srv.spawnChestClose(pool, a, act.chest_close);
+    }
+    {
+        srv.chest_lock.lock();
+        defer srv.chest_lock.unlock();
+        try std.testing.expect(srv.findChest(12, 64, 8) == null);
+    }
+    // Touch it, empty it, flush: row deleted, not written empty.
+    try std.testing.expect(srv.tryOpenChest(c, pool, a, &bev2, false));
+    c.inv[10] = .{ .id = game_ids.dirt, .count = 4, .damage = 0, .nbt = null };
+    srv.applyChestClick(c, pool, a, .{ .slot = 28, .button = 0, .action = 9, .mode = 1 });
+    try std.testing.expect(c.inv[10] == null);
+    srv.applyChestClick(c, pool, a, .{ .slot = 0, .button = 0, .action = 10, .mode = 0 });
+    try std.testing.expect(c.cursor != null);
+    // Drop the cursor stack (test cleanup); the chest is empty + dirty.
+    {
+        var owned: ?item_mod.Stack = c.cursor;
+        item_mod.freeStack(a, &owned);
+        c.cursor = null;
+    }
+    srv.flushDirtyChests();
+    {
+        const gone = try chest_mod.loadRow(pool, a, 12, 64, 8);
+        try std.testing.expect(gone == null);
+    }
+    {
+        const o = try c.takeOutput();
+        defer a.free(o);
+    }
+}
+
+test "chest: drag-spread distributes across cells, persists on reopen" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    defer srv.items.deinit(a);
+    defer srv.chests.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    srv.world = pool;
+    const c = try a.create(Conn);
+    defer {
+        c.deinit();
+        a.destroy(c);
+    }
+    c.* = Conn.init(a, io, .{}, 7);
+    c.state = .play;
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+    }
+    _ = try view.applyBlock(pool, a, 8, 64, 8, game_ids.chest, 2);
+    var bev = BlockEvent{ .x = 8, .y = 65, .z = 8, .id = game_ids.air, .meta = 0, .face = 1 };
+    try std.testing.expect(srv.tryOpenChest(c, pool, a, &bev, false));
+    try std.testing.expectEqual(@as(u8, 5), c.open_win.?.id);
+    // Left-drag 10 dirt over chest cells 0,1,2 -> 4/3/3.
+    c.cursor = .{ .id = game_ids.dirt, .count = 10, .damage = 0, .nbt = null };
+    srv.applyChestClick(c, pool, a, .{ .slot = -999, .button = 0, .action = 30, .mode = 5 });
+    srv.applyChestClick(c, pool, a, .{ .slot = 0, .button = 1, .action = 31, .mode = 5 });
+    srv.applyChestClick(c, pool, a, .{ .slot = 1, .button = 1, .action = 32, .mode = 5 });
+    srv.applyChestClick(c, pool, a, .{ .slot = 2, .button = 1, .action = 33, .mode = 5 });
+    srv.applyChestClick(c, pool, a, .{ .slot = -999, .button = 2, .action = 34, .mode = 5 });
+    try std.testing.expect(c.cursor == null);
+    {
+        srv.chest_lock.lock();
+        defer srv.chest_lock.unlock();
+        const e = srv.findChest(8, 64, 8).?;
+        try std.testing.expectEqual(@as(i8, 4), e.slots[0].?.count);
+        try std.testing.expectEqual(@as(i8, 3), e.slots[1].?.count);
+        try std.testing.expectEqual(@as(i8, 3), e.slots[2].?.count);
+        try std.testing.expect(e.dirty);
+    }
+    // Right-drag 5 dirt over player slots 27,28 (inv 9,10) -> 1 each.
+    c.cursor = .{ .id = game_ids.dirt, .count = 5, .damage = 0, .nbt = null };
+    srv.applyChestClick(c, pool, a, .{ .slot = -999, .button = 4, .action = 35, .mode = 5 });
+    srv.applyChestClick(c, pool, a, .{ .slot = 27, .button = 5, .action = 36, .mode = 5 });
+    srv.applyChestClick(c, pool, a, .{ .slot = 28, .button = 5, .action = 37, .mode = 5 });
+    srv.applyChestClick(c, pool, a, .{ .slot = -999, .button = 6, .action = 38, .mode = 5 });
+    try std.testing.expectEqual(@as(i8, 3), c.cursor.?.count);
+    try std.testing.expectEqual(@as(i8, 1), c.inv[9].?.count);
+    try std.testing.expectEqual(@as(i8, 1), c.inv[10].?.count);
+    {
+        const o = try c.takeOutput();
+        defer a.free(o);
+    }
+}
+
+test "chest: double pair windows, break drops one half" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    defer srv.items.deinit(a);
+    defer srv.chests.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    srv.world = pool;
+    const c = try a.create(Conn);
+    c.* = Conn.init(a, io, .{}, 7);
+    c.state = .play;
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+    }
+    _ = try view.applyBlock(pool, a, 8, 64, 8, game_ids.chest, 2);
+    _ = try view.applyBlock(pool, a, 9, 64, 8, game_ids.chest, 2);
+    var bev = BlockEvent{ .x = 8, .y = 65, .z = 8, .id = game_ids.air, .meta = 0, .face = 1 };
+    var port: u16 = 38101;
+    var listener: std.Io.net.Server = while (true) {
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+        break addr.listen(io, .{}) catch |err| switch (err) {
+            error.AddressInUse => {
+                port += 1;
+                if (port > 38120) return err;
+                continue;
+            },
+            else => return err,
+        };
+    };
+    defer listener.deinit(io);
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    var cli = try addr.connect(io, .{ .mode = .stream });
+    defer cli.close(io);
+    const sv = try listener.accept(io);
+    defer sv.close(io);
+    try srv.register(c, sv);
+    defer srv.unregister(c);
+    // Tracked chunk: lid events scope to trackers.
+    try c.sent.put(Conn.sentKey(0, 0), {});
+    var cli_rb: [512]u8 = undefined;
+    var cli_rr = cli.reader(io, &cli_rb);
+    // Adjacent pair opens the double window (id 6); BOTH halves get the
+    // S24 lid frame (pair total, viewers 1) on the wire, after the open,
+    // items, and sound frames.
+    try std.testing.expect(srv.tryOpenChest(c, pool, a, &bev, false));
+    try std.testing.expectEqual(@as(u8, 6), c.open_win.?.id);
+    try expectWire.id(&cli_rr, 0x2D);
+    try expectWire.id(&cli_rr, 0x30);
+    try expectWire.id(&cli_rr, 0x29);
+    try expectWire.lid(&cli_rr, 1);
+    try expectWire.lid(&cli_rr, 1);
+    // Shift inv[9] (window slot 54) into the pair: first half first.
+    c.inv[9] = .{ .id = game_ids.dirt, .count = 4, .damage = 0, .nbt = null };
+    srv.applyChestClick(c, pool, a, .{ .slot = 54, .button = 0, .action = 1, .mode = 1 });
+    try std.testing.expect(c.inv[9] == null);
+    {
+        srv.chest_lock.lock();
+        defer srv.chest_lock.unlock();
+        try std.testing.expectEqual(game_ids.dirt, srv.findChest(8, 64, 8).?.slots[0].?.id);
+        try std.testing.expect(srv.findChest(9, 64, 8).?.slots[0] == null);
+    }
+    // Second-half cell (window slot 30 = half[1][3]): seed + pick up.
+    {
+        srv.chest_lock.lock();
+        srv.findChest(9, 64, 8).?.slots[3] = .{ .id = game_ids.stone, .count = 2, .damage = 0, .nbt = null };
+        srv.chest_lock.unlock();
+    }
+    srv.applyChestClick(c, pool, a, .{ .slot = 30, .button = 0, .action = 2, .mode = 0 });
+    try std.testing.expectEqual(game_ids.stone, c.cursor.?.id);
+    {
+        var owned: ?item_mod.Stack = c.cursor;
+        item_mod.freeStack(a, &owned);
+        c.cursor = null;
+    }
+    // Persist both halves, then break (8,64,8): only its dirt drops, its
+    // row/entry vanish, the survivor keeps its (now single) state.
+    srv.flushDirtyChests();
+    {
+        var row = try chest_mod.loadRow(pool, a, 8, 64, 8);
+        defer {
+            if (row) |*r| chest_mod.freeSlots(a, &r.slots);
+        }
+        try std.testing.expect(row != null);
+    }
+    _ = try view.applyBlock(pool, a, 8, 64, 8, game_ids.air, 0);
+    var bbreak = BlockEvent{ .x = 8, .y = 64, .z = 8, .id = game_ids.chest, .meta = 2, .face = 1 };
+    srv.breakWindowsFor(pool, a, &bbreak, game_ids.chest);
+    try std.testing.expect(c.open_win == null);
+    {
+        srv.chest_lock.lock();
+        defer srv.chest_lock.unlock();
+        try std.testing.expect(srv.findChest(8, 64, 8) == null);
+        const surv = srv.findChest(9, 64, 8).?;
+        for (surv.slots) |s| try std.testing.expect(s == null);
+    }
+    {
+        const gone = try chest_mod.loadRow(pool, a, 8, 64, 8);
+        try std.testing.expect(gone == null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), srv.items.items.len);
+    try std.testing.expectEqual(game_ids.dirt, srv.items.items[0].stack.id);
+    {
+        const o = try c.takeOutput();
+        defer a.free(o);
+    }
+}
+
+test "chest: multi-viewer sync, trapped power, lid sounds" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    defer srv.items.deinit(a);
+    defer srv.chests.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    srv.world = pool;
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+    }
+    _ = try view.applyBlock(pool, a, 8, 64, 8, game_ids.trapped_chest, 2);
+    var port: u16 = 38121;
+    var listener: std.Io.net.Server = while (true) {
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+        break addr.listen(io, .{}) catch |err| switch (err) {
+            error.AddressInUse => {
+                port += 1;
+                if (port > 38140) return err;
+                continue;
+            },
+            else => return err,
+        };
+    };
+    defer listener.deinit(io);
+    const mk = struct {
+        fn run(l: *std.Io.net.Server, p: u16, name: []const u8) !struct {
+            conn: *Conn,
+            srv_stream: std.Io.net.Stream,
+            cli_stream: std.Io.net.Stream,
+        } {
+            const c = try a.create(Conn);
+            errdefer a.destroy(c);
+            c.* = Conn.init(a, io, .{}, 1);
+            c.state = .play;
+            @memcpy(c.username[0..name.len], name);
+            c.username_len = name.len;
+            const addr = try std.Io.net.IpAddress.parse("127.0.0.1", p);
+            const cli = try addr.connect(io, .{ .mode = .stream });
+            errdefer cli.close(io);
+            const sv = try l.accept(io);
+            return .{ .conn = c, .srv_stream = sv, .cli_stream = cli };
+        }
+    };
+    var alice = try mk.run(&listener, port, "AliceV");
+    defer alice.cli_stream.close(io);
+    defer alice.srv_stream.close(io);
+    var bob = try mk.run(&listener, port, "BobV");
+    defer bob.cli_stream.close(io);
+    defer bob.srv_stream.close(io);
+    try srv.register(alice.conn, alice.srv_stream);
+    try srv.register(bob.conn, bob.srv_stream);
+    defer srv.unregister(alice.conn);
+    defer srv.unregister(bob.conn);
+    // Persistent wire readers (see expectWire NOTE).
+    var alice_rb: [512]u8 = undefined;
+    var alice_rr = alice.cli_stream.reader(io, &alice_rb);
+    var bob_rb: [512]u8 = undefined;
+    var bob_rr = bob.cli_stream.reader(io, &bob_rb);
+    // Tracked chunk (mimics post-burst): S24 lid events scope to trackers.
+    try alice.conn.sent.put(Conn.sentKey(0, 0), {});
+    try bob.conn.sent.put(Conn.sentKey(0, 0), {});
+    var bev = BlockEvent{ .x = 8, .y = 65, .z = 8, .id = game_ids.air, .meta = 0, .face = 1 };
+    // No viewers: trapped chest is dark.
+    try std.testing.expectEqual(@as(u4, 0), srv.trappedPower(pool, a, 8, 64, 8));
+    // Alice opens: window 5, power 15, Bob gets the open sound (0x29).
+    // Both trackers get the S24 lid frame (0x24, viewers 1) on the wire.
+    try std.testing.expect(srv.tryOpenChest(alice.conn, pool, a, &bev, false));
+    try std.testing.expectEqual(@as(u8, 5), alice.conn.open_win.?.id);
+    try std.testing.expectEqual(@as(u4, 15), srv.trappedPower(pool, a, 8, 64, 8));
+    try expectWire.id(&alice_rr, 0x2D);
+    try expectWire.id(&alice_rr, 0x30);
+    try expectWire.id(&alice_rr, 0x29);
+    try expectWire.lid(&alice_rr, 1);
+    try expectWire.id(&bob_rr, 0x29);
+    try expectWire.lid(&bob_rr, 1);
+    // Bob opens too: lid already open, Alice hears nothing new — but both
+    // trackers get the S24 recount (viewers 2).
+    try std.testing.expect(srv.tryOpenChest(bob.conn, pool, a, &bev, false));
+    try expectWire.lid(&alice_rr, 2);
+    try expectWire.id(&bob_rr, 0x2D);
+    try expectWire.id(&bob_rr, 0x30);
+    try expectWire.lid(&bob_rr, 2);
+    // Alice shift-clicks stone in: Bob's window refreshes (0x30, 63 slots).
+    // Viewer refresh flushes to the socket immediately (like a live tick
+    // would), so read Bob's wire bytes, not his outbox.
+    alice.conn.inv[9] = .{ .id = game_ids.stone, .count = 8, .damage = 0, .nbt = null };
+    srv.applyChestClick(alice.conn, pool, a, .{ .slot = 27, .button = 0, .action = 1, .mode = 1 });
+    try expectWire.winItems(&bob_rr, 5, 63);
+    {
+        const o = try alice.conn.takeOutput();
+        defer a.free(o);
+    }
+    // Alice closes: Bob still in, lid stays open (silence), power stays.
+    // Both trackers get the S24 recount (viewers 1) on the wire.
+    {
+        var cb: [8]u8 = undefined;
+        var w = codec.PacketWriter.init(&cb);
+        try w.writeByte(5);
+        var f: [64]u8 = undefined;
+        try alice.conn.feedData(try codec.framePacket(0x0D, w.written(), &f));
+        const fr = (try alice.conn.poll()).?;
+        const act = try alice.conn.handleFrame(fr);
+        try std.testing.expect(act == .chest_close);
+        srv.spawnChestClose(pool, a, act.chest_close);
+    }
+    try expectWire.lid(&bob_rr, 1);
+    try expectWire.lid(&alice_rr, 1);
+    try std.testing.expectEqual(@as(u4, 15), srv.trappedPower(pool, a, 8, 64, 8));
+    // Bob closes last: Alice hears the lid (0x29), power drops, lid shuts.
+    {
+        var cb: [8]u8 = undefined;
+        var w = codec.PacketWriter.init(&cb);
+        try w.writeByte(5);
+        var f: [64]u8 = undefined;
+        try bob.conn.feedData(try codec.framePacket(0x0D, w.written(), &f));
+        const fr = (try bob.conn.poll()).?;
+        const act = try bob.conn.handleFrame(fr);
+        try std.testing.expect(act == .chest_close);
+        srv.spawnChestClose(pool, a, act.chest_close);
+    }
+    try expectWire.id(&alice_rr, 0x29);
+    try expectWire.lid(&alice_rr, 0);
+    try expectWire.id(&bob_rr, 0x29);
+    try expectWire.lid(&bob_rr, 0);
+    try std.testing.expectEqual(@as(u4, 0), srv.trappedPower(pool, a, 8, 64, 8));
+}
+
+test "chest: corrupt rows fail closed to empty" {
+    // Chunk-ban posture: garbage, truncated, overlong, version-skewed,
+    // and cross-key rows never surface as contents (and never crash the
+    // open path). The store API reports corruption loudly; the open path
+    // treats it as an empty chest.
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    defer srv.items.deinit(a);
+    defer srv.chests.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    srv.world = pool;
+    const c = try a.create(Conn);
+    defer {
+        c.deinit();
+        a.destroy(c);
+    }
+    c.* = Conn.init(a, io, .{}, 7);
+    c.state = .play;
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+    }
+    _ = try view.applyBlock(pool, a, 8, 64, 8, game_ids.chest, 2);
+    var bev = BlockEvent{ .x = 8, .y = 65, .z = 8, .id = game_ids.air, .meta = 0, .face = 1 };
+    // Garbage row under the chest's key: open succeeds with an empty chest.
+    try pool.put(chest_mod.keyForChest(8, 64, 8), "junk-bytes");
+    try std.testing.expectError(error.CorruptChest, chest_mod.loadRow(pool, a, 8, 64, 8));
+    try std.testing.expect(srv.tryOpenChest(c, pool, a, &bev, false));
+    {
+        srv.chest_lock.lock();
+        defer srv.chest_lock.unlock();
+        const e = srv.findChest(8, 64, 8).?;
+        for (e.slots) |s| try std.testing.expect(s == null);
+    }
+    // Valid row for a DIFFERENT pos parked under this key: position
+    // mismatch reads as absent (never as someone else's contents).
+    {
+        var slots: [chest_mod.chest_size]?item_mod.Stack = [_]?item_mod.Stack{null} ** chest_mod.chest_size;
+        slots[0] = .{ .id = game_ids.diamond, .count = 1, .damage = 0, .nbt = null };
+        const enc = try chest_mod.encode(a, 9, 64, 8, &slots);
+        defer a.free(enc);
+        try pool.put(chest_mod.keyForChest(8, 64, 8), enc);
+    }
+    // ...reads as absent through the store API too.
+    {
+        const miss = try chest_mod.loadRow(pool, a, 8, 64, 8);
+        try std.testing.expect(miss == null);
+    }
+    // Reopen (clear + close first so the open path re-resolves).
+    c.open_win = null;
+    try std.testing.expect(srv.tryOpenChest(c, pool, a, &bev, false));
+    {
+        srv.chest_lock.lock();
+        defer srv.chest_lock.unlock();
+        const e = srv.findChest(8, 64, 8).?;
+        for (e.slots) |s| try std.testing.expect(s == null);
+    }
+    {
+        const o = try c.takeOutput();
+        defer a.free(o);
+    }
+}
+
+test "chest: oversize stacks fail the click, never persist" {
+    // Insertion gate: stacks over the slot cap can't enter chest rows
+    // (decode would reject them on next load, silently emptying the
+    // chest). Rejected clicks echo snap-back: no mutation, no dirty, no
+    // viewer traffic. In-game NBT has no manufacturing path (no book
+    // writing, no renames, no creative NBT pick-block), so the gate is a
+    // backstop that legit play never touches.
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    defer srv.items.deinit(a);
+    defer srv.chests.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    srv.world = pool;
+    const c = try a.create(Conn);
+    defer {
+        c.deinit();
+        a.destroy(c);
+    }
+    c.* = Conn.init(a, io, .{}, 7);
+    c.state = .play;
+    // Materialize chunk (1,0): applyBlock is a no-op on missing columns.
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 1, 0);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+    }
+    _ = try view.applyBlock(pool, a, 20, 64, 8, game_ids.chest, 2);
+    var bev = BlockEvent{ .x = 20, .y = 65, .z = 8, .id = game_ids.air, .meta = 0, .face = 1 };
+    try std.testing.expect(srv.tryOpenChest(c, pool, a, &bev, false));
+    const big = try a.alloc(u8, chest_mod.max_slot_nbt_bytes + 1024);
+    @memset(big, 0xAB);
+    // Shift oversize inv stack in: rejected, stays put, chest untouched.
+    // (One buffer, moved between cells — never duped, never leaked.)
+    c.inv[9] = .{ .id = game_ids.written_book, .count = 1, .damage = 0, .nbt = big };
+    srv.applyChestClick(c, pool, a, .{ .slot = 27, .button = 0, .action = 1, .mode = 1 });
+    try std.testing.expect(c.inv[9] != null);
+    {
+        srv.chest_lock.lock();
+        defer srv.chest_lock.unlock();
+        const e = srv.findChest(20, 64, 8).?;
+        for (e.slots) |s| try std.testing.expect(s == null);
+        try std.testing.expect(!e.dirty);
+    }
+    // Place oversize cursor stack in: rejected, cursor keeps it.
+    c.cursor = c.inv[9].?;
+    c.inv[9] = null;
+    srv.applyChestClick(c, pool, a, .{ .slot = 0, .button = 0, .action = 2, .mode = 0 });
+    try std.testing.expect(c.cursor != null);
+    {
+        srv.chest_lock.lock();
+        defer srv.chest_lock.unlock();
+        const e = srv.findChest(20, 64, 8).?;
+        for (e.slots) |s| try std.testing.expect(s == null);
+        try std.testing.expect(!e.dirty);
+    }
+    // Number-key swap oversize hotbar stack in: rejected, both stay.
+    c.inv[36] = c.cursor.?;
+    c.cursor = null;
+    srv.applyChestClick(c, pool, a, .{ .slot = 0, .button = 0, .action = 3, .mode = 2 });
+    try std.testing.expect(c.inv[36] != null);
+    {
+        srv.chest_lock.lock();
+        defer srv.chest_lock.unlock();
+        const e = srv.findChest(20, 64, 8).?;
+        for (e.slots) |s| try std.testing.expect(s == null);
+        try std.testing.expect(!e.dirty);
+    }
+    // A fitting stack still flows (gate doesn't jam legitimate clicks).
+    item_mod.freeStack(a, &c.inv[36]);
+    c.inv[9] = .{ .id = game_ids.stone, .count = 1, .damage = 0, .nbt = null };
+    srv.applyChestClick(c, pool, a, .{ .slot = 27, .button = 0, .action = 4, .mode = 1 });
+    try std.testing.expect(c.inv[9] == null);
+    {
+        srv.chest_lock.lock();
+        defer srv.chest_lock.unlock();
+        try std.testing.expectEqual(game_ids.stone, srv.findChest(20, 64, 8).?.slots[0].?.id);
+    }
+    // NBT ownership: the big buffer lives in conn inv (freed by deinit);
+    // the chest never adopted it.
+    {
+        const o = try c.takeOutput();
+        defer a.free(o);
+    }
+}
+
+test "placement: occupied cells refuse with resync, air applies" {
+    // Anti-grief gate: placing into an occupied non-replaceable cell
+    // (chest, furnace, solids) is refused instead of silently overwriting
+    // tile entities (contents lost, rows orphaned). The client's
+    // prediction is resynced with the true cell (0x23).
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    defer srv.items.deinit(a);
+    defer srv.chests.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    srv.world = pool;
+    const c = try a.create(Conn);
+    c.* = Conn.init(a, io, .{}, 7);
+    c.state = .play;
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+    }
+    _ = try view.applyBlock(pool, a, 8, 64, 8, game_ids.chest, 2);
+    _ = try view.applyBlock(pool, a, 9, 64, 8, game_ids.stone, 0);
+    var port: u16 = 38161;
+    var listener: std.Io.net.Server = while (true) {
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+        break addr.listen(io, .{}) catch |err| switch (err) {
+            error.AddressInUse => {
+                port += 1;
+                if (port > 38180) return err;
+                continue;
+            },
+            else => return err,
+        };
+    };
+    defer listener.deinit(io);
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    var cli = try addr.connect(io, .{ .mode = .stream });
+    defer cli.close(io);
+    const sv = try listener.accept(io);
+    defer sv.close(io);
+    try srv.register(c, sv);
+    defer srv.unregister(c);
+    try c.sent.put(Conn.sentKey(0, 0), {});
+    var cli_rb: [512]u8 = undefined;
+    var cli_rr = cli.reader(io, &cli_rb);
+    c.sneaking = true; // sneak+block places (no UI routing)
+    c.inv[36] = .{ .id = game_ids.stone, .count = 64, .damage = 0, .nbt = null };
+    c.selected = 0;
+    var state = SessionState{};
+    defer state.deinit(a);
+    // Frame one 0x08: click (9,64,8) face -X(4) -> target (8,64,8) chest.
+    {
+        var cb: [64]u8 = undefined;
+        var w = codec.PacketWriter.init(&cb);
+        try w.writeInt(9);
+        try w.writeByte(64);
+        try w.writeInt(8);
+        try w.writeByte(4);
+        try w.writeShort(-1); // held slot: empty (onPlace uses selected)
+        try w.writeByte(8);
+        try w.writeByte(8);
+        try w.writeByte(8);
+        var f: [96]u8 = undefined;
+        const framed = try codec.framePacket(0x08, w.written(), &f);
+        const res = try sessionStep(&srv, c, a, &state, framed);
+        _ = res;
+    }
+    // Chest intact (block, entry-free, row-free): refused, resynced.
+    {
+        const pb = try view.peekBlock(pool, a, 8, 64, 8);
+        try std.testing.expect(pb != null);
+        try std.testing.expectEqual(game_ids.chest, pb.?.id);
+    }
+    try expectWire.id(&cli_rr, 0x23);
+    // Control: face +Y(1) from (9,64,8) -> target (9,65,8) air applies.
+    {
+        var cb: [64]u8 = undefined;
+        var w = codec.PacketWriter.init(&cb);
+        try w.writeInt(9);
+        try w.writeByte(64);
+        try w.writeInt(8);
+        try w.writeByte(1);
+        try w.writeShort(-1);
+        try w.writeByte(8);
+        try w.writeByte(8);
+        try w.writeByte(8);
+        var f: [96]u8 = undefined;
+        const framed = try codec.framePacket(0x08, w.written(), &f);
+        const res = try sessionStep(&srv, c, a, &state, framed);
+        _ = res;
+    }
+    {
+        const pb = try view.peekBlock(pool, a, 9, 65, 8);
+        try std.testing.expect(pb != null);
+        try std.testing.expectEqual(game_ids.stone, pb.?.id);
+    }
+    try expectWire.id(&cli_rr, 0x23);
+}
+
+test "place: feet-intersection and missing chunk NACK air, control applies" {
+    // Ghost-wall bundle (move-and-place stop + stuck jitter): (a) placement
+    // into the placer's own cells is refused (vanilla canPlaceEntityOnSide)
+    // with an air NACK — applying would stick the client inside solid;
+    // (b) placement into a server-missing chunk NACKs air instead of
+    // echoing a lie (the edit cannot land); (c) control: a head-clear cell
+    // applies and echoes stone.
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    defer srv.items.deinit(a);
+    defer srv.chests.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    srv.world = pool;
+    const c = try a.create(Conn);
+    // No c.deinit/destroy: matches the neighboring placement test (conn
+    // teardown after a never-fed read buffer crashes in deinit — the
+    // `.empty` buffer has no allocation to free; pre-existing harness
+    // quirk, out of scope for this fix).
+    c.* = Conn.init(a, io, .{}, 7);
+    c.state = .play;
+    c.config.gamemode = .creative;
+    c.pos_x = 8.5;
+    c.pos_y = 64;
+    c.pos_z = 8.5;
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+    }
+    _ = try view.applyBlock(pool, a, 8, 63, 8, game_ids.stone, 0);
+    var port: u16 = 38361;
+    var listener: std.Io.net.Server = while (true) {
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+        break addr.listen(io, .{}) catch |err| switch (err) {
+            error.AddressInUse => {
+                port += 1;
+                if (port > 38380) return err;
+                continue;
+            },
+            else => return err,
+        };
+    };
+    defer listener.deinit(io);
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    var cli = try addr.connect(io, .{ .mode = .stream });
+    defer cli.close(io);
+    const sv = try listener.accept(io);
+    defer sv.close(io);
+    try srv.register(c, sv);
+    defer srv.unregister(c);
+    try c.sent.put(Conn.sentKey(0, 0), {});
+    var cli_rb: [512]u8 = undefined;
+    var cli_rr = cli.reader(io, &cli_rb);
+    c.inv[36] = .{ .id = game_ids.stone, .count = 64, .damage = 0, .nbt = null };
+    c.selected = 0;
+    var state = SessionState{};
+    defer state.deinit(a);
+    const doPlace = struct {
+        fn run(s: *Server, cc: *Conn, al: std.mem.Allocator, st: *SessionState, x: i32, y: u8, z: i32, dir: u8) !void {
+            var cb: [64]u8 = undefined;
+            var w = codec.PacketWriter.init(&cb);
+            try w.writeInt(x);
+            try w.writeByte(y);
+            try w.writeInt(z);
+            try w.writeByte(dir);
+            try w.writeShort(-1);
+            try w.writeByte(8);
+            try w.writeByte(8);
+            try w.writeByte(8);
+            var f: [96]u8 = undefined;
+            const framed = try codec.framePacket(0x08, w.written(), &f);
+            const res = try sessionStep(s, cc, al, st, framed);
+            _ = res;
+        }
+    }.run;
+    const readChange = struct {
+        fn run(rr: anytype) !struct { id: i32, x: i32, y: u8, z: i32, wire_id: i32, meta: u8 } {
+            var fb: [256]u8 = undefined;
+            const f = try readFrame(&rr.interface, &fb);
+            try std.testing.expectEqual(@as(i32, 0x23), f.id);
+            var pr = codec.PacketReader.init(f.body);
+            const x = try pr.readInt();
+            const y = try pr.readByte();
+            const z = try pr.readInt();
+            const wire_id = try pr.readVarInt();
+            const meta = try pr.readByte();
+            return .{ .id = f.id, .x = x, .y = y, .z = z, .wire_id = wire_id, .meta = meta };
+        }
+    }.run;
+    // (a) Feet cell: click the floor (8,63,8) face +Y -> target (8,64,8)
+    // intersects the placer -> refused, air NACK, truth stays air.
+    try doPlace(&srv, c, a, &state, 8, 63, 8, 1);
+    {
+        const n = try readChange(&cli_rr);
+        try std.testing.expectEqual(@as(i32, 8), n.x);
+        try std.testing.expectEqual(@as(u8, 64), n.y);
+        try std.testing.expectEqual(@as(i32, 8), n.z);
+        try std.testing.expectEqual(@as(i32, 0), n.wire_id);
+        const pb = try view.peekBlock(pool, a, 8, 64, 8);
+        try std.testing.expect(pb == null or pb.?.id == game_ids.air);
+    }
+    // (b) Missing chunk: click (40,64,8) face +X -> target (41,64,8) in
+    // chunk (2,0), absent server-side -> air NACK, nothing applied. The
+    // NACK bypasses the sent gate (no (2,0) entry): the click itself
+    // proves a prediction exists to clear.
+    // (Conn-side reach: move the conn next to it first.)
+    c.pos_x = 38.5;
+    c.pos_z = 8.5;
+    try doPlace(&srv, c, a, &state, 40, 64, 8, 5);
+    {
+        const n = try readChange(&cli_rr);
+        try std.testing.expectEqual(@as(i32, 41), n.x);
+        try std.testing.expectEqual(@as(u8, 64), n.y);
+        try std.testing.expectEqual(@as(i32, 0), n.wire_id);
+        const pb = try view.peekBlock(pool, a, 41, 64, 8);
+        try std.testing.expect(pb == null);
+    }
+    // (c) Control: same geometry with the chunk present applies + echoes.
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 2, 0);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+    }
+    try c.sent.put(Conn.sentKey(2, 0), {});
+    try doPlace(&srv, c, a, &state, 40, 64, 8, 5);
+    {
+        const n = try readChange(&cli_rr);
+        try std.testing.expectEqual(@as(i32, 41), n.x);
+        try std.testing.expectEqual(wire.toWire(game_ids.stone), n.wire_id);
+        const pb2 = try view.peekBlock(pool, a, 41, 64, 8);
+        try std.testing.expect(pb2 != null);
+        try std.testing.expectEqual(game_ids.stone, pb2.?.id);
+    }
+}
+
+test "dig: refused finish/start resyncs the digger, applied break airs" {
+    // Ghost-block negative-ack: the client predicts the removal on FINISH
+    // (and on creative START), so every refused dig must 0x23 the digger
+    // with truth when the cell is still solid (vanilla S23-iff-solid).
+    // A bare drop strands the prediction as a ghost.
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    defer srv.items.deinit(a);
+    defer srv.chests.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    srv.world = pool;
+    const c = try a.create(Conn);
+    c.* = Conn.init(a, io, .{}, 7);
+    c.state = .play;
+    c.config.gamemode = .survival;
+    c.pos_x = 12.5;
+    c.pos_y = 64;
+    c.pos_z = 12.5;
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+    }
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 6, 6);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+    }
+    _ = try view.applyBlock(pool, a, 12, 64, 12, game_ids.stone, 0);
+    _ = try view.applyBlock(pool, a, 100, 64, 100, game_ids.stone, 0);
+    var port: u16 = 38201;
+    var listener: std.Io.net.Server = while (true) {
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+        break addr.listen(io, .{}) catch |err| switch (err) {
+            error.AddressInUse => {
+                port += 1;
+                if (port > 38220) return err;
+                continue;
+            },
+            else => return err,
+        };
+    };
+    defer listener.deinit(io);
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    var cli = try addr.connect(io, .{ .mode = .stream });
+    defer cli.close(io);
+    const sv = try listener.accept(io);
+    defer sv.close(io);
+    try srv.register(c, sv);
+    defer srv.unregister(c);
+    try c.sent.put(Conn.sentKey(0, 0), {});
+    try c.sent.put(Conn.sentKey(6, 6), {});
+    var cli_rb: [512]u8 = undefined;
+    var cli_rr = cli.reader(io, &cli_rb);
+    var state = SessionState{};
+    defer state.deinit(a);
+    const feedDig = struct {
+        fn run(s: *Server, cc: *Conn, al: std.mem.Allocator, st: *SessionState, status: u8, x: i32, y: u8, z: i32) !void {
+            var cb: [32]u8 = undefined;
+            var w = codec.PacketWriter.init(&cb);
+            try w.writeByte(status);
+            try w.writeInt(x);
+            try w.writeByte(y);
+            try w.writeInt(z);
+            try w.writeByte(1);
+            var f: [64]u8 = undefined;
+            const framed = try codec.framePacket(0x07, w.written(), &f);
+            const res = try sessionStep(s, cc, al, st, framed);
+            _ = res;
+        }
+    }.run;
+    const expectBlock = struct {
+        fn change(rr: anytype, x: i32, y: u8, z: i32, wid: i32) !void {
+            var fb: [2048]u8 = undefined;
+            const f = try readFrame(&rr.interface, &fb);
+            try std.testing.expectEqual(@as(i32, 0x23), f.id);
+            var pr = codec.PacketReader.init(f.body);
+            try std.testing.expectEqual(x, try pr.readInt());
+            try std.testing.expectEqual(y, try pr.readByte());
+            try std.testing.expectEqual(z, try pr.readInt());
+            try std.testing.expectEqual(wid, try pr.readVarInt());
+        }
+        // Breaks also fan out drop spawns (0x0E) + dig sounds ahead of the
+        // cell broadcast: skip non-0x23 frames (bounded), then assert the
+        // cell body. Fails on a solid-cell 0x23 (resurrection) or silence.
+        fn changeSkip(rr: anytype, x: i32, y: u8, z: i32, wid: i32) !void {
+            var fb: [2048]u8 = undefined;
+            var n: usize = 0;
+            while (n < 8) : (n += 1) {
+                const f = try readFrame(&rr.interface, &fb);
+                if (f.id != 0x23) continue;
+                var pr = codec.PacketReader.init(f.body);
+                const fx = try pr.readInt();
+                const fy = try pr.readByte();
+                const fz = try pr.readInt();
+                const fw = try pr.readVarInt();
+                if (fx == x and fy == y and fz == z) {
+                    try std.testing.expectEqual(wid, fw);
+                    return;
+                }
+            }
+            return error.TestExpectedEqual;
+        }
+    };
+    // Survival FINISH with no START: no break, resync stone truth.
+    try feedDig(&srv, c, a, &state, 2, 12, 64, 12);
+    {
+        const pb = try view.peekBlock(pool, a, 12, 64, 12);
+        try std.testing.expect(pb != null);
+        try std.testing.expectEqual(game_ids.stone, pb.?.id);
+    }
+    try expectBlock.change(&cli_rr, 12, 64, 12, 1);
+    // Survival START + FINISH in reach: break applies, broadcast airs.
+    try feedDig(&srv, c, a, &state, 0, 12, 64, 12);
+    try feedDig(&srv, c, a, &state, 2, 12, 64, 12);
+    {
+        const pb = try view.peekBlock(pool, a, 12, 64, 12);
+        try std.testing.expect(pb != null);
+        try std.testing.expectEqual(game_ids.air, pb.?.id);
+    }
+    try expectBlock.changeSkip(&cli_rr, 12, 64, 12, 0);
+    // Creative START out of reach: no break, resync stone truth.
+    c.config.gamemode = .creative;
+    try feedDig(&srv, c, a, &state, 0, 100, 64, 100);
+    {
+        const pb = try view.peekBlock(pool, a, 100, 64, 100);
+        try std.testing.expect(pb != null);
+        try std.testing.expectEqual(game_ids.stone, pb.?.id);
+    }
+    try expectBlock.change(&cli_rr, 100, 64, 100, 1);
+    // Survival FINISH out of reach (no START): no break, resync truth.
+    c.config.gamemode = .survival;
+    try feedDig(&srv, c, a, &state, 2, 100, 64, 100);
+    try expectBlock.change(&cli_rr, 100, 64, 100, 1);
+}
+
+test "eat start: bread begins the use, tables win over eating" {
+    // Right-click with food routes to the 32-tick use; a crafting table
+    // in the way opens its UI instead (vanilla routing, like placements).
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    defer srv.items.deinit(a);
+    defer srv.chests.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    srv.world = pool;
+    const c = try a.create(Conn);
+    c.* = Conn.init(a, io, .{}, 7);
+    c.state = .play;
+    c.config.gamemode = .survival;
+    c.food = 10;
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+    }
+    _ = try view.applyBlock(pool, a, 8, 64, 8, game_ids.crafting_table, 0);
+    c.inv[36] = .{ .id = game_ids.bread, .count = 3, .damage = 0, .nbt = null };
+    c.selected = 0;
+    var port: u16 = 38261;
+    var listener: std.Io.net.Server = while (true) {
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+        break addr.listen(io, .{}) catch |err| switch (err) {
+            error.AddressInUse => {
+                port += 1;
+                if (port > 38280) return err;
+                continue;
+            },
+            else => return err,
+        };
+    };
+    defer listener.deinit(io);
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    var cli = try addr.connect(io, .{ .mode = .stream });
+    defer cli.close(io);
+    const sv = try listener.accept(io);
+    defer sv.close(io);
+    try srv.register(c, sv);
+    defer srv.unregister(c);
+    try c.sent.put(Conn.sentKey(0, 0), {});
+    var state = SessionState{};
+    defer state.deinit(a);
+    const feedPlace = struct {
+        fn run(s: *Server, cc: *Conn, al: std.mem.Allocator, st: *SessionState, x: i32, y: u8, z: i32, dir: u8) !void {
+            var cb: [64]u8 = undefined;
+            var w = codec.PacketWriter.init(&cb);
+            try w.writeInt(x);
+            try w.writeByte(y);
+            try w.writeInt(z);
+            try w.writeByte(dir);
+            try w.writeShort(-1);
+            try w.writeByte(8);
+            try w.writeByte(8);
+            try w.writeByte(8);
+            var f: [96]u8 = undefined;
+            const framed = try codec.framePacket(0x08, w.written(), &f);
+            const res = try sessionStep(s, cc, al, st, framed);
+            _ = res;
+        }
+    }.run;
+    // Air click with bread: eating starts (survival, hungry).
+    try feedPlace(&srv, c, a, &state, 8, 64, 8, 255);
+    try std.testing.expect(c.eating != null);
+    try std.testing.expectEqual(game_ids.bread, c.eating.?.id);
+    // Full hunger refuses (bread is not always-edible).
+    c.eating = null;
+    c.food = 20;
+    try feedPlace(&srv, c, a, &state, 8, 64, 8, 255);
+    try std.testing.expect(c.eating == null);
+    c.food = 10;
+    // Table click with bread: UI opens (window 1), no eating.
+    // Click the table block (8,64,8) face +Y(1): target (8,65,8) air,
+    // reversal recovers clicked (8,64,8).
+    try feedPlace(&srv, c, a, &state, 8, 64, 8, 1);
+    try std.testing.expect(c.eating == null);
+    try std.testing.expect(c.open_win != null);
+    try std.testing.expectEqual(@as(u8, 1), c.open_win.?.id);
+}
+
+test "pps gate: 600 frames in one batch trips the per-conn cap" {
+    // Global packets-per-second flood gate (config max_packets_per_second,
+    // 0 = off): 600 keepalives in one sessionStep with a 500 cap must end
+    // the session with the spam kick (0x40) on the wire.
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    defer srv.items.deinit(a);
+    defer srv.chests.deinit(a);
+    srv.world = null;
+    const c = try a.create(Conn);
+    c.* = Conn.init(a, io, .{}, 7);
+    c.state = .play;
+    c.config.max_packets_per_second = 500;
+    var port: u16 = 38241;
+    var listener: std.Io.net.Server = while (true) {
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+        break addr.listen(io, .{}) catch |err| switch (err) {
+            error.AddressInUse => {
+                port += 1;
+                if (port > 38260) return err;
+                continue;
+            },
+            else => return err,
+        };
+    };
+    defer listener.deinit(io);
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    var cli = try addr.connect(io, .{ .mode = .stream });
+    defer cli.close(io);
+    const sv = try listener.accept(io);
+    defer sv.close(io);
+    try srv.register(c, sv);
+    defer srv.unregister(c);
+    var state = SessionState{};
+    defer state.deinit(a);
+    var big: [600 * 8]u8 = undefined;
+    var w = codec.PacketWriter.init(&big);
+    var i: u32 = 0;
+    while (i < 600) : (i += 1) {
+        var kb: [16]u8 = undefined;
+        var kw = codec.PacketWriter.init(&kb);
+        try kw.writeInt(@as(i32, @intCast(i)));
+        var fb: [32]u8 = undefined;
+        const one = try codec.framePacket(0x00, kw.written(), &fb);
+        try w.writeBytes(one);
+    }
+    const res = try sessionStep(&srv, c, a, &state, w.written());
+    try std.testing.expect(res.finished);
+    // The kick flushes on the transport's output path live; in the test
+    // harness drain the outbox directly and expect the 0x40 spam kick.
+    const out = try c.takeOutput();
+    defer a.free(out);
+    try std.testing.expect(out.len > 0);
+    var pr = codec.PacketReader.init(out);
+    const flen = try pr.readVarInt();
+    try std.testing.expect(flen > 0 and flen <= out.len);
+    try std.testing.expectEqual(@as(i32, 0x40), try pr.readVarInt());
+}
+
+test "login snap lifts out of feet-solid instead of affirming it" {
+    // maybeLoginResync must never pin the client inside solid ground:
+    // sub-threshold falls can adopt a feet-in-solid pos before the grace
+    // engages, and the old bare re-send affirmed it (fallrepro snap-71).
+    // Feet solid now lifts to headroom (rescueEmbedded's two-open rule).
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    defer srv.items.deinit(a);
+    defer srv.chests.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    srv.world = pool;
+    const c = try a.create(Conn);
+    c.* = Conn.init(a, io, .{}, 7);
+    c.state = .play;
+    c.pos_x = 12.5;
+    c.pos_y = 64;
+    c.pos_z = 12.5;
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+    }
+    _ = try view.applyBlock(pool, a, 12, 64, 12, game_ids.stone, 0);
+    _ = try view.applyBlock(pool, a, 12, 65, 12, game_ids.stone, 0);
+    _ = try view.applyBlock(pool, a, 12, 66, 12, game_ids.stone, 0);
+    try c.sent.put(Conn.sentKey(0, 0), {});
+    c.armLoginGrace();
+    c.login_fell = true;
+    var port: u16 = 38281;
+    var listener: std.Io.net.Server = while (true) {
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+        break addr.listen(io, .{}) catch |err| switch (err) {
+            error.AddressInUse => {
+                port += 1;
+                if (port > 38300) return err;
+                continue;
+            },
+            else => return err,
+        };
+    };
+    defer listener.deinit(io);
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    var cli = try addr.connect(io, .{ .mode = .stream });
+    defer cli.close(io);
+    const sv = try listener.accept(io);
+    defer sv.close(io);
+    try srv.register(c, sv);
+    defer srv.unregister(c);
+    var state = SessionState{};
+    defer state.deinit(a);
+    var kb: [16]u8 = undefined;
+    var kw = codec.PacketWriter.init(&kb);
+    try kw.writeInt(7);
+    var f: [32]u8 = undefined;
+    const framed = try codec.framePacket(0x00, kw.written(), &f);
+    _ = try sessionStep(&srv, c, a, &state, framed);
+    // Lifted to headroom (67: 67 air + 68 air above stone 64..66).
+    try std.testing.expectEqual(@as(f64, 67), c.pos_y);
+    const out = try c.takeOutput();
+    defer a.free(out);
+    var pr = codec.PacketReader.init(out);
+    const flen = try pr.readVarInt();
+    try std.testing.expect(flen > 0 and flen <= out.len);
+    try std.testing.expectEqual(@as(i32, 0x08), try pr.readVarInt());
+    try std.testing.expectEqual(@as(f64, 12.5), try pr.readDouble());
+    try std.testing.expectEqual(@as(f64, 67), try pr.readDouble());
+    try std.testing.expectEqual(@as(f64, 12.5), try pr.readDouble());
+}
+
+test "save epochs: bump owns rows, fence trips on newer logins" {
+    // Reconnect-race ownership: only an announced login bumps; a wedged
+    // earlier login must see the newer epoch and abort (straggler fence)
+    // instead of kicking the live session or poisoning the row.
+    const a = std.testing.allocator;
+    var srv = Server{ .net = undefined, .io = std.testing.io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    defer {
+        // bumpSaveEpoch dupes name keys; the map outlives this test only.
+        if (srv.save_epochs) |*m| {
+            var it = m.iterator();
+            while (it.next()) |kv| a.free(kv.key_ptr.*);
+            m.deinit();
+        }
+    }
+    // Unknown names: permissive reads (no owner yet).
+    try std.testing.expectEqual(@as(u64, 0), srv.epochFor("Al"));
+    try std.testing.expect(srv.saveEpochCurrent("Al", 0));
+    // First announce bumps to 1 and owns the row.
+    try std.testing.expectEqual(@as(u64, 1), srv.bumpSaveEpoch("Al"));
+    try std.testing.expectEqual(@as(u64, 1), srv.epochFor("Al"));
+    try std.testing.expect(srv.saveEpochCurrent("Al", 1));
+    // A session that read the epoch earlier (0) is stale now: the fence
+    // predicate (epochFor != login_epoch_seen) trips for it, while the
+    // owner (seen == current) proceeds.
+    try std.testing.expect(!srv.saveEpochCurrent("Al", 0));
+    try std.testing.expect(srv.epochFor("Al") != 0);
+    // Epochs are per-name and monotonic.
+    try std.testing.expectEqual(@as(u64, 1), srv.bumpSaveEpoch("Bo"));
+    try std.testing.expectEqual(@as(u64, 2), srv.bumpSaveEpoch("Al"));
+    try std.testing.expect(srv.saveEpochCurrent("Bo", 1));
+    try std.testing.expect(!srv.saveEpochCurrent("Bo", 2));
+}
+
+test "kickEntry skips already-dying conns (no re-flush)" {
+    // A second kick at a closing conn must not append another disconnect:
+    // re-flushing a dead peer's outbox is the write that wedges kickers
+    // (duplicate-login path) for TCP-timeout minutes.
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const c = try a.create(Conn);
+    defer a.destroy(c);
+    c.* = Conn.init(a, io, .{}, 77);
+    defer c.deinit();
+    c.state = .play;
+    @memcpy(c.username[0.."Bo".len], "Bo");
+    c.username_len = 2;
+    var kb: [16]u8 = undefined;
+    try c.queueFramed(try packets.frameKeepAlive(7, &kb));
+    const before = c.out.items.len;
+    try std.testing.expect(before > 0);
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    // Guard returns before touching the stream (undefined here on purpose).
+    c.close_after_flush = true;
+    srv.kickEntry(.{ .conn = c, .stream = undefined }, "bye");
+    try std.testing.expectEqual(before, c.out.items.len);
+    c.close_after_flush = false;
+    c.dead = true;
+    srv.kickEntry(.{ .conn = c, .stream = undefined }, "bye");
+    try std.testing.expectEqual(before, c.out.items.len);
 }
 
 test "weather: flags, strength fade, expiry, login sync frames" {
@@ -10016,6 +15367,9 @@ test "commands help/list/save-all/unknown (+ console null-sender)" {
             c.state = .play;
             @memcpy(c.username[0..name.len], name);
             c.username_len = name.len;
+            // Offline login sets uuid_str from the name; mirror it so
+            // UUID-keyed permission checks match test conns.
+            uuid_mod.formatUuid(uuid_mod.offlineUuid(name), &c.uuid_str);
             return c;
         }
     };
@@ -10188,6 +15542,14 @@ test "runtime registry: mods show in help and dispatch" {
     try std.testing.expect(std.mem.indexOf(u8, h, "fakecmd") != null);
 }
 
+/// Test UUID for a name (mirrors the offline-mode derivation in
+/// resolveUuid; the command tests run with online_mode=false).
+fn testUuid(name: []const u8) [perms_mod.uuid_len]u8 {
+    var out: [perms_mod.uuid_len]u8 = undefined;
+    uuid_mod.formatUuid(uuid_mod.offlineUuid(name), &out);
+    return out;
+}
+
 test "permissions gate commands: op/deop/grant/deny/show/clear/reload" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -10208,6 +15570,9 @@ test "permissions gate commands: op/deop/grant/deny/show/clear/reload" {
             c.state = .play;
             @memcpy(c.username[0..name.len], name);
             c.username_len = name.len;
+            // Offline login sets uuid_str from the name; mirror it so
+            // UUID-keyed permission checks match test conns.
+            uuid_mod.formatUuid(uuid_mod.offlineUuid(name), &c.uuid_str);
             return c;
         }
     };
@@ -10285,7 +15650,7 @@ test "permissions gate commands: op/deop/grant/deny/show/clear/reload" {
     {
         srv.perm_lock.lock();
         defer srv.perm_lock.unlock();
-        try std.testing.expectEqual(perms_mod.OpLevel.owner, srv.perms.?.levelFor("AliceP"));
+        try std.testing.expectEqual(perms_mod.OpLevel.owner, srv.perms.?.levelForUuid(&testUuid("AliceP")));
     }
     // /help now lists privileged commands for Alice (vanilla 7-per-page).
     srv.handleCommand(alice, "/help");
@@ -10495,6 +15860,7 @@ test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
         srv.items.deinit(a);
         srv.ent_lock.unlock();
     }
+    var port: u16 = 37951;
     const mk = struct {
         fn run(name: []const u8, id: i32) !*Conn {
             const c = try a.create(Conn);
@@ -10503,6 +15869,9 @@ test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
             c.state = .play;
             @memcpy(c.username[0..name.len], name);
             c.username_len = name.len;
+            // Offline login sets uuid_str from the name; mirror it so
+            // UUID-keyed permission checks match test conns.
+            uuid_mod.formatUuid(uuid_mod.offlineUuid(name), &c.uuid_str);
             return c;
         }
     };
@@ -10603,8 +15972,33 @@ test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
         bob.deinit();
         a.destroy(bob);
     }
-    try srv.registry.append(a, .{ .conn = alice, .stream = undefined });
-    try srv.registry.append(a, .{ .conn = bob, .stream = undefined });
+    // killPlayer now broadcasts the death line (broadcastChat flushes inline),
+    // so the registry streams must be real sockets: loopback pairs whose far
+    // end is never read (frames are tiny; kernel buffers hold them).
+    // `.stream = undefined` panics on flush (NOTSOCK in Debug).
+    var listener: std.Io.net.Server = while (true) {
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+        break addr.listen(io, .{}) catch |err| switch (err) {
+            error.AddressInUse => {
+                port += 1;
+                if (port > 38000) return err;
+                continue;
+            },
+            else => return err,
+        };
+    };
+    defer listener.deinit(io);
+    const laddr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    var alice_cli = try laddr.connect(io, .{ .mode = .stream });
+    defer alice_cli.close(io);
+    var alice_srv = try listener.accept(io);
+    defer alice_srv.close(io);
+    var bob_cli = try laddr.connect(io, .{ .mode = .stream });
+    defer bob_cli.close(io);
+    var bob_srv = try listener.accept(io);
+    defer bob_srv.close(io);
+    try srv.registry.append(a, .{ .conn = alice, .stream = alice_srv });
+    try srv.registry.append(a, .{ .conn = bob, .stream = bob_srv });
     // Bob (level 0) is denied the new commands, same as unknown.
     srv.handleCommand(bob, "/gamemode 0");
     const _r1 = try readChat(bob);
@@ -10655,17 +16049,17 @@ test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
     const _d1b = try readChat(alice);
     defer a.free(_d1b);
     try std.testing.expectEqualStrings("{\"text\":\"Set BobG's game mode to adventure\"}", _d1b);
-    // /give: 64 dirt to Bob (first empty main slot = 9).
+    // /give: 64 dirt to Bob (first empty hotbar slot = 36).
     srv.handleCommand(alice, "/give BobG 1 64");
     {
-        try std.testing.expectEqual(game_ids.stone, bob.inv[9].?.id);
-        try std.testing.expectEqual(@as(i8, 64), bob.inv[9].?.count);
+        try std.testing.expectEqual(game_ids.stone, bob.inv[36].?.id);
+        try std.testing.expectEqual(@as(i8, 64), bob.inv[36].?.count);
         var fr = try Drain.run(bob);
         defer Drain.free(&fr);
         const sb = Drain.find(&fr, 0x2F) orelse return error.NoSetSlot;
         var r = codec.PacketReader.init(sb);
         _ = try r.readByte();
-        try std.testing.expectEqual(@as(i16, 9), try r.readShort());
+        try std.testing.expectEqual(@as(i16, 36), try r.readShort());
         const it = (try packets.parseSlot(&r)).?;
         try std.testing.expectEqual(@as(i16, 1), it.id);
         try std.testing.expectEqual(@as(i8, 64), it.count);
@@ -10704,9 +16098,9 @@ test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
     defer a.free(_d2);
     srv.handleCommand(bob, "/give BobG 3 5");
     {
-        // dirt merges into slot 9 (64/64 full) -> first empty slot 10.
-        try std.testing.expectEqual(game_ids.dirt, bob.inv[10].?.id);
-        try std.testing.expectEqual(@as(i8, 5), bob.inv[10].?.count);
+        // dirt is a new id: stone fills slot 36 (64/64 full) -> first empty slot 37.
+        try std.testing.expectEqual(game_ids.dirt, bob.inv[37].?.id);
+        try std.testing.expectEqual(@as(i8, 5), bob.inv[37].?.count);
     }
     const _d3w = try readChat(bob);
     defer a.free(_d3w);
@@ -10834,7 +16228,7 @@ test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
     defer a.free(_r22);
     try std.testing.expectEqualStrings("{\"text\":\"'xyz' is not a valid number\"}", _r22);
     // Full inventory: /give reports partial with leftover.
-    for (9..45) |s| bob.inv[s] = .{ .id = game_ids.planks, .count = 64, .damage = 0, .nbt = null };
+    for (item_mod.main_lo..item_mod.inv_size) |s| bob.inv[s] = .{ .id = game_ids.planks, .count = 64, .damage = 0, .nbt = null };
     srv.handleCommand(alice, "/perm clear BobG asteorite.command.give");
     const _d8 = try readChat(alice);
     defer a.free(_d8);
@@ -10911,6 +16305,40 @@ test "gameplay commands: gamemode/give/tp/time (+ denials, usage, nodes)" {
     _ = srv.registry.pop();
 }
 
+test "canSpawnMob: master, per-kind, and doMobSpawning all gate" {
+    // Spawn ingress gate: open by default; any one refusal (config
+    // master, per-kind map, gamerule) closes it. Existing mobs are
+    // unaffected by construction (callers only gate new spawns).
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    defer srv.items.deinit(a);
+    defer srv.chests.deinit(a);
+    try std.testing.expect(srv.canSpawnMob(.pig));
+    try std.testing.expect(srv.canSpawnMob(.zombie));
+    try std.testing.expect(srv.canSpawnMob(.ender_dragon));
+    {
+        var c = srv.cfg.load();
+        c.spawn_mobs = false;
+        srv.cfg.store(c);
+    }
+    try std.testing.expect(!srv.canSpawnMob(.pig));
+    {
+        var c = srv.cfg.load();
+        c.spawn_mobs = true;
+        c.mob_spawn_allowed[@intFromEnum(mob_mod.Kind.pig)] = false;
+        srv.cfg.store(c);
+    }
+    try std.testing.expect(!srv.canSpawnMob(.pig));
+    try std.testing.expect(srv.canSpawnMob(.cow));
+    try std.testing.expect(srv.gameruleSet("doMobSpawning", false));
+    try std.testing.expect(!srv.canSpawnMob(.cow));
+    try std.testing.expect(srv.gameruleSet("doMobSpawning", true));
+    try std.testing.expect(srv.canSpawnMob(.cow));
+}
+
 test "furnace: take output moves stack to cursor + syncs" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -10933,3 +16361,829 @@ test "furnace: take output moves stack to cursor + syncs" {
     defer a.free(out);
     try std.testing.expect(out.len > 0);
 }
+
+test "brew: shift-click routes potions and ingredients, brews in 20s" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    defer srv.brews.deinit(a);
+    var conn = Conn.init(a, io, .{}, 7);
+    defer conn.deinit();
+    conn.open_win = .{ .id = 7, .x = 2, .y = 69, .z = 0 };
+    srv.ensureBrew(2, 69, 0);
+    const br = srv.findBrew(2, 69, 0).?;
+    // Shift-click water bottles -> bottle slots 0-2 in order.
+    conn.inv[9] = .{ .id = game_ids.potion, .count = 3, .damage = 0, .nbt = null };
+    srv.applyBrewClick(&conn, .{ .slot = 4, .button = 0, .action = 701, .mode = 1 });
+    try std.testing.expect(br.bottles[0] != null);
+    try std.testing.expectEqual(@as(i8, 3), br.bottles[0].?.count);
+    try std.testing.expect(conn.inv[9] == null);
+    // Shift-click nether wart -> ingredient slot.
+    conn.inv[10] = .{ .id = game_ids.nether_wart_item, .count = 2, .damage = 0, .nbt = null };
+    srv.applyBrewClick(&conn, .{ .slot = 5, .button = 0, .action = 702, .mode = 1 });
+    try std.testing.expectEqual(game_ids.nether_wart_item, br.ingredient.?.id);
+    try std.testing.expect(conn.inv[10] == null);
+    // Non-brewing items refuse the stand (stone shifts to the hotbar,
+    // never into a bottle or the ingredient slot).
+    conn.inv[11] = .{ .id = game_ids.stone, .count = 1, .damage = 0, .nbt = null };
+    srv.applyBrewClick(&conn, .{ .slot = 6, .button = 0, .action = 703, .mode = 1 });
+    try std.testing.expect(br.bottles[1] == null);
+    try std.testing.expect(br.bottles[2] == null);
+    try std.testing.expectEqual(game_ids.nether_wart_item, br.ingredient.?.id);
+    var found_stone = false;
+    for (conn.inv) |st| if (st) |s| {
+        if (s.id == game_ids.stone) found_stone = true;
+    };
+    try std.testing.expect(found_stone);
+    // Drive the server row through the engine (same borrow pattern as the
+    // ticker): 20 quanta convert in place, one wart consumed.
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        var slots = brewing_mod.Slots{ .ingredient = br.ingredient };
+        for (&br.bottles, 0..) |*bt, k| slots.bottles[k] = bt.*;
+        _ = brewing_mod.tick(&slots, &br.brew);
+        for (&br.bottles, 0..) |*bt, k| bt.* = slots.bottles[k];
+        br.ingredient = slots.ingredient;
+    }
+    try std.testing.expectEqual(@as(i16, 16), br.bottles[0].?.damage);
+    try std.testing.expectEqual(@as(i8, 3), br.bottles[0].?.count);
+    try std.testing.expectEqual(@as(i8, 1), br.ingredient.?.count);
+    try std.testing.expectEqual(@as(u32, brewing_mod.brew_target), br.brew);
+}
+
+test "brew: mode-0 pickup and number-key swap move bottles" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    defer srv.brews.deinit(a);
+    var conn = Conn.init(a, io, .{}, 7);
+    defer conn.deinit();
+    conn.open_win = .{ .id = 7, .x = 2, .y = 69, .z = 0 };
+    srv.ensureBrew(2, 69, 0);
+    const br = srv.findBrew(2, 69, 0).?;
+    br.bottles[0] = .{ .id = game_ids.potion, .count = 1, .damage = 16, .nbt = null };
+    // Left-click bottle -> cursor.
+    srv.applyBrewClick(&conn, .{ .slot = 0, .button = 0, .action = 710, .mode = 0 });
+    try std.testing.expectEqual(game_ids.potion, conn.cursor.?.id);
+    try std.testing.expectEqual(@as(i16, 16), conn.cursor.?.damage);
+    try std.testing.expect(br.bottles[0] == null);
+    // Right-click places one back... (single stack: whole stack returns).
+    srv.applyBrewClick(&conn, .{ .slot = 0, .button = 1, .action = 711, .mode = 0 });
+    try std.testing.expect(conn.cursor == null);
+    try std.testing.expectEqual(@as(i16, 16), br.bottles[0].?.damage);
+    // Number-key swaps bottle with hotbar.
+    conn.inv[36] = .{ .id = game_ids.potion, .count = 1, .damage = 8194, .nbt = null };
+    srv.applyBrewClick(&conn, .{ .slot = 0, .button = 0, .action = 712, .mode = 2 });
+    try std.testing.expectEqual(@as(i16, 8194), br.bottles[0].?.damage);
+    try std.testing.expectEqual(@as(i16, 16), conn.inv[36].?.damage);
+    const out = try conn.takeOutput();
+    defer a.free(out);
+    try std.testing.expect(out.len > 0);
+}
+
+test "furnace: drag-spread fills fuel + player slots" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    defer srv.furnaces.deinit(a);
+    var conn = Conn.init(a, io, .{}, 7);
+    defer conn.deinit();
+    conn.open_win = .{ .id = 2, .x = 2, .y = 69, .z = 0 };
+    srv.ensureFurnace(2, 69, 0);
+    // 8 coal over fuel + inv[9] + inv[10]: 3/3/2, cursor empties.
+    conn.cursor = .{ .id = game_ids.coal, .count = 8, .damage = 0, .nbt = null };
+    srv.applyFurnaceClick(&conn, .{ .slot = -999, .button = 0, .action = 610, .mode = 5 });
+    srv.applyFurnaceClick(&conn, .{ .slot = 1, .button = 1, .action = 611, .mode = 5 });
+    srv.applyFurnaceClick(&conn, .{ .slot = 3, .button = 1, .action = 612, .mode = 5 });
+    srv.applyFurnaceClick(&conn, .{ .slot = 4, .button = 1, .action = 613, .mode = 5 });
+    srv.applyFurnaceClick(&conn, .{ .slot = -999, .button = 2, .action = 614, .mode = 5 });
+    try std.testing.expect(conn.cursor == null);
+    try std.testing.expectEqual(@as(i8, 3), srv.findFurnace(2, 69, 0).?.fuel.?.count);
+    try std.testing.expectEqual(@as(i8, 3), conn.inv[9].?.count);
+    try std.testing.expectEqual(@as(i8, 2), conn.inv[10].?.count);
+    // Output slot rejects paint: drag over it is skipped.
+    conn.cursor = .{ .id = game_ids.dirt, .count = 4, .damage = 0, .nbt = null };
+    srv.applyFurnaceClick(&conn, .{ .slot = -999, .button = 0, .action = 615, .mode = 5 });
+    srv.applyFurnaceClick(&conn, .{ .slot = 2, .button = 1, .action = 616, .mode = 5 });
+    srv.applyFurnaceClick(&conn, .{ .slot = 5, .button = 1, .action = 617, .mode = 5 });
+    srv.applyFurnaceClick(&conn, .{ .slot = -999, .button = 2, .action = 618, .mode = 5 });
+    try std.testing.expect(conn.cursor == null);
+    try std.testing.expectEqual(@as(i8, 4), conn.inv[11].?.count);
+    const out2 = try conn.takeOutput();
+    defer a.free(out2);
+}
+
+test "pregenOffset walks concentric squares center-first" {
+    const P = Server.pregenOffset(0);
+    try std.testing.expectEqual(@as(i32, 0), P.dx);
+    try std.testing.expectEqual(@as(i32, 0), P.dz);
+    // Ring 1 (idx 1..8): north edge L-to-R, east top-down, south R-to-L,
+    // west bottom-up — matches serve.Spiral cell for cell.
+    const r1 = [_]ColOffset{
+        .{ .dx = -1, .dz = -1 }, .{ .dx = 0, .dz = -1 }, .{ .dx = 1, .dz = -1 }, .{ .dx = 1, .dz = 0 },
+        .{ .dx = 1, .dz = 1 }, .{ .dx = 0, .dz = 1 }, .{ .dx = -1, .dz = 1 }, .{ .dx = -1, .dz = 0 },
+    };
+    for (r1, 0..) |w, k| {
+        const got = Server.pregenOffset(1 + k);
+        try std.testing.expectEqual(w.dx, got.dx);
+        try std.testing.expectEqual(w.dz, got.dz);
+    }
+    // Ring starts: 1, 9, 25, 49 (1+4r(r-1)).
+    for ([_]struct { idx: usize, dx: i32, dz: i32 }{
+        .{ .idx = 9, .dx = -2, .dz = -2 },
+        .{ .idx = 25, .dx = -3, .dz = -3 },
+        .{ .idx = 49, .dx = -4, .dz = -4 },
+    }) |c| {
+        const got = Server.pregenOffset(c.idx);
+        try std.testing.expectEqual(c.dx, got.dx);
+        try std.testing.expectEqual(c.dz, got.dz);
+    }
+    // Ring 2 has 16 cells ending adjacent to ring 3's start.
+    const last2 = Server.pregenOffset(24);
+    try std.testing.expectEqual(@as(i32, -2), last2.dx);
+    try std.testing.expectEqual(@as(i32, -1), last2.dz);
+}
+
+test "pregen completes a radius-1 task end to end" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    var lock: spin.SpinLock = .{};
+    var gp = try v5genpool.GenPool.create(a, io, pool, &lock, 42, false, false, 1, .{});
+    defer {
+        gp.destroy();
+        a.destroy(gp);
+    }
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    srv.gen_pool = gp;
+    try std.testing.expect(srv.pregenBegin("", 1, 0, 0) == .started);
+    try std.testing.expect(srv.pregenBegin("", 1, 0, 0) == .already_running);
+    // First poll enqueues all 9 chunks; drain lets the worker finish them;
+    // the next poll observes the empty in-flight set and completes.
+    srv.pollPregen(std.Io.Timestamp.now(io, .awake).toMilliseconds());
+    srv.pregen_lock.lock();
+    const queued = srv.pregen.next_idx;
+    srv.pregen_lock.unlock();
+    try std.testing.expectEqual(@as(usize, 9), queued);
+    gp.drain();
+    srv.pollPregen(std.Io.Timestamp.now(io, .awake).toMilliseconds());
+    srv.pregen_lock.lock();
+    const done = srv.pregen.done_idx;
+    const still = srv.pregen.active;
+    srv.pregen_lock.unlock();
+    try std.testing.expectEqual(@as(usize, 9), done);
+    try std.testing.expect(!still);
+    // Every chunk actually landed in storage.
+    var ox: i32 = -1;
+    while (ox <= 1) : (ox += 1) {
+        var oz: i32 = -1;
+        while (oz <= 1) : (oz += 1) {
+            const got = try pool.getChunk(a, 0, ox, oz);
+            try std.testing.expect(got != null);
+            defer got.?.destroy(a);
+        }
+    }
+    // Stop/pause on an idle task report idle.
+    try std.testing.expect(!srv.pregenStop());
+    try std.testing.expect(srv.pregenPauseToggle(true) == .not_running);
+    var sb: [256]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), srv.pregenStatus(&sb).len);
+}
+
+test "pregen stop cancels and status formats progress" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    // No gen pool: begin refuses (no seed/generation configured).
+    try std.testing.expect(srv.pregenBegin("", 2, 0, 0) == .no_gen);
+    var sb: [256]u8 = undefined;
+    const line = Server.formatPregenLine(.{
+        .active = true,
+        .ccx = 0,
+        .ccz = 0,
+        .radius = 1,
+        .total = 9,
+        .next_idx = 9,
+        .done_idx = 3,
+        .last_ms = 40000,
+        .t_start_ms = 0,
+        .rate = 1.5,
+    }, 142 * 1024 * 1024, 301 * 1024 * 1024, &sb);
+    try std.testing.expectEqualStrings("33.3% (3/9) chunks — 1.5/s, ETA 00:04, elapsed 00:40, rss=142 MiB peak=301 MiB, gpu 0ch/0dsp fb=0 avg=0.0, cache n/a, true 0.0/s tot 0.0/s dup 0 sf 0 ore 0%", line);
+}
+
+test "pregen command dispatches start/stop/status/pause/resume" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    var out: [8192]u8 = undefined;
+    try std.testing.expectEqualStrings("No pregeneration task is running", srv.executeCommand(null, "/pregen status", &out));
+    try std.testing.expectEqualStrings("/pregen start <radius> [x z] OR /pregen stop|status|pause|resume", srv.executeCommand(null, "/pregen frobnicate", &out)[7..]);
+    try std.testing.expectEqualStrings(
+        "/pregen start <radius> [x z] OR /pregen stop|status|pause|resume",
+        srv.executeCommand(null, "/pregen start", &out)[7..],
+    );
+    try std.testing.expectEqualStrings(
+        "Pregeneration needs a world seed (generation is not enabled on this server)",
+        srv.executeCommand(null, "/pregen start 5", &out),
+    );
+    // With a worker pool: full lifecycle through the command layer.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    var lock: spin.SpinLock = .{};
+    var gp = try v5genpool.GenPool.create(a, io, pool, &lock, 42, false, false, 1, .{});
+    defer {
+        gp.destroy();
+        a.destroy(gp);
+    }
+    srv.gen_pool = gp;
+    const started = srv.executeCommand(null, "/pregen start 1", &out);
+    try std.testing.expect(std.mem.startsWith(u8, started, "Pregeneration started: 9 chunks"));
+    try std.testing.expect(std.mem.startsWith(u8, srv.executeCommand(null, "/pregen status", &out), "Pregeneration: "));
+    try std.testing.expectEqualStrings("Pregeneration paused", srv.executeCommand(null, "/pregen pause", &out));
+    try std.testing.expect(std.mem.indexOf(u8, srv.executeCommand(null, "/pregen status", &out), "[paused]") != null);
+    try std.testing.expectEqualStrings("Pregeneration resumed", srv.executeCommand(null, "/pregen resume", &out));
+    try std.testing.expectEqualStrings("Pregeneration cancelled", srv.executeCommand(null, "/pregen stop", &out));
+    try std.testing.expectEqualStrings("No pregeneration task is running", srv.executeCommand(null, "/pregen stop", &out));
+    try std.testing.expectEqualStrings("No pregeneration task is running", srv.executeCommand(null, "/pregen pause", &out));
+}
+
+test "pregen bar health/title" {
+    try std.testing.expectEqual(@as(f32, 1.0), Server.pregenBarHealth(0));
+    try std.testing.expectEqual(@as(f32, 150.0), Server.pregenBarHealth(0.5));
+    try std.testing.expectEqual(@as(f32, 300.0), Server.pregenBarHealth(1));
+    try std.testing.expectEqual(@as(f32, 300.0), Server.pregenBarHealth(9));
+    try std.testing.expectEqual(@as(f32, 1.0), Server.pregenBarHealth(-1));
+    var tb: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Pregeneration 12%", Server.pregenBarTitle(0.124, false, &tb));
+    try std.testing.expectEqualStrings("Pregeneration 12% (paused)", Server.pregenBarTitle(0.124, true, &tb));
+    try std.testing.expectEqualStrings("Pregeneration 100%", Server.pregenBarTitle(1, false, &tb));
+}
+
+test "pregen bossbar tracks offline owner without crashing" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    var lock: spin.SpinLock = .{};
+    var gp = try v5genpool.GenPool.create(a, io, pool, &lock, 42, false, false, 1, .{});
+    defer {
+        gp.destroy();
+        a.destroy(gp);
+    }
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    srv.gen_pool = gp;
+    // "Ghost" never logs in: spawn attempts fail silent, flag stays clear.
+    try std.testing.expect(srv.pregenBegin("Ghost", 1, 0, 0) == .started);
+    srv.pollPregen(std.Io.Timestamp.now(io, .awake).toMilliseconds());
+    srv.pregen_lock.lock();
+    try std.testing.expect(!srv.pregen.bar_spawned);
+    srv.pregen_lock.unlock();
+    // Pause path refreshes a frozen bar (still offline: no crash, no flag).
+    try std.testing.expect(srv.pregenPauseToggle(true) == .paused);
+    srv.pollPregen(std.Io.Timestamp.now(io, .awake).toMilliseconds());
+    srv.pregen_lock.lock();
+    try std.testing.expectEqual(@as(usize, 0), srv.pregen.done_idx);
+    try std.testing.expect(!srv.pregen.bar_spawned);
+    srv.pregen_lock.unlock();
+    try std.testing.expect(srv.pregenPauseToggle(false) == .resumed);
+    gp.drain();
+    srv.pollPregen(std.Io.Timestamp.now(io, .awake).toMilliseconds());
+    srv.pregen_lock.lock();
+    const done = srv.pregen.done_idx;
+    const still = srv.pregen.active;
+    const bar = srv.pregen.bar_spawned;
+    srv.pregen_lock.unlock();
+    try std.testing.expectEqual(@as(usize, 9), done);
+    try std.testing.expect(!still);
+    try std.testing.expect(!bar);
+}
+
+test "ops/bans/whitelist live in sidecar files" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Seed the files directly (as a previous boot would have left them).
+    {
+        var pdb = perms_mod.Db.init(a);
+        defer pdb.deinit();
+        const steve = testUuid("Steve");
+        try pdb.setLevelUuid(&steve, "Steve", .owner);
+        try perms_mod.saveFile(io, tmp.dir, a, &pdb);
+    }
+    {
+        var bdb = bans_mod.BanDb.init(a);
+        defer bdb.deinit();
+        const griefer = testUuid("Griefer");
+        try bdb.banUuid(&griefer, "Griefer", "x");
+        try bdb.banIp("9.9.9.9", "y");
+        try bans_mod.saveBansFile(io, tmp.dir, a, &bdb);
+    }
+    {
+        var wl = bans_mod.Whitelist.init(a);
+        defer wl.deinit();
+        wl.enabled = true;
+        const wlu = testUuid("Alice");
+        try wl.add(&wlu, "Alice");
+        try bans_mod.saveWhitelistFile(io, tmp.dir, a, &wl);
+    }
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer if (srv.perms) |*db| db.deinit();
+    defer if (srv.bans) |*db| db.deinit();
+    defer if (srv.whitelist) |*wl| wl.deinit();
+    srv.list_dir = tmp.dir;
+    // Boot path with no world at all: files are the whole store.
+    srv.loadPerms();
+    srv.banLoad();
+    srv.whitelistLoad();
+    try std.testing.expectEqual(perms_mod.OpLevel.owner, srv.permDb().levelForUuid(&testUuid("Steve")));
+    const griefer = testUuid("Griefer");
+    try std.testing.expect(srv.isUuidBanned(&griefer) != null);
+    // UUID identity is exact: case no longer folds at enforcement (the
+    // old "GRIEFER matches Griefer" behavior died with name keys —
+    // resolution stays case-insensitive, matching does not).
+    const caps = testUuid("GRIEFER");
+    try std.testing.expect(srv.isUuidBanned(&caps) == null);
+    try std.testing.expect(srv.isIpBanned("9.9.9.9"));
+    try std.testing.expect(srv.whitelist != null and srv.whitelist.?.enabled);
+    const wlu = testUuid("Alice");
+    try std.testing.expect(srv.whitelist.?.contains(&wlu));
+    {
+        const raw = try tmp.dir.readFileAlloc(io, perms_mod.ops_file, a, .limited(1 << 20));
+        defer a.free(raw);
+        var back = try perms_mod.decodeJson(a, raw);
+        defer back.db.deinit();
+        try std.testing.expectEqual(perms_mod.OpLevel.owner, back.db.levelForUuid(&testUuid("Steve")));
+    }
+    // Mutations persist to the files (no world writes involved).
+    _ = srv.grantOp("Bob");
+    _ = srv.banName("Mallory", "z");
+    _ = srv.wlAdd("Bob");
+    {
+        const raw = try tmp.dir.readFileAlloc(io, perms_mod.ops_file, a, .limited(1 << 20));
+        defer a.free(raw);
+        var back = try perms_mod.decodeJson(a, raw);
+        defer back.db.deinit();
+        try std.testing.expectEqual(perms_mod.OpLevel.owner, back.db.levelForUuid(&testUuid("Bob")));
+    }
+    // Reload picks up hand edits.
+    {
+        var wl2 = bans_mod.Whitelist.init(a);
+        defer wl2.deinit();
+        wl2.enabled = false;
+        try bans_mod.saveWhitelistFile(io, tmp.dir, a, &wl2);
+        srv.whitelistLoad();
+        try std.testing.expect(!srv.whitelist.?.enabled);
+    }
+}
+
+test "pregen bossbar spawns below feet, updates, destroys on the owner's client" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    // Fake play conn (no sockets: outbox drained directly, like the
+    // help-command tests).
+    const c = try a.create(Conn);
+    defer {
+        c.deinit();
+        a.destroy(c);
+    }
+    c.* = Conn.init(a, io, .{}, 7);
+    c.state = .play;
+    @memcpy(c.username[0.."Hank".len], "Hank");
+    c.username_len = "Hank".len;
+    c.pos_x = 100.5;
+    c.pos_y = 70.0;
+    c.pos_z = 200.5;
+    try srv.registry.append(a, .{ .conn = c, .stream = undefined });
+    // Spawn: 0x0F wither at the owner's feet minus pregen_bar_drop.
+    // Invisibility hides the model but not the wither's per-tick smoke /
+    // armored mobSpell emitters (jar-verified), so the follow point sits
+    // below the view; the camera stays inside the 4.0-tall AABB, which keeps
+    // it frustum-immune (a parked wither feeds no BossStatus — the bar
+    // expires 100 frames after its last render).
+    try std.testing.expect(srv.updateBossBar("hank", 0.5, "Pregeneration 50%", true));
+    {
+        c.lock.lock();
+        const raw = try c.takeOutput();
+        c.lock.unlock();
+        defer a.free(raw);
+        var r = codec.PacketReader.init(raw);
+        const h = try codec.decodeFrame(&r);
+        try std.testing.expectEqual(@as(i32, 0x0F), h.id);
+        try std.testing.expectEqual(@as(i32, -424242), try r.readVarInt());
+        try std.testing.expectEqual(@as(u8, 64), try r.readByte());
+        try std.testing.expectEqual(@as(i32, 3216), try r.readInt()); // 100.5*32
+        const want_y: i32 = @intFromFloat((70.0 - Server.pregen_bar_drop) * 32);
+        try std.testing.expectEqual(want_y, try r.readInt()); // (70-1.8)*32
+        try std.testing.expectEqual(@as(i32, 6416), try r.readInt()); // 200.5*32
+    }
+    // Update: teleport-follow + metadata refresh.
+    try std.testing.expect(srv.updateBossBar("HANK", 1.0, "Pregeneration 100%", false));
+    {
+        c.lock.lock();
+        const raw = try c.takeOutput();
+        c.lock.unlock();
+        defer a.free(raw);
+        var off: usize = 0;
+        var saw_tp = false;
+        var saw_md = false;
+        while (off < raw.len) {
+            var r = codec.PacketReader.init(raw[off..]);
+            const h = try codec.decodeFrame(&r);
+            const flen: usize = @as(usize, @intCast(codec.PacketWriter.varIntLen(h.length))) + @as(usize, @intCast(h.length));
+            if (h.id == 0x18) {
+                saw_tp = true;
+                try std.testing.expectEqual(@as(i32, -424242), try r.readInt());
+                try std.testing.expectEqual(@as(i32, 3216), try r.readInt());
+                const want_ty: i32 = @intFromFloat((70.0 - Server.pregen_bar_drop) * 32);
+                try std.testing.expectEqual(want_ty, try r.readInt());
+            }
+            if (h.id == 0x1C) saw_md = true;
+            off += flen;
+        }
+        try std.testing.expect(saw_tp and saw_md);
+    }
+    // Destroy + offline silence.
+    srv.destroyBossBar("Hank");
+    {
+        c.lock.lock();
+        const raw = try c.takeOutput();
+        c.lock.unlock();
+        defer a.free(raw);
+        var r = codec.PacketReader.init(raw);
+        const h = try codec.decodeFrame(&r);
+        try std.testing.expectEqual(@as(i32, 0x13), h.id);
+        try std.testing.expectEqual(@as(u8, 1), try r.readByte());
+        try std.testing.expectEqual(@as(i32, -424242), try r.readInt());
+    }
+    try std.testing.expect(!srv.updateBossBar("Nobody", 0.5, "x", true));
+    try std.testing.expect(!srv.updateBossBar("", 0.5, "x", true));
+}
+
+test "cactus contact: point detection incl. chunk borders" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+        try pool.flushAll();
+    }
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 1, 0);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+        try pool.flushAll();
+    }
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, -1, -1);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+        try pool.flushAll();
+    }
+    _ = try view.applyBlock(pool, a, 8, 63, 8, game_ids.sand, 0);
+    _ = try view.applyBlock(pool, a, 8, 64, 8, game_ids.cactus, 0);
+    // Chunk-border cactus (x=15/16 seam) + negative coords.
+    _ = try view.applyBlock(pool, a, 16, 63, 8, game_ids.sand, 0);
+    _ = try view.applyBlock(pool, a, 16, 64, 8, game_ids.cactus, 0);
+    _ = try view.applyBlock(pool, a, -5, 63, -3, game_ids.sand, 0);
+    _ = try view.applyBlock(pool, a, -5, 64, -3, game_ids.cactus, 0);
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    srv.world = pool;
+    try std.testing.expect(srv.touchesCactus(pool, 8.5, 64.0, 8.5));
+    try std.testing.expect(srv.touchesCactus(pool, 8.8, 64.0, 8.5));
+    try std.testing.expect(!srv.touchesCactus(pool, 4.5, 64.0, 8.5));
+    try std.testing.expect(srv.touchesCactus(pool, 16.5, 64.0, 8.5));
+    try std.testing.expect(srv.touchesCactus(pool, 15.8, 64.0, 8.5));
+    try std.testing.expect(srv.touchesCactus(pool, -4.5, 64.0, -2.5));
+}
+
+test "cactus contact: segment sweep catches crossings between 1Hz samples" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+        try pool.flushAll();
+    }
+    _ = try view.applyBlock(pool, a, 8, 63, 8, game_ids.sand, 0);
+    _ = try view.applyBlock(pool, a, 8, 64, 8, game_ids.cactus, 0);
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    srv.world = pool;
+    // Walk-through in one tick (sprint covers ~5 blocks/tick; a cactus
+    // cell takes ~0.2s): the point checks at both ends miss, the sweep hits.
+    try std.testing.expect(!srv.touchesCactus(pool, 6.5, 64.0, 8.5));
+    try std.testing.expect(!srv.touchesCactus(pool, 10.5, 64.0, 8.5));
+    try std.testing.expect(srv.segmentTouchesCactus(pool, 6.5, 64.0, 8.5, 10.5, 64.0, 8.5));
+    // A parallel lane that never overlaps stays clean.
+    try std.testing.expect(!srv.segmentTouchesCactus(pool, 6.5, 64.0, 4.5, 10.5, 64.0, 4.5));
+    // Standing still degenerates to the point check.
+    try std.testing.expect(srv.segmentTouchesCactus(pool, 8.5, 64.0, 8.5, 8.5, 64.0, 8.5));
+    try std.testing.expect(!srv.segmentTouchesCactus(pool, 4.5, 64.0, 8.5, 4.5, 64.0, 8.5));
+    // Teleport-length segments fall back to the endpoint (no mid-way hit).
+    try std.testing.expect(!srv.segmentTouchesCactus(pool, 4.5, 64.0, 4.5, 100.5, 64.0, 100.5));
+}
+
+test "hazard bbox spans every adopted position since the last sample" {
+    const a = std.testing.allocator;
+    var c = Conn.init(a, std.testing.io, .{ .gamemode = .survival }, 7);
+    defer c.deinit();
+    c.state = .play;
+    c.baseline_sent = true; // hazard tracking is post-join (pre-burst moves don't adopt)
+    // First sample initializes the box; movement expands it both ways.
+    c.setPos(8.5, 64.0, 8.5, 0, 0, true);
+    c.haz_min_x = c.pos_x;
+    c.haz_min_y = c.pos_y;
+    c.haz_min_z = c.pos_z;
+    c.haz_max_x = c.pos_x;
+    c.haz_max_y = c.pos_y;
+    c.haz_max_z = c.pos_z;
+    c.haz_set = true;
+    c.setPos(10.5, 64.0, 8.5, 0, 0, true);
+    c.setPos(6.5, 63.5, 8.5, 0, 0, true);
+    try std.testing.expectEqual(@as(f64, 6.5), c.haz_min_x);
+    try std.testing.expectEqual(@as(f64, 63.5), c.haz_min_y);
+    try std.testing.expectEqual(@as(f64, 10.5), c.haz_max_x);
+    try std.testing.expectEqual(@as(f64, 64.0), c.haz_max_y);
+}
+
+test "break-drop toss: vanilla motion ranges on a dedicated stream" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    // Jar `xk` EntityItem ctor: XZ in [-0.1, 0.1], Y exactly 0.2.
+    var i: usize = 0;
+    while (i < 16) : (i += 1) {
+        const m = srv.tossPopMotion();
+        try std.testing.expect(m[0] >= -0.1 and m[0] <= 0.1);
+        try std.testing.expectEqual(@as(f64, 0.2), m[1]);
+        try std.testing.expect(m[2] >= -0.1 and m[2] <= 0.1);
+    }
+    // Deterministic per fixed seed, and independent of the drop stream:
+    // draining toss draws never advances drop_rand (goldens stay stable,
+    // no worldgen info leaks through scatter — no randar).
+    try std.testing.expect(srv.drop_rand == null);
+    _ = srv.nextToss();
+    try std.testing.expect(srv.toss_rand != null);
+    try std.testing.expect(srv.drop_rand == null);
+}
+
+test "break drops spawn inside the cell with toss motion" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    defer {
+        for (srv.items.items) |*it| {
+            var s: ?item_mod.Stack = it.stack;
+            item_mod.freeStack(a, &s);
+        }
+        srv.items.deinit(a);
+    }
+    srv.spawnBreakDrops(8, 64, 8, game_ids.stone, 0);
+    try std.testing.expectEqual(@as(usize, 1), srv.items.items.len);
+    const it = srv.items.items[0];
+    // Inside the broken cell (vanilla dropBlockAsItem_do), not the ground.
+    try std.testing.expect(it.x >= 8.15 and it.x <= 8.85);
+    try std.testing.expect(it.y >= 64.15 and it.y <= 64.85);
+    try std.testing.expect(it.z >= 8.15 and it.z <= 8.85);
+    // Vanilla EntityItem pop (jar `xk`), from the toss stream.
+    try std.testing.expect(it.vx >= -0.1 and it.vx <= 0.1);
+    try std.testing.expectEqual(@as(f64, 0.2), it.vy);
+    try std.testing.expect(it.vz >= -0.1 and it.vz <= 0.1);
+    try std.testing.expectEqual(@as(u32, 10), it.delay);
+}
+
+test "breaking support re-arms settled drops above it" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    defer {
+        for (srv.items.items) |*it| {
+            var s: ?item_mod.Stack = it.stack;
+            item_mod.freeStack(a, &s);
+        }
+        srv.items.deinit(a);
+    }
+    const mk = struct {
+        fn stack(id: game_ids.Id) item_mod.Stack {
+            return .{ .id = id, .count = 1, .damage = 0, .nbt = null };
+        }
+    }.stack;
+    // Resting on top of where (8,64,8) was; mid-air tossed one; one below.
+    srv.items.append(a, .{ .id = 1, .x = 8.5, .y = 65.125, .z = 8.5, .stack = mk(game_ids.dirt) }) catch unreachable;
+    srv.items.append(a, .{ .id = 2, .x = 8.5, .y = 66.0, .z = 8.5, .vx = 0.1, .vy = 0.1, .vz = 0, .stack = mk(game_ids.dirt) }) catch unreachable;
+    srv.items.append(a, .{ .id = 3, .x = 8.5, .y = 60.0, .z = 8.5, .stack = mk(game_ids.dirt) }) catch unreachable;
+    srv.wakeItemsAbove(8, 64, 8);
+    // The rested one re-arms (integration will drop it); the live one and
+    // the one below the break are untouched.
+    try std.testing.expectEqual(@as(f64, -0.05), srv.items.items[0].vy);
+    try std.testing.expectEqual(@as(f64, 0), srv.items.items[0].vx);
+    try std.testing.expectEqual(@as(f64, 0.1), srv.items.items[1].vx);
+    try std.testing.expectEqual(@as(f64, 0.1), srv.items.items[1].vy);
+    try std.testing.expectEqual(@as(f64, 0), srv.items.items[2].vx);
+    try std.testing.expectEqual(@as(f64, 0), srv.items.items[2].vy);
+}
+
+test "tossed item arcs and settles on the ground" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+        try pool.flushAll();
+    }
+    // Flat stone floor at y=63.
+    var x: i32 = 0;
+    while (x < 16) : (x += 1) {
+        var z: i32 = 0;
+        while (z < 16) : (z += 1) {
+            _ = try view.applyBlock(pool, a, x, 63, z, game_ids.stone, 0);
+        }
+    }
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    srv.world = pool;
+    var it = entity.ItemEnt{
+        .id = 1,
+        .x = 8.5,
+        .y = 64.6,
+        .z = 8.5,
+        .stack = .{ .id = game_ids.dirt, .count = 1, .damage = 0, .nbt = null },
+        .delay = 10,
+        .vx = 0.1,
+        .vy = 0.2,
+        .vz = -0.05,
+    };
+    // The 0.2 pop lands within a tick or two (20 substeps each); the
+    // bounce decays below the settle threshold quickly.
+    var n: usize = 0;
+    while ((it.vx != 0 or it.vy != 0 or it.vz != 0) and n < 10) : (n += 1) {
+        try srv.integrateItemToss(pool, &it);
+    }
+    try std.testing.expect(n < 10);
+    try std.testing.expectApproxEqAbs(@as(f64, 64.125), it.y, 1e-6);
+    try std.testing.expect(it.x != 8.5); // thrown, not static
+    try std.testing.expectEqual(@as(f64, 0), it.vx);
+    try std.testing.expectEqual(@as(f64, 0), it.vy);
+    try std.testing.expectEqual(@as(f64, 0), it.vz);
+    var s: ?item_mod.Stack = it.stack;
+    item_mod.freeStack(a, &s);
+}
+
+test "tossed item tracks the landing column across a cliff edge" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+        try pool.flushAll();
+    }
+    // Step cliff: floor 63 west of x=8, floor 60 east of it.
+    var x: i32 = 0;
+    while (x < 16) : (x += 1) {
+        var z: i32 = 0;
+        while (z < 16) : (z += 1) {
+            _ = try view.applyBlock(pool, a, x, if (x < 8) 63 else 60, z, game_ids.stone, 0);
+        }
+    }
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    srv.world = pool;
+    var it = entity.ItemEnt{
+        .id = 1,
+        .x = 7.5,
+        .y = 64.6,
+        .z = 8.5,
+        .stack = .{ .id = game_ids.dirt, .count = 1, .damage = 0, .nbt = null },
+        .delay = 10,
+        .vx = 0.3,
+        .vy = 0.2,
+        .vz = 0.0,
+    };
+    var n: usize = 0;
+    while ((it.vx != 0 or it.vy != 0 or it.vz != 0) and n < 10) : (n += 1) {
+        try srv.integrateItemToss(pool, &it);
+    }
+    try std.testing.expect(n < 10);
+    // East of the edge on the LOW floor: a stale start-column height
+    // would park it floating at 64.125 (the client's sim lands it below,
+    // and the 1Hz correction reads as a mid-air teleport).
+    try std.testing.expect(it.x > 8.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 61.125), it.y, 1e-6);
+    var s: ?item_mod.Stack = it.stack;
+    item_mod.freeStack(a, &s);
+}
+
+test "tossed item stops at a wall instead of embedding" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+        try pool.flushAll();
+    }
+    // Flat floor 63 plus a full-height wall column at x=10.
+    var x: i32 = 0;
+    while (x < 16) : (x += 1) {
+        var z: i32 = 0;
+        while (z < 16) : (z += 1) {
+            _ = try view.applyBlock(pool, a, x, 63, z, game_ids.stone, 0);
+        }
+    }
+    var y: i32 = 64;
+    while (y < 70) : (y += 1) {
+        _ = try view.applyBlock(pool, a, 10, @intCast(y), 8, game_ids.stone, 0);
+    }
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    srv.world = pool;
+    var it = entity.ItemEnt{
+        .id = 1,
+        .x = 8.5,
+        .y = 64.6,
+        .z = 8.5,
+        .stack = .{ .id = game_ids.dirt, .count = 1, .damage = 0, .nbt = null },
+        .delay = 10,
+        .vx = 0.3,
+        .vy = 0.2,
+        .vz = 0.0,
+    };
+    var n: usize = 0;
+    while ((it.vx != 0 or it.vy != 0 or it.vz != 0) and n < 10) : (n += 1) {
+        try srv.integrateItemToss(pool, &it);
+    }
+    try std.testing.expect(n < 10);
+    // Stopped at the wall face and settled on the floor west of it —
+    // never inside the rock column, never floating above it.
+    try std.testing.expect(it.x < 10.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 64.125), it.y, 1e-6);
+    var s: ?item_mod.Stack = it.stack;
+    item_mod.freeStack(a, &s);
+}
+
+
+
+
+

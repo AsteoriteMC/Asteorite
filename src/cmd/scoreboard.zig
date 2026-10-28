@@ -111,10 +111,8 @@ fn playersCmd(srv: anytype, sender: anytype, args: [][]const u8, out: []u8) []co
     }
     if (std.mem.eql(u8, args[0], "reset")) {
         if (args.len != 2) return u_pla_reset;
-        var target: [16]u8 = undefined;
-        const t = srv.resolvePlayerName(sender, args[1], &target) orelse {
-            return "That player cannot be found";
-        };
+        var target: [cmd.max_name_len]u8 = undefined;
+        const t = cmd.resolveTarget(srv, sender, args[1], &target) orelse return cmd.unknown_player;
         srv.sbResetScores(t);
         const msg = std.fmt.bufPrint(out, "Reset all scores of player {s}", .{t}) catch "Reset scores";
         srv.notifyAdmins(sender, &def, msg);
@@ -125,10 +123,8 @@ fn playersCmd(srv: anytype, sender: anytype, args: [][]const u8, out: []u8) []co
         const is_add = std.mem.eql(u8, args[0], "add");
         const usage = if (is_set) u_pla_set else if (is_add) u_pla_add else u_pla_remove;
         if (args.len != 4) return usage;
-        var target: [16]u8 = undefined;
-        const t = srv.resolvePlayerName(sender, args[1], &target) orelse {
-            return "That player cannot be found";
-        };
+        var target: [cmd.max_name_len]u8 = undefined;
+        const t = cmd.resolveTarget(srv, sender, args[1], &target) orelse return cmd.unknown_player;
         const v = std.fmt.parseInt(i32, args[3], 10) catch return usage;
         if (is_set) {
             switch (srv.sbSetScore(t, args[2], v)) {
@@ -154,7 +150,7 @@ fn playersCmd(srv: anytype, sender: anytype, args: [][]const u8, out: []u8) []co
 }
 
 fn playersListAll(srv: anytype, out: []u8) []const u8 {
-    var names: [64][16]u8 = undefined;
+    var names: [64][cmd.max_name_len]u8 = undefined;
     const n = srv.sbTrackedPlayers(&names);
     var ow: usize = 0;
     ow += (std.fmt.bufPrint(out[ow..], "Showing {d} tracked players on the scoreboard:", .{n}) catch return out[0..ow]).len;
@@ -180,7 +176,7 @@ fn playersListOne(srv: anytype, name: []const u8, out: []u8) []const u8 {
     return out[0..ow];
 }
 
-const srv_mod = @import("../sim/scoreboard.zig");
+const srv_mod = @import("../sim/player/scoreboard.zig");
 
 fn teams(srv: anytype, sender: anytype, args: [][]const u8, out: []u8) []const u8 {
     if (args.len == 0) return u_teams;
@@ -232,12 +228,10 @@ fn teams(srv: anytype, sender: anytype, args: [][]const u8, out: []u8) []const u
     }
     if (std.mem.eql(u8, args[0], "join")) {
         if (args.len < 2 or args.len > 3) return u_team_join;
-        var target: [16]u8 = undefined;
+        var target: [cmd.max_name_len]u8 = undefined;
         var t: []const u8 = "";
         if (args.len == 3) {
-            t = srv.resolvePlayerName(sender, args[2], &target) orelse {
-                return "That player cannot be found";
-            };
+            t = cmd.resolveTarget(srv, sender, args[2], &target) orelse return cmd.unknown_player;
         } else {
             if (sender == null) return u_team_join;
             const self_name = cmd.senderName(sender, &target);
@@ -254,12 +248,10 @@ fn teams(srv: anytype, sender: anytype, args: [][]const u8, out: []u8) []const u
     }
     if (std.mem.eql(u8, args[0], "leave")) {
         if (args.len > 2) return u_team_leave;
-        var target: [16]u8 = undefined;
+        var target: [cmd.max_name_len]u8 = undefined;
         var t: []const u8 = "";
         if (args.len == 2) {
-            t = srv.resolvePlayerName(sender, args[1], &target) orelse {
-                return "That player cannot be found";
-            };
+            t = cmd.resolveTarget(srv, sender, args[1], &target) orelse return cmd.unknown_player;
         } else {
             if (sender == null) return u_team_leave;
             const self_name = cmd.senderName(sender, &target);

@@ -22,10 +22,8 @@ pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u
     var toks: [6][]const u8 = undefined;
     const n = cmd.Spec.tokenize(args, &toks);
     if (n < 2 or n > 5) return cmd.usageError(&def, out);
-    var target: [16]u8 = undefined;
-    const t = srv.resolvePlayerName(sender, toks[0], &target) orelse {
-        return "That player cannot be found";
-    };
+    var target: [cmd.max_name_len]u8 = undefined;
+    const t = cmd.resolveTarget(srv, sender, toks[0], &target) orelse return cmd.unknown_player;
     // Item by name (canonical snake_case) or numeric id (vanilla warns).
     var numeric = false;
     const wire_id: u16 = blk: {
@@ -63,9 +61,6 @@ pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u
     }
     if (numeric) {
         // Vanilla deprecation warning (separate message, then the success).
-        var who: [16]u8 = undefined;
-        const nm = cmd.senderName(sender, &who);
-        _ = nm;
         srv.sendDirect(sender, std.fmt.bufPrint(out, "Warning: Using numeric IDs will not be supported in the future. Please use names, such as '{s}'", .{srv.itemName(id)}) catch "Warning: numeric IDs are deprecated");
     }
     const r = srv.giveItems(t, id, count, damage) orelse {

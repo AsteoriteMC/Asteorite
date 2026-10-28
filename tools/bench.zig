@@ -548,9 +548,13 @@ fn benchStore(allocator: std.mem.Allocator, io: std.Io) !void {
         std.debug.print("    compaction throughput: {d} MiB in {d} ms\n", .{ mb, dt_compact / 1_000_000 });
     }
 
-    // NVMe path: same dataset through the io_uring ring (fixed files +
-    // registered buffers) vs plain pread. Gets repeat to make the
-    // difference measurable; the counters prove which road was taken.
+    // NVMe store for comparison: same dataset with use_uring_io set.
+    // NOTE (optimistic-get split): both loops below go through the
+    // unlocked pread path — without lock contention nothing falls back
+    // to getLocked, so the ring stays idle (counters prove it: expect
+    // ring reads 0, fallback reads 0). This section now compares store
+    // configs, not I/O roads; the ring-vs-pread proof lives in the
+    // getLocked unit tests (ring counters advance only there).
     var tmp_ring = try std.Io.Dir.cwd().createDirPathOpen(io, "/tmp/opencode/bench-store-ring", .{});
     defer tmp_ring.close(io);
     var ring_st = try store_mod.Store.open(allocator, io, tmp_ring, .{
@@ -575,8 +579,8 @@ fn benchStore(allocator: std.mem.Allocator, io: std.Io) !void {
     const dt_ring = nowNs(io) - t3;
     const rs = ring_st.ringStats();
     if (ring_st.ringActive()) {
-        report("lsm get via ring (fixed+regbuf)", reps * keys.len, dt_ring);
-        std.debug.print("    ring reads: {d}, fallback reads: {d}\n", .{ rs.ring_reads, rs.fallback_reads });
+        report("lsm get (uring-configured store, optimistic pread)", reps * keys.len, dt_ring);
+        std.debug.print("    ring reads: {d}, fallback reads: {d} (both 0 expected: no contention, no fallback)\n", .{ rs.ring_reads, rs.fallback_reads });
     } else {
         std.debug.print("    (no io_uring in this environment — ring path skipped)\n", .{});
     }
@@ -594,7 +598,7 @@ fn benchStore(allocator: std.mem.Allocator, io: std.Io) !void {
         }
     }
     const dt_plain = nowNs(io) - t4;
-    report("lsm get via pread (plain)", reps * keys.len, dt_plain);
+    report("lsm get (plain store, optimistic pread)", reps * keys.len, dt_plain);
     if (plain_hits != reps * keys.len) std.debug.print("    (missing hits!)\n", .{});
 }
 

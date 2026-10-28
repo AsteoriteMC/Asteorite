@@ -33,7 +33,7 @@ pub const Overload = spec_mod.Overload;
 pub const Value = spec_mod.Value;
 
 /// Static command metadata. Field types intentionally match
-/// `sim/permissions.zig`'s registry entry so defs plug straight into the
+/// `sim/player/permissions.zig`'s registry entry so defs plug straight into the
 /// permission matrix with no conversion.
 ///
 /// `usage` is DERIVED, never written by hand: `define()` renders it from
@@ -71,6 +71,12 @@ pub const Command = struct {
     }
 };
 
+/// Comptime single-word check shared by command names + aliases.
+fn checkWord(comptime what: []const u8, comptime s: []const u8) void {
+    if (s.len == 0) @compileError(what ++ " must not be empty");
+    if (std.mem.indexOfAny(u8, s, " /") != null) @compileError(what ++ " must be a single word");
+}
+
 /// Builder: validates the definition at comptime and renders `usage` from
 /// the spec. The explicit `comptime` block matters: bare `if` +
 /// `@compileError` mis-evaluates `indexOfAny` on 0.16 (fires for clean
@@ -79,11 +85,9 @@ pub fn define(comptime d: anytype) Command {
     const aliases: []const []const u8 = if (@hasField(@TypeOf(d), "aliases")) d.aliases else &.{};
     const usage_override: ?[]const u8 = if (@hasField(@TypeOf(d), "usage_override")) d.usage_override else null;
     comptime {
-        if (d.name.len == 0) @compileError("command name must not be empty");
-        if (std.mem.indexOfAny(u8, d.name, " /") != null) @compileError("command name must be a single word");
+        checkWord("command name", d.name);
         for (aliases) |a| {
-            if (a.len == 0) @compileError("command alias must not be empty");
-            if (std.mem.indexOfAny(u8, a, " /") != null) @compileError("command alias must be a single word");
+            checkWord("command alias", a);
             if (std.mem.eql(u8, a, d.name)) @compileError("alias must differ from the command name");
         }
         if (!std.mem.startsWith(u8, d.node, "asteorite.command.")) @compileError("command node must live under asteorite.command.");
@@ -137,29 +141,20 @@ fn comptimeSlots(comptime over: spec_mod.Overload) []const u8 {
     return out;
 }
 
-/// One slot rendered at comptime (mirrors spec.renderSlot).
+/// One slot rendered at comptime (mirrors spec.renderSlot: same
+/// display/optional/choice rules, `++` concatenation instead of bufPrint).
 fn comptimeSlot(comptime slot: spec_mod.Slot) []const u8 {
-    if (slot.display) |disp| {
-        if (slot.optional) return "[" ++ disp ++ "]";
-        return disp;
-    }
-    const inner = switch (slot.arg) {
+    const inner = if (slot.display) |disp| disp else switch (slot.arg) {
         .literal => |lit| lit,
         .player => "<player>",
         .word => "<text>",
         .rest => "<message ...>",
-        .int_range => "<number>",
-        .float_range => "<number>",
-        .coord => "<number>",
+        .int_range, .float_range, .coord => "<number>",
         .boolean => "<true|false>",
         .choice => |opts| comptimeChoices(opts),
     };
-    if (slot.arg == .literal) {
-        if (slot.optional) return "[" ++ inner ++ "]";
-        return inner;
-    }
+    if (!slot.optional and slot.arg == .choice) return "<" ++ inner ++ ">";
     if (slot.optional) return "[" ++ inner ++ "]";
-    if (slot.arg == .choice) return "<" ++ inner ++ ">";
     return inner;
 }
 
@@ -194,17 +189,10 @@ pub fn matches(cmd: *const Command, word: []const u8) bool {
 }
 
 /// Split args on spaces, skipping empties, up to `out.len` tokens.
-/// Returns the token count.
+/// Returns the token count. (Single home is Spec.tokenize; every command
+/// calls that directly. This alias keeps the framework test local.)
 pub fn splitArgs(args: []const u8, out: [][]const u8) usize {
-    var n: usize = 0;
-    var it = std.mem.splitScalar(u8, args, ' ');
-    while (it.next()) |tok| {
-        if (tok.len == 0) continue;
-        if (n >= out.len) break;
-        out[n] = tok;
-        n += 1;
-    }
-    return n;
+    return spec_mod.tokenize(args, out);
 }
 
 /// First whitespace-separated token, or null when blank.
@@ -215,10 +203,24 @@ pub fn firstArg(args: []const u8) ?[]const u8 {
     return args[0..end];
 }
 
+/// Login-name cap (mirrors the login gate; local literal keeps cmd
+/// free of net/sim imports — see the module docs).
+pub const max_name_len: usize = 16;
+
+/// Vanilla "player not found" reply (one spelling across commands).
+pub const unknown_player: []const u8 = "That player cannot be found";
+
+/// Resolve a player token to its login name (selectors included).
+/// Null when vanilla would reply unknown_player — the caller returns
+/// that const. `target` is a `[max_name_len]u8` scratch buffer.
+pub fn resolveTarget(srv: anytype, sender: anytype, tok: []const u8, target: *[max_name_len]u8) ?[]const u8 {
+    return srv.resolvePlayerName(sender, tok, target);
+}
+
 /// Sender's login name ("" for console). Backend-agnostic: only needs
 /// `lock`, `username`, `username_len` like today's Conn. Accepts both
 /// `?*Conn` and `*Conn`.
-pub fn senderName(sender: anytype, out: *[16]u8) []const u8 {
+pub fn senderName(sender: anytype, out: *[max_name_len]u8) []const u8 {
     const c = switch (@typeInfo(@TypeOf(sender))) {
         .optional => sender orelse return "",
         else => sender,

@@ -16,6 +16,7 @@ const biome = @import("biome.zig");
 const surface = @import("surface.zig");
 const ids = @import("../../ids.zig");
 const wire = @import("../../proto/v5/wire_ids.zig");
+const mapgen_mod = @import("struct/mapgen.zig");
 
 pub const SEA_LEVEL: i32 = 63;
 pub const Q_LEN: usize = 5 * 33 * 5;
@@ -131,8 +132,12 @@ pub const Shaper = struct {
                 var bf3: f32 = 0;
                 const center_am = bam[i + 2 + (j + 2) * 10];
                 for (0..5) |di| {
+                    const ii = i + di;
                     for (0..5) |dj| {
-                        const bi = (i + di) + (j + dj) * 10;
+                        // Row bases hoisted: (j+dj)*10 and dj*5 are
+                        // dj-loop invariants (small non-negative ints).
+                        const brow = (j + dj) * 10;
+                        const bi = ii + brow;
                         var f4 = bam[bi];
                         var f5 = ban[bi];
                         if (self.amplified and f4 > 0.0) {
@@ -140,7 +145,7 @@ pub const Shaper = struct {
                             f5 = 1.0 + f5 * 4.0;
                         }
                         var f6 = self.par_w[di + dj * 5] / (f4 + 2.0);
-                        if (bam[bi] > center_am) f6 /= 2.0;
+                        if (bam[bi] > center_am) f6 *= 0.5;
                         bf += f5 * f6;
                         bf2 += f4 * f6;
                         bf3 += f6;
@@ -149,33 +154,36 @@ pub const Shaper = struct {
                 bf /= bf3;
                 bf2 /= bf3;
                 bf = bf * 0.9 + 0.1;
-                bf2 = (bf2 * 4.0 - 1.0) / 8.0;
+                bf2 = (bf2 * 4.0 - 1.0) * 0.125;
                 var d6 = g[n5] / 8000.0;
                 if (d6 < 0.0) d6 = -d6 * 0.3;
                 d6 = d6 * 3.0 - 2.0;
                 if (d6 < 0.0) {
-                    d6 /= 2.0;
+                    d6 *= 0.5;
                     if (d6 < -1.0) d6 = -1.0;
                     d6 /= 1.4;
-                    d6 /= 2.0;
+                    d6 *= 0.5;
                 } else {
                     if (d6 > 1.0) d6 = 1.0;
-                    d6 /= 8.0;
+                    d6 *= 0.125;
                 }
                 n5 += 1;
                 var d7: f64 = @as(f64, bf2) + d6 * 0.2;
-                d7 = d7 * 8.5 / 8.0;
+                d7 = d7 * 8.5 * 0.125;
                 const d8: f64 = bf;
                 const d9 = 8.5 + d7 * 4.0;
                 for (0..33) |y| {
                     const yf: f64 = @floatFromInt(y);
-                    var d10 = (yf - d9) * 12.0 * 128.0 / 256.0 / d8;
+                    // /256.0 and /512.0 are exact power-of-two scales, folded
+                    // to multiplies; /10.0 and /d8 stay (not powers of two).
+                    // /2.0 likewise exact. Rounding of the chain unchanged.
+                    var d10 = (yf - d9) * 12.0 * 128.0 * (1.0 / 256.0) / d8;
                     if (d10 < 0.0) d10 *= 4.0;
-                    const d11 = e[n4] / 512.0;
-                    const d12 = f[n4] / 512.0;
-                    const d13 = (dd[n4] / 10.0 + 1.0) / 2.0;
+                    const d11 = e[n4] * 0.001953125;
+                    const d12 = f[n4] * 0.001953125;
+                    const d13 = (dd[n4] / 10.0 + 1.0) * 0.5;
                     // NOTE: qh.b = clamped lerp (verified CFR).
-                    const lerped = if (d13 < 0.0) d11 else if (d13 > 1.0) d12 else d11 + (d12 - d11) * d13;
+                    const lerped = noise.clampLerp(d11, d12, d13);
                     var d14 = lerped - d10;
                     if (y > 29) {
                         // NOTE: (float)(y-29)/3.0f in f32, then widened.
@@ -213,10 +221,16 @@ pub const Shaper = struct {
                         var d12 = d3;
                         const d13 = (d4 - d2) * 0.25;
                         const d14 = (d5 - d3) * 0.25;
+                        // y hoisted out of the fx/fz loops (loop-invariant);
+                        // n10 base (x/z-field bits) hoisted out of fx, x bits
+                        // (fx<<12) added per fx — bit fields are disjoint so
+                        // OR == +, identical index values, all non-negative.
+                        const y: i32 = @intCast(cy * 8 + fy);
+                        const n10zb: i32 = @as(i32, @intCast(((i * 4) << 12) | ((j * 4) << 8) | @as(usize, @intCast(y))));
                         for (0..4) |fx| {
                             // NOTE: x<<12 | z<<8 | y with z = j*4 (+fz stride).
                             // Signed index: base can be < 256 (vanilla int wraps).
-                            var n10: i32 = @as(i32, @intCast(((fx + i * 4) << 12) | ((j * 4) << 8) | (cy * 8 + fy)));
+                            var n10: i32 = n10zb + @as(i32, @intCast(fx << 12));
                             n10 -= 256;
                             var d16 = d11;
                             const d17 = (d12 - d11) * 0.25;
@@ -225,7 +239,6 @@ pub const Shaper = struct {
                             for (0..4) |_| {
                                 d16 += d17;
                                 n10 += 256;
-                                const y: i32 = @intCast(cy * 8 + fy);
                                 blocks[@as(usize, @intCast(n10))] = if (d16 > 0.0) ids.stone else if (y < SEA_LEVEL) ids.water else ids.air;
                             }
                             d11 += d13;
@@ -254,7 +267,9 @@ pub const Shaper = struct {
         defer scratch.free(bio);
         try self.chain.getInts(scratch, self.roots[1], cx * 16, cz * 16, 16, 16, bio);
         var r = java_random.JavaRandom.init(0);
-        r.setSeed(@as(i64, cx) *% 341873128712 +% @as(i64, cz) *% 132897987541);
+        // Surface rand mixes chunk coords only (no world seed — vanilla).
+        // Salts shared with MapGen chunkRand (see struct/mapgen.zig).
+        r.setSeed(@as(i64, cx) *% mapgen_mod.chunk_rand_mul_x +% @as(i64, cz) *% mapgen_mod.chunk_rand_mul_z);
         for (0..16) |i| {
             for (0..16) |j| {
                 const bio_id = bio[j + i * 16];

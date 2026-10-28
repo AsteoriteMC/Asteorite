@@ -56,17 +56,45 @@ pub fn buildColumn(
     temp_eval: *const TempEval,
 ) void {
     const stride: usize = 256;
+    // Column base hoisted out of the 256-deep y-walk (non-negative, exact).
+    const col: usize = (lz * 16 + lx) * stride;
     var top: ids.Id = biome.TOP256[@as(usize, @intCast(bio_id))];
     var top_meta: u8 = biome.TOPMETA256[@as(usize, @intCast(bio_id))];
     var filler: ids.Id = biome.FILLER256[@as(usize, @intCast(bio_id))];
     var filler_depth: i32 = -1;
     // NOTE: (int) truncation toward zero, not floor.
-    const depth: i32 = @intFromFloat(stone_noise / 3.0 + 3.0 + rand.nextDouble() * 0.25);
+    // Bulk two-draw double: bit-identical to nextDouble (A2/C2 affine form).
+    const depth: i32 = @intFromFloat(stone_noise / 3.0 + 3.0 + rand.nextDoubleFast() * 0.25);
     const bio_temp = biome.TEMPF256[@as(usize, @intCast(bio_id))];
+    // Bulk r5 path: filler can never be sand here (initial FILLER != sand,
+    // and filler only transitions to stone/air/sandstone, never TO sand),
+    // so the conditional nextIntBound(4) below never fires. All 256 r5
+    // draws are consecutive rejection-free nextIntBound(5) steps
+    // (4-(r%5)>=0, never rejects), precomputed via parallel affine jumps.
+    // Sand-filler columns keep the serial reference path (r4 interleaves).
+    const bulk_ok = (filler != ids.sand);
+    var r5_buf: [256]i32 = undefined;
+    if (bulk_ok) {
+        var done: usize = 0;
+        while (done < 256) {
+            var seeds: [8]u64 = undefined;
+            rand.fillSeeds(seeds[0..8]);
+            for (seeds, 0..) |s, k| {
+                const r: u32 = @intCast(s >> 17);
+                r5_buf[done + k] = @intCast(r % 5);
+            }
+            done += 8;
+        }
+    }
     var y: i32 = 255;
+    var r5_pos: usize = 0;
     while (y >= 0) : (y -= 1) {
-        const idx = (lz * 16 + lx) * stride + @as(usize, @intCast(y));
-        const r5: i32 = rand.nextIntBound(5) catch unreachable;
+        const idx = col + @as(usize, @intCast(y));
+        const r5: i32 = if (bulk_ok) blk: {
+            const v = r5_buf[r5_pos];
+            r5_pos += 1;
+            break :blk v;
+        } else rand.nextIntBound(5) catch unreachable;
         if (y <= 0 + r5) {
             blocks[idx] = ids.bedrock;
             continue;
@@ -206,8 +234,21 @@ pub const MesaState = struct {
     /// decompile mislabels it as z). n4 from the g simplex on X only.
     fn band(self: *const MesaState, wx: i32, y: i32, wz: i32) u8 {
         _ = wz;
-        const n4: i32 = @intFromFloat(@floor(self.g_stack.eval(@as(f64, @floatFromInt(wx)) / 512.0, @as(f64, @floatFromInt(wx)) / 512.0) * 2.0 + 0.5));
-    // NOTE: Java Math.round(double) == (long)floor(a + 0.5), verified exact.
+        return self.bandN(bandN4(self, wx), y);
+    }
+
+    /// wx-only half of band(): the g-simplex eval + round. Hoisted per
+    /// column by mesaBuildColumn (eval is pure in wx — same bits).
+    fn bandN4(self: *const MesaState, wx: i32) i32 {
+        // /512.0 is an exact power-of-two scale: `* 0.001953125` is
+        // bit-identical (same pattern as the bryce e/f evals below).
+        const gx = @as(f64, @floatFromInt(wx)) * 0.001953125;
+        return @intFromFloat(@floor(self.g_stack.eval(gx, gx) * 2.0 + 0.5));
+    }
+
+    /// Band lookup with a precomputed n4 (same index math as band()).
+    fn bandN(self: *const MesaState, n4: i32, y: i32) u8 {
+        // NOTE: Java Math.round(double) == (long)floor(a + 0.5), verified exact.
         const idx = @mod(y + n4 + 64, 64);
         return self.layers[@as(usize, @intCast(idx))];
     }
@@ -229,6 +270,9 @@ pub fn mesaBuildColumn(
     has_forest_cap: bool,
 ) void {
     const stride: usize = 256;
+    const col: usize = (lz * 16 + lx) * stride;
+    // Band base (wx-only simplex eval) hoisted out of the y-walk.
+    const bn4: i32 = MesaState.bandN4(mesa, wx);
     var d2: f64 = 0.0;
     if (is_bryce) {
         const n4: i32 = (wx & -16) + (wz & 15);
@@ -249,11 +293,12 @@ pub fn mesaBuildColumn(
     // NOTE: method-scoped in vanilla (set in the surface block, read by
     // later subsurface rows of the same column).
     var bl2 = false;
-    const depth: i32 = @intFromFloat(stone_noise / 3.0 + 3.0 + rand.nextDouble() * 0.25);
+    // Bulk two-draw double: bit-identical to nextDouble (A2/C2 affine form).
+    const depth: i32 = @intFromFloat(stone_noise / 3.0 + 3.0 + rand.nextDoubleFast() * 0.25);
     const bl: bool = @cos(stone_noise / 3.0 * std.math.pi) > 0.0;
     var y: i32 = 255;
     while (y >= 0) : (y -= 1) {
-        const idx = (lz * 16 + lx) * stride + @as(usize, @intCast(y));
+        const idx = col + @as(usize, @intCast(y));
         if (blocks[idx] == ids.air and @as(f64, @floatFromInt(y)) < d2) blocks[idx] = ids.stone;
         const r5: i32 = rand.nextIntBound(5) catch unreachable;
         if (y <= 0 + r5) {
@@ -296,7 +341,7 @@ pub fn mesaBuildColumn(
                     if (y < 64 or y > 127) {
                         n9 = 1;
                     } else if (!bl) {
-                        n9 = mesa.band(wx, y, wz);
+                        n9 = mesa.bandN(bn4, y);
                     }
                     if (n9 < 16) {
                         blocks[idx] = ids.stained_hardened_clay;
@@ -323,7 +368,7 @@ pub fn mesaBuildColumn(
             meta[idx] = 1;
             continue;
         }
-        const n9 = mesa.band(wx, y, wz);
+        const n9 = mesa.bandN(bn4, y);
         if (n9 < 16) {
             blocks[idx] = ids.stained_hardened_clay;
             meta[idx] = n9;

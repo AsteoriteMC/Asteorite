@@ -218,13 +218,13 @@ game-data layers.
 | `src/net/conn.zig` | imports `proto/v5/{ids,packets,slot}` directly; 1.7 login/framing assumptions | import `version.proto`; add compression/login hooks |
 | `src/net/server.zig` | imports packets/ids/wire/v5 worldgen/cmd data; hundreds of semantic packet calls | swap imports to `version.proto`; later canonicalize block APIs |
 | `src/net/status.zig` | defaults now from `profile.meta` | keep only profile-selected defaults; no per-version branches |
-| `src/sim/view.zig` | imports v5 chunk + packet codecs; bulk buffers sized for 1.7 | use `profile.proto.chunks`; profile batch size/scratch |
-| `src/sim/entity.zig` | v5 entity frame functions; raw `u8` mob kinds | use `profile.proto.packets`; canonical mob kind + per-profile ID |
+| `src/sim/world/view.zig` | imports v5 chunk + packet codecs; bulk buffers sized for 1.7 | use `profile.proto.chunks`; profile batch size/scratch |
+| `src/sim/entity/entity.zig` | v5 entity frame functions; raw `u8` mob kinds | use `profile.proto.packets`; canonical mob kind + per-profile ID |
 | `src/world/chunk.zig` | ZC1 canonical storage; Anvil conversion split to `world/import/anvil.zig` in C1 | no proto import in runtime storage |
-| `src/sim/players.zig` | ZPLR v5 stores canonical ids; v3/v4 wire rows decode through `world/import/player.zig` in C1 | keep canonical slots append-only |
+| `src/sim/player/players.zig` | ZPLR v5 stores canonical ids; v3/v4 wire rows decode through `world/import/player.zig` in C1 | keep canonical slots append-only |
 | `src/worldgen/v5/*` | 1.7.10 generator | behind `profile.worldgen`; 1.12 can initially reuse it |
-| `src/sim/{drops,recipes,smelting,furnace,redstone}.zig` | 1.7.10 engines/behavior; recipe/smelting data tables now live in `game/mc5/` | keep engines; move remaining tables to `game` profile modules |
-| `src/sim/scoreboard.zig` | Criteria come from `profile.game.cmd_data` (C0) | replace the transitional re-export when tables move in C6 |
+| `src/sim/world/{drops,recipes,smelting,furnace,redstone}.zig` | 1.7.10 engines/behavior; recipe/smelting data tables now live in `game/mc5/` | keep engines; move remaining tables to `game` profile modules |
+| `src/sim/player/scoreboard.zig` | Criteria come from `profile.game.cmd_data` (C0) | replace the transitional re-export when tables move in C6 |
 | `src/cmd/*`, `src/cmd/spec.zig` | 1.7 command names/IDs | per-profile command data; 1.13+ Brigadier later |
 | `src/main.zig` | hardcodes `asteorite.v5gen` | use `asteorite.worldgen` (selected profile) |
 | `src/ids.zig` | 342 canonical ids, 1.7 universe | append 1.8/1.12 ids; per-profile support sets |
@@ -275,7 +275,7 @@ Dependency rules (code-review gates):
 - `src/proto/*` may import canonical core (`ids`, `item`, read-only
   `world/chunk`) and `proto/model.zig`.
 - Core may import `version.proto` only at delivery boundaries: `net/conn.zig`,
-  `net/server.zig`, `net/status.zig`, `sim/view.zig`, `sim/entity.zig`.
+  `net/server.zig`, `net/status.zig`, `sim/world/view.zig`, `sim/entity/entity.zig`.
 - `src/world/*` must not import a protocol module. Profile-to-profile, Anvil and
   player.dat conversion lives in `world/import/` or tools.
 - `src/sim/*` tick/physics/redstone/recipes code must not import a protocol
@@ -404,7 +404,7 @@ Fuzz this path; it is the main remote attack surface.
 
 ### 7.4 Chunk delivery
 
-`src/sim/view.zig` keeps the version-neutral work: spiral order, holes,
+`src/sim/world/view.zig` keeps the version-neutral work: spiral order, holes,
 sent-set, movement resync, unload diff. The profile owns byte layout and
 batching:
 
@@ -564,8 +564,8 @@ secure profiles/chat signing are a separate workstream.
 > pending. C2 is implemented: redstone reads the profile `BlockDef` table and
 > `RedstoneRules`, and the server/storage edge exposes a typed `WorldView`;
 > see `CORE_SHARING.md` section 8. C3 and C4 are implemented too: container
-> click primitives live in `sim/container.zig`; reach and movement rules live
-> in `sim/{interaction,movement}.zig`, backed by `game/rules.zig`. C5 is next.
+> click primitives live in `sim/world/container.zig`; reach and movement rules live
+> in `sim/world/{interaction,movement}.zig`, backed by `game/rules.zig`. C5 is next.
 
 - Add `-Dmc`, `build_options`, `src/version.zig`, `src/versions/mc5.zig`.
 - Add `src/proto/v5/root.zig`, `src/worldgen/v5/root.zig`, `src/game/mc5.zig`.

@@ -38,11 +38,11 @@ pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u
         return std.fmt.bufPrint(out, "'{s}' is not true or false", .{toks[4]}) catch cmd.usageError(&def, out);
     };
     // Expand targets (@a = everyone, @p/@r/plain = one).
-    var members: [64][16]u8 = undefined;
+    var members: [64][cmd.max_name_len]u8 = undefined;
     var mlens: [64]u8 = undefined;
     var mcount: usize = 0;
     for (toks[5..n]) |tok| {
-        var one: [8][16]u8 = undefined;
+        var one: [8][cmd.max_name_len]u8 = undefined;
         var ll: [8]u8 = undefined;
         const got = srv.resolvePlayerList(sender, tok, &one, &ll);
         for (one[0..got], ll[0..got]) |nm, ln| {
@@ -66,14 +66,14 @@ pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u
         return msg;
     }
     // Group by team when respecting teams (vanilla spreads teams as units).
-    var keys: [64][16]u8 = undefined;
+    var keys: [64][cmd.max_name_len]u8 = undefined;
     var klens: [64]u8 = undefined;
     var groups: [64][8]u8 = undefined; // member indices per group
     var glens: [64]u8 = undefined;
     var ngroups: usize = 0;
     for (0..mcount) |mi| {
         const nm = members[mi][0..mlens[mi]];
-        var key: [16]u8 = undefined;
+        var key: [cmd.max_name_len]u8 = undefined;
         var klen: u8 = 0;
         if (respect) {
             if (srv.sbTeamOf(nm)) |team| {

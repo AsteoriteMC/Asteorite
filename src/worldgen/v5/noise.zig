@@ -21,7 +21,10 @@ fn toIntSat(d: f64) i32 {
 
 /// MathHelper.floor_double: (long)d adjusted down. Long cast saturates like Java.
 fn floorLong(d: f64) i64 {
-    const l: i64 = if (std.math.isNan(d)) 0 else if (d >= 9223372036854775807.0) std.math.maxInt(i64) else if (d <= -9223372036854775808.0) std.math.minInt(i64) else @intFromFloat(d);
+    if (std.math.isNan(d)) return 0;
+    if (d >= 9223372036854775807.0) return std.math.maxInt(i64);
+    if (d <= -9223372036854775808.0) return std.math.minInt(i64);
+    const l: i64 = @intFromFloat(d);
     return if (d < @as(f64, @floatFromInt(l))) l - 1 else l;
 }
 
@@ -32,6 +35,14 @@ fn fade(t: f64) f64 {
 fn lerp(t: f64, a: f64, b: f64) f64 {
     // Bytecode order: a + t * (b - a).
     return a + t * (b - a);
+}
+
+/// Clamp-lerp (vanilla qh.b): clamp t to [0,1], then lerp. Shared by the
+/// shaper density blend and the carver width profile (one home, no drift).
+pub fn clampLerp(a: f64, b: f64, t: f64) f64 {
+    if (t < 0.0) return a;
+    if (t > 1.0) return b;
+    return a + (b - a) * t;
 }
 
 // Gradient tables from awj static init (verified bit-for-bit in disassembly).
@@ -50,6 +61,95 @@ fn grad3(hash: u8, x: f64, y: f64, z: f64) f64 {
     const h: usize = @as(usize, hash) & 15;
     return grad_x[h] * x + grad_y[h] * y + grad_z[h] * z;
 }
+
+/// One scaled lattice axis: wrapped perm index + fractional part + fade.
+/// The prologue below repeats per axis (xx/zz in 2D, xx/zz/yy in 3D);
+/// one helper keeps the six copies identical.
+const AxisParts = struct { wrap: usize, frac: f64, f: f64 };
+
+fn axisParts(base: f64, i: usize, scale: f64, origin: f64) AxisParts {
+    var v = base + @as(f64, @floatFromInt(i)) * scale + origin;
+    var q = toIntSat(v);
+    if (v < @as(f64, @floatFromInt(q))) q -= 1;
+    const wrap: usize = @as(usize, @as(u32, @bitCast(q)) & 255);
+    v -= @as(f64, @floatFromInt(q));
+    return .{ .wrap = wrap, .frac = v, .f = fade(v) };
+}
+
+/// Y-corner grad cache replicating vanilla's y-cache check: hashes refresh
+/// only when the wrapped y-hash changed (the 256 sentinel covers iy==0);
+/// otherwise the x-lerps below reuse STALE grads while y/z use fresh
+/// fades. Recomputing always is *more correct* but NOT vanilla-identical
+/// (proven by octave goldens) — replicate exactly.
+const YCache = struct {
+    last_yw: usize = 256, // sentinel: no u8 hash equals this
+    b1: usize = 0,
+    b2: usize = 0,
+    c1: usize = 0,
+    c2: usize = 0,
+    e1: usize = 0,
+    f1: usize = 0,
+    x: [8]f64 = [_]f64{0} ** 8,
+    /// Cached four X-lerps from the last refresh (bit-identical reuse
+    /// while the wrapped y-hash is unchanged). Per-column fx is constant
+    /// (YCache lives per (ix,iz) column), so the cached lerps equal a
+    /// recomputation; the fx-bits guard preserves exactness even if a
+    /// future caller reuses one cache across differing fx.
+    lx: [4]f64 = [_]f64{0} ** 4,
+    lx_fx_bits: u64 = 0,
+    has_lx: bool = false,
+
+    /// Refresh hashes when the y-hash changed; always returns the four
+    /// x-lerps (fresh or stale, per the vanilla rule).
+    fn lerpX(self: *YCache, perm: *const [512]u8, xi_wrap: usize, zi_wrap: usize, yi_w: usize, xx: f64, yy: f64, zz: f64, fx: f64) [4]f64 {
+        if (yi_w != self.last_yw) {
+            self.last_yw = yi_w;
+            self.b1 = @as(usize, perm[xi_wrap]) + yi_w;
+            self.b2 = @as(usize, perm[self.b1]) + zi_wrap;
+            self.c1 = @as(usize, perm[xi_wrap + 1]) + yi_w;
+            self.c2 = @as(usize, perm[self.c1]) + zi_wrap;
+            self.e1 = @as(usize, perm[self.b1 + 1]) + zi_wrap;
+            self.f1 = @as(usize, perm[self.c1 + 1]) + zi_wrap;
+            // NOTE: the y+1 corners come from the e1/f1 TRACK
+            // (recomputed hashes), while the z+1 corners come from
+            // the +1 index family. They are NOT interchangeable.
+            self.x = .{
+                grad3(perm[self.b2], xx, yy, zz),
+                grad3(perm[self.c2], xx - 1.0, yy, zz),
+                grad3(perm[self.e1], xx, yy - 1.0, zz),
+                grad3(perm[self.f1], xx - 1.0, yy - 1.0, zz),
+                grad3(perm[self.b2 + 1], xx, yy, zz - 1.0),
+                grad3(perm[self.c2 + 1], xx - 1.0, yy, zz - 1.0),
+                grad3(perm[self.e1 + 1], xx, yy - 1.0, zz - 1.0),
+                grad3(perm[self.f1 + 1], xx - 1.0, yy - 1.0, zz - 1.0),
+            };
+            self.lx = .{
+                lerp(fx, self.x[0], self.x[1]),
+                lerp(fx, self.x[2], self.x[3]),
+                lerp(fx, self.x[4], self.x[5]),
+                lerp(fx, self.x[6], self.x[7]),
+            };
+            self.lx_fx_bits = @bitCast(fx);
+            self.has_lx = true;
+        } else {
+            // Stale-grad path: X-lerps are constant while fx is constant
+            // (per-column). Recompute only if fx bits differ, preserving
+            // exactness for any cross-fx reuse.
+            const fx_bits: u64 = @bitCast(fx);
+            if (!self.has_lx or fx_bits != self.lx_fx_bits) {
+                self.lx = .{
+                    lerp(fx, self.x[0], self.x[1]),
+                    lerp(fx, self.x[2], self.x[3]),
+                    lerp(fx, self.x[4], self.x[5]),
+                    lerp(fx, self.x[6], self.x[7]),
+                };
+                self.lx_fx_bits = fx_bits;
+                self.has_lx = true;
+            }
+        }
+        return self.lx;
+    }
+};
 
 /// 1.7 ImprovedNoise (awj). Permutation built from the RNG exactly as vanilla.
 pub const ImprovedNoise = struct {
@@ -82,39 +182,39 @@ pub const ImprovedNoise = struct {
         if (y_size == 1) {
             var idx: usize = 0;
             const inv_amp = 1.0 / amplitude;
+            // Axis reuse: zp depends only on (z,iz), not ix. Precompute once
+            // (bit-identical: same axisParts inputs, same bits).
+            var zp_buf: [64]AxisParts = undefined;
+            const use_zpre = z_size <= 64;
+            if (use_zpre) {
+                var iz0: usize = 0;
+                while (iz0 < z_size) : (iz0 += 1) {
+                    zp_buf[iz0] = axisParts(z, iz0, z_scale, self.z_coord);
+                }
+            }
             var ix: usize = 0;
             while (ix < x_size) : (ix += 1) {
-                var xx = x + @as(f64, @floatFromInt(ix)) * x_scale + self.x_coord;
-                var xi = toIntSat(xx);
-                if (xx < @as(f64, @floatFromInt(xi))) xi -= 1;
-                const xi_wrap: usize = @as(usize, @as(u32, @bitCast(xi)) & 255);
-                xx -= @as(f64, @floatFromInt(xi));
-                const fx = fade(xx);
+                const xp = axisParts(x, ix, x_scale, self.x_coord);
                 var iz: usize = 0;
                 while (iz < z_size) : (iz += 1) {
-                    var zz = z + @as(f64, @floatFromInt(iz)) * z_scale + self.z_coord;
-                    var zi = toIntSat(zz);
-                    if (zz < @as(f64, @floatFromInt(zi))) zi -= 1;
-                    const zi_wrap: usize = @as(usize, @as(u32, @bitCast(zi)) & 255);
-                    zz -= @as(f64, @floatFromInt(zi));
-                    const fz = fade(zz);
+                    const zp = if (use_zpre) zp_buf[iz] else axisParts(z, iz, z_scale, self.z_coord);
                     // NOTE: vanilla mixes 2D grads on the near corners and
                     // 3D grads (y=0) on the far corners. Not a typo.
                     // NOTE: the second-level values are index SUMS (perm[v]+w),
                     // not indexed loads (perm[v+w]). The corner hash is a
                     // THIRD load: perm[sum]. The 512-long perm table exists
                     // because these sums reach 510.
-                    const p0: usize = self.perm[xi_wrap]; // v19
-                    const sum0: usize = @as(usize, self.perm[p0]) + zi_wrap; // v20
+                    const p0: usize = self.perm[xp.wrap]; // v19
+                    const sum0: usize = @as(usize, self.perm[p0]) + zp.wrap; // v20
                     const ha: u8 = self.perm[sum0]; // corner hash
-                    const p1: usize = self.perm[@as(usize, xi_wrap) + 1]; // v21
-                    const sum1: usize = @as(usize, self.perm[p1]) + zi_wrap; // v22
+                    const p1: usize = self.perm[xp.wrap + 1]; // v21
+                    const sum1: usize = @as(usize, self.perm[p1]) + zp.wrap; // v22
                     const hb: u8 = self.perm[sum1]; // corner hash
-                    const v00 = lerp(fx, grad2(ha, xx, zz), grad3(hb, xx - 1.0, 0.0, zz));
+                    const v00 = lerp(xp.f, grad2(ha, xp.frac, zp.frac), grad3(hb, xp.frac - 1.0, 0.0, zp.frac));
                     // NOTE: the far corner uses grad3 (y=0) for BOTH terms —
                     // asymmetric with v00's grad2 first term. Bytecode-verified.
-                    const v10 = lerp(fx, grad3(self.perm[sum0 + 1], xx, 0.0, zz - 1.0), grad3(self.perm[sum1 + 1], xx - 1.0, 0.0, zz - 1.0));
-                    arr[idx] += lerp(fz, v00, v10) * inv_amp;
+                    const v10 = lerp(xp.f, grad3(self.perm[sum0 + 1], xp.frac, 0.0, zp.frac - 1.0), grad3(self.perm[sum1 + 1], xp.frac - 1.0, 0.0, zp.frac - 1.0));
+                    arr[idx] += lerp(zp.f, v00, v10) * inv_amp;
                     idx += 1;
                 }
             }
@@ -123,86 +223,47 @@ pub const ImprovedNoise = struct {
         // 3D branch. y-cache optimization skipped (output-identical).
         var idx: usize = 0;
         const inv_amp = 1.0 / amplitude;
+        // Axis reuse: xp depends only on (x,ix), zp only on (z,iz), yp only
+        // on (y,iy). Original recomputed zp x_size times (25->5) and yp
+        // x_size*z_size times (825->33). Same axisParts inputs => same bits.
+        var xp_buf: [64]AxisParts = undefined;
+        var zp_buf2: [64]AxisParts = undefined;
+        var yp_buf: [256]AxisParts = undefined;
+        const use_xpre = x_size <= 64;
+        const use_zpre2 = z_size <= 64;
+        const use_ypre = y_size <= 256;
+        if (use_xpre) {
+            var ia: usize = 0;
+            while (ia < x_size) : (ia += 1) xp_buf[ia] = axisParts(x, ia, x_scale, self.x_coord);
+        }
+        if (use_zpre2) {
+            var ib: usize = 0;
+            while (ib < z_size) : (ib += 1) zp_buf2[ib] = axisParts(z, ib, z_scale, self.z_coord);
+        }
+        if (use_ypre) {
+            var ic: usize = 0;
+            while (ic < y_size) : (ic += 1) yp_buf[ic] = axisParts(y, ic, y_scale, self.y_coord);
+        }
         var ix: usize = 0;
         while (ix < x_size) : (ix += 1) {
-            var xx = x + @as(f64, @floatFromInt(ix)) * x_scale + self.x_coord;
-            var xi = toIntSat(xx);
-            if (xx < @as(f64, @floatFromInt(xi))) xi -= 1;
-            const xi_wrap: usize = @as(usize, @as(u32, @bitCast(xi)) & 255);
-            xx -= @as(f64, @floatFromInt(xi));
-            const fx = fade(xx);
+            const xp = if (use_xpre) xp_buf[ix] else axisParts(x, ix, x_scale, self.x_coord);
             var iz: usize = 0;
             while (iz < z_size) : (iz += 1) {
-                var zz = z + @as(f64, @floatFromInt(iz)) * z_scale + self.z_coord;
-                var zi = toIntSat(zz);
-                if (zz < @as(f64, @floatFromInt(zi))) zi -= 1;
-                const zi_wrap: usize = @as(usize, @as(u32, @bitCast(zi)) & 255);
-                zz -= @as(f64, @floatFromInt(zi));
-                const fz = fade(zz);
+                const zp = if (use_zpre2) zp_buf2[iz] else axisParts(z, iz, z_scale, self.z_coord);
                 // Hash bases + x-lerps. NOTE: vanilla only recomputes these when
                 // iy==0 or the wrapped y-hash changed (the y-cache check).
                 // This is NOT a pure memoization: on a skip, the x-lerps below
                 // keep STALE yy grads while the y/z lerps use fresh fy/fz.
                 // Recomputing always is *more correct* but NOT vanilla-identical
-                // (proven by octave goldens). Replicate exactly.
-                var last_yw: usize = 256; // sentinel: no u8 hash equals this
-                var b1: usize = 0;
-                var b2: usize = 0;
-                var c1: usize = 0;
-                var c2: usize = 0;
-                var e1: usize = 0;
-                var f1: usize = 0;
-                var x000: f64 = 0;
-                var x100: f64 = 0;
-                var x010: f64 = 0;
-                var x110: f64 = 0;
-                var x001: f64 = 0;
-                var x101: f64 = 0;
-                var x011: f64 = 0;
-                var x111: f64 = 0;
+                // (proven by octave goldens). Replicate exactly (see YCache).
+                var cache = YCache{};
                 var iy: usize = 0;
                 while (iy < y_size) : (iy += 1) {
-                    var yy = y + @as(f64, @floatFromInt(iy)) * y_scale + self.y_coord;
-                    var yi = toIntSat(yy);
-                    if (yy < @as(f64, @floatFromInt(yi))) yi -= 1;
-                    const yi_w: usize = @as(usize, @as(u32, @bitCast(yi)) & 255);
-                    yy -= @as(f64, @floatFromInt(yi));
-                    const fy = fade(yy);
-                    if (iy == 0 or yi_w != last_yw) {
-                        last_yw = yi_w;
-                        b1 = @as(usize, self.perm[xi_wrap]) + yi_w;
-                        b2 = @as(usize, self.perm[b1]) + zi_wrap;
-                        c1 = @as(usize, self.perm[xi_wrap + 1]) + yi_w;
-                        c2 = @as(usize, self.perm[c1]) + zi_wrap;
-                        e1 = @as(usize, self.perm[b1 + 1]) + zi_wrap;
-                        f1 = @as(usize, self.perm[c1 + 1]) + zi_wrap;
-                        // NOTE: the y+1 corners come from the e1/f1 TRACK
-                        // (recomputed hashes), while the z+1 corners come from
-                        // the +1 index family. They are NOT interchangeable.
-                        const h000: u8 = self.perm[b2];
-                        const h100: u8 = self.perm[c2];
-                        const h010: u8 = self.perm[e1];
-                        const h110: u8 = self.perm[f1];
-                        const h001: u8 = self.perm[b2 + 1];
-                        const h101: u8 = self.perm[c2 + 1];
-                        const h011: u8 = self.perm[e1 + 1];
-                        const h111: u8 = self.perm[f1 + 1];
-                        x000 = grad3(h000, xx, yy, zz);
-                        x100 = grad3(h100, xx - 1.0, yy, zz);
-                        x010 = grad3(h010, xx, yy - 1.0, zz);
-                        x110 = grad3(h110, xx - 1.0, yy - 1.0, zz);
-                        x001 = grad3(h001, xx, yy, zz - 1.0);
-                        x101 = grad3(h101, xx - 1.0, yy, zz - 1.0);
-                        x011 = grad3(h011, xx, yy - 1.0, zz - 1.0);
-                        x111 = grad3(h111, xx - 1.0, yy - 1.0, zz - 1.0);
-                    }
-                    const y00 = lerp(fx, x000, x100);
-                    const y10 = lerp(fx, x010, x110);
-                    const y01 = lerp(fx, x001, x101);
-                    const y11 = lerp(fx, x011, x111);
-                    const z0 = lerp(fy, y00, y10);
-                    const z1 = lerp(fy, y01, y11);
-                    arr[idx] += lerp(fz, z0, z1) * inv_amp;
+                    const yp = if (use_ypre) yp_buf[iy] else axisParts(y, iy, y_scale, self.y_coord);
+                    const yl = cache.lerpX(&self.perm, xp.wrap, zp.wrap, yp.wrap, xp.frac, yp.frac, zp.frac, xp.f);
+                    const z0 = lerp(yp.f, yl[0], yl[1]);
+                    const z1 = lerp(yp.f, yl[2], yl[3]);
+                    arr[idx] += lerp(zp.f, z0, z1) * inv_amp;
                     idx += 1;
                 }
             }
@@ -270,12 +331,15 @@ fn lattice(d: f64) i32 {
 /// 1.7 simplex Perlin (awo). Stores its own x/y/z offsets.
 pub const Simplex = struct {
     perm: [512]u8,
+    /// perm[i] % 12 precomputed: all simplex gradient indexes are
+    /// non-negative (< 512), so `% 12` == table load, bit-identical.
+    perm12: [512]u8,
     x_coord: f64,
     y_coord: f64,
     z_coord: f64,
 
     pub fn init(rand: *java_random.JavaRandom) !Simplex {
-        var r = Simplex{ .perm = undefined, .x_coord = 0, .y_coord = 0, .z_coord = 0 };
+        var r = Simplex{ .perm = undefined, .perm12 = undefined, .x_coord = 0, .y_coord = 0, .z_coord = 0 };
         r.x_coord = rand.nextDouble() * 256.0;
         r.y_coord = rand.nextDouble() * 256.0;
         r.z_coord = rand.nextDouble() * 256.0;
@@ -287,6 +351,7 @@ pub const Simplex = struct {
             r.perm[j] = tmp;
             r.perm[i + 256] = r.perm[i];
         }
+        for (0..512) |i| r.perm12[i] = r.perm[i] % 12;
         return r;
     }
 
@@ -319,9 +384,9 @@ pub const Simplex = struct {
         // NOTE: double perm indirection (perm[a + perm[b]]) — same family
         // of transcription trap as the ImprovedNoise 2D hashes. Verified
         // against CFR decompile, not just javap.
-        const gi0: usize = self.perm[@as(usize, ii) + self.perm[jj]] % 12;
-        const gi1: usize = self.perm[@as(usize, ii) + @as(usize, @intCast(ci1)) + self.perm[jj + @as(usize, @intCast(cj1))]] % 12;
-        const gi2: usize = self.perm[@as(usize, ii) + 1 + self.perm[jj + 1]] % 12;
+        const gi0: usize = self.perm12[@as(usize, ii) + self.perm[jj]];
+        const gi1: usize = self.perm12[@as(usize, ii) + @as(usize, @intCast(ci1)) + self.perm[jj + @as(usize, @intCast(cj1))]];
+        const gi2: usize = self.perm12[@as(usize, ii) + 1 + self.perm[jj + 1]];
         var t0 = 0.5 - dx0 * dx0 - dz0 * dz0;
         var n0: f64 = 0;
         if (t0 >= 0.0) {
@@ -374,9 +439,9 @@ pub const Simplex = struct {
                 const ii: usize = @as(usize, @as(u32, @bitCast(i)) & 255);
                 const jj: usize = @as(usize, @as(u32, @bitCast(j)) & 255);
                 // NOTE: double perm indirection — see eval() above.
-                const gi0: usize = self.perm[ii + self.perm[jj]] % 12;
-                const gi1: usize = self.perm[ii + @as(usize, @intCast(ci1)) + self.perm[jj + @as(usize, @intCast(cj1))]] % 12;
-                const gi2: usize = self.perm[ii + 1 + self.perm[jj + 1]] % 12;
+                const gi0: usize = self.perm12[ii + self.perm[jj]];
+                const gi1: usize = self.perm12[ii + @as(usize, @intCast(ci1)) + self.perm[jj + @as(usize, @intCast(cj1))]];
+                const gi2: usize = self.perm12[ii + 1 + self.perm[jj + 1]];
                 var n0: f64 = 0;
                 var t0 = 0.5 - dx0 * dx0 - dz0 * dz0;
                 if (t0 >= 0.0) {
@@ -510,4 +575,100 @@ test "simplex grid matches JVM (stone noise shape)" {
     try std.testing.expectEqual(@as(u64, 0xC009E67B6C3FE46D), @as(u64, @bitCast(kahanSum(out))));
     try std.testing.expectEqual(@as(u64, 0xBFDC5CDB82BC0630), @as(u64, @bitCast(out[0])));
     try std.testing.expectEqual(@as(u64, 0x4008756080B056AE), @as(u64, @bitCast(out[out.len - 1])));
+}
+
+// Differential gate for the axis-precompute + X-lerp-cache optimization:
+// a naive reference (no axis tables, recompute X-lerps from stale grads
+// every sample) must match the optimized populate bit-for-bit over the
+// full array (interior cells included, not just sum/endpoints).
+const YCacheNaive = struct {
+    last_yw: usize = 256,
+    b1: usize = 0,
+    b2: usize = 0,
+    c1: usize = 0,
+    c2: usize = 0,
+    e1: usize = 0,
+    f1: usize = 0,
+    x: [8]f64 = [_]f64{0} ** 8,
+
+    fn lerpX(self: *YCacheNaive, perm: *const [512]u8, xi_wrap: usize, zi_wrap: usize, yi_w: usize, xx: f64, yy: f64, zz: f64, fx: f64) [4]f64 {
+        if (yi_w != self.last_yw) {
+            self.last_yw = yi_w;
+            self.b1 = @as(usize, perm[xi_wrap]) + yi_w;
+            self.b2 = @as(usize, perm[self.b1]) + zi_wrap;
+            self.c1 = @as(usize, perm[xi_wrap + 1]) + yi_w;
+            self.c2 = @as(usize, perm[self.c1]) + zi_wrap;
+            self.e1 = @as(usize, perm[self.b1 + 1]) + zi_wrap;
+            self.f1 = @as(usize, perm[self.c1 + 1]) + zi_wrap;
+            self.x = .{
+                grad3(perm[self.b2], xx, yy, zz),
+                grad3(perm[self.c2], xx - 1.0, yy, zz),
+                grad3(perm[self.e1], xx, yy - 1.0, zz),
+                grad3(perm[self.f1], xx - 1.0, yy - 1.0, zz),
+                grad3(perm[self.b2 + 1], xx, yy, zz - 1.0),
+                grad3(perm[self.c2 + 1], xx - 1.0, yy, zz - 1.0),
+                grad3(perm[self.e1 + 1], xx, yy - 1.0, zz - 1.0),
+                grad3(perm[self.f1 + 1], xx - 1.0, yy - 1.0, zz - 1.0),
+            };
+        }
+        return .{
+            lerp(fx, self.x[0], self.x[1]),
+            lerp(fx, self.x[2], self.x[3]),
+            lerp(fx, self.x[4], self.x[5]),
+            lerp(fx, self.x[6], self.x[7]),
+        };
+    }
+};
+
+fn populateNaive(self: *const ImprovedNoise, arr: []f64, x: f64, y: f64, z: f64, x_size: usize, y_size: usize, z_size: usize, x_scale: f64, y_scale: f64, z_scale: f64, amplitude: f64) void {
+    var idx: usize = 0;
+    const inv_amp = 1.0 / amplitude;
+    var ix: usize = 0;
+    while (ix < x_size) : (ix += 1) {
+        const xp = axisParts(x, ix, x_scale, self.x_coord);
+        var iz: usize = 0;
+        while (iz < z_size) : (iz += 1) {
+            const zp = axisParts(z, iz, z_scale, self.z_coord);
+            var cache = YCacheNaive{};
+            var iy: usize = 0;
+            while (iy < y_size) : (iy += 1) {
+                const yp = axisParts(y, iy, y_scale, self.y_coord);
+                const yl = cache.lerpX(&self.perm, xp.wrap, zp.wrap, yp.wrap, xp.frac, yp.frac, zp.frac, xp.f);
+                const z0 = lerp(yp.f, yl[0], yl[1]);
+                const z1 = lerp(yp.f, yl[2], yl[3]);
+                arr[idx] += lerp(zp.f, z0, z1) * inv_amp;
+                idx += 1;
+            }
+        }
+    }
+}
+
+test "populate precompute matches naive full-array (5x33x5 + 5x5x5)" {
+    const alloc = std.testing.allocator;
+    var rand = java_random.JavaRandom.init(777);
+    var imp = try ImprovedNoise.init(&rand);
+    // Case 1: 5x33x5 density shape (covers stale-cache hits on small-freq octaves).
+    {
+        var opt: [5 * 33 * 5]f64 = [_]f64{0} ** (5 * 33 * 5);
+        var refb: [5 * 33 * 5]f64 = [_]f64{0} ** (5 * 33 * 5);
+        imp.populate(&opt, 10.0, 20.0, 30.0, 5, 33, 5, 684.412, 684.412, 684.412, 4.0);
+        populateNaive(&imp, &refb, 10.0, 20.0, 30.0, 5, 33, 5, 684.412, 684.412, 684.412, 4.0);
+        for (opt, refb, 0..) |a, b, i| {
+            if (@as(u64, @bitCast(a)) != @as(u64, @bitCast(b))) {
+                std.debug.print("mismatch at {d}: opt {x} ref {x}\n", .{ i, @as(u64, @bitCast(a)), @as(u64, @bitCast(b)) });
+                try std.testing.expectEqual(@as(u64, @bitCast(b)), @as(u64, @bitCast(a)));
+            }
+        }
+    }
+    // Case 2: small-freq octave (many Y-cache hits) + different amplitude.
+    {
+        var opt: [5 * 5 * 5]f64 = [_]f64{0} ** (5 * 5 * 5);
+        var refb: [5 * 5 * 5]f64 = [_]f64{0} ** (5 * 5 * 5);
+        imp.populate(&opt, 0.0, 0.0, 0.0, 5, 5, 5, 0.05, 0.05, 0.05, 0.03125);
+        populateNaive(&imp, &refb, 0.0, 0.0, 0.0, 5, 5, 5, 0.05, 0.05, 0.05, 0.03125);
+        for (opt, refb) |a, b| {
+            try std.testing.expectEqual(@as(u64, @bitCast(b)), @as(u64, @bitCast(a)));
+        }
+        _ = alloc;
+    }
 }

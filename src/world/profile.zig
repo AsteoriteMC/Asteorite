@@ -35,20 +35,14 @@ pub const Profile = enum {
 
     /// Parse a `--storage-profile` / config value. Null for unknown text.
     pub fn parse(text: []const u8) ?Profile {
-        if (std.mem.eql(u8, text, "auto")) return .auto;
-        if (std.mem.eql(u8, text, "hdd")) return .hdd;
-        if (std.mem.eql(u8, text, "ssd")) return .ssd;
-        if (std.mem.eql(u8, text, "nvme")) return .nvme;
+        inline for (@typeInfo(Profile).@"enum".fields) |f| {
+            if (std.mem.eql(u8, text, f.name)) return @enumFromInt(f.value);
+        }
         return null;
     }
 
     pub fn name(self: Profile) []const u8 {
-        return switch (self) {
-            .auto => "auto",
-            .hdd => "hdd",
-            .ssd => "ssd",
-            .nvme => "nvme",
-        };
+        return @tagName(self);
     }
 };
 

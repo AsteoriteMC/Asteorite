@@ -18,13 +18,6 @@ pub const Biome = struct {
 
 pub const Temp = enum { ocean, cold, medium, warm };
 
-pub fn biomeById(id: i32) ?Biome {
-    return switch (id) {
-        0 => .{ .root_height = -1.0, .height_var = 0.00012207031, .temp = .ocean }, // Ocean (0x1.0p-1? exact below)
-        else => null,
-    };
-}
-
 // Full table, generated from BiomeDump output (hex floats are exact).
 pub const BIOMES: [40]?Biome = .{
     .{ .root_height = -0x1.0p0, .height_var = 0x1.99999ap-4, .temp = .ocean }, // 0 Ocean
@@ -71,8 +64,10 @@ pub const BIOMES: [40]?Biome = .{
 
 /// Registered biome ids (getBiomeById(x) != null). Used for the +128 mutated
 /// checks in RiverMix; verified by dumping the jar's registry.
+/// Vanilla ids fit in a byte (0..255); 0..39 are always registered.
+pub const max_biome_id: i32 = 255;
 pub fn biomeExists(id: i32) bool {
-    if (id < 0 or id > 255) return false;
+    if (id < 0 or id > max_biome_id) return false;
     if (id <= 39) return true;
     return switch (@as(u8, @truncate(@as(u32, @bitCast(id))))) {
         129, 130, 131, 132, 133, 134, 140, 149, 151, 155, 156, 157, 158, 160, 161, 162, 163, 164, 165, 166, 167 => true,

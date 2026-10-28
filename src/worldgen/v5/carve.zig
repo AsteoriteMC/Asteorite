@@ -49,11 +49,19 @@ fn floorD(d: f64) i32 {
 pub const Carver = struct {
     rand: java_random.JavaRandom,
     trig: [65536]f32,
-    chain: *genlayer.Chain,
+    chain: genlayer.Chain,
     roots_voronoi: u32,
     alloc: std.mem.Allocator,
+    /// Prefetched voronoi window for the column under carve (set at
+    /// carveChunk entry; topFor reads here instead of a 1x1 chain eval
+    /// per carved cell — same root, same coords, identical values).
+    /// Invalid outside carveChunk (topFor falls back to the chain then).
+    vor: [256]i32 = [_]i32{0} ** 256,
+    vor_cx: i32 = 0,
+    vor_cz: i32 = 0,
+    vor_valid: bool = false,
 
-    pub fn init(alloc: std.mem.Allocator, chain: *genlayer.Chain, roots_voronoi: u32) Carver {
+    pub fn init(alloc: std.mem.Allocator, chain: genlayer.Chain, roots_voronoi: u32) Carver {
         return .{
             .rand = java_random.JavaRandom.init(0),
             .trig = buildTrigTable(),
@@ -63,16 +71,20 @@ pub const Carver = struct {
         };
     }
 
-    /// Clamp-lerp qh.b (shared with shaper blend; duplicated: no import cycle).
-    fn cle(a: f64, b: f64, t: f64) f64 {
-        if (t < 0.0) return a;
-        if (t > 1.0) return b;
-        return a + (b - a) * t;
-    }
-
     /// Base dispatcher (aqx.a): 17x17 neighbor chunks, each reseeded.
     /// scratch arena for voronoi lookups during grass-top replacement.
     pub fn carveChunk(self: *Carver, scratch: std.mem.Allocator, cx: i32, cz: i32, world_seed: i64, blocks: *[65536]ids.Id) !void {
+        // One 16x16 voronoi fetch covers every topFor lookup below
+        // (carveCells clamps to the carved column, so all coords land
+        // inside). On fetch failure the per-cell fallback in topFor keeps
+        // the old behavior exactly (grass substitution per failed cell).
+        self.vor_cx = cx;
+        self.vor_cz = cz;
+        if (self.chain.getInts(scratch, self.roots_voronoi, cx * 16, cz * 16, 16, 16, &self.vor)) {
+            self.vor_valid = true;
+        } else |_| {
+            self.vor_valid = false;
+        }
         self.rand.setSeed(worldSeed(world_seed));
         const l = self.rand.nextLong();
         const l2 = self.rand.nextLong();
@@ -224,11 +236,12 @@ pub const Carver = struct {
             while (!bl3 and nz < n14) : (nz += 1) {
                 // NOTE: j starts one ABOVE the range; edge columns scan every
                 // cell, interior columns check top+bottom only then jump.
+                // jy provably in [0,249]: n11>=1 so jy>=n11-1>=0, and
+                // n12<=248 so jy starts <=249 — no bounds check needed.
+                const col: usize = @as(usize, @intCast(nx * 16 + nz)) * 256;
                 var jy = n12 + 1;
                 while (!bl3 and jy >= n11 - 1) : (jy -= 1) {
-                    if (jy < 0 or jy >= 256) continue;
-                    const cell: usize = @as(usize, @intCast(nx * 16 + nz)) * 256 + @as(usize, @intCast(jy));
-                    const id = blocks[cell];
+                    const id = blocks[col + @as(usize, @intCast(jy))];
                     if (id == ids.flowing_water or id == ids.water) bl3 = true;
                     if (jy == n11 - 1 or nx == n9 or nx == n10 - 1 or nz == n13 or nz == n14 - 1) continue;
                     jy = n11;
@@ -283,7 +296,18 @@ pub const Carver = struct {
     }
 
     /// Top block for the grass-top replacement (voronoi biome -> TOP256).
+    /// Reads the carveChunk-prefetched window (same coords as a 1x1 fetch);
+    /// out-of-window or failed-prefetch falls back to the per-cell fetch.
     fn topFor(self: *Carver, scratch: std.mem.Allocator, wx: i32, wz: i32) ids.Id {
+        if (self.vor_valid) {
+            const lx = wx - self.vor_cx * 16;
+            const lz = wz - self.vor_cz * 16;
+            if (lx >= 0 and lx < 16 and lz >= 0 and lz < 16) {
+                // Row-major [z*w + x] (getInts convention).
+                const id: usize = @as(usize, @intCast(@as(u32, @bitCast(self.vor[@as(usize, @intCast(lz)) * 16 + @as(usize, @intCast(lx))])) & 255));
+                return biome.TOP256[id];
+            }
+        }
         var one: [1]i32 = undefined;
         self.chain.getInts(scratch, self.roots_voronoi, wx, wz, 1, 1, &one) catch return ids.grass;
         const id: usize = @as(usize, @intCast(@as(u32, @bitCast(one[0])) & 255));
@@ -386,7 +410,7 @@ test "grass-top path matches JVM (synthetic dirt+grass, wide walk)" {
     const alloc = std.testing.allocator;
     var built = try genlayer.Chain.buildDefault(alloc, 42, false);
     defer built.chain.deinit();
-    var carver = Carver.init(alloc, &built.chain, built.roots[1]);
+    var carver = Carver.init(alloc, built.chain, built.roots[1]);
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     var blocks: [65536]ids.Id = undefined;

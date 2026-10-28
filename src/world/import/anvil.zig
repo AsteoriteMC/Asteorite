@@ -43,10 +43,7 @@ pub fn fromAnvilNbt(allocator: std.mem.Allocator, nbt_bytes: []const u8, dim: u8
             try r.skipPayload(t);
         }
     }
-    if (!found_level) {
-        allocator.destroy(c);
-        return error.Truncated;
-    }
+    if (!found_level) return error.Truncated;
     return c;
 }
 
@@ -70,7 +67,7 @@ fn parseLevel(r: *nbt.Reader, c: *Chunk) ChunkError!void {
             if (len != 256) return error.Truncated;
             for (&c.heights) |*h| {
                 const v = try r.readBE(i32);
-                h.* = @truncate(@as(u32, @intCast(@min(@max(v, 0), 255))));
+                h.* = @intCast(@min(@max(v, 0), 255));
             }
         } else {
             try r.skipPayload(t);
@@ -78,11 +75,14 @@ fn parseLevel(r: *nbt.Reader, c: *Chunk) ChunkError!void {
     }
 }
 
+/// Sections per Anvil chunk (16 x 16 blocks high).
+pub const max_sections: i32 = 16;
+
 fn parseSections(r: *nbt.Reader, c: *Chunk) ChunkError!void {
     const elem = try r.readTagType();
     if (elem != .compound) return error.Truncated;
     const count = try r.readBE(i32);
-    if (count < 0 or count > 16) return error.Truncated;
+    if (count < 0 or count > max_sections) return error.Truncated;
     var i: i32 = 0;
     while (i < count) : (i += 1) {
         // section compound entries
@@ -133,7 +133,6 @@ fn parseSections(r: *nbt.Reader, c: *Chunk) ChunkError!void {
             const an: u16 = if (add) |a| nibbleAt(a, idx) else 0;
             const w: u16 = (an << 8) | base;
             s.blocks[idx] = wire.fromWire(w) orelse return error.BlockIdRange;
-            s.meta[idx >> 1] = d[idx >> 1]; // copy whole byte once (loop hits twice, idempotent)
         }
         if (add) |a| @memcpy(&s.add, a[0..2048]);
         @memcpy(&s.meta, d[0..2048]);

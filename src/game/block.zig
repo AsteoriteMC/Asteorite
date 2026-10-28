@@ -35,6 +35,7 @@ pub const Orientation = enum(u8) {
     directional,
     hopper,
     anvil,
+    chest,
 };
 
 /// Redstone component identity. This is semantic, not a wire id: profiles

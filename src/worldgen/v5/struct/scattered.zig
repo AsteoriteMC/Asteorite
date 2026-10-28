@@ -32,6 +32,11 @@ pub fn drawFacing(rand: *JavaRandom) u2 {
     return @truncate(@as(u2, @intCast(rand.nextIntBound(4) catch unreachable)));
 }
 
+/// Footprint dims (w,h,d) per scattered kind (vanilla constructors).
+const desert_dims: [3]i32 = .{ 21, 15, 21 };
+const jungle_dims: [3]i32 = .{ 12, 10, 15 };
+const witch_dims: [3]i32 = .{ 7, 5, 9 };
+
 /// Place one scattered start into the populate chunk (`ave.a` per-start
 /// step): single piece with facing from the position rand, run when its
 /// box touches clip. Returns true when anything could generate.
@@ -46,45 +51,27 @@ pub fn generate(
 ) bool {
     const kind = mapgen_mod.scatteredKindFor(bio_center) orelse return false;
     const mode = comp_mod.Facing.fromInt(drawFacing(build_rand));
-    switch (kind) {
-        .desert => {
-            const c = Component{ .mode = mode, .box = bbox_mod.sizedBox(sx * 16, 64, sz * 16, 21, 15, 21, mode) };
-            if (!c.box.intersects(clip)) return false;
-            desertPyramid(p, c, clip, place_rand);
-            return true;
-        },
-        .jungle => {
-            const c = Component{ .mode = mode, .box = bbox_mod.sizedBox(sx * 16, 64, sz * 16, 12, 10, 15, mode) };
-            if (!c.box.intersects(clip)) return false;
-            junglePyramid(p, c, clip, place_rand);
-            return true;
-        },
-        .witch => {
-            const c = Component{ .mode = mode, .box = bbox_mod.sizedBox(sx * 16, 64, sz * 16, 7, 5, 9, mode) };
-            if (!c.box.intersects(clip)) return false;
-            witchHut(p, c, clip, place_rand);
-            return true;
-        },
-    }
+    const dims = switch (kind) {
+        .desert => desert_dims,
+        .jungle => jungle_dims,
+        .witch => witch_dims,
+    };
+    const place: *const fn (Placer, Component, BBox, *JavaRandom) void = switch (kind) {
+        .desert => desertPyramid,
+        .jungle => junglePyramid,
+        .witch => witchHut,
+    };
+    const c = Component{ .mode = mode, .box = bbox_mod.sizedBox(sx * 16, 64, sz * 16, dims[0], dims[1], dims[2], mode) };
+    if (!c.box.intersects(clip)) return false;
+    place(p, c, clip, place_rand);
+    return true;
 }
 
 /// Ground level: average topY over the box∩clip columns, maxed with the
 /// provider average; null when no column is inside (`aue.a`). Shifts the
 /// component by (avg - minY + yOff).
 fn groundShift(p: Placer, c: *Component, clip: BBox, y_off: i32) bool {
-    var sum: i64 = 0;
-    var n: i64 = 0;
-    var z = c.box.min_z;
-    while (z <= c.box.max_z) : (z += 1) {
-        var x = c.box.min_x;
-        while (x <= c.box.max_x) : (x += 1) {
-            if (!clip.contains(x, 64, z)) continue;
-            sum += @max(p.topY(x, z), p.groundBase());
-            n += 1;
-        }
-    }
-    if (n == 0) return false;
-    const avg: i32 = @intCast(@divTrunc(sum, n));
+    const avg = mapgen_mod.groundAverage(p, c.box, clip) orelse return false;
     c.box = c.box.offset(0, avg - c.box.min_y + y_off, 0);
     return true;
 }
@@ -368,6 +355,10 @@ pub fn junglePyramid(p: Placer, c: Component, clip: BBox, rand: *JavaRandom) voi
     comp_mod.fillBoxChoose(p, c0, clip, rand, 9, 7, 2, 9, 9, 2, false, jungleChoose);
     comp_mod.fillBoxChoose(p, c0, clip, rand, 2, 7, 12, 2, 9, 12, false, jungleChoose);
     comp_mod.fillBoxChoose(p, c0, clip, rand, 9, 7, 12, 9, 9, 12, false, jungleChoose);
+    comp_mod.fillBoxChoose(p, c0, clip, rand, 4, 9, 4, 4, 9, 4, false, jungleChoose);
+    comp_mod.fillBoxChoose(p, c0, clip, rand, 7, 9, 4, 7, 9, 4, false, jungleChoose);
+    comp_mod.fillBoxChoose(p, c0, clip, rand, 4, 9, 10, 4, 9, 10, false, jungleChoose);
+    comp_mod.fillBoxChoose(p, c0, clip, rand, 7, 9, 10, 7, 9, 10, false, jungleChoose);
     comp_mod.fillBoxChoose(p, c0, clip, rand, 5, 9, 7, 6, 9, 7, false, jungleChoose);
     comp_mod.placeAt(p, c0, clip, .stone_stairs, st3, 5, 9, 6);
     comp_mod.placeAt(p, c0, clip, .stone_stairs, st3, 6, 9, 6);

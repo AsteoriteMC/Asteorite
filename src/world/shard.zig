@@ -11,6 +11,13 @@ const chunk_mod = @import("chunk.zig");
 
 pub const region_size = 32;
 
+/// printf-style shard directory name ("shard-00" ... ).
+pub const shard_name_fmt = "shard-{d:0>2}";
+
+fn shardName(buf: []u8, i: usize) ![]u8 {
+    return std.fmt.bufPrint(buf, shard_name_fmt, .{i});
+}
+
 pub fn regionOf(chunk_coord: i32) i32 {
     return @divFloor(chunk_coord, region_size);
 }
@@ -55,7 +62,7 @@ pub const ShardPool = struct {
         }
         while (i < n_shards) : (i += 1) {
             var name_buf: [32]u8 = undefined;
-            const name = try std.fmt.bufPrint(&name_buf, "shard-{d:0>2}", .{i});
+            const name = try shardName(&name_buf, i);
             const dir = try root_dir.createDirPathOpen(io, name, .{});
             self.owned_dirs[i] = dir;
             self.shards[i] = try store_mod.Store.open(allocator, io, dir, opts);
@@ -89,22 +96,22 @@ pub const ShardPool = struct {
         return @as(usize, h.final()) % self.shards.len;
     }
 
-    pub fn put(self: *ShardPool, key: store_mod.ChunkKey, value: []const u8) !void {
+    /// Route a key to its owning store (decode + hash once).
+    fn route(self: *const ShardPool, key: store_mod.ChunkKey) *store_mod.Store {
         const d = store_mod.decodeKey(key);
-        const s = self.shardFor(d.dim, d.x, d.z);
-        try self.shards[s].put(key, value);
+        return self.shards[self.shardFor(d.dim, d.x, d.z)];
+    }
+
+    pub fn put(self: *ShardPool, key: store_mod.ChunkKey, value: []const u8) !void {
+        try self.route(key).put(key, value);
     }
 
     pub fn get(self: *ShardPool, alloc: std.mem.Allocator, key: store_mod.ChunkKey) !?[]u8 {
-        const d = store_mod.decodeKey(key);
-        const s = self.shardFor(d.dim, d.x, d.z);
-        return self.shards[s].get(alloc, key);
+        return self.route(key).get(alloc, key);
     }
 
     pub fn delete(self: *ShardPool, key: store_mod.ChunkKey) !void {
-        const d = store_mod.decodeKey(key);
-        const s = self.shardFor(d.dim, d.x, d.z);
-        try self.shards[s].delete(key);
+        try self.route(key).delete(key);
     }
 
     /// Encode + store a chunk. Convenience for the tick loop.
@@ -123,18 +130,29 @@ pub const ShardPool = struct {
         return try chunk_mod.Chunk.decode(alloc, raw.?);
     }
 
+    /// Sum a per-shard metric across the pool (diagnostics / stats line).
+    fn sumMetric(self: *ShardPool, f: *const fn (*store_mod.Store) usize) usize {
+        var n: usize = 0;
+        for (self.shards) |sh| n += f(sh);
+        return n;
+    }
+
     /// Total live SST files across the shards (diagnostics / stats line).
     pub fn sstCount(self: *ShardPool) usize {
-        var n: usize = 0;
-        for (self.shards) |sh| n += sh.sstCount();
-        return n;
+        return self.sumMetric(struct {
+            fn f(sh: *store_mod.Store) usize {
+                return sh.sstCount();
+            }
+        }.f);
     }
 
     /// Total pinned io_uring read-buffer bytes (diagnostics / stats line).
     pub fn ringBytes(self: *ShardPool) usize {
-        var n: usize = 0;
-        for (self.shards) |sh| n += sh.ringBytes();
-        return n;
+        return self.sumMetric(struct {
+            fn f(sh: *store_mod.Store) usize {
+                return sh.ringBytes();
+            }
+        }.f);
     }
 
     pub fn flushAll(self: *ShardPool) !void {
@@ -191,7 +209,7 @@ pub const ShardPool = struct {
     pub fn snapshotAll(self: *ShardPool, backup_root: std.Io.Dir) !void {
         for (self.shards, 0..) |st, i| {
             var name_buf: [32]u8 = undefined;
-            const name = try std.fmt.bufPrint(&name_buf, "shard-{d:0>2}", .{i});
+            const name = try shardName(&name_buf, i);
             var snap_dir = try backup_root.createDirPathOpen(self.io, name, .{});
             defer snap_dir.close(self.io);
             try st.snapshot(snap_dir);

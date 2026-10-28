@@ -51,6 +51,11 @@ const ConnSlot = struct {
     write_armed: bool = false,
     /// Set by `request_flush` (any thread).
     flush_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Graceful close requested (kick / ping-done / timeout): no new
+    /// inbound reads are processed, but queued output still drains —
+    /// the slot is destroyed once drained (see maybeDestroySlot). Same
+    /// flush-then-close contract as the other transports.
+    closing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Set by the close path (any thread): the worker skips dead slots.
     /// Safety never depends on this flag (retained memory + the server's
     /// map re-lookup cover every race); it just avoids wasted work.
@@ -192,6 +197,14 @@ const Worker = struct {
         var buf: [16 * 1024]u8 = undefined;
         while (true) {
             if (slot.dead.load(.acquire)) return;
+            // A closing connection takes no new input (a kicked client
+            // spamming packets must not get served), but its queued
+            // output still drains below.
+            if (slot.closing.load(.acquire)) {
+                self.drainOut(slot);
+                self.maybeDestroySlot(slot);
+                return;
+            }
             const n = c.read(slot.fd, &buf, buf.len);
             if (n < 0) {
                 const err = c._errno().*;
@@ -200,11 +213,17 @@ const Worker = struct {
                 return;
             }
             if (n == 0) {
-                self.closeSlot(slot);
+                // Peer closed: drain what's queued, then destroy
+                // (graceful — a raced kick message still goes out on a
+                // half-close).
+                slot.closing.store(true, .acq_rel);
+                self.drainOut(slot);
+                self.maybeDestroySlot(slot);
                 return;
             }
             self.backend.handler.on_read(self.backend.handler.ctx, slot.id, buf[0..@intCast(n)]);
             self.drainOut(slot);
+            self.maybeDestroySlot(slot);
             if (n < buf.len) return;
         }
     }
@@ -259,18 +278,36 @@ const Worker = struct {
         var it = self.conns.valueIterator();
         while (it.next()) |slot| {
             if (slot.*.dead.load(.acquire)) continue;
-            if (slot.*.flush_requested.swap(false, .acq_rel)) {
-                if (n_pending < pending.len) {
-                    pending[n_pending] = slot.*;
-                    n_pending += 1;
-                }
+            // Closing slots always ride the sweep (their flag may already
+            // be consumed); a closing slot dropped by the batch cap
+            // re-arms so a re-wake picks it up instead of stranding it.
+            const want = slot.*.flush_requested.swap(false, .acq_rel) or slot.*.closing.load(.acquire);
+            if (!want) continue;
+            if (n_pending < pending.len) {
+                pending[n_pending] = slot.*;
+                n_pending += 1;
+            } else if (slot.*.closing.load(.acquire)) {
+                _ = slot.*.flush_requested.swap(true, .acq_rel);
             }
         }
         self.lock.unlock();
         var i: usize = 0;
         while (i < n_pending) : (i += 1) {
             self.drainOut(pending[i]);
+            self.maybeDestroySlot(pending[i]);
         }
+        // A full batch may have left a closing slot unchecked; re-wake so
+        // a follow-up sweep picks it up instead of stranding it.
+        if (n_pending == pending.len) self.wake();
+    }
+
+    /// Destroy a closing slot once its queue drained (graceful close:
+    /// pong / kick reason go out first). Called wherever outbox state
+    /// can change: after each drain and after each completed write.
+    fn maybeDestroySlot(self: *Worker, slot: *ConnSlot) void {
+        if (!slot.closing.load(.acquire)) return;
+        if (slot.out.items.len != 0) return;
+        self.closeSlot(slot);
     }
 
     fn closeSlot(self: *Worker, slot: *ConnSlot) void { // Map-authority: whoever removes the entry owns the close (the
@@ -285,6 +322,9 @@ const Worker = struct {
         if (removed == null) return;
         slot.dead.store(true, .release);
         self.backend.handler.on_close(self.backend.handler.ctx, slot.id);
+        // Match the uring backend: shutdown before close so the peer
+        // sees FIN promptly (status pong / kick reason flushed first).
+        _ = c.shutdown(slot.fd, 2);
         _ = c.close(slot.fd);
         self.lock.lock();
         self.dead_slots.append(self.backend.allocator, slot) catch {
@@ -376,7 +416,10 @@ pub const Backend = struct {
         }
     }
 
-    fn closeConn(self: *Backend, conn_id: u32) void {
+    /// Graceful close (same contract as the other backends):
+    /// mark closing, wake a drain sweep, destroy on drain.
+    /// Error/EOF paths keep the immediate closeSlot below.
+    pub fn closeConn(self: *Backend, conn_id: u32) void {
         for (self.workers) |*w| {
             w.lock.lock();
             var found: ?*ConnSlot = null;
@@ -389,28 +432,16 @@ pub const Backend = struct {
             }
             w.lock.unlock();
             if (found) |sl| {
-                w.closeSlot(sl);
+                if (sl.closing.swap(true, .acq_rel)) return;
+                _ = sl.flush_requested.swap(true, .acq_rel);
+                w.wake();
                 return;
             }
         }
     }
 
     pub fn handle(self: *Backend) transport.Handle {
-        return .{
-            .request_flush = struct {
-                fn f(ctx: *anyopaque, conn_id: u32) void {
-                    const b: *Backend = @ptrCast(@alignCast(ctx));
-                    b.requestFlush(conn_id);
-                }
-            }.f,
-            .close_conn = struct {
-                fn f(ctx: *anyopaque, conn_id: u32) void {
-                    const b: *Backend = @ptrCast(@alignCast(ctx));
-                    b.closeConn(conn_id);
-                }
-            }.f,
-            .ctx = self,
-        };
+        return transport.handleFor(Backend, self);
     }
 
     pub fn statsSnapshot(self: *Backend) transport.Stats {
@@ -453,6 +484,9 @@ fn workerMain(w: *Worker) void {
                 w.readReady(sl);
             } else if (ev.filter == EVFILT_WRITE) {
                 w.writeReady(sl);
+                // A closing connection whose queue just drained is
+                // finished: destroy it now instead of waiting.
+                w.maybeDestroySlot(sl);
             }
         }
     }

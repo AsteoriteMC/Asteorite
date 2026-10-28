@@ -4,6 +4,7 @@
 //! fields only when an engine reads them; profile deltas land here as the
 //! corresponding component does.
 
+const std = @import("std");
 const ids = @import("../ids.zig");
 
 /// Numbers, toggles and component state ids for the redstone/piston engine.
@@ -88,11 +89,19 @@ pub const GameMode = enum(u8) {
     }
 
     pub fn name(self: GameMode) []const u8 {
-        return switch (self) {
-            .survival => "survival",
-            .creative => "creative",
-            .adventure => "adventure",
-        };
+        return @tagName(self);
+    }
+
+    /// Config/chat spelling back to a mode: full names + single letters
+    /// (case-insensitive) + wire digits, else null. Same contract as the
+    /// /gamemode argument parser (which delegates here).
+    pub fn parse(s: []const u8) ?GameMode {
+        if (std.ascii.eqlIgnoreCase(s, "survival") or std.ascii.eqlIgnoreCase(s, "s")) return .survival;
+        if (std.ascii.eqlIgnoreCase(s, "creative") or std.ascii.eqlIgnoreCase(s, "c")) return .creative;
+        if (std.ascii.eqlIgnoreCase(s, "adventure") or std.ascii.eqlIgnoreCase(s, "a")) return .adventure;
+        const v = std.fmt.parseInt(i64, s, 10) catch return null;
+        if (v < 0 or v >= std.enums.values(GameMode).len) return null;
+        return @enumFromInt(v);
     }
 };
 
@@ -119,12 +128,20 @@ pub const Difficulty = enum(u8) {
     }
 
     pub fn name(self: Difficulty) []const u8 {
-        return switch (self) {
-            .peaceful => "peaceful",
-            .easy => "easy",
-            .normal => "normal",
-            .hard => "hard",
-        };
+        return @tagName(self);
+    }
+
+    /// Config/chat spelling back to a difficulty: full names + single
+    /// letters (case-insensitive) + wire digits, else null. Same contract
+    /// as the /difficulty argument parser (which delegates here).
+    pub fn parse(s: []const u8) ?Difficulty {
+        if (std.ascii.eqlIgnoreCase(s, "peaceful") or std.ascii.eqlIgnoreCase(s, "p")) return .peaceful;
+        if (std.ascii.eqlIgnoreCase(s, "easy") or std.ascii.eqlIgnoreCase(s, "e")) return .easy;
+        if (std.ascii.eqlIgnoreCase(s, "normal") or std.ascii.eqlIgnoreCase(s, "n")) return .normal;
+        if (std.ascii.eqlIgnoreCase(s, "hard") or std.ascii.eqlIgnoreCase(s, "h")) return .hard;
+        const v = std.fmt.parseInt(i64, s, 10) catch return null;
+        if (v < 0 or v >= std.enums.values(Difficulty).len) return null;
+        return @enumFromInt(v);
     }
 };
 
@@ -141,7 +158,6 @@ pub const mc5: Rules = .{ .redstone = .{}, .interaction = .{}, .movement = .{}, 
 pub const mc5_redstone: RedstoneRules = mc5.redstone;
 
 test "mc5 redstone rules are the 1.7.10 values" {
-    const std = @import("std");
     try std.testing.expectEqual(@as(i64, 20), mc5.redstone.button_ticks_stone);
     try std.testing.expectEqual(@as(i64, 30), mc5.redstone.button_ticks_wood);
     try std.testing.expectEqual(@as(i64, 30), mc5.redstone.ore_fade_ticks);
@@ -161,7 +177,6 @@ test "mc5 redstone rules are the 1.7.10 values" {
 }
 
 test "mc5 interaction and movement rules are the 1.7.10 values" {
-    const std = @import("std");
     try std.testing.expectApproxEqAbs(@as(f32, 1.62), mc5.interaction.eye_height, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 6.0), mc5.interaction.reach, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.01), mc5.movement.walk_exhaustion, 1e-6);

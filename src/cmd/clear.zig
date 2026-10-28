@@ -20,10 +20,8 @@ pub fn run(srv: anytype, sender: anytype, args: []const u8, out: []u8) []const u
     var toks: [4][]const u8 = undefined;
     const n = cmd.Spec.tokenize(args, &toks);
     if (n == 0 or n > 3) return cmd.usageError(&def, out);
-    var target: [16]u8 = undefined;
-    const t = srv.resolvePlayerName(sender, toks[0], &target) orelse {
-        return "That player cannot be found";
-    };
+    var target: [cmd.max_name_len]u8 = undefined;
+    const t = cmd.resolveTarget(srv, sender, toks[0], &target) orelse return cmd.unknown_player;
     var wire: ?u16 = null;
     if (n >= 2) {
         if (srv.itemWireByName(toks[1])) |w| {

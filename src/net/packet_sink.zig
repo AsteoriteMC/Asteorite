@@ -8,7 +8,7 @@ const std = @import("std");
 const flate = std.compress.flate;
 const Conn = @import("conn.zig").Conn;
 const codec = @import("codec.zig");
-const sink_mod = @import("../sim/packet_sink.zig");
+const sink_mod = @import("../sim/net/packet_sink.zig");
 const chunk_mod = @import("../world/chunk.zig");
 const item_mod = @import("../item.zig");
 const profile = @import("../version.zig");
@@ -91,14 +91,37 @@ fn headLook(ctx: *anyopaque, eid: i32, yaw: f32) anyerror!void {
     try asConn(ctx).queueFramed(f);
 }
 
+/// Vanilla 0x0E/S12 velocity quantum: motion (blocks/tick) x8000,
+/// clamped to i16 range (toss speeds are < 0.5, nowhere near the cap).
+fn velShort(v: f64) i16 {
+    const s: i32 = @intFromFloat(@round(v * 8000.0));
+    return @intCast(std.math.clamp(s, -32768, 32767));
+}
+
 fn spawnItem(ctx: *anyopaque, spawn: *const sink_mod.ItemSpawn) anyerror!void {
     const conn = asConn(ctx);
     var sb: [96]u8 = undefined;
-    const spawn_frame = try packets.frameSpawnObject(spawn.eid, 2, spawn.x, spawn.y, spawn.z, 0, 0, 1, null, &sb);
+    // Hand the client the live toss velocity (x8000 shorts): its EntityItem
+    // sim arcs smoothly between our 1Hz corrections. Zero velocity used to
+    // go out here, so the client drew a stationary item that then snapped
+    // 2-5 blocks on the next correction (diagonal teleports on break
+    // drops, long jumps on Q-drops).
+    const spawn_frame = try packets.frameSpawnObject(spawn.eid, 2, spawn.x, spawn.y, spawn.z, 0, 0, 1, .{ velShort(spawn.vx), velShort(spawn.vy), velShort(spawn.vz) }, &sb);
     try conn.queueFramed(spawn_frame);
     var mb: [1024]u8 = undefined;
     const meta_frame = try packets.frameItemMetadata(spawn.eid, spawn.stack, &mb);
     try conn.queueFramed(meta_frame);
+}
+
+/// Splash potion spawn: type 73 with the item damage in the data field
+/// (vanilla EntityPotion reads it for the render + effect), live arc
+/// velocity in the x8000 shorts like items.
+fn spawnPotion(ctx: *anyopaque, spawn: *const sink_mod.PotionSpawn) anyerror!void {
+    const conn = asConn(ctx);
+    var sb: [96]u8 = undefined;
+    const data: i32 = spawn.damage;
+    const spawn_frame = try packets.frameSpawnObject(spawn.eid, 73, spawn.x, spawn.y, spawn.z, 0, 0, data, .{ velShort(spawn.vx), velShort(spawn.vy), velShort(spawn.vz) }, &sb);
+    try conn.queueFramed(spawn_frame);
 }
 
 fn collectItem(ctx: *anyopaque, collected_eid: i32, collector_eid: i32) anyerror!void {
@@ -177,6 +200,7 @@ const vtable = sink_mod.VTable{
     .teleport = teleport,
     .head_look = headLook,
     .spawn_item = spawnItem,
+    .spawn_potion = spawnPotion,
     .collect_item = collectItem,
     .inventory_slot = inventorySlot,
     .unload_chunk = unloadChunk,
@@ -237,6 +261,78 @@ test "sink item spawn emits object + metadata, inventory/collect/destroy frame" 
         const body_len: usize = @intCast(h.length - @as(i32, @intCast(codec.PacketWriter.varIntLen(h.id))));
         r.index += body_len;
     }
+    try std.testing.expectEqual(@as(usize, 0), r.remaining());
+}
+
+test "sink item spawn carries toss velocity so the client arcs smoothly" {
+    const a = std.testing.allocator;
+    var c = Conn.init(a, std.testing.io, .{}, 9);
+    defer c.deinit();
+    c.state = .play;
+    const sink = bind(&c);
+
+    // Tossed Q-drop: forward 0.3, up 0.15 (spawnQDrop shape).
+    var item = sink_mod.ItemSpawn{
+        .eid = 52,
+        .stack = .{ .id = @import("../ids.zig").dirt, .count = 1, .damage = 0, .nbt = null },
+        .x = 0.5,
+        .y = 64,
+        .z = 0.5,
+        .vx = 0.3,
+        .vy = 0.15,
+        .vz = 0.0,
+    };
+    try sink.spawnItem(&item);
+    // Settled drop: zero velocity.
+    var rest = sink_mod.ItemSpawn{
+        .eid = 53,
+        .stack = .{ .id = @import("../ids.zig").dirt, .count = 1, .damage = 0, .nbt = null },
+        .x = 1.5,
+        .y = 64,
+        .z = 0.5,
+    };
+    try sink.spawnItem(&rest);
+
+    const out = try c.takeOutput();
+    defer a.free(out);
+    var r = codec.PacketReader.init(out);
+    // First 0x0E: tossed drop must carry its arc as x8000 velocity shorts.
+    var h = try codec.decodeFrame(&r);
+    try std.testing.expectEqual(@as(i32, 0x0E), h.id);
+    _ = try r.readVarInt(); // eid
+    _ = try r.readByte(); // type 2
+    _ = try r.readInt(); // x
+    _ = try r.readInt(); // y
+    _ = try r.readInt(); // z
+    _ = try r.readByte(); // pitch
+    _ = try r.readByte(); // yaw
+    _ = try r.readInt(); // data 1
+    try std.testing.expectEqual(@as(i16, 2400), try r.readShort()); // 0.3 * 8000
+    try std.testing.expectEqual(@as(i16, 1200), try r.readShort()); // 0.15 * 8000
+    try std.testing.expectEqual(@as(i16, 0), try r.readShort());
+    // Skip 0x1C metadata, then the settled drop's 0x0E must be all zeros.
+    h = try codec.decodeFrame(&r);
+    try std.testing.expectEqual(@as(i32, 0x1C), h.id);
+    const mlen: usize = @intCast(h.length - @as(i32, @intCast(codec.PacketWriter.varIntLen(h.id))));
+    r.index += mlen;
+    h = try codec.decodeFrame(&r);
+    try std.testing.expectEqual(@as(i32, 0x0E), h.id);
+    _ = try r.readVarInt();
+    _ = try r.readByte();
+    _ = try r.readInt();
+    _ = try r.readInt();
+    _ = try r.readInt();
+    _ = try r.readByte();
+    _ = try r.readByte();
+    _ = try r.readInt();
+    try std.testing.expectEqual(@as(i16, 0), try r.readShort());
+    try std.testing.expectEqual(@as(i16, 0), try r.readShort());
+    try std.testing.expectEqual(@as(i16, 0), try r.readShort());
+    // Trailing 0x1C metadata for the settled drop.
+    h = try codec.decodeFrame(&r);
+    try std.testing.expectEqual(@as(i32, 0x1C), h.id);
+    const mlen2: usize = @intCast(h.length - @as(i32, @intCast(codec.PacketWriter.varIntLen(h.id))));
+    r.index += mlen2;
     try std.testing.expectEqual(@as(usize, 0), r.remaining());
 }
 
