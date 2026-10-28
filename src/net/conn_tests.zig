@@ -2019,6 +2019,36 @@ test "pre-baseline moves never adopt position" {
     try std.testing.expectApproxEqAbs(@as(f64, 72.0), c.pos_y, 1e-9);
 }
 
+test "pre-baseline drift never disarms the login grace" {
+    // The client runs physics from world spawn before our login teleport
+    // goes out, so its first packets always read "far away" — disarming
+    // on them would kill the grace before the burst even arrives, and a
+    // post-PosLook hole-fall would adopt instead of holding for the
+    // resync snap. Horizontal jumps pre-baseline hold the grace (and, via
+    // the baseline gate, never adopt); the same jump post-baseline
+    // disarms immediately.
+    var c = mkConn(.{}, 25);
+    defer c.deinit();
+    c.state = .play;
+    c.pos_x = 0.5;
+    c.pos_y = 74.0;
+    c.pos_z = 0.5;
+    c.armLoginGrace();
+    try std.testing.expect(c.login_grace_ms != 0);
+    // Far pre-baseline packet (client falling at world spawn): grace holds.
+    c.setPos(8.5, 60.0, 8.5, 0.0, 0.0, false);
+    try std.testing.expect(c.login_grace_ms != 0);
+    try std.testing.expect(c.login_fell);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), c.pos_x, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 74.0), c.pos_y, 1e-9);
+    // Same jump post-baseline: live input, grace clears, pos adopted.
+    c.baseline_sent = true;
+    c.armLoginGrace();
+    c.setPos(8.5, 60.0, 8.5, 0.0, 0.0, false);
+    try std.testing.expect(c.login_grace_ms == 0);
+    try std.testing.expectApproxEqAbs(@as(f64, 8.5), c.pos_x, 1e-9);
+}
+
 test "join packets order + fields" {
     const a = std.testing.allocator;
     var c = mkConn(.{ .gamemode = .creative }, 1);

@@ -2502,7 +2502,13 @@ pub const Conn = struct {
                 // adopts the whole fall through solid ground (fallrepro:
                 // 2cm/packet drift buried a login fall to y=66, saved).
                 // Intentional moves (walk 4+ blocks/s) clear instantly.
-                if (gdx * gdx + gdz * gdz > 0.0625) {
+                // Pre-baseline packets never disarm: the client runs physics
+                // from world spawn before our login teleport goes out, so its
+                // first packets always read "far away" — disarming on them
+                // would kill the grace before the burst even arrives, and a
+                // post-PosLook hole-fall would adopt instead of holding for
+                // the resync snap.
+                if (self.baseline_sent and gdx * gdx + gdz * gdz > 0.0625) {
                     self.login_grace_ms = 0; // playing, not falling
                     self.login_grace_lapsed = false;
                 } else if (y < self.login_y - 1.0) {

@@ -11605,6 +11605,22 @@ fn sessionLocked(
                 conn.pitch = 0;
             }
         }
+        // An explicit /setworldspawn wins over the gen search above — and it
+        // must land BEFORE landing-safety/rescue/audit/grace below, so every
+        // one of those sees the final position (otherwise the audit logs a
+        // good spot while the client is teleported somewhere unvetted).
+        if (fresh) {
+            const scfg = server.cfg.load();
+            if (scfg.world_spawn_set and !conn.spawn_forced) {
+                const ssw = scfg.world_spawn;
+                conn.config.spawn_x = ssw[0];
+                conn.config.spawn_y = ssw[1];
+                conn.config.spawn_z = ssw[2];
+                conn.pos_x = @as(f64, @floatFromInt(ssw[0])) + 0.5;
+                conn.pos_y = @as(f64, @floatFromInt(ssw[1]));
+                conn.pos_z = @as(f64, @floatFromInt(ssw[2])) + 0.5;
+            }
+        }
         // Landing safety: sync-fill a small disk around the login position
         // before the chunk burst + PosLook go out. Holes (background gen
         // pending) would leave a real client falling through the world on
@@ -11685,25 +11701,14 @@ fn sessionLocked(
         const cfg = server.cfg.load();
         const srv_diff = cfg.difficulty;
         const srv_gm = cfg.default_gamemode;
-        const srv_spawn = cfg.world_spawn;
-        const srv_spawn_set = cfg.world_spawn_set;
         conn.config.difficulty = srv_diff;
         // Fresh logins inherit the default gamemode; force_gamemode
         // (vanilla server.properties) also re-applies it to returning
         // players. Spawn placement below stays fresh-only: forced players
         // keep their saved position (only the mode is overridden).
         if (fresh or cfg.force_gamemode) conn.config.gamemode = srv_gm;
-        if (fresh) {
-            const was_forced = conn.spawn_forced;
-            if (srv_spawn_set and !was_forced) {
-                conn.config.spawn_x = srv_spawn[0];
-                conn.config.spawn_y = srv_spawn[1];
-                conn.config.spawn_z = srv_spawn[2];
-                conn.pos_x = @as(f64, @floatFromInt(srv_spawn[0])) + 0.5;
-                conn.pos_y = @as(f64, @floatFromInt(srv_spawn[1]));
-                conn.pos_z = @as(f64, @floatFromInt(srv_spawn[2])) + 0.5;
-            }
-        }
+        // (Fresh spawn placement happened above, before rescue/audit — the
+        // /setworldspawn override lives there so it is vetted too.)
         // Ban/whitelist gate (jar-hardcoded screens). Runs before any
         // join packets: rejected logins get a play disconnect + close.
         var login_rejected = false;
