@@ -8716,7 +8716,7 @@ pub const Server = struct {
     /// locks held when the snapshot drops to the registry lock).
     fn broadcastItemMeta(self: *Server, id: i32, stack: item_mod.Stack) void {
         var mb: [1024]u8 = undefined;
-        const meta = packets.frameItemMetadata(self.gpa, id, stack, &mb) catch return;
+        const meta = packets.frameItemMetadata(id, stack, &mb) catch return;
         var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
