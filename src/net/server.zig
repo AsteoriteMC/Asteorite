@@ -6834,10 +6834,15 @@ pub const Server = struct {
                     }
                     for (b.primes) |c| {
                         if (c.y < 0 or c.y > 255) continue;
-                        _ = self.primeTnt(pool, self.gpa, c.x, @intCast(c.y), c.z, self.chainFuse());
+                        const yu: u8 = @intCast(c.y);
+                        const cur = view.peekBlock(pool, self.gpa, c.x, yu, c.z) catch continue;
+                        const cell = cur orelse continue;
+                        if (cell.id != game_ids.tnt) continue;
+                        _ = self.primeTnt(pool, self.gpa, c.x, yu, c.z, self.chainFuse());
+                        b.primes[b.primes_applied] = c;
+                        b.primes_applied += 1;
                     }
-                    self.gpa.free(b.primes);
-                    b.primes = &.{};
+                    // (primes buffer freed after the phase-2 broadcast.)
                     execs[n_exec] = b;
                     n_exec += 1;
                 }
@@ -6858,6 +6863,24 @@ pub const Server = struct {
                         var chunks: [64]struct { cx: i32, cz: i32 } = undefined;
                         var n_chunks: usize = 0;
                         for (b.breaks[0..b.applied]) |c| {
+                            self.broadcastBlockChange(null, c.x, @intCast(c.y), c.z, game_ids.air, 0) catch {};
+                            const cx = @divFloor(c.x, 16);
+                            const cz = @divFloor(c.z, 16);
+                            var found = false;
+                            for (chunks[0..n_chunks]) |ch| {
+                                if (ch.cx == cx and ch.cz == cz) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found and n_chunks < chunks.len) {
+                                chunks[n_chunks] = .{ .cx = cx, .cz = cz };
+                                n_chunks += 1;
+                            }
+                        }
+                        // Chained-TNT cells primed above broadcast as air too
+                        // (else they stay ghost-solid on viewers).
+                        for (b.primes[0..b.primes_applied]) |c| {
                             self.broadcastBlockChange(null, c.x, @intCast(c.y), c.z, game_ids.air, 0) catch {};
                             const cx = @divFloor(c.x, 16);
                             const cz = @divFloor(c.z, 16);
@@ -7042,7 +7065,10 @@ pub const Server = struct {
                         const f = packets.frameDestroyEntitiesFramed(&[_]i32{id}, &fb) catch continue;
                         self.broadcastToTrackers(id, f);
                     }
-                    for (execs[0..n_exec]) |*b| self.gpa.free(b.breaks);
+                    for (execs[0..n_exec]) |*b| {
+                        self.gpa.free(b.breaks);
+                        self.gpa.free(b.primes);
+                    }
                 }
             }
             const blast_dt_ms = @as(f64, @floatFromInt(blast_t0.durationTo(std.Io.Timestamp.now(self.io, .awake)).nanoseconds)) / 1e6;
@@ -8133,6 +8159,10 @@ pub const Server = struct {
         /// Cells actually applied (compacted to the front of `breaks` by
         /// the apply pass; S23/resends/records use this prefix).
         applied: usize = 0,
+        /// Chained-TNT cells actually primed (compacted to the front of
+        /// `primes`; broadcast as air — without this the primed cells
+        /// stay ghost-solid on viewers).
+        primes_applied: usize = 0,
     };
     fn applyPotionImpacts(self: *Server, impacts: []const PotionImpact) void {
         if (impacts.len == 0) return;
@@ -13063,6 +13093,8 @@ test "K4 glue: primed TNT fuses, detonates, craters stone, drops" {
         }
     }
     _ = try view.applyBlock(pool, a, 8, 64, 8, game_ids.tnt, 0);
+    // Adjacent TNT for the chain path (primed by the blast, not the hand).
+    _ = try view.applyBlock(pool, a, 9, 64, 8, game_ids.tnt, 0);
     var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
     defer srv.deinitRegions();
     defer srv.registry.deinit(a);
@@ -13078,8 +13110,9 @@ test "K4 glue: primed TNT fuses, detonates, craters stone, drops" {
     try std.testing.expectEqual(game_ids.air, (try view.peekBlock(pool, a, 8, 64, 8)).?.id);
     // Fuse 80 ticks down 20/tick: detonation on the 4th tick, blast
     // applied the same tick (budget 8/tick — one blast runs at once).
+    // The chained neighbor (short 10-29 fuse) follows within 2 ticks.
     var t: i64 = 0;
-    while (t < 6) : (t += 1) srv.tickOnce(1000 + t * 1000);
+    while (t < 8) : (t += 1) srv.tickOnce(1000 + t * 1000);
     srv.ent_lock.lock();
     const n_tnts = srv.tnts.items.len;
     const n_blasts = srv.pending_blasts.items.len;
@@ -13087,8 +13120,9 @@ test "K4 glue: primed TNT fuses, detonates, craters stone, drops" {
     srv.ent_lock.unlock();
     try std.testing.expectEqual(@as(usize, 0), n_tnts);
     try std.testing.expectEqual(@as(usize, 0), n_blasts);
-    // Crater: the stone directly under the blast is gone.
+    // Crater: the stone directly under both blasts is gone.
     try std.testing.expectEqual(game_ids.air, (try view.peekBlock(pool, a, 8, 63, 8)).?.id);
+    try std.testing.expectEqual(game_ids.air, (try view.peekBlock(pool, a, 9, 63, 8)).?.id);
     // Drops went through the J1 pipeline (1/4 chance per cell over a
     // ~100-cell crater — empty would be a real regression).
     try std.testing.expect(n_items > 0);
