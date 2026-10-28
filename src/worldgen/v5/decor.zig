@@ -2828,6 +2828,66 @@ pub fn computeHeights(view: *const View, heights: []i32) void {
 /// Decorate center chunk (cx,cz) in `view` (must cover (cx-1..cx+1) chunks,
 /// i.e. 48x48 with ox=(cx-1)*16). `biomeAt` returns voronoi biome id at
 /// world (x,z). Heights are recomputed per run after lakes/dungeons.
+/// Merge one populate run's work into the accumulated view. Every cell
+/// where work differs from the pristine base in EITHER block or meta copies
+/// BOTH components (whole cell, last-writer-wins). The components must not
+/// be compared/copied independently: oak log/0 over base stone/0 matches
+/// the base meta, so an independent meta pass would skip it and a previous
+/// run's spruce meta would survive (spruce log at an oak base where forest
+/// borders taiga). Touched 4-cell groups are recorded for sparse restore.
+/// Only dirty tiles are scanned (clean tiles equal pristine by the
+/// markDirty completeness gate). Assumes the 48-wide view (6x6 tiles).
+pub fn mergeWorkView(view: *View, base_blocks: []const ids.Id, base_metas: []const u8, work: *View, dirty_b: []usize) usize {
+    var nb_dirty: usize = 0;
+    var dtx: usize = 0;
+    while (dtx < 6) : (dtx += 1) {
+        var dtz: usize = 0;
+        while (dtz < 6) : (dtz += 1) {
+            const dbit: u6 = @intCast(dtx * 6 + dtz);
+            if ((work.dirty >> dbit) & 1 == 0) continue;
+            var ddx: usize = 0;
+            while (ddx < 8) : (ddx += 1) {
+                var ddz: usize = 0;
+                while (ddz < 8) : (ddz += 1) {
+                    const col_x = dtx * 8 + ddx;
+                    const col_z = dtz * 8 + ddz;
+                    const cbase = (col_x * view.sz + col_z) * 256;
+                    var y0: usize = 0;
+                    while (y0 < 256) : (y0 += 4) {
+                        const b0 = cbase + y0;
+                        const wb64 = std.mem.readInt(u64, std.mem.sliceAsBytes(work.blocks[b0..][0..4])[0..8], .little);
+                        const bb64 = std.mem.readInt(u64, std.mem.sliceAsBytes(base_blocks[b0..][0..4])[0..8], .little);
+                        const wm32 = std.mem.readInt(u32, work.metas[b0..][0..4], .little);
+                        const bm32 = std.mem.readInt(u32, base_metas[b0..][0..4], .little);
+                        if (wb64 != bb64 or wm32 != bm32) {
+                            var kb: usize = 0;
+                            while (kb < 4) : (kb += 1) {
+                                if (work.blocks[b0 + kb] != base_blocks[b0 + kb] or work.metas[b0 + kb] != base_metas[b0 + kb]) {
+                                    view.blocks[b0 + kb] = work.blocks[b0 + kb];
+                                    view.metas[b0 + kb] = work.metas[b0 + kb];
+                                }
+                            }
+                            dirty_b[nb_dirty] = b0 / 4;
+                            nb_dirty += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return nb_dirty;
+}
+
+/// Sparse restore: return work's touched groups to pristine for the next run.
+pub fn restoreWork(work_blocks: []ids.Id, work_metas: []u8, base_blocks: []const ids.Id, base_metas: []const u8, dirty_b: []const usize, nb_dirty: usize) void {
+    var di: usize = 0;
+    while (di < nb_dirty) : (di += 1) {
+        const b0 = dirty_b[di] * 4;
+        @memcpy(work_blocks[b0..][0..4], base_blocks[b0..][0..4]);
+        @memcpy(work_metas[b0..][0..4], base_metas[b0..][0..4]);
+    }
+}
+
 pub fn decorateCenter(
     view: *View,
     world_seed: i64,
@@ -2880,13 +2940,12 @@ pub fn decorateCenter(
     // restore (no per-write tracking needed). Merge still compares work vs
     // pristine base (not vs view), so a cell written then restored to
     // pristine never clobbers an earlier populate's merged result.
-    // Independent block/meta comparisons are preserved exactly.
+    // mergeWorkView copies whole cells (see doc comment for why the
+    // components must not be merged independently).
     @memcpy(work_blocks, base_blocks);
     @memcpy(work_metas, base_metas);
     const dirty_b = try scratch.alloc(usize, n / 4 + 1);
     defer scratch.free(dirty_b);
-    const dirty_m = try scratch.alloc(usize, n / 8 + 1);
-    defer scratch.free(dirty_m);
     for (order) |o| {
         const nx = cx + o.dx;
         const nz = cz + o.dz;
@@ -2964,85 +3023,8 @@ pub fn decorateCenter(
         // pristine by the gate above, so skipping them is exact.
         // Dirty group indices are recorded so only they are restored to
         // pristine afterwards (sparse reset, no full copy).
-        var nb_dirty: usize = 0;
-        var dtx: usize = 0;
-        while (dtx < 6) : (dtx += 1) {
-            var dtz: usize = 0;
-            while (dtz < 6) : (dtz += 1) {
-                const dbit: u6 = @intCast(dtx * 6 + dtz);
-                if ((work.dirty >> dbit) & 1 == 0) continue;
-                var ddx: usize = 0;
-                while (ddx < 8) : (ddx += 1) {
-                    var ddz: usize = 0;
-                    while (ddz < 8) : (ddz += 1) {
-                        const col_x = dtx * 8 + ddx;
-                        const col_z = dtz * 8 + ddz;
-                        const cbase = (col_x * view.sz + col_z) * 256;
-                        var y0: usize = 0;
-                        while (y0 < 256) : (y0 += 4) {
-                            const b0 = cbase + y0;
-                            const wb64 = std.mem.readInt(u64, std.mem.sliceAsBytes(work_blocks[b0..][0..4])[0..8], .little);
-                            const bb64 = std.mem.readInt(u64, std.mem.sliceAsBytes(base_blocks[b0..][0..4])[0..8], .little);
-                            if (wb64 != bb64) {
-                                var kb: usize = 0;
-                                while (kb < 4) : (kb += 1) {
-                                    const wb = work_blocks[b0 + kb];
-                                    if (wb != base_blocks[b0 + kb]) view.blocks[b0 + kb] = wb;
-                                }
-                                dirty_b[nb_dirty] = b0 / 4;
-                                nb_dirty += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        var nm_dirty: usize = 0;
-        var mtx: usize = 0;
-        while (mtx < 6) : (mtx += 1) {
-            var mtz: usize = 0;
-            while (mtz < 6) : (mtz += 1) {
-                const mbit: u6 = @intCast(mtx * 6 + mtz);
-                if ((work.dirty >> mbit) & 1 == 0) continue;
-                var mdx: usize = 0;
-                while (mdx < 8) : (mdx += 1) {
-                    var mdz: usize = 0;
-                    while (mdz < 8) : (mdz += 1) {
-                        const col_x = mtx * 8 + mdx;
-                        const col_z = mtz * 8 + mdz;
-                        const cbase = (col_x * view.sz + col_z) * 256;
-                        var y0: usize = 0;
-                        while (y0 < 256) : (y0 += 8) {
-                            const m0 = cbase + y0;
-                            const wm64 = std.mem.readInt(u64, work_metas[m0..][0..8], .little);
-                            const bm64 = std.mem.readInt(u64, base_metas[m0..][0..8], .little);
-                            if (wm64 != bm64) {
-                                var km: usize = 0;
-                                while (km < 8) : (km += 1) {
-                                    const wm = work_metas[m0 + km];
-                                    if (wm != base_metas[m0 + km]) view.metas[m0 + km] = wm;
-                                }
-                                dirty_m[nm_dirty] = m0 / 8;
-                                nm_dirty += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // Restore dirty groups to pristine for the next run.
-        var di: usize = 0;
-        while (di < nb_dirty) : (di += 1) {
-            const gg = dirty_b[di];
-            const b0 = gg * 4;
-            @memcpy(work_blocks[b0..][0..4], base_blocks[b0..][0..4]);
-        }
-        var dj: usize = 0;
-        while (dj < nm_dirty) : (dj += 1) {
-            const hh = dirty_m[dj];
-            const m0 = hh * 8;
-            @memcpy(work_metas[m0..][0..8], base_metas[m0..][0..8]);
-        }
+        const nb_dirty = mergeWorkView(view, base_blocks, base_metas, &work, dirty_b);
+        restoreWork(work_blocks, work_metas, base_blocks, base_metas, dirty_b, nb_dirty);
     }
     // Post-merge floater sweep: a later run's lake can undercut an earlier
     // run's flora (see sweepFloaters). Center chunk only; neighbors sweep
@@ -3089,6 +3071,79 @@ pub fn sweepFloaters(view: *View, cx: i32, cz: i32) void {
             }
         }
     }
+}
+
+test "merge is whole-cell: oak over spruce keeps oak meta" {
+    // Regression for forest-border oaks with a spruce (or birch) log at the
+    // base. The 3x3 merge compared/copied blocks and metas independently:
+    // oak log/0 over base stone/0 matches the base meta, so the meta pass
+    // skipped it and a previous run's spruce meta survived in the view.
+    // mergeWorkView must copy both components whenever either differs.
+    const alloc = std.testing.allocator;
+    const S: usize = 48;
+    const n = S * 256 * S;
+    const blocks = try alloc.alloc(ids.Id, n);
+    defer alloc.free(blocks);
+    const metas = try alloc.alloc(u8, n);
+    defer alloc.free(metas);
+    @memset(blocks, ids.air);
+    @memset(metas, 0);
+    for (0..S) |x| {
+        for (0..S) |z| {
+            for (0..70) |y| blocks[(x * S + z) * 256 + y] = ids.stone;
+            blocks[(x * S + z) * 256 + 70] = ids.grass;
+        }
+    }
+    var view = View{ .blocks = blocks, .metas = metas, .ox = 0, .oz = 0, .sx = S, .sz = S };
+    const base_b = try alloc.alloc(ids.Id, n);
+    defer alloc.free(base_b);
+    const base_m = try alloc.alloc(u8, n);
+    defer alloc.free(base_m);
+    @memcpy(base_b, blocks);
+    @memcpy(base_m, metas);
+    const wb = try alloc.alloc(ids.Id, n);
+    defer alloc.free(wb);
+    const wm = try alloc.alloc(u8, n);
+    defer alloc.free(wm);
+    @memcpy(wb, base_b);
+    @memcpy(wm, base_m);
+    var work = View{ .blocks = wb, .metas = wm, .ox = 0, .oz = 0, .sx = S, .sz = S };
+    const dirty = try alloc.alloc(usize, n / 4 + 1);
+    defer alloc.free(dirty);
+
+    // Run 1 (neighbor taiga): spruce trunk + a spruce leaf beside the oak spot.
+    work.set(4, 71, 4, ids.log, 1);
+    work.set(4, 72, 4, ids.log, 1);
+    work.set(4, 73, 4, ids.log, 1);
+    work.set(5, 71, 4, ids.leaves, 1);
+    var nb = mergeWorkView(&view, base_b, base_m, &work, dirty);
+    restoreWork(wb, wm, base_b, base_m, dirty, nb);
+    work.clearDirty();
+    try std.testing.expectEqual(ids.log, view.get(4, 71, 4));
+    try std.testing.expectEqual(@as(u8, 1), view.getMeta(4, 71, 4));
+
+    // Run 2 (center forest): oak trunk over the spruce column, trunk through
+    // the spruce leaf cell. Every cell must come out oak/0.
+    work.set(4, 71, 4, ids.log, 0);
+    work.set(4, 72, 4, ids.log, 0);
+    work.set(4, 73, 4, ids.log, 0);
+    work.set(5, 71, 4, ids.log, 0);
+    nb = mergeWorkView(&view, base_b, base_m, &work, dirty);
+    restoreWork(wb, wm, base_b, base_m, dirty, nb);
+    work.clearDirty();
+    for ([_]i32{ 71, 72, 73 }) |y| {
+        try std.testing.expectEqual(ids.log, view.get(4, y, 4));
+        try std.testing.expectEqual(@as(u8, 0), view.getMeta(4, y, 4));
+    }
+    try std.testing.expectEqual(ids.log, view.get(5, 71, 4));
+    try std.testing.expectEqual(@as(u8, 0), view.getMeta(5, 71, 4));
+
+    // Reverse order still works (spruce over oak -> spruce meta).
+    work.set(4, 71, 4, ids.log, 1);
+    nb = mergeWorkView(&view, base_b, base_m, &work, dirty);
+    restoreWork(wb, wm, base_b, base_m, dirty, nb);
+    work.clearDirty();
+    try std.testing.expectEqual(@as(u8, 1), view.getMeta(4, 71, 4));
 }
 
 test "populateOne matches JVM (seed 42 chunk 0,0 forest)" {
