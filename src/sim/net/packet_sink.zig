@@ -73,6 +73,19 @@ pub const PotionSpawn = struct {
     vz: f64 = 0,
 };
 
+/// Primed-TNT spawn: type 50 (vanilla EntityTNTPrimed). No data field and
+/// no velocity shorts on the wire (data 0 carries none); the client
+/// renders the flashing primed block from the type alone and our 1Hz
+/// rel_move/teleport stream corrects the arc, same as settled items.
+pub const TntSpawn = struct {
+    eid: i32,
+    x: f64 = 0,
+    y: f64 = 0,
+    z: f64 = 0,
+    vx: f64 = 0,
+    vy: f64 = 0,
+    vz: f64 = 0,
+};
 /// One column in a bulk delivery. The layout fields are codec results, not
 /// canonical world state.
 pub const BulkColumn = struct {
@@ -99,6 +112,7 @@ pub const VTable = struct {
     head_look: *const fn (ctx: *anyopaque, eid: i32, yaw: f32) anyerror!void,
     spawn_item: *const fn (ctx: *anyopaque, spawn: *const ItemSpawn) anyerror!void,
     spawn_potion: *const fn (ctx: *anyopaque, spawn: *const PotionSpawn) anyerror!void,
+    spawn_tnt: *const fn (ctx: *anyopaque, spawn: *const TntSpawn) anyerror!void,
     collect_item: *const fn (ctx: *anyopaque, collected_eid: i32, collector_eid: i32) anyerror!void,
     inventory_slot: *const fn (ctx: *anyopaque, window: i8, slot: i16, stack: ?item_mod.Stack) anyerror!void,
     unload_chunk: *const fn (ctx: *anyopaque, x: i32, z: i32) anyerror!void,
@@ -149,6 +163,10 @@ pub const PacketSink = struct {
 
     pub fn spawnPotion(self: PacketSink, spawn: *const PotionSpawn) !void {
         return self.vtable.spawn_potion(self.ctx, spawn);
+    }
+
+    pub fn spawnTnt(self: PacketSink, spawn: *const TntSpawn) !void {
+        return self.vtable.spawn_tnt(self.ctx, spawn);
     }
 
     pub fn collectItem(self: PacketSink, collected_eid: i32, collector_eid: i32) !void {

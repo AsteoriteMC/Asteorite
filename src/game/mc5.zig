@@ -18,6 +18,8 @@ pub const smelting_data = @import("mc5/smelting_data.zig");
 pub const mobs = @import("mc5/mobs.zig");
 /// 1.7.10 block drop table.
 pub const drops_data = @import("mc5/drops_data.zig");
+/// 1.7.10 block blast-resistance table (K4 explosion attenuation).
+pub const blast_data = @import("mc5/blast_data.zig");
 /// Dense 1.7.10 block-definition table (normal cube, support, piston
 /// mobility, redstone component identity).
 pub const blocks = @import("mc5/blocks.zig").table;

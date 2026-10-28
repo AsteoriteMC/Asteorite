@@ -183,13 +183,13 @@ needs), then K4, then K2/K3 (independent of K1, can interleave).
 - [ ] Follow-up: anvil combine/repair UI (can reuse the J3 repair matcher + XP cost rules).
 - [x] Acceptance (unit goldens, no live client in this session): 15-shelf setup offers 30 (seed-0 golden `[8,13,30]`); same seed → same outcome; applied enchants visible in NBT (multi-pick merge, book→enchanted_book); XP levels deducted; insufficient levels resync without enchanting; books keep ≤2 (vanilla single-removal).
 
-### K4. TNT + optimized explosions
+### K4. TNT + optimized explosions ✅ (implemented, golden-tested; live E2E pending)
 
-- [ ] Primed TNT entity (Spawn Object type 50), 80-tick fuse, gravity/drag on the J1 entity-motion path; ignition via K1 redstone power and flint-and-steel Use-Item action (shared with K2 drinking); fire-spread ignition deferred (no fire-spread sim yet — say so).
-- [ ] Explosion core, batched (the "optimized TNT" design): one 16³-raycast exposure pass per blast (vanilla attenuation by blast resistance), per-tick update budget with a chain queue (no recursion, chained TNT never skips ticks — closes the G1 acceptance item), single collect-then-apply block pass; drops through the J1 pipeline at the vanilla size-scaled chance; entity damage with exposure falloff + knockback; S27 Explosion packet (pos + radius + records) + `random.explode` S29.
-- [ ] Chain reactions ride the same queue; per-region load counted by the Phase C breaker; GPU raycast stays a Phase G1 job only after this CPU reference proves out with goldens.
-- [ ] Follow-ups: creeper/ghast-fireball variants on the same core.
-- [ ] Acceptance: fuse→S27→crater matches a vanilla raycast golden on flat stone; 64-TNT chain clears with zero skipped ticks (timing logged); drops + damage + knockback live-verified over TCP.
+- [x] Primed TNT entity (Spawn Object type 50, S27-tested framer + recorder/loopback paths), 80-tick fuse, gravity/drag on the J1 entity-motion path (20 substeps/tick: 0.04 gravity, 0.98 drag, -0.5 bounce + 0.7 friction, rest on first-solid-top); ignition via K1 redstone power (post-edit neighbor scan primes powered TNT) and flint-and-steel Use-Item action (shared K2 drinking path shape; 64-use wear, creative keeps); fire-spread ignition deferred (no fire-spread sim yet — pinned by `fire never ignites tnt`).
+- [x] Explosion core, batched: one 16³-face raycast exposure pass per blast (vanilla attenuation, blast-resistance table as data), per-tick update budget (8 blasts/tick) with a chain queue (no recursion, chained TNT primes with 10+rand(20) fuses so fuses never skip ticks), single collect-then-apply block pass (re-peek guards, unbreakable skipped); drops through the J1 pipeline at the vanilla 1/size chance; entity damage with exposure falloff + knockback (players: EPF-reduced + capped authoritative shove + PosLook; S27 tail velocity zeroed so the client never double-applies); S27 Explosion packet (per-viewer records + zeroed vel) + `random.explode` S29 (volume 4.0, 64-block earshot).
+- [x] Chain reactions ride short-fuse entities (never the blast queue); per-region breaker integration is a follow-up (the budget caps tick load; no breaker accounting yet). GPU raycast stays a Phase G1 job — the CPU reference here is the golden baseline.
+- [ ] Follow-ups: creeper/ghast-fireball variants on the same core; blast-popped container contents are lost (no window fan-out on blast breaks); mob drops ride J4; live-client feel (fuse flicker is client-side from type 50).
+- [x] Acceptance, unit goldens + headless glue (no live client in this session): flat-stone crater golden (seed 42), water-absorbs/bedrock-stops/TNT-chains goldens, damage/exposure formula anchors, 64-blast bounded-chain test; headless LSM tests (redstone lever→wire→prime, full fuse→detonate→crater→drops); conn test (flint routing); S27 layout test. Live E2E (fuse→S27→crater over TCP, 64-TNT chain timing, drops + damage + knockback feel) pending a live client.
 
 ## Phase L — Vanilla parity sweep (everything else 1.7.10 does that we don't)
 
@@ -250,7 +250,7 @@ goldens where the algorithm is deterministic.
 - [x] Rate limits: login attempts per IP (5 joins/10s sliding window, `Too many login attempts` + close; IOCP conns carry no IP and bypass), block-place attempts per conn (32/s burst, same vanilla spam kick as chat — creative spam is a chunk-rewrite storm into the LSM). Chat throttle pre-existing. Unit + live bot verified (5 in, 6th/7th rejected)
 - [x] `/tps` (server extension like `/perm`, `/netstat`, usable by players): 1Hz tick p50/p99 + flush timing + player/tick counts (honest about the 1Hz ticker, no fake 20.0)
 - [ ] Spawn protection (16-block, op-bypassed, vanilla radius) + sleeping in beds (skip-night vote + spawn set) + hardcore world flag.
-- [ ] Presentation sweep: S2A particle packet (potion splash, crits, note smoke — K2/K4/L3 consume it), remaining S29 voices (hurt, eat, splash, explode is K4, doors), server-list favicon.
+- [ ] Presentation sweep: S2A particle packet (potion splash, crits, note smoke — K2/K4/L3 consume it), remaining S29 voices (hurt, eat, splash, doors — `random.explode` shipped in K4), server-list favicon.
 - [ ] Command blocks (redstone-powered command execution via K1 power + existing dispatch; `testfor` already hardcodes its message).
 - [ ] Acceptance: query responds to GameSpy packets; death by creeper prints the vanilla line; non-op can't break spawn; all sleepers → dawn; hardcore death bans (vanilla SMP rule).
 

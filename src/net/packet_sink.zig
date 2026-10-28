@@ -124,6 +124,16 @@ fn spawnPotion(ctx: *anyopaque, spawn: *const sink_mod.PotionSpawn) anyerror!voi
     try conn.queueFramed(spawn_frame);
 }
 
+/// Primed-TNT spawn: type 50 (vanilla EntityTNTPrimed), data 0 so no
+/// velocity shorts ride along (the framer only appends them for data>0);
+/// the 1Hz rel_move/teleport stream owns the arc like settled items.
+fn spawnTnt(ctx: *anyopaque, spawn: *const sink_mod.TntSpawn) anyerror!void {
+    const conn = asConn(ctx);
+    var sb: [64]u8 = undefined;
+    const spawn_frame = try packets.frameSpawnObject(spawn.eid, 50, spawn.x, spawn.y, spawn.z, 0, 0, 0, null, &sb);
+    try conn.queueFramed(spawn_frame);
+}
+
 fn collectItem(ctx: *anyopaque, collected_eid: i32, collector_eid: i32) anyerror!void {
     var buf: [24]u8 = undefined;
     const f = try packets.frameCollect(collected_eid, collector_eid, &buf);
@@ -201,6 +211,7 @@ const vtable = sink_mod.VTable{
     .head_look = headLook,
     .spawn_item = spawnItem,
     .spawn_potion = spawnPotion,
+    .spawn_tnt = spawnTnt,
     .collect_item = collectItem,
     .inventory_slot = inventorySlot,
     .unload_chunk = unloadChunk,

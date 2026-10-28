@@ -470,6 +470,29 @@ test "potion routing: drinkables eat, splash throws, never places" {
     }
 }
 
+test "flint-and-steel routing: block click ignites, air does nothing" {
+    var c = mkConn(.{ .gamemode = .survival, .spawn_x = 8, .spawn_y = 64, .spawn_z = 8 }, 34);
+    defer c.deinit();
+    c.state = .play;
+    c.inv[36] = .{ .id = game_ids.flint_and_steel, .count = 1, .damage = 0, .nbt = null };
+    c.selected = 0;
+    // Air click: vanilla does nothing (no fire without a face).
+    {
+        const act = c.onPlace(8, 64, 8, -1, 8);
+        try std.testing.expect(act == .none);
+    }
+    // Block click carries the clicked cell (serve peeks for TNT) and the
+    // target (serve NACKs it when the click was not TNT).
+    {
+        const act = c.onPlace(8, 64, 8, 1, 8);
+        try std.testing.expect(act == .ignite_tnt);
+        try std.testing.expectEqual(@as(i32, 8), act.ignite_tnt.x);
+        try std.testing.expectEqual(@as(u8, 64), act.ignite_tnt.y);
+        try std.testing.expectEqual(@as(i32, 8), act.ignite_tnt.z);
+        try std.testing.expectEqual(@as(usize, 36), act.ignite_tnt.slot);
+    }
+}
+
 test "potion drink finish: effect applies, bottle back, no food change" {
     // Swiftness (8194) at low food: 32 ticks -> effect 1 (speed) for 3600
     // ticks, bottle back, food/saturation untouched (potions don't feed).

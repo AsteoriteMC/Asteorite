@@ -88,6 +88,32 @@ test "block change + animation frames parse back" {
     try std.testing.expectEqual(@as(usize, 0), rb.remaining());
 }
 
+test "explosion frame parses back (S27 layout)" {
+    var out: [4096]u8 = undefined;
+    const recs = [_]ExplosionRecord{
+        .{ .dx = 0, .dy = 0, .dz = 0 },
+        .{ .dx = -3, .dy = 1, .dz = 2 },
+    };
+    const f = try frameExplosion(10.5, 64.0, -3.25, 4.0, &recs, .{ 0.5, 1.0, -0.25 }, &out);
+    var r = codec.PacketReader.init(f);
+    try std.testing.expectEqual(@as(i32, 0x27), (try codec.decodeFrame(&r)).id);
+    try std.testing.expectEqual(@as(f32, 10.5), try r.readFloat());
+    try std.testing.expectEqual(@as(f32, 64.0), try r.readFloat());
+    try std.testing.expectEqual(@as(f32, -3.25), try r.readFloat());
+    try std.testing.expectEqual(@as(f32, 4.0), try r.readFloat());
+    try std.testing.expectEqual(@as(i32, 2), try r.readInt());
+    try std.testing.expectEqual(@as(u8, 0), try r.readByte());
+    try std.testing.expectEqual(@as(u8, 0), try r.readByte());
+    try std.testing.expectEqual(@as(u8, 0), try r.readByte());
+    try std.testing.expectEqual(@as(u8, @bitCast(@as(i8, -3))), try r.readByte());
+    try std.testing.expectEqual(@as(u8, 1), try r.readByte());
+    try std.testing.expectEqual(@as(u8, 2), try r.readByte());
+    try std.testing.expectEqual(@as(f32, 0.5), try r.readFloat());
+    try std.testing.expectEqual(@as(f32, 1.0), try r.readFloat());
+    try std.testing.expectEqual(@as(f32, -0.25), try r.readFloat());
+    try std.testing.expectEqual(@as(usize, 0), r.remaining());
+}
+
 
 /// Clientbound 0x29 NamedSoundEffect: coords are absolute blocks * 8,
 /// volume float, pitch byte (vanilla scale: pitch * 63).
@@ -104,6 +130,42 @@ pub fn frameSoundEffect(name: []const u8, x: f64, y: f64, z: f64, volume: f32, p
     return try codec.framePacket(@intFromEnum(ids.PlayClient.sound_effect), w.written(), out);
 }
 
+
+/// S27 record: one floor-relative block offset (client particles).
+pub const ExplosionRecord = struct { dx: i8, dy: i8, dz: i8 };
+
+/// Clientbound 0x27 Explosion (minecraft-data 1.7 `packet_explosion`:
+/// f32 x/y/z, f32 radius, i32 count + i8 xyz triples, then 3x f32
+/// player motion). Records are floor-relative byte offsets of the broken
+/// cells (the client spawns particles there); the tail velocity is
+/// per-viewer knockback (vanilla sends one S27 per player with their
+/// own motion — no shared broadcast).
+pub fn frameExplosion(
+    x: f32,
+    y: f32,
+    z: f32,
+    radius: f32,
+    records: []const ExplosionRecord,
+    vel: [3]f32,
+    out: []u8,
+) codec.CodecError![]const u8 {
+    var payload: [4096]u8 = undefined;
+    var w = codec.PacketWriter.init(&payload);
+    try w.writeFloat(x);
+    try w.writeFloat(y);
+    try w.writeFloat(z);
+    try w.writeFloat(radius);
+    try w.writeInt(@as(i32, @intCast(records.len)));
+    for (records) |r| {
+        try w.writeByte(@bitCast(r.dx));
+        try w.writeByte(@bitCast(r.dy));
+        try w.writeByte(@bitCast(r.dz));
+    }
+    try w.writeFloat(vel[0]);
+    try w.writeFloat(vel[1]);
+    try w.writeFloat(vel[2]);
+    return try codec.framePacket(@intFromEnum(ids.PlayClient.explosion), w.written(), out);
+}
 
 /// Clientbound 0x2C SpawnGlobalEntity (lightning = type 1): fixed-point
 /// absolute coords (* 32, floored like vanilla).

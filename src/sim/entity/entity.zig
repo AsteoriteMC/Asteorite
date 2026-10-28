@@ -50,6 +50,36 @@ pub const PotionSnap = struct {
     vy: f64 = 0,
     vz: f64 = 0,
 };
+/// Primed TNT (vanilla EntityTNTPrimed, type 50 on the wire).
+/// Fuse is game ticks (20 per 1Hz server tick; vanilla fuse 80 = 4s).
+/// Motion is blocks per 20tps tick, integrated 20 substeps per 1Hz tick
+/// like items (vanilla: gravity 0.04, drag 0.98, ground bounce -0.5 with
+/// 0.7 horizontal friction). No pickup, no merging — detonation at
+/// fuse <= 0 queues a batched blast (see sim/world/explosion.zig).
+pub const TntEnt = struct {
+    id: i32,
+    x: f64,
+    y: f64,
+    z: f64,
+    vx: f64 = 0,
+    vy: f64 = 0,
+    vz: f64 = 0,
+    /// Game ticks remaining (vanilla 80 at prime, 10-30 for chains).
+    fuse: u16 = 80,
+};
+
+/// TNT snapshot (copied out from under the entity lock; fuse is shown so
+/// viewers could render urgency, though the client flashes on its own).
+pub const TntSnap = struct {
+    id: i32,
+    x: f64,
+    y: f64,
+    z: f64,
+    vx: f64 = 0,
+    vy: f64 = 0,
+    vz: f64 = 0,
+    fuse: u16 = 80,
+};
 /// Dropped-item entity (vanilla EntityItem, type 2 on the wire).
 /// Ticks are 20tps units advanced 20 per 1Hz server tick (same convention as
 /// world_age in tickOnce). `stack` is OWNED (NBT duped at spawn, freed with
@@ -296,6 +326,7 @@ pub fn reconcileViewer(
     mobs: []const MobSnap,
     items: []const ItemSnap,
     potions: []const PotionSnap,
+    tnts: []const TntSnap,
     claimed: *ClaimSet,
     present: *const fn (ctx: *anyopaque, x: f64, z: f64) bool,
     present_ctx: *anyopaque,
@@ -446,12 +477,34 @@ pub fn reconcileViewer(
             try conn.tracked.put(pot.id, .{ .x = pot.x, .y = pot.y, .z = pot.z, .yaw = 0, .pitch = 0 });
         }
     }
+    // primed TNT (spawn type 50 with the flicker fuse, rel_move/teleport
+    // like items so the arc is visible, destroy on gone/detonate)
+    for (tnts) |tnt| {
+        if (!present(present_ctx, tnt.x, tnt.z)) {
+            if (conn.tracked.fetchRemove(tnt.id)) |_| try sink.destroyEntities(&[_]i32{tnt.id});
+            continue;
+        }
+        if (conn.tracked.get(tnt.id)) |t| {
+            const tplan = planUpdate(t, tnt.x, tnt.y, tnt.z, 0, 0);
+            switch (tplan) {
+                .none => {},
+                .rel_move => |d| try sink.moveRelative(tnt.id, d.dx, d.dy, d.dz),
+                .teleport => try sink.teleport(tnt.id, tnt.x, tnt.y, tnt.z, 0, 0),
+                else => {},
+            }
+            try track(conn, tnt.id, tnt.x, tnt.y, tnt.z, 0, 0);
+        } else {
+            var spawn = packet_sink.TntSpawn{ .eid = tnt.id, .x = tnt.x, .y = tnt.y, .z = tnt.z, .vx = tnt.vx, .vy = tnt.vy, .vz = tnt.vz };
+            try sink.spawnTnt(&spawn);
+            try conn.tracked.put(tnt.id, .{ .x = tnt.x, .y = tnt.y, .z = tnt.z, .yaw = 0, .pitch = 0 });
+        }
+    }
     // despawn tracked ids absent from the snapshot (left range / removed)
     var gone: [max_gone_batch]i32 = undefined;
     var n_gone: usize = 0;
     var it = conn.tracked.keyIterator();
     while (it.next()) |id| {
-        if (!stillVisible(id.*, conn.eid, players, mobs, items, potions, present, present_ctx)) {
+        if (!stillVisible(id.*, conn.eid, players, mobs, items, potions, tnts, present, present_ctx)) {
             if (n_gone < gone.len) {
                 gone[n_gone] = id.*;
                 n_gone += 1;
@@ -472,6 +525,7 @@ fn stillVisible(
     mobs: []const MobSnap,
     items: []const ItemSnap,
     potions: []const PotionSnap,
+    tnts: []const TntSnap,
     present: *const fn (ctx: *anyopaque, x: f64, z: f64) bool,
     present_ctx: *anyopaque,
 ) bool {
@@ -486,6 +540,9 @@ fn stillVisible(
     }
     for (potions) |pot| {
         if (pot.id == id and present(present_ctx, pot.x, pot.z)) return true;
+    }
+    for (tnts) |tnt| {
+        if (tnt.id == id and present(present_ctx, tnt.x, tnt.z)) return true;
     }
     return false;
 }
@@ -549,7 +606,7 @@ test "pickup grants to inventory with collect + destroy" {
     }.f;
     const ctx: *anyopaque = @ptrCast(@alignCast(@as(*u8, @ptrFromInt(0x1000))));
     // pass 1: untracked -> semantic item spawn (object + metadata at the edge)
-    try reconcileViewer(&c, sink, &[_]PlayerSnap{}, &[_]MobSnap{}, &items, &[_]PotionSnap{}, &claims, Always, ctx);
+    try reconcileViewer(&c, sink, &[_]PlayerSnap{}, &[_]MobSnap{}, &items, &[_]PotionSnap{}, &[_]TntSnap{}, &claims, Always, ctx);
     try std.testing.expect(!claims.contains(51));
     try std.testing.expect(c.tracked.contains(51));
     try std.testing.expectEqualSlices(sink_test.Event, &[_]sink_test.Event{.item}, recorder.eventSlice());
@@ -559,7 +616,7 @@ test "pickup grants to inventory with collect + destroy" {
 
     // pass 2: tracked + delay expired -> grant + collect + destroy
     recorder.reset();
-    try reconcileViewer(&c, sink, &[_]PlayerSnap{}, &[_]MobSnap{}, &items, &[_]PotionSnap{}, &claims, Always, ctx);
+    try reconcileViewer(&c, sink, &[_]PlayerSnap{}, &[_]MobSnap{}, &items, &[_]PotionSnap{}, &[_]TntSnap{}, &claims, Always, ctx);
     try std.testing.expect(claims.contains(51));
     // first hotbar slot (36) got the diamonds
     try std.testing.expect(c.inv[36] != null);
@@ -627,7 +684,7 @@ test "potion reconcile: spawn type 73, arc moves, destroy on gone" {
     }.f;
     const ctx: *anyopaque = @ptrCast(@alignCast(@as(*u8, @ptrFromInt(0x1000))));
     // pass 1: untracked -> potion spawn
-    try reconcileViewer(&c, sink, &[_]PlayerSnap{}, &[_]MobSnap{}, &[_]ItemSnap{}, &pots, &claims, Always, ctx);
+    try reconcileViewer(&c, sink, &[_]PlayerSnap{}, &[_]MobSnap{}, &[_]ItemSnap{}, &pots, &[_]TntSnap{}, &claims, Always, ctx);
     try std.testing.expect(c.tracked.contains(61));
     try std.testing.expectEqualSlices(sink_test.Event, &[_]sink_test.Event{.potion}, recorder.eventSlice());
     try std.testing.expectEqual(@as(usize, 1), recorder.potion_spawns);
@@ -636,11 +693,11 @@ test "potion reconcile: spawn type 73, arc moves, destroy on gone" {
     var moved = pots;
     moved[0].x += 1.0;
     recorder.reset();
-    try reconcileViewer(&c, sink, &[_]PlayerSnap{}, &[_]MobSnap{}, &[_]ItemSnap{}, &moved, &claims, Always, ctx);
+    try reconcileViewer(&c, sink, &[_]PlayerSnap{}, &[_]MobSnap{}, &[_]ItemSnap{}, &moved, &[_]TntSnap{}, &claims, Always, ctx);
     try std.testing.expectEqualSlices(sink_test.Event, &[_]sink_test.Event{.rel_move}, recorder.eventSlice());
     // pass 3: gone from the snapshot (impact) -> destroy
     recorder.reset();
-    try reconcileViewer(&c, sink, &[_]PlayerSnap{}, &[_]MobSnap{}, &[_]ItemSnap{}, &[_]PotionSnap{}, &claims, Always, ctx);
+    try reconcileViewer(&c, sink, &[_]PlayerSnap{}, &[_]MobSnap{}, &[_]ItemSnap{}, &[_]PotionSnap{}, &[_]TntSnap{}, &claims, Always, ctx);
     try std.testing.expect(!c.tracked.contains(61));
     try std.testing.expectEqualSlices(sink_test.Event, &[_]sink_test.Event{.destroy}, recorder.eventSlice());
 }

@@ -77,6 +77,7 @@ const cmd_data = @import("../proto/v5/cmd_data.zig");
 const bans_mod = @import("../sim/player/bans.zig");
 const scoreboard_mod = @import("../sim/player/scoreboard.zig");
 const redstone_mod = @import("../sim/world/redstone.zig");
+const explosion_mod = @import("../sim/world/explosion.zig");
 const interaction_mod = @import("../sim/world/interaction.zig");
 const profile = @import("../version.zig");
 const transport_mod = @import("transport.zig");
@@ -310,6 +311,25 @@ pub const Server = struct {
     /// Global thrown-splash-potion list (guarded by ent_lock, like items).
     /// Short-lived arcs (impact or age/void despawn); capped like items.
     potions: std.ArrayList(entity.PotionEnt) = .empty,
+    /// Global primed-TNT list (guarded by ent_lock, like items). Fuse ticks
+    /// down every tick (never skipped, even when blast execution is
+    /// budgeted); detonation queues a batched blast (see BlastExec).
+    /// Capped like items (anti-lag).
+    tnts: std.ArrayList(entity.TntEnt) = .empty,
+    /// Queued blast executions: the raycast collect ran under ent_lock
+    /// with pool reads only; the block-apply pass runs later under
+    /// world_lock (furnace-swap pattern). Heap buffers are freed after
+    /// apply. Chain priming rides entities (short fuses), never this
+    /// queue — chains never skip ticks (closes the G1 acceptance item).
+    pending_blasts: std.ArrayList(BlastExec) = .empty,
+    /// Explosion RNG stream (raycast power rolls, chained-fuse rolls,
+    /// drop-chance rolls). Seeded from the world seed like drop_rand but
+    /// a separate stream so blast draws never perturb gameplay draw
+    /// order. Guarded by rand_lock (leaf lock, never nested).
+    explosion_rand: ?java_random.JavaRandom = null,
+    /// Fuse/blast sequencing for the per-blast tick RNG (mutated under
+    /// ent_lock; isolates blast draws from the gameplay streams).
+    blast_seq: u64 = 0,
     /// Furnace tile entities (server-owned; in-memory only, lost on restart —
     /// no chunk unloading exists so lifetime matches the loaded world).
     /// Guarded by furn_lock (leaf; furn is never held while acquiring conn,
@@ -443,6 +463,11 @@ pub const Server = struct {
     pub const autosave_ticks: u64 = 300;
     /// Anti-DoS cap on live item entities (snapshot arrays are fixed-size).
     pub const max_items: usize = 256;
+    /// Anti-DoS cap on primed TNT (same snapshot discipline as items).
+    pub const max_tnts: usize = 256;
+    /// Max blasts executed per 1Hz tick (anti-lag; the rest wait a tick —
+    /// their light/sound/damage land late, but no fuse ever skips).
+    pub const max_blasts_per_tick: usize = 8;
 
     // ---- lifecycle: bind/deinit/chunk source ----
 
@@ -796,6 +821,7 @@ pub const Server = struct {
         fire, // "<n> went up in flames"
         suffocate, // "<n> suffocated in a wall"
         cactus, // "<n> was pricked to death"
+        explosion, // "<n> was blown up"
         player, // "<n> was slain by <killer>"
     };
 
@@ -813,6 +839,7 @@ pub const Server = struct {
             .fire => std.fmt.bufPrint(out, "{s} went up in flames", .{victim}) catch out[0..0],
             .suffocate => std.fmt.bufPrint(out, "{s} suffocated in a wall", .{victim}) catch out[0..0],
             .cactus => std.fmt.bufPrint(out, "{s} was pricked to death", .{victim}) catch out[0..0],
+            .explosion => std.fmt.bufPrint(out, "{s} was blown up", .{victim}) catch out[0..0],
             .player => std.fmt.bufPrint(out, "{s} was slain by {s}", .{ victim, killer }) catch out[0..0],
         };
     }
@@ -5245,6 +5272,7 @@ pub const Server = struct {
         mobs: []entity.MobSnap,
         items: []entity.ItemSnap,
         potions: []entity.PotionSnap,
+        tnts: []entity.TntSnap,
         envs: []EnvFlag,
         furn_snaps: []FurnSnap,
         brew_snaps: []BrewSnap,
@@ -5272,6 +5300,7 @@ pub const Server = struct {
         mobs: []entity.MobSnap,
         items: []entity.ItemSnap,
         potions: []entity.PotionSnap,
+        tnts: []entity.TntSnap,
         envs: []EnvFlag,
         furn_snaps: []FurnSnap,
         brew_snaps: []BrewSnap,
@@ -5296,6 +5325,7 @@ pub const Server = struct {
             .mobs = if (shed) mobs[0..0] else mobs,
             .items = if (shed) items[0..0] else items,
             .potions = if (shed) potions[0..0] else potions,
+            .tnts = if (shed) tnts[0..0] else tnts,
             .envs = envs,
             .furn_snaps = if (shed) furn_snaps[0..0] else furn_snaps,
             .brew_snaps = if (shed) brew_snaps[0..0] else brew_snaps,
@@ -5337,6 +5367,7 @@ pub const Server = struct {
                 w.mobs,
                 w.items,
                 w.potions,
+                w.tnts,
                 w.envs,
                 w.furn_snaps,
                 w.brew_snaps,
@@ -5366,6 +5397,7 @@ pub const Server = struct {
         mobs: []entity.MobSnap,
         items: []entity.ItemSnap,
         potions: []entity.PotionSnap,
+        tnts: []entity.TntSnap,
         envs: []EnvFlag,
         furn_snaps: []FurnSnap,
         brew_snaps: []BrewSnap,
@@ -5395,6 +5427,7 @@ pub const Server = struct {
                 d.mobs,
                 d.items,
                 d.potions,
+                d.tnts,
                 d.envs,
                 d.furn_snaps,
                 d.brew_snaps,
@@ -5600,6 +5633,7 @@ pub const Server = struct {
         mobs: []entity.MobSnap,
         items: []entity.ItemSnap,
         potions: []entity.PotionSnap,
+        tnts: []entity.TntSnap,
         envs: []EnvFlag,
         furn_snaps: []FurnSnap,
         brew_snaps: []BrewSnap,
@@ -5866,7 +5900,7 @@ pub const Server = struct {
             }
             var pctx = PresentCtx{ .viewer = e.conn, .range_blocks = @as(f64, @floatFromInt(self.view_distance)) * 16.0 + 16.0 };
             const r0 = std.Io.Timestamp.now(self.io, .awake);
-            entity.reconcileViewer(e.conn, conn_sink.bind(e.conn), vc.players, vc.mobs, vc.items, vc.potions, vc.claims, present, &pctx) catch {};
+            entity.reconcileViewer(e.conn, conn_sink.bind(e.conn), vc.players, vc.mobs, vc.items, vc.potions, vc.tnts, vc.claims, present, &pctx) catch {};
             const r1 = std.Io.Timestamp.now(self.io, .awake);
             vc.reconcile_ns.* += @intCast(@max(0, r0.durationTo(r1).nanoseconds));
         }
@@ -6204,6 +6238,54 @@ pub const Server = struct {
             }
         }
         var item_snaps: [Server.max_items]entity.ItemSnap = undefined;
+        // Primed TNT: fuse ticks down every tick (never skipped, even when
+        // blast execution is budgeted), physics integrates 20 substeps per
+        // 1Hz tick (vanilla EntityTNTPrimed: gravity 0.04, drag 0.98,
+        // ground bounce -0.5 with 0.7 horizontal friction). Detonation
+        // queues a batched blast (raycast collect with pool reads only —
+        // the block-apply pass runs later under world_lock, furnace-swap
+        // pattern). Missing chunks read as air (keep flying, like the
+        // potion arc); void (y < -64) fizzles like items.
+        self.blast_seq +|= 1;
+        const blast_base: i64 = self.drop_seed ^ @as(i64, @bitCast(self.blast_seq *% 0x9E3779B97F4A7C15));
+        // Detonated ids broadcast destroy to trackers below (the tick
+        // reconcile would also drop them as gone, but explicit destroy
+        // is immediate, like the item-despawn path).
+        var gone_tnt: [Server.max_tnts]i32 = undefined;
+        var n_gone_tnt: usize = 0;
+        if (self.world) |pool| {
+            var ti: usize = 0;
+            while (ti < self.tnts.items.len) {
+                const tnt = &self.tnts.items[ti];
+                if (tnt.fuse >= 20) tnt.fuse -= 20 else tnt.fuse = 0;
+                self.integrateTnt(pool, tnt) catch {};
+                if (tnt.y < -64.0) {
+                    _ = self.tnts.swapRemove(ti);
+                    continue;
+                }
+                if (tnt.fuse == 0) {
+                    const dead = self.tnts.swapRemove(ti);
+                    self.queueBlast(pool, dead.x, dead.y, dead.z, Server.tnt_size, blast_base +% @as(i64, dead.id));
+                    if (n_gone_tnt < gone_tnt.len) {
+                        gone_tnt[n_gone_tnt] = dead.id;
+                        n_gone_tnt += 1;
+                    }
+                    continue;
+                }
+                ti += 1;
+            }
+        } else {
+            var ti: usize = 0;
+            while (ti < self.tnts.items.len) {
+                const tnt = &self.tnts.items[ti];
+                if (tnt.fuse >= 20) tnt.fuse -= 20 else tnt.fuse = 0;
+                if (tnt.fuse == 0) {
+                    _ = self.tnts.swapRemove(ti);
+                    continue;
+                }
+                ti += 1;
+            }
+        }
         var n_items: usize = 0;
         var despawned: [Server.max_items]i32 = undefined;
         var n_despawned: usize = 0;
@@ -6246,6 +6328,24 @@ pub const Server = struct {
                 .vz = pot.vz,
             };
             n_potions += 1;
+        }
+        var tnt_snaps: [Server.max_tnts]entity.TntSnap = undefined;
+        var n_tnts: usize = 0;
+        for (self.tnts.items) |tnt| {
+            if (n_tnts >= tnt_snaps.len) break;
+            // Detonated entities leave the list in the fuse pass above
+            // (swapRemove), so every survivor here is still live.
+            tnt_snaps[n_tnts] = .{
+                .id = tnt.id,
+                .x = tnt.x,
+                .y = tnt.y,
+                .z = tnt.z,
+                .vx = tnt.vx,
+                .vy = tnt.vy,
+                .vz = tnt.vz,
+                .fuse = tnt.fuse,
+            };
+            n_tnts += 1;
         }
         self.ent_lock.unlock();
         // Splash impacts fan out with no locks held (conn locks nest
@@ -6462,6 +6562,7 @@ pub const Server = struct {
                 .mobs = mobs[0..n_mobs],
                 .items = item_snaps[0..n_items],
                 .potions = potion_snaps[0..n_potions],
+                .tnts = tnt_snaps[0..n_tnts],
                 .envs = envs[0..],
                 .furn_snaps = furn_snaps[0..n_furn],
                 .brew_snaps = brew_snaps[0..n_brew],
@@ -6509,6 +6610,7 @@ pub const Server = struct {
                     .mobs = mobs[0..n_mobs],
                     .items = item_snaps[0..n_items],
                     .potions = potion_snaps[0..n_potions],
+                    .tnts = tnt_snaps[0..n_tnts],
                     .envs = envs[0..],
                     .furn_snaps = furn_snaps[0..n_furn],
                     .brew_snaps = brew_snaps[0..n_brew],
@@ -6562,6 +6664,7 @@ pub const Server = struct {
                             .mobs = mobs[0..n_mobs],
                             .items = item_snaps[0..n_items],
                             .potions = potion_snaps[0..n_potions],
+                            .tnts = tnt_snaps[0..n_tnts],
                             .envs = envs[0..],
                             .furn_snaps = furn_snaps[0..n_furn],
                             .brew_snaps = brew_snaps[0..n_brew],
@@ -6628,6 +6731,10 @@ pub const Server = struct {
                 const f = packets.frameDestroyEntitiesFramed(&[_]i32{id}, &fb) catch continue;
                 self.broadcastToTrackers(id, f);
             }
+            for (gone_tnt[0..n_gone_tnt]) |id| {
+                const f = packets.frameDestroyEntitiesFramed(&[_]i32{id}, &fb) catch continue;
+                self.broadcastToTrackers(id, f);
+            }
             var cb: [perms_mod.max_name_len]u8 = undefined;
             var i: usize = 0;
             while (i < claims.n) : (i += 1) {
@@ -6668,6 +6775,278 @@ pub const Server = struct {
             if (s.in) |st| if (st.nbt) |n| self.gpa.free(n);
             if (s.fuel) |st| if (st.nbt) |n| self.gpa.free(n);
             if (s.out) |st| if (st.nbt) |n| self.gpa.free(n);
+        }
+        for (furn_snaps[0..n_furn]) |s| {
+            if (s.in) |st| if (st.nbt) |n| self.gpa.free(n);
+            if (s.fuel) |st| if (st.nbt) |n| self.gpa.free(n);
+            if (s.out) |st| if (st.nbt) |n| self.gpa.free(n);
+        }
+        // K4 blast apply (furnace-swap discipline: world writes under
+        // world_lock, then broadcasts + damage with no locks — never
+        // nested). Up to max_blasts_per_tick queued blasts per tick; the
+        // rest wait a tick (their light/sound/damage land late, but every
+        // fuse already ticked, so chains never skip ticks — this closes
+        // the G1 acceptance item). Single collect-then-apply block pass
+        // per blast: cells are re-peeked (racing edits win, like the
+        // furnace guard), TNT primes with short fuses (chain) instead of
+        // breaking, the rest go to air with the vanilla 1/size drop chance
+        // through the J1 pipeline. Unbreakable (bedrock/portal/frames,
+        // `piston_unbreakable`) and raced-away cells are skipped.
+        // Container contents are lost (documented K4 gap — no window fan
+        // out on blast breaks). Item entities are immune (vanilla
+        // `EntityItem` is invulnerable); mobs take damage but never drop
+        // (J4 owns mob drops) and keep wandering (no knockback velocity —
+        // the wander tick recomputes it). Players take EPF-reduced damage
+        // with an authoritative capped shove + PosLook (the S27 tail
+        // velocity is zeroed: the client must not double-apply our
+        // server-side shove).
+        if (self.pending_blasts.items.len > 0) {
+            const blast_t0 = std.Io.Timestamp.now(self.io, .awake);
+            var execs: [Server.max_blasts_per_tick]BlastExec = undefined;
+            var n_exec: usize = 0;
+            var n_cells: usize = 0;
+            self.world_lock.lock();
+            if (self.world) |pool| {
+                while (self.pending_blasts.items.len > 0 and n_exec < execs.len) {
+                    var b = self.pending_blasts.orderedRemove(0);
+                    b.applied = 0;
+                    for (b.breaks) |c| {
+                        if (c.y < 0 or c.y > 255) continue;
+                        const yu: u8 = @intCast(c.y);
+                        const cur = view.peekBlock(pool, self.gpa, c.x, yu, c.z) catch continue;
+                        const cell = cur orelse continue;
+                        if (cell.id == game_ids.air) continue;
+                        if (profile.game.blocks.get(cell.id).piston_unbreakable) continue;
+                        if (cell.id == game_ids.tnt) {
+                            _ = self.primeTnt(pool, self.gpa, c.x, yu, c.z, self.chainFuse());
+                            b.breaks[b.applied] = c;
+                            b.applied += 1;
+                            n_cells += 1;
+                            continue;
+                        }
+                        _ = view.applyBlock(pool, self.gpa, c.x, yu, c.z, game_ids.air, 0) catch continue;
+                        b.breaks[b.applied] = c;
+                        b.applied += 1;
+                        n_cells += 1;
+                        if (self.tileDrops()) {
+                            self.spawnExplosionDrops(c.x, yu, c.z, cell.id, cell.meta, b.size);
+                        }
+                    }
+                    for (b.primes) |c| {
+                        if (c.y < 0 or c.y > 255) continue;
+                        _ = self.primeTnt(pool, self.gpa, c.x, @intCast(c.y), c.z, self.chainFuse());
+                    }
+                    self.gpa.free(b.primes);
+                    b.primes = &.{};
+                    execs[n_exec] = b;
+                    n_exec += 1;
+                }
+            } else {
+                for (self.pending_blasts.items) |*b| {
+                    self.gpa.free(b.breaks);
+                    self.gpa.free(b.primes);
+                }
+                self.pending_blasts.clearRetainingCapacity();
+            }
+            self.world_lock.unlock();
+            // Broadcasts + damage with no locks held.
+            if (n_exec > 0) {
+                if (self.world) |pool| {
+                    var bread = BlastRead{ .pool = pool, .gpa = self.gpa };
+                    for (execs[0..n_exec]) |*b| {
+                        // S23 per applied cell + one resend per touched chunk.
+                        var chunks: [64]struct { cx: i32, cz: i32 } = undefined;
+                        var n_chunks: usize = 0;
+                        for (b.breaks[0..b.applied]) |c| {
+                            self.broadcastBlockChange(null, c.x, @intCast(c.y), c.z, game_ids.air, 0) catch {};
+                            const cx = @divFloor(c.x, 16);
+                            const cz = @divFloor(c.z, 16);
+                            var found = false;
+                            for (chunks[0..n_chunks]) |ch| {
+                                if (ch.cx == cx and ch.cz == cz) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found and n_chunks < chunks.len) {
+                                chunks[n_chunks] = .{ .cx = cx, .cz = cz };
+                                n_chunks += 1;
+                            }
+                        }
+                        for (chunks[0..n_chunks]) |ch| self.resendTouchedNeighbors(pool, ch.cx * 16, ch.cz * 16, 0xFF);
+                        // S27 records: floor-relative i8 offsets of the
+                        // applied cells (the client spawns particles there).
+                        var recs: [1024]packets.ExplosionRecord = undefined;
+                        var n_recs: usize = 0;
+                        const fx: i32 = @intFromFloat(@floor(b.x));
+                        const fy: i32 = @intFromFloat(@floor(b.y));
+                        const fz: i32 = @intFromFloat(@floor(b.z));
+                        for (b.breaks[0..b.applied]) |c| {
+                            if (n_recs >= recs.len) break;
+                            const dx = c.x - fx;
+                            const dy = c.y - fy;
+                            const dz = c.z - fz;
+                            if (dx < -128 or dx > 127 or dy < -128 or dy > 127 or dz < -128 or dz > 127) continue;
+                            recs[n_recs] = .{ .dx = @intCast(dx), .dy = @intCast(dy), .dz = @intCast(dz) };
+                            n_recs += 1;
+                        }
+                        // Per-viewer S27 (zeroed tail velocity — the server
+                        // owns knockback via PosLook below) + damage +
+                        // authoritative shove.
+                        var bbatch: [max_fanout]RegistryEntry = undefined;
+                        const bsnap = self.snapshot(&bbatch);
+                        defer releaseSnap(bsnap);
+                        for (bsnap) |e| {
+                            e.conn.lock.lock();
+                            const play = e.conn.state == .play and !e.conn.dead and !e.conn.is_dead;
+                            if (!play) {
+                                e.conn.lock.unlock();
+                                continue;
+                            }
+                            const hw = interaction_mod.player_half_width;
+                            const expo = explosion_mod.exposure(
+                                blastGet,
+                                &bread,
+                                b.x,
+                                b.y,
+                                b.z,
+                                e.conn.pos_x - hw,
+                                e.conn.pos_y,
+                                e.conn.pos_z - hw,
+                                e.conn.pos_x + hw,
+                                e.conn.pos_y + 1.8,
+                                e.conn.pos_z + hw,
+                            );
+                            const ddx = e.conn.pos_x - b.x;
+                            const ddy = e.conn.pos_y + 0.9 - b.y;
+                            const ddz = e.conn.pos_z - b.z;
+                            const dist = @sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
+                            const raw = explosion_mod.damageFor(b.size, dist, expo);
+                            const dmg: f32 = @floor(raw);
+                            var eb: [4096]u8 = undefined;
+                            const sfr = packets.frameExplosion(@floatCast(b.x), @floatCast(b.y), @floatCast(b.z), b.size, recs[0..n_recs], .{ 0, 0, 0 }, &eb) catch null;
+                            if (sfr) |fr| e.conn.queueFramed(fr) catch {};
+                            var died_here = false;
+                            var dd: ?DeathDrop = null;
+                            if (dmg > 0) {
+                                died_here = applyBlockedDamage(e.conn, dmg, .explosion);
+                                if (died_here and !self.keepInv()) dd = collectDeathDrops(e.conn);
+                                // Authoritative capped shove (1Hz approx of
+                                // the velocity kick): stepwise into passable
+                                // cells only, then PosLook the victim.
+                                const dir = explosion_mod.knockDir(b.x, b.y, b.z, e.conn.pos_x, e.conn.pos_y, e.conn.pos_z);
+                                var mag: f64 = @min(3.0, expo * 2.0);
+                                var nx = e.conn.pos_x;
+                                var ny = e.conn.pos_y;
+                                var nz = e.conn.pos_z;
+                                while (mag > 0) {
+                                    const step: f64 = @min(0.25, mag);
+                                    mag -= step;
+                                    const tx = nx + dir[0] * step;
+                                    const ty = ny + dir[1] * step;
+                                    const tz = nz + dir[2] * step;
+                                    const fyy: i32 = @intFromFloat(@floor(ty));
+                                    if (fyy < 1 or fyy > 254) break;
+                                    const cell = view.peekBlock(pool, self.gpa, @intFromFloat(@floor(tx)), @intCast(fyy), @intFromFloat(@floor(tz))) catch break;
+                                    const blk = cell orelse break;
+                                    if (!Server.replaceableForPlace(blk.id)) break;
+                                    nx = tx;
+                                    ny = ty;
+                                    nz = tz;
+                                }
+                                e.conn.pos_x = nx;
+                                e.conn.pos_y = ny;
+                                e.conn.pos_z = nz;
+                                e.conn.queuePlayerPosLook() catch {};
+                            }
+                            const eid = e.conn.eid;
+                            const px = e.conn.pos_x;
+                            const py = e.conn.pos_y;
+                            const pz = e.conn.pos_z;
+                            e.conn.lock.unlock();
+                            flushEntry(e, self.io);
+                            if (died_here) {
+                                deaths.append(self.gpa, .{
+                                    .conn = e.conn,
+                                    .eid = eid,
+                                    .dd = dd,
+                                    .cause = .explosion,
+                                    .x = px,
+                                    .y = py,
+                                    .z = pz,
+                                }) catch {};
+                            }
+                        }
+                        // Vanilla voice: volume 4.0, pitch (1+rand*0.2)*0.7.
+                        self.rand_lock.lock();
+                        if (self.explosion_rand == null) self.explosion_rand = java_random.JavaRandom.init(self.drop_seed ^ 0x546E74526E643F);
+                        var srng = self.explosion_rand.?;
+                        const pitch = (1.0 + srng.nextFloat() * 0.2) * 0.7;
+                        self.explosion_rand = srng;
+                        self.rand_lock.unlock();
+                        self.broadcastSoundRadius(null, "random.explode", b.x + 0.5, b.y + 0.5, b.z + 0.5, 4.0, pitch, 64.0 * 64.0);
+                    }
+                    // Mob damage under ent_lock (world->ent order, like the
+                    // serve arm): exposure + raw damage, silent removal.
+                    self.ent_lock.lock();
+                    var dead_mobs: [256]i32 = undefined;
+                    var n_dead_mobs: usize = 0;
+                    var bstack: [64]*tick_mod.Region = undefined;
+                    const n_bregs = self.region_reg.allRegions(bstack[0..]);
+                    for (bstack[0..n_bregs]) |reg| {
+                        var mi: usize = 0;
+                        while (mi < reg.mobs.len()) {
+                            const mx = reg.mobs.px.items[mi];
+                            const my = reg.mobs.py.items[mi];
+                            const mz = reg.mobs.pz.items[mi];
+                            var hurt = false;
+                            for (execs[0..n_exec]) |*b| {
+                                const expo = explosion_mod.exposure(
+                                    blastGet,
+                                    &bread,
+                                    b.x,
+                                    b.y,
+                                    b.z,
+                                    mx - 0.3,
+                                    my,
+                                    mz - 0.3,
+                                    mx + 0.3,
+                                    my + 1.8,
+                                    mz + 0.3,
+                                );
+                                const ddx = mx - b.x;
+                                const ddy = my + 0.9 - b.y;
+                                const ddz = mz - b.z;
+                                const dist = @sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
+                                const dmg = explosion_mod.damageFor(b.size, dist, expo);
+                                if (dmg > 0) {
+                                    hurt = true;
+                                    reg.mobs.health.items[mi] -= dmg;
+                                    break;
+                                }
+                            }
+                            if (hurt and reg.mobs.health.items[mi] <= 0) {
+                                if (n_dead_mobs < dead_mobs.len) {
+                                    dead_mobs[n_dead_mobs] = reg.mobs.ids.items[mi];
+                                    n_dead_mobs += 1;
+                                }
+                                reg.mobs.removeAt(mi);
+                                continue;
+                            }
+                            mi += 1;
+                        }
+                    }
+                    self.ent_lock.unlock();
+                    for (dead_mobs[0..n_dead_mobs]) |id| {
+                        var fb: [32]u8 = undefined;
+                        const f = packets.frameDestroyEntitiesFramed(&[_]i32{id}, &fb) catch continue;
+                        self.broadcastToTrackers(id, f);
+                    }
+                    for (execs[0..n_exec]) |*b| self.gpa.free(b.breaks);
+                }
+            }
+            const blast_dt_ms = @as(f64, @floatFromInt(blast_t0.durationTo(std.Io.Timestamp.now(self.io, .awake)).nanoseconds)) / 1e6;
+            std.log.debug("tnt: {d} blasts, {d} cells, {d:.2}ms ({d} queued)", .{ n_exec, n_cells, blast_dt_ms, self.pending_blasts.items.len });
         }
         // Deaths from hunger/environment/void this tick, one pass per
         // death (drops + metadata + death line), then one save pass.
@@ -6740,6 +7119,13 @@ pub const Server = struct {
     /// Block place/break feedback (silent before: only /playsound made
     /// noise). Volume 1.0, pitch 0.8 like vanilla's break/place calls.
     pub fn broadcastSound(self: *Server, exclude: ?*Conn, sound: []const u8, x: f64, y: f64, z: f64, volume: f32, pitch: f32) void {
+        self.broadcastSoundRadius(exclude, sound, x, y, z, volume, pitch, hear_radius_sq);
+    }
+
+    /// S29 sound with an explicit squared hearing radius (explosions carry
+    /// much farther than the 16-block block-feedback default; vanilla
+    /// volume-4.0 explosions are heard ~64 blocks out).
+    pub fn broadcastSoundRadius(self: *Server, exclude: ?*Conn, sound: []const u8, x: f64, y: f64, z: f64, volume: f32, pitch: f32, radius_sq: f64) void {
         var sb: [512]u8 = undefined;
         const f = packets.frameSoundEffect(sound, x, y, z, volume, pitch, &sb) catch return;
         var batch: [max_fanout]RegistryEntry = undefined;
@@ -6752,7 +7138,7 @@ pub const Server = struct {
             const dx = x - e.conn.pos_x;
             const dy = y - e.conn.pos_y;
             const dz = z - e.conn.pos_z;
-            const near = dx * dx + dy * dy + dz * dz <= hear_radius_sq;
+            const near = dx * dx + dy * dy + dz * dz <= radius_sq;
             if (play and near) e.conn.queueFramed(f) catch {};
             e.conn.lock.unlock();
         }
@@ -7731,6 +8117,23 @@ pub const Server = struct {
     /// apply full to the whole radius. No HP changes (L2 owns those) —
     /// delivery is S1D only.
     const PotionImpact = struct { eid: i32, a6: u8, seconds: u32, amp: u8 };
+    /// K4 primed-TNT constants (vanilla 1.7.10 `EntityTNTPrimed` / `BlockTNT`).
+    pub const tnt_fuse: u16 = 80;
+    pub const tnt_size: f32 = 4.0;
+    /// Queued blast execution (collect-then-apply). `breaks`/`primes` are
+    /// gpa-owned (freed after the apply pass).
+    pub const BlastExec = struct {
+        x: f64,
+        y: f64,
+        z: f64,
+        size: f32,
+        breaks: []explosion_mod.Cell,
+        primes: []explosion_mod.Cell,
+        truncated: bool,
+        /// Cells actually applied (compacted to the front of `breaks` by
+        /// the apply pass; S23/resends/records use this prefix).
+        applied: usize = 0,
+    };
     fn applyPotionImpacts(self: *Server, impacts: []const PotionImpact) void {
         if (impacts.len == 0) return;
         var batch: [max_fanout]RegistryEntry = undefined;
@@ -7878,6 +8281,311 @@ pub const Server = struct {
         }
     }
 
+    /// One 1Hz tick of vanilla primed-TNT motion (20 substeps of the 20tps
+    /// `EntityTNTPrimed.onUpdate`: gravity 0.04, drag 0.98, per-axis solid
+    /// clamp with ground bounce -0.5 + 0.7 horizontal friction, rest at
+    /// first-solid-top). Passable cells are the placement-refusal set
+    /// (air/water/plants — TNT sinks through water, falls through vines).
+    /// Pure pool reads (leaf, like the item toss path).
+    fn integrateTnt(self: *Server, pool: *shard_mod.ShardPool, tnt: *entity.TntEnt) !void {
+        var n: u8 = 0;
+        while (n < 20) : (n += 1) {
+            tnt.vy -= 0.04;
+            const nx = tnt.x + tnt.vx;
+            if (try self.tntSolid(pool, nx, tnt.y, tnt.z)) {
+                tnt.vx = 0;
+            } else {
+                tnt.x = nx;
+            }
+            const nz = tnt.z + tnt.vz;
+            if (try self.tntSolid(pool, tnt.x, tnt.y, nz)) {
+                tnt.vz = 0;
+            } else {
+                tnt.z = nz;
+            }
+            const ny = tnt.y + tnt.vy;
+            if (try self.tntSolid(pool, tnt.x, ny, tnt.z)) {
+                if (tnt.vy < 0) {
+                    tnt.y = @floor(ny) + 1.0;
+                    tnt.vx *= 0.7;
+                    tnt.vz *= 0.7;
+                    tnt.vy *= -0.5;
+                    if (@abs(tnt.vy) < 0.05 and tnt.vx * tnt.vx + tnt.vz * tnt.vz < 0.0025) {
+                        tnt.vx = 0;
+                        tnt.vy = 0;
+                        tnt.vz = 0;
+                        break;
+                    }
+                } else {
+                    tnt.vy = 0;
+                }
+            } else {
+                tnt.y = ny;
+            }
+            tnt.vx *= 0.98;
+            tnt.vy *= 0.98;
+            tnt.vz *= 0.98;
+        }
+    }
+
+    /// True when the feet cell at (x,y,z) blocks TNT motion. Missing
+    /// chunks read as air (keep flying); out-of-world top is air, the
+    /// void below is handled by the caller.
+    fn tntSolid(self: *Server, pool: *shard_mod.ShardPool, x: f64, y: f64, z: f64) !bool {
+        const by: i32 = @intFromFloat(@floor(y));
+        if (by < 0 or by > 255) return false;
+        const pb = try view.peekBlock(pool, self.gpa, @intFromFloat(@floor(x)), @intCast(by), @intFromFloat(@floor(z)));
+        const b = pb orelse return false;
+        return !Server.replaceableForPlace(b.id);
+    }
+
+    /// Pool reader adapter for the explosion core (resistance from the
+    /// 1.7.10 blast table; missing chunks read as air).
+    const BlastRead = struct {
+        pool: *shard_mod.ShardPool,
+        gpa: std.mem.Allocator,
+    };
+
+    fn blastGet(ctx: *anyopaque, x: i32, y: i32, z: i32) ?explosion_mod.Block {
+        const br: *BlastRead = @ptrCast(@alignCast(ctx));
+        if (y < 0 or y > 255) return null;
+        const pb = view.peekBlock(br.pool, br.gpa, x, @intCast(y), z) catch return null;
+        const b = pb orelse return null;
+        return .{ .id = b.id, .res = profile.game.blast_data.attenuate(b.id) };
+    }
+
+    /// Raycast collect for one detonation (pool reads only; caller holds
+    /// ent_lock, never world_lock — same discipline as the potion arc).
+    /// The per-blast RNG is seeded from the blast sequence (lock-free and
+    /// deterministic; vanilla shares world.rand, but our streams are
+    /// isolated by design so blast draws never perturb gameplay order).
+    /// Buffers that survive go on the heap (owned by the BlastExec, freed
+    /// after the apply pass); on OOM the blast fizzles (logged).
+    fn queueBlast(self: *Server, pool: *shard_mod.ShardPool, cx: f64, cy: f64, cz: f64, size: f32, seed: i64) void {
+        var rng = java_random.JavaRandom.init(seed);
+        var breaks_buf: [explosion_mod.max_cells]explosion_mod.Cell = undefined;
+        var primes_buf: [explosion_mod.max_primes]explosion_mod.Cell = undefined;
+        var br = BlastRead{ .pool = pool, .gpa = self.gpa };
+        const r = explosion_mod.collect(blastGet, &br, cx, cy, cz, size, &rng, &breaks_buf, &primes_buf);
+        const breaks = self.gpa.dupe(explosion_mod.Cell, breaks_buf[0..r.n_breaks]) catch {
+            std.log.debug("tnt: blast at {d},{d},{d} dropped (OOM)", .{ cx, cy, cz });
+            return;
+        };
+        errdefer self.gpa.free(breaks);
+        const primes = self.gpa.dupe(explosion_mod.Cell, primes_buf[0..r.n_primes]) catch {
+            self.gpa.free(breaks);
+            std.log.debug("tnt: blast at {d},{d},{d} dropped (OOM)", .{ cx, cy, cz });
+            return;
+        };
+        self.pending_blasts.append(self.gpa, .{
+            .x = cx,
+            .y = cy,
+            .z = cz,
+            .size = size,
+            .breaks = breaks,
+            .primes = primes,
+            .truncated = r.truncated,
+        }) catch {
+            self.gpa.free(breaks);
+            self.gpa.free(primes);
+        };
+    }
+
+    /// Spawn vanilla explosion drops for one broken cell: the 1/size
+    /// block chance first (vanilla `dropBlockAsItemWithChance`), then the
+    /// normal J1 singles with toss motion when it passes. Takes rand_lock
+    /// then ent_lock, in order (caller holds world_lock, same as
+    /// spawnBreakDrops).
+    fn spawnExplosionDrops(self: *Server, x: i32, y: u8, z: i32, old_id: game_ids.Id, old_meta: u4, size: f32) void {
+        self.rand_lock.lock();
+        if (self.explosion_rand == null) self.explosion_rand = java_random.JavaRandom.init(self.drop_seed ^ 0x546E74526E643F);
+        var rng = self.explosion_rand.?;
+        const keep = rng.nextFloat() <= 1.0 / size;
+        var rolls: [2]profile.game.drops_data.DropRoll = undefined;
+        const n_rolls: usize = if (keep) profile.game.drops_data.rollDrops(old_id, old_meta, &rng, &rolls) else 0;
+        var offs: [8][3]f32 = undefined;
+        var n_spawn: usize = 0;
+        for (rolls[0..n_rolls]) |r| {
+            var k: u8 = 0;
+            while (k < r.singles and n_spawn < offs.len) : (k += 1) {
+                if (rng.nextFloat() > 1.0) continue;
+                offs[n_spawn] = .{
+                    rng.nextFloat() * 0.7 + 0.15,
+                    rng.nextFloat() * 0.7 + 0.15,
+                    rng.nextFloat() * 0.7 + 0.15,
+                };
+                n_spawn += 1;
+            }
+        }
+        self.explosion_rand = rng;
+        self.rand_lock.unlock();
+        var oi: usize = 0;
+        var ri: usize = 0;
+        while (ri < n_rolls) : (ri += 1) {
+            const r = rolls[ri];
+            var k: u8 = 0;
+            while (k < r.singles and oi < n_spawn) : (k += 1) {
+                const o = offs[oi];
+                oi += 1;
+                const stack = item_mod.Stack{ .id = r.item_id, .count = 1, .damage = r.damage, .nbt = null };
+                self.spawnItemLive(stack, @as(f64, @floatFromInt(x)) + o[0], @as(f64, @floatFromInt(y)) + o[1], @as(f64, @floatFromInt(z)) + o[2], 10, self.tossPopMotion());
+            }
+        }
+    }
+
+    /// Short chain fuse for TNT caught in a blast (vanilla
+    /// `BlockTNT.onBlockDestroyedByExplosion`: rand(fuse/4) + fuse/8, here
+    /// 10 + rand(20) on the explosion stream).
+    fn chainFuse(self: *Server) u16 {
+        self.rand_lock.lock();
+        defer self.rand_lock.unlock();
+        if (self.explosion_rand == null) self.explosion_rand = java_random.JavaRandom.init(self.drop_seed ^ 0x546E74526E643F);
+        var rng = self.explosion_rand.?;
+        const f: u16 = 10 + @as(u16, @intCast(@mod(rng.nextInt(), @as(i32, 20))));
+        self.explosion_rand = rng;
+        return f;
+    }
+
+    /// Prime the TNT block at (x,y,z): remove the block (relight included)
+    /// and spawn the primed entity at the cell center with the vanilla
+    /// upward pop (motionY 0.2, XZ jitter from the explosion stream).
+    /// Caller holds world_lock; takes ent_lock + rand_lock (world->leaf
+    /// order, same as spawnBreakDrops). Returns the touched mask for
+    /// neighbor resends (0 when the cell was not live TNT).
+    fn primeTnt(self: *Server, pool: *shard_mod.ShardPool, allocator: std.mem.Allocator, x: i32, y: u8, z: i32, fuse: u16) u8 {
+        const cur = view.peekBlock(pool, allocator, x, y, z) catch return 0;
+        const cell = cur orelse return 0;
+        if (cell.id != game_ids.tnt) return 0;
+        const touched = view.applyBlock(pool, allocator, x, y, z, game_ids.air, 0) catch return 0;
+        self.rand_lock.lock();
+        if (self.explosion_rand == null) self.explosion_rand = java_random.JavaRandom.init(self.drop_seed ^ 0x546E74526E643F);
+        var rng = self.explosion_rand.?;
+        const jx = (rng.nextFloat() - 0.5) * 0.04;
+        const jz = (rng.nextFloat() - 0.5) * 0.04;
+        self.explosion_rand = rng;
+        self.rand_lock.unlock();
+        self.spawnTntLive(
+            @as(f64, @floatFromInt(x)) + 0.5,
+            @as(f64, @floatFromInt(y)) + 0.5,
+            @as(f64, @floatFromInt(z)) + 0.5,
+            jx,
+            0.2,
+            jz,
+            fuse,
+        );
+        return touched;
+    }
+
+    /// Spawn a primed-TNT entity with instant visibility (see
+    /// broadcastItemSpawn/broadcastTntSpawn for the discipline). Caller
+    /// holds no locks (world->ent order when called under world_lock).
+    fn spawnTntLive(self: *Server, x: f64, y: f64, z: f64, vx: f64, vy: f64, vz: f64, fuse: u16) void {
+        self.ent_lock.lock();
+        const id = self.eid_counter.fetchAdd(1, .acq_rel);
+        var eid: ?i32 = null;
+        if (self.tnts.items.len < Server.max_tnts) {
+            self.tnts.append(self.gpa, .{ .id = id, .x = x, .y = y, .z = z, .vx = vx, .vy = vy, .vz = vz, .fuse = fuse }) catch {};
+            eid = id;
+        }
+        self.ent_lock.unlock();
+        const live = eid orelse {
+            std.log.debug("tnt: primed entity dropped (cap {d})", .{Server.max_tnts});
+            return; // cap-hit: silent fizzle
+        };
+        self.broadcastTntSpawn(live, x, y, z, vx, vy, vz);
+    }
+
+    /// Instant 0x0E (type 50) to every in-range viewer with the chunk
+    /// loaded (serve thread; caller holds no locks). Mirrors
+    /// broadcastItemSpawn: the spawn is queued before any tick pickup can
+    /// run, and tracked-put makes the tick relay moves, not respawns.
+    fn broadcastTntSpawn(self: *Server, id: i32, x: f64, y: f64, z: f64, vx: f64, vy: f64, vz: f64) void {
+        var batch: [max_fanout]RegistryEntry = undefined;
+        const snap = self.snapshot(&batch);
+        defer releaseSnap(snap);
+        const range = @as(f64, @floatFromInt(self.view_distance)) * 16.0 + 16.0;
+        const cx: i32 = @intFromFloat(@floor(x / 16.0));
+        const cz: i32 = @intFromFloat(@floor(z / 16.0));
+        for (snap) |e| {
+            if (e.conn.state != .play or e.conn.is_dead) continue;
+            e.conn.lock.lock();
+            const dx = x - e.conn.pos_x;
+            const dz = z - e.conn.pos_z;
+            const in_range = @abs(dx) <= range and @abs(dz) <= range;
+            const loaded = e.conn.sent.contains(Conn.sentKey(cx, cz));
+            var queued = false;
+            if (in_range and loaded and !e.conn.tracked.contains(id)) {
+                var spawn = sink_mod.TntSpawn{ .eid = id, .x = x, .y = y, .z = z, .vx = vx, .vy = vy, .vz = vz };
+                conn_sink.bind(e.conn).spawnTnt(&spawn) catch {};
+                e.conn.tracked.put(id, .{ .x = x, .y = y, .z = z, .yaw = 0, .pitch = 0 }) catch {};
+                queued = true;
+            }
+            e.conn.lock.unlock();
+            if (queued) flushEntry(e, self.io);
+        }
+    }
+
+    /// Queued primed-TNT cell for the post-unlock broadcast (furnace pattern).
+    pub const TntPrimed = struct { x: i32, y: u8, z: i32, touched: u8 };
+    /// Redstone ignition scan (K4): after any edit, TNT adjacent to changed
+    /// power primes with the full fuse. Candidates are the edited cell, its
+    /// 6 neighbors, every redstone-changed cell, and their neighbors
+    /// (deduped, capped) — a TNT primes when a neighbor change powers it,
+    /// which is exactly the set a vanilla neighbor notification reaches.
+    /// Caller holds world_lock. Primed cells land in `out` for the
+    /// post-unlock broadcast (furnace pattern).
+    fn primePoweredTnt(
+        self: *Server,
+        pool: *shard_mod.ShardPool,
+        allocator: std.mem.Allocator,
+        x: i32,
+        y: u8,
+        z: i32,
+        changes: *const redstone_mod.ChangeList,
+        out: []TntPrimed,
+        n_out: *usize,
+    ) void {
+        const Cand = struct { x: i32, y: i32, z: i32 };
+        var cands: [160]Cand = undefined;
+        var n: usize = 0;
+        const addCand = struct {
+            fn run(cs: *[160]Cand, cn: *usize, cx: i32, cy: i32, cz: i32) void {
+                if (cn.* >= cs.len) return;
+                for (cs[0..cn.*]) |c| if (c.x == cx and c.y == cy and c.z == cz) return;
+                cs[cn.*] = .{ .x = cx, .y = cy, .z = cz };
+                cn.* += 1;
+            }
+        }.run;
+        const yi: i32 = y;
+        addCand(&cands, &n, x, yi, z);
+        const nb = [_]struct { dx: i32, dy: i32, dz: i32 }{
+            .{ .dx = 1, .dy = 0, .dz = 0 }, .{ .dx = -1, .dy = 0, .dz = 0 },
+            .{ .dx = 0, .dy = 1, .dz = 0 }, .{ .dx = 0, .dy = -1, .dz = 0 },
+            .{ .dx = 0, .dy = 0, .dz = 1 }, .{ .dx = 0, .dy = 0, .dz = -1 },
+        };
+        for (nb) |d| addCand(&cands, &n, x + d.dx, yi + d.dy, z + d.dz);
+        for (changes.items[0..changes.n]) |c| {
+            if (n >= cands.len) break;
+            addCand(&cands, &n, c.x, c.y, c.z);
+            for (nb) |d| addCand(&cands, &n, c.x + d.dx, c.y + d.dy, c.z + d.dz);
+        }
+        var w_changes: redstone_mod.ChangeList = .{};
+        var w = Server.RsWorld{ .pool = pool, .alloc = allocator, .changes = &w_changes };
+        defer w.deinit();
+        for (cands[0..n]) |c| {
+            if (c.y < 0 or c.y > 255) continue;
+            const yu: u8 = @intCast(c.y);
+            const cell = w.get(c.x, c.y, c.z) orelse continue;
+            if (cell.id != game_ids.tnt) continue;
+            if (!redstone_mod.gettingPowered(w.rsView(), c.x, c.y, c.z)) continue;
+            const touched = self.primeTnt(pool, allocator, c.x, yu, c.z, Server.tnt_fuse);
+            if (n_out.* < out.len) {
+                out[n_out.*] = .{ .x = c.x, .y = yu, .z = c.z, .touched = touched };
+                n_out.* += 1;
+            }
+        }
+    }
+
     /// Store an OWNED stack as a live item entity (always consumes `stack`:
     /// merged into a neighbor, appended, or freed on cap-hit). Merge-on-spawn
     /// mirrors the tick merge (same id/damage/NBT, centers within 1 block,
@@ -7978,7 +8686,7 @@ pub const Server = struct {
     /// locks held when the snapshot drops to the registry lock).
     fn broadcastItemMeta(self: *Server, id: i32, stack: item_mod.Stack) void {
         var mb: [1024]u8 = undefined;
-        const meta = packets.frameItemMetadata(id, stack, &mb) catch return;
+        const meta = packets.frameItemMetadata(self.gpa, id, stack, &mb) catch return;
         var batch: [max_fanout]RegistryEntry = undefined;
         const snap = self.snapshot(&batch);
         defer releaseSnap(snap);
@@ -10836,7 +11544,7 @@ fn sessionLocked(
         const action = try conn.handleFrame(f);
         if (action == .entered_play) entered.* = true;
         switch (action) {
-            .block_set, .block_resync, .place_deny, .interact, .arm_swing, .chat, .attack, .command, .tab_complete, .qdrop, .table_close, .furnace_click, .brew_click, .chest_click, .chest_close, .ender_close, .enchant_click, .enchant, .equip_armor, .eat, .throw_potion => try events.append(allocator, action),
+            .block_set, .block_resync, .place_deny, .interact, .arm_swing, .chat, .attack, .command, .tab_complete, .qdrop, .table_close, .furnace_click, .brew_click, .chest_click, .chest_close, .ender_close, .enchant_click, .enchant, .equip_armor, .eat, .throw_potion, .ignite_tnt => try events.append(allocator, action),
             else => {},
         }
     }
@@ -11368,6 +12076,10 @@ pub fn sessionStep(
             // sounds + pop drops flush after unlock, furnace pattern).
             var rs_changes: redstone_mod.ChangeList = .{};
             var rs_sounds: redstone_mod.SoundList = .{};
+            // K4: redstone/flint-primed TNT cells (S23 air + neighbor
+            // resends flush after unlock, same pattern).
+            var tnt_primed: [32]Server.TntPrimed = undefined;
+            var n_tnt_primed: usize = 0;
             server.world_lock.lock();
             const now_ticks = server.rs_tick;
             for (events.items, 0..) |*ev, i| {
@@ -11486,6 +12198,8 @@ pub fn sessionStep(
                         }
                         // K1: recompute + neighbor fan-out for the edit.
                         server.redstoneOnEdit(pool, allocator, b.x, b.y, b.z, now_ticks, &rs_changes, &rs_sounds);
+                        // K4: freshly powered TNT primes (full fuse).
+                        server.primePoweredTnt(pool, allocator, b.x, b.y, b.z, &rs_changes, &tnt_primed, &n_tnt_primed);
                         // Block sounds (S29 to nearby viewers).
                         const sx: f64 = @as(f64, @floatFromInt(b.x)) + 0.5;
                         const sy: f64 = @as(f64, @floatFromInt(b.y)) + 0.5;
@@ -11557,10 +12271,37 @@ pub fn sessionStep(
                         conn.eating = .{ .slot = e.slot, .id = e.id, .damage = e.damage, .ticks = profile.game.item_data.eat_ticks };
                         events.items[i] = .none;
                     },
+                    .ignite_tnt => |*e| {
+                        // Flint-and-steel on a live TNT block: prime it
+                        // (full fuse) instead of placing anything. Anything
+                        // else NACKs the target (no fire placement: the
+                        // client predicted fire there and L1 owns fire).
+                        const cur = view.peekBlock(pool, allocator, e.x, e.y, e.z) catch null;
+                        if (cur) |cell| {
+                            if (cell.id == game_ids.tnt) {
+                                const pmask = server.primeTnt(pool, allocator, e.x, e.y, e.z, Server.tnt_fuse);
+                                if (n_tnt_primed < tnt_primed.len) {
+                                    tnt_primed[n_tnt_primed] = .{ .x = e.x, .y = e.y, .z = e.z, .touched = pmask };
+                                    n_tnt_primed += 1;
+                                }
+                                e.primed = true;
+                                continue;
+                            }
+                        }
+                        events.items[i] = .{ .place_deny = .{ .x = e.tx, .y = e.ty, .z = e.tz } };
+                    },
                     else => {},
                 }
             }
             server.world_lock.unlock();
+            // K4: primed cells broadcast as air + neighbor resends (the
+            // entity itself went out instantly at prime time).
+            for (tnt_primed[0..n_tnt_primed]) |p| {
+                server.broadcastBlockChange(null, p.x, p.y, p.z, game_ids.air, 0) catch {};
+                if (server.world) |pl| {
+                    server.resendTouchedNeighbors(pl, p.x, p.z, p.touched);
+                }
+            }
             // K1 flush: propagation edits + interaction sounds/pops.
             // (Primary edits broadcast in the event loop below.)
             if (rs_changes.n > 0 or rs_sounds.n > 0) {
@@ -11626,6 +12367,28 @@ pub fn sessionStep(
                 },
                 .qdrop => |q| server.spawnQDrop(conn, q),
                 .throw_potion => |t| server.throwPotion(conn, t),
+                .ignite_tnt => |e| {
+                    // Flint wear for a successful prime (vanilla 64 uses;
+                    // creative keeps; a moved stack is left alone).
+                    if (!e.primed) continue;
+                    conn.lock.lock();
+                    defer conn.lock.unlock();
+                    const st = conn.inv[e.slot] orelse continue;
+                    if (st.id != game_ids.flint_and_steel) continue;
+                    if (!conn.config.gamemode.isCreative()) {
+                        const worn: i32 = @as(i32, st.damage) + 1;
+                        if (worn > 64) {
+                            var gone = conn.inv[e.slot];
+                            item_mod.freeStack(conn.allocator, &gone);
+                            conn.inv[e.slot] = null;
+                        } else {
+                            conn.inv[e.slot].?.damage = @intCast(worn);
+                        }
+                    }
+                    const f = packets.frameSetSlotAlloc(conn.allocator, 0, @intCast(e.slot), conn.inv[e.slot]) catch continue;
+                    defer conn.allocator.free(f);
+                    conn.queueFramed(f) catch {};
+                },
                 .equip_armor => {
                     conn.lock.lock();
                     defer conn.lock.unlock();
@@ -12218,6 +12981,119 @@ test "K1 glue: lever interact powers wire + lamp through the LSM pool" {
     try std.testing.expectEqual(game_ids.redstone_lamp, (try view.peekBlock(pool, a, 11, 64, 8)).?.id);
 }
 
+test "K4 glue: redstone powers adjacent TNT (lever-wire-prime)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+        try pool.flushAll();
+    }
+    // Stone floor with lever/wire/wire/TNT at y=64.
+    for ([_]i32{ 5, 6, 7, 8 }) |x| _ = try view.applyBlock(pool, a, x, 63, 8, game_ids.stone, 0);
+    _ = try view.applyBlock(pool, a, 5, 64, 8, game_ids.lever, 5);
+    _ = try view.applyBlock(pool, a, 6, 64, 8, game_ids.redstone_wire, 0);
+    _ = try view.applyBlock(pool, a, 7, 64, 8, game_ids.redstone_wire, 0);
+    _ = try view.applyBlock(pool, a, 8, 64, 8, game_ids.tnt, 0);
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    defer srv.tnts.deinit(a);
+    defer srv.potions.deinit(a);
+    defer srv.pending_blasts.deinit(a);
+    defer srv.items.deinit(a);
+    srv.world = pool;
+    var changes: redstone_mod.ChangeList = .{};
+    var sounds: redstone_mod.SoundList = .{};
+    // Flip the lever on (same tryInteract path the serve loop uses).
+    var evt = BlockEvent{ .x = 5, .y = 65, .z = 8, .id = game_ids.air, .meta = 0, .face = 1 };
+    srv.world_lock.lock();
+    try std.testing.expect(srv.tryInteract(pool, a, &evt, 0, &changes, &sounds));
+    // K4 scan over the edited cell + changed wire cells primes the TNT.
+    var primed: [8]Server.TntPrimed = undefined;
+    var n_primed: usize = 0;
+    srv.primePoweredTnt(pool, a, 5, 64, 8, &changes, &primed, &n_primed);
+    srv.world_lock.unlock();
+    try std.testing.expectEqual(@as(usize, 1), n_primed);
+    try std.testing.expectEqual(game_ids.air, (try view.peekBlock(pool, a, 8, 64, 8)).?.id);
+    srv.ent_lock.lock();
+    const n_tnts = srv.tnts.items.len;
+    srv.ent_lock.unlock();
+    try std.testing.expectEqual(@as(usize, 1), n_tnts);
+    // Lever off + a fresh scan does NOT re-prime (block is already gone).
+    var evt2 = BlockEvent{ .x = 5, .y = 65, .z = 8, .id = game_ids.air, .meta = 0, .face = 1 };
+    var changes2: redstone_mod.ChangeList = .{};
+    var sounds2: redstone_mod.SoundList = .{};
+    srv.world_lock.lock();
+    defer srv.world_lock.unlock();
+    try std.testing.expect(srv.tryInteract(pool, a, &evt2, 20, &changes2, &sounds2));
+    var primed2: [8]Server.TntPrimed = undefined;
+    var n_primed2: usize = 0;
+    srv.primePoweredTnt(pool, a, 5, 64, 8, &changes2, &primed2, &n_primed2);
+    try std.testing.expectEqual(@as(usize, 0), n_primed2);
+}
+
+test "K4 glue: primed TNT fuses, detonates, craters stone, drops" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try shard_mod.ShardPool.open(a, io, tmp.dir, 1, .{ .flush_threshold_bytes = 1 << 30 });
+    defer pool.deinit();
+    {
+        var ch = try chunk_mod.Chunk.createEmpty(a, 0, 0, 0);
+        defer ch.destroy(a);
+        try pool.putChunk(a, ch);
+        try pool.flushAll();
+    }
+    // 9x9 stone slab y=60..63, TNT at (8,64,8).
+    var x: i32 = 4;
+    while (x <= 12) : (x += 1) {
+        var z: i32 = 4;
+        while (z <= 12) : (z += 1) {
+            var y: u8 = 60;
+            while (y <= 63) : (y += 1) {
+                _ = try view.applyBlock(pool, a, x, y, z, game_ids.stone, 0);
+            }
+        }
+    }
+    _ = try view.applyBlock(pool, a, 8, 64, 8, game_ids.tnt, 0);
+    var srv = Server{ .net = undefined, .io = io, .config = .{}, .gpa = a };
+    defer srv.deinitRegions();
+    defer srv.registry.deinit(a);
+    defer srv.tnts.deinit(a);
+    defer srv.potions.deinit(a);
+    defer srv.pending_blasts.deinit(a);
+    defer srv.items.deinit(a);
+    srv.world = pool;
+    srv.world_lock.lock();
+    const touched = srv.primeTnt(pool, a, 8, 64, 8, Server.tnt_fuse);
+    srv.world_lock.unlock();
+    _ = touched;
+    try std.testing.expectEqual(game_ids.air, (try view.peekBlock(pool, a, 8, 64, 8)).?.id);
+    // Fuse 80 ticks down 20/tick: detonation on the 4th tick, blast
+    // applied the same tick (budget 8/tick — one blast runs at once).
+    var t: i64 = 0;
+    while (t < 6) : (t += 1) srv.tickOnce(1000 + t * 1000);
+    srv.ent_lock.lock();
+    const n_tnts = srv.tnts.items.len;
+    const n_blasts = srv.pending_blasts.items.len;
+    const n_items = srv.items.items.len;
+    srv.ent_lock.unlock();
+    try std.testing.expectEqual(@as(usize, 0), n_tnts);
+    try std.testing.expectEqual(@as(usize, 0), n_blasts);
+    // Crater: the stone directly under the blast is gone.
+    try std.testing.expectEqual(game_ids.air, (try view.peekBlock(pool, a, 8, 63, 8)).?.id);
+    // Drops went through the J1 pipeline (1/4 chance per cell over a
+    // ~100-cell crater — empty would be a real regression).
+    try std.testing.expect(n_items > 0);
+}
+
 test "K1 glue: door halves place/break together" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -12290,6 +13166,7 @@ test "Phase C: grouping covers each viewer exactly once (interleaved regions)" {
         .mobs = &mobs,
         .items = &items,
         .potions = &[_]entity.PotionSnap{},
+        .tnts = &[_]entity.TntSnap{},
         .envs = &envs,
         .furn_snaps = &furn,
         .brew_snaps = &[_]Server.BrewSnap{},
@@ -12391,6 +13268,7 @@ test "Phase C: >256 viewers spill to legacy without smashing the stack" {
         .mobs = &mobs,
         .items = &items,
         .potions = &[_]entity.PotionSnap{},
+        .tnts = &[_]entity.TntSnap{},
         .envs = &envs,
         .furn_snaps = &furn,
         .brew_snaps = &[_]Server.BrewSnap{},
@@ -12960,7 +13838,7 @@ test "live drop spawn: instant 0x0E/0x1C, no tick re-spawn, tick pickup grants" 
             }
         }.f;
         var ctx: u8 = 0;
-        try entity.reconcileViewer(c, conn_sink.bind(c), &[_]entity.PlayerSnap{}, &[_]entity.MobSnap{}, &snap, &[_]entity.PotionSnap{}, &claims, Always, &ctx);
+        try entity.reconcileViewer(c, conn_sink.bind(c), &[_]entity.PlayerSnap{}, &[_]entity.MobSnap{}, &snap, &[_]entity.PotionSnap{}, &[_]entity.TntSnap{}, &claims, Always, &ctx);
         try std.testing.expect(!claims.contains(eid));
         try std.testing.expect(c.tracked.contains(eid));
         c.lock.lock();
@@ -12989,7 +13867,7 @@ test "live drop spawn: instant 0x0E/0x1C, no tick re-spawn, tick pickup grants" 
             }
         }.f;
         var ctx: u8 = 0;
-        try entity.reconcileViewer(c, conn_sink.bind(c), &[_]entity.PlayerSnap{}, &[_]entity.MobSnap{}, &snap, &[_]entity.PotionSnap{}, &claims, Always, &ctx);
+        try entity.reconcileViewer(c, conn_sink.bind(c), &[_]entity.PlayerSnap{}, &[_]entity.MobSnap{}, &snap, &[_]entity.PotionSnap{}, &[_]entity.TntSnap{}, &claims, Always, &ctx);
         try std.testing.expect(claims.contains(eid));
         try std.testing.expect(!c.tracked.contains(eid));
         try std.testing.expect(c.inv[36] != null);

@@ -130,6 +130,22 @@ pub const ThrowPotionEvent = struct {
     damage: i16,
 };
 
+/// Flint-and-steel right-click on a block. The serve thread peeks the
+/// CLICKED cell: live TNT primes (full fuse, flint takes 1 damage) while
+/// anything else NACKs the target (no fire placement — the client
+/// predicted fire there and L1 owns fire). `primed` is serve-set for the
+/// second-loop flint wear.
+pub const IgniteEvent = struct {
+    x: i32,
+    y: u8,
+    z: i32,
+    slot: usize,
+    tx: i32,
+    ty: u8,
+    tz: i32,
+    primed: bool = false,
+};
+
 /// Dig negative-ack (vanilla S23-iff-solid): the serve thread re-reads the
 /// cell and 0x23s the digger with truth when it is still solid. Fires on
 /// every refused dig (reach/pending/apply-failure) because the client
@@ -237,6 +253,9 @@ pub const Action = union(enum) {
     /// Right-click splash-potion throw: serve spawns the arc entity and
     /// consumes one from the held stack.
     throw_potion: ThrowPotionEvent,
+    /// Flint-and-steel right-click: serve primes clicked TNT or NACKs
+    /// the target (no fire placement yet).
+    ignite_tnt: IgniteEvent,
     /// Right-click air with armor held: serve loop equips one piece
     /// into its armor slot (equip-if-empty) + 0x2F syncs.
     equip_armor,
@@ -2221,6 +2240,11 @@ pub const Conn = struct {
             profile.game.potion_data.isDrinkable(h.id, h.damage))
         {
             return .{ .eat = .{ .face = direction, .x = tx, .y = @intCast(ty), .z = tz, .slot = 36 + self.selected, .id = h.id, .damage = h.damage } };
+        }
+        // Flint-and-steel lights clicked TNT (prime) instead of placing;
+        // anything else is a deny (fire placement lives in L1).
+        if (h.id == game_ids.flint_and_steel) {
+            return .{ .ignite_tnt = .{ .x = x, .y = y, .z = z, .slot = 36 + self.selected, .tx = tx, .ty = @intCast(ty), .tz = tz } };
         }
         // Canonical ids are always < 4096, so the old wire range check is
         // vacuous; unknown wires never reach here (slot parse maps them to empty).

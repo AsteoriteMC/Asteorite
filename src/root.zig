@@ -122,10 +122,15 @@ pub const spin = @import("sim/core/spin.zig");
 /// Vanilla 1.7.10 redstone simulation: scheduled ticks, power model,
 /// components (wire/torch/lever/button/plates/doors/lamp/repeater/ore).
 pub const redstone = @import("sim/world/redstone.zig");
+/// K4 explosion core: batched 16^3-face raycast collect + damage/exposure
+/// (CPU reference for the Phase G1 GPU raycast).
+pub const explosion = @import("sim/world/explosion.zig");
 /// Version-neutral interaction geometry/reach rules (C4).
 pub const interaction = @import("sim/world/interaction.zig");
 /// Version-neutral movement bookkeeping (exhaustion, fall distance) (C4).
 pub const movement = @import("sim/world/movement.zig");
+/// L1 block simulation: fluids, falling blocks, random ticks, fire, melt, golems.
+pub const blocksim = @import("sim/world/blocksim.zig");
 /// Bump arena with O(1) reset (Phase D per-tick transient data).
 pub const arena = @import("sim/core/arena.zig");
 /// Fixed-size slab allocator (Phase D entity/block-entity storage).
@@ -240,6 +245,7 @@ test {
     _ = @import("sim/world/enchanting.zig");
     _ = @import("sim/world/interaction.zig");
     _ = @import("sim/world/movement.zig");
+    _ = @import("sim/world/blocksim.zig");
     _ = @import("sim/world/world_view.zig");
     _ = @import("sim/core/arena.zig");
     _ = @import("sim/core/slab.zig");

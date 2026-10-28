@@ -19,6 +19,7 @@ pub const Event = enum {
     head_look,
     item,
     potion,
+    tnt,
     collect,
     slot,
     unload,
@@ -52,6 +53,8 @@ pub const Recorder = struct {
     last_item: ?sink_mod.ItemSpawn = null,
     potion_spawns: usize = 0,
     last_potion: ?sink_mod.PotionSpawn = null,
+    tnt_spawns: usize = 0,
+    last_tnt: ?sink_mod.TntSpawn = null,
     collects: usize = 0,
     last_collect: ?[2]i32 = null,
     slots: usize = 0,
@@ -87,6 +90,8 @@ pub const Recorder = struct {
         self.last_item = null;
         self.potion_spawns = 0;
         self.last_potion = null;
+        self.tnt_spawns = 0;
+        self.last_tnt = null;
         self.collects = 0;
         self.last_collect = null;
         self.slots = 0;
@@ -196,6 +201,13 @@ pub const Recorder = struct {
         self.last_potion = spawn.*;
     }
 
+    fn spawnTnt(ctx: *anyopaque, spawn: *const sink_mod.TntSpawn) anyerror!void {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.add(.tnt);
+        self.tnt_spawns += 1;
+        self.last_tnt = spawn.*;
+    }
+
     fn collectItem(ctx: *anyopaque, collected_eid: i32, collector_eid: i32) anyerror!void {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
         self.add(.collect);
@@ -257,6 +269,7 @@ const vtable = sink_mod.VTable{
     .head_look = Recorder.headLook,
     .spawn_item = Recorder.spawnItem,
     .spawn_potion = Recorder.spawnPotion,
+    .spawn_tnt = Recorder.spawnTnt,
     .collect_item = Recorder.collectItem,
     .inventory_slot = Recorder.inventorySlot,
     .unload_chunk = Recorder.unloadChunk,
