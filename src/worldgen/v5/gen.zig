@@ -873,7 +873,7 @@ pub const Gen = struct {
             .sz = VS,
             .ore_cache = self.ore_cache,
         };
-        try decor_mod.decorateCenter(&view, self.world_seed, cx, cz, &self.shaper.chain, self.shaper.roots[1], scratch);
+        try decor_mod.decorateCenter(&view, self.world_seed, cx, cz, &self.shaper.chain, self.shaper.roots[0], scratch);
         // Border-exact light over the merged 48x48 view (cross-chunk
         // flood; the old per-chunk flood clamped at borders and seamed).
         // Layout matches View: idx = (x*48+z)*256+y.
@@ -923,16 +923,40 @@ test "genChunk packs ZC1 faithfully (seed 42 chunk 3,-5)" {
         const grass = s4.blocks[4 * 256];
         try std.testing.expectEqual(ids.dirt, dirt);
         try std.testing.expectEqual(ids.grass, grass);
-        // Skylight: 15 at/above surface, 0 inside stone.
+        // Skylight: shaded to 12 at the surface by the spruce canopy
+        // overhanging (0,0) (taiga runs now plant; voronoi ice-plains
+        // planted nothing), 0 inside stone.
         const sky_top = chunk_mod.Section.getNibble(&s4.sky, 4 * 256);
-        try std.testing.expectEqual(@as(u4, 15), sky_top);
+        try std.testing.expectEqual(@as(u4, 12), sky_top);
         const sky_in = s4.blocks[0];
         _ = sky_in;
         const sky_below = chunk_mod.Section.getNibble(&s4.sky, 0);
         try std.testing.expectEqual(@as(u4, 0), sky_below);
     }
-    // Heightmap: topmost non-air.
-    try std.testing.expectEqual(@as(u8, 68), ch.heights[0]);
+    // Heightmap: topmost non-air (spruce canopy at 75 overhangs (0,0)).
+    try std.testing.expectEqual(@as(u8, 75), ch.heights[0]);
+    // Full-res taiga runs plant spruce only: every log/leaf in the chunk
+    // is meta 1 (regression lock for mixed-leaf canopies: voronoi runs
+    // planted oak/birch/spruce side by side here).
+    {
+        var nlog: usize = 0;
+        var nleaves: usize = 0;
+        for (ch.sections) |maybe| {
+            const sec = maybe orelse continue;
+            for (0..4096) |kk| {
+                if (sec.blocks[kk] == ids.log) {
+                    nlog += 1;
+                    try std.testing.expectEqual(@as(u4, 1), chunk_mod.Section.getNibble(&sec.meta, @intCast(kk)));
+                }
+                if (sec.blocks[kk] == ids.leaves) {
+                    nleaves += 1;
+                    try std.testing.expectEqual(@as(u4, 1), chunk_mod.Section.getNibble(&sec.meta, @intCast(kk)));
+                }
+            }
+        }
+        try std.testing.expect(nlog > 0);
+        try std.testing.expect(nleaves > 0);
+    }
 }
 
 // Batched hoist == sequential genChunk, byte-for-byte, on the CPU path
@@ -1092,17 +1116,18 @@ test "batched fill matches CPU fill (seed 42, chunk (6,0) neighborhood)" {
     }
 }
 
-test "roofed forest chunk grows dark oaks (seed 42 chunk 42,45)" {
-    // End-to-end through the real pipeline: chunk (42,45) is biome 29 at
-    // its center column, so populateOne runs the roofed grid. Must
-    // contain dark-oak wood (log2:1) and dark-oak leaves (leaves2:1).
-    // Catches "no trees" wiring regressions (grid skipped/unreachable).
+test "roofed forest chunk grows dark oaks (seed 42 chunk 11,10)" {
+    // End-to-end through the real pipeline: chunk (11,10) is biome 29 at
+    // its full-res center (11*16+16, 10*16+16), so populateOne runs the
+    // roofed grid. Must contain dark-oak wood (log2:1) and dark-oak
+    // leaves (leaves2:1). Catches "no trees" wiring regressions (grid
+    // skipped/unreachable).
     const alloc = std.testing.allocator;
     var gen = try Gen.init(alloc, 42, false, false);
     defer gen.deinit();
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    const ch = try gen.genChunk(alloc, arena.allocator(), 42, 45);
+    const ch = try gen.genChunk(alloc, arena.allocator(), 11, 10);
     defer ch.destroy(alloc);
     var dark_wood: usize = 0;
     var dark_leaves: usize = 0;

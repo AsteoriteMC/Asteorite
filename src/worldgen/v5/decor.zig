@@ -2826,8 +2826,14 @@ pub fn computeHeights(view: *const View, heights: []i32) void {
 }
 
 /// Decorate center chunk (cx,cz) in `view` (must cover (cx-1..cx+1) chunks,
-/// i.e. 48x48 with ox=(cx-1)*16). `biomeAt` returns voronoi biome id at
-/// world (x,z). Heights are recomputed per run after lakes/dungeons.
+/// i.e. 48x48 with ox=(cx-1)*16). `root_biome` is the full-res final-mix
+/// root for everything: run biomes are getBiomeGenAt(nx*16+16,
+/// nz*16+16) (jar `aqz.populate`), and the tail gates per column on
+/// getBiomeGenForCoords (jar `ahb.r` / `ahb.e`, full-res chunk array).
+/// Voronoi feeds nothing here: using it planted wrong-kind runs wherever
+/// it disagreed with full-res, mixing foreign leaves into canopies while
+/// stranded vine columns floated. Heights are recomputed per run after
+/// lakes/dungeons.
 /// Merge one populate run's work into the accumulated view. Every cell
 /// where work differs from the pristine base in EITHER block or meta copies
 /// BOTH components (whole cell, last-writer-wins). The components must not
@@ -2894,7 +2900,7 @@ pub fn decorateCenter(
     cx: i32,
     cz: i32,
     chain: *genlayer_mod.Chain,
-    root_voronoi: u32,
+    root_biome: u32,
     scratch: std.mem.Allocator,
 ) !void {
     const n = view.sx * 256 * view.sz;
@@ -2916,13 +2922,30 @@ pub fn decorateCenter(
     defer flower_noise.deinit();
     const run_heights = try scratch.alloc(i32, view.sx * view.sz);
     defer scratch.free(run_heights);
-    // Per-column voronoi for the snow/ice tail (one fetch for the whole
-    // 48x48 view; each run slices its 16x16 populate window). The tail
-    // gates every column on its own biome (vanilla `World.r`/`World.e`);
-    // a single center biome per window would freeze warm columns.
+    // Full-res biome window for the whole 48x48 view (one fetch; each
+    // run slices its 16x16 populate window for the snow/ice tail). The
+    // tail gates every column on its own biome (vanilla `World.r` /
+    // `World.e` read the full-res chunk array per column); a single
+    // center biome per window would freeze warm columns.
     const bio48 = try scratch.alloc(i32, view.sx * view.sz);
     defer scratch.free(bio48);
-    try chain.getInts(scratch, root_voronoi, view.ox, view.oz, view.sx, view.sz, bio48);
+    try chain.getInts(scratch, root_biome, view.ox, view.oz, view.sx, view.sz, bio48);
+    // Full-res run biomes, one per populate (vanilla getBiomeGenAt at
+    // (nx*16+16, nz*16+16): jar `aqz.populate` reads the chunk biome
+    // array corner, full-res per column). Fetched 1x1: the 9 points are
+    // each in a different chunk, so no shared window covers them.
+    var run_biomes: [9]i32 = undefined;
+    {
+        var bdz: i32 = -1;
+        while (bdz <= 1) : (bdz += 1) {
+            var bdx: i32 = -1;
+            while (bdx <= 1) : (bdx += 1) {
+                var cbout: [1]i32 = undefined;
+                try chain.getInts(scratch, root_biome, (cx + bdx) * 16 + 16, (cz + bdz) * 16 + 16, 1, 1, cbout[0..]);
+                run_biomes[@as(usize, @intCast((bdz + 1) * 3 + (bdx + 1)))] = cbout[0];
+            }
+        }
+    }
     // Fixed order: 8 neighbors (sorted dz,dx) then center last.
     var order: [9]struct { dx: i32, dz: i32 } = undefined;
     var k: usize = 0;
@@ -2950,14 +2973,9 @@ pub fn decorateCenter(
         const nx = cx + o.dx;
         const nz = cz + o.dz;
         seedForChunk(&rand, world_seed, nx, nz);
-        // Center biome straight from the prefetched 48-wide voronoi window
-        // (same chain, same root, same coords as biomeAt's 1x1 fetch —
-        // identical value, no second chain eval). lx/lz land on {8,24,40}
-        // by construction ((nx-cx+1)*16+8 for nx-cx in -1..1).
-        const blx: usize = @intCast(nx * 16 + 8 - view.ox);
-        const blz: usize = @intCast(nz * 16 + 8 - view.oz);
-        std.debug.assert(blx < view.sx and blz < view.sz);
-        const biome: i32 = bio48[blx + blz * view.sx];
+        // Run biome: full-res at (nx*16+16, nz*16+16), pre-fetched
+        // above (jar `aqz.populate` reads the chunk biome array corner).
+        const biome: i32 = run_biomes[@as(usize, @intCast((o.dz + 1) * 3 + (o.dx + 1)))];
         // Populate window [nx*16+8, nx*16+23]^2 in view-local coords;
         // out-of-view cells fall back to the center biome (their writes
         // are dropped by View bounds checks anyway).
