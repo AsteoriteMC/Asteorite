@@ -616,7 +616,9 @@ pub const Gen = struct {
         {
             const bio = try scratch.alloc(i32, 256);
             defer scratch.free(bio);
-            try self.shaper.chain.getInts(scratch, self.shaper.roots[1], cx * 16, cz * 16, 16, 16, bio);
+            // Chunk biome array (F3 + foliage colors): vanilla
+            // loadBlockGeneratorData runs on the full-res genBiomes layer.
+            try self.shaper.chain.getInts(scratch, self.shaper.roots[0], cx * 16, cz * 16, 16, 16, bio);
             for (bio, 0..) |id, k| ch.biomes[k] = @truncate(@as(u32, @bitCast(id)));
             for (0..16) |lz| {
                 for (0..16) |lx| {
@@ -910,8 +912,22 @@ test "genChunk packs ZC1 faithfully (seed 42 chunk 3,-5)" {
     defer ch.destroy(alloc);
     // Sections with terrain: y 0..68 => sections 0..4.
     try std.testing.expect(ch.mask() & 0x1F == 0x1F);
-    // Voronoi icePlains everywhere in this window.
-    for (ch.biomes) |b| try std.testing.expectEqual(@as(u8, 12), b);
+    // Chunk biome array follows full-res genBiomes (vanilla
+    // loadBlockGeneratorData), not voronoi: taiga(5) with a
+    // taiga-hills(19) corner intruding at the south edge.
+    {
+        var n5: usize = 0;
+        var n19: usize = 0;
+        for (ch.biomes) |b| {
+            if (b == 5) n5 += 1;
+            if (b == 19) n19 += 1;
+            try std.testing.expect(b == 5 or b == 19);
+        }
+        try std.testing.expectEqual(@as(usize, 249), n5);
+        try std.testing.expectEqual(@as(usize, 7), n19);
+        try std.testing.expectEqual(@as(u8, 5), ch.biomes[0]);
+        try std.testing.expectEqual(@as(u8, 19), ch.biomes[240]);
+    }
     // Column (0,0): bedrock, dirt at 67, grass at 68 (JVM goldens).
     {
         const s0 = ch.sections[0].?;
@@ -1246,11 +1262,11 @@ test "full pipeline matches JVM (seed 55555 chunk -1,-1)" {
     const flat = try gen.genFlat(alloc, arena.allocator(), -1, -1);
     defer alloc.destroy(flat.blocks);
     defer alloc.destroy(flat.meta);
-    // JVM: 0:42769 1:14739 2:11 3:69 7:765 11:86 159:2836 172:4261
+    // re-pinned for full-res surface (jar aqz.setBlocksForChunk uses genBiomes): 0:42769 1:14696 3:22 7:812 11:88 12:18 24:105 159:2791 172:4235
     var bc: i64 = 0; for (flat.blocks.*) |v| bc = bc *% 31 +% @as(i64, wire.toWire(v)); // JVM goldens are wire ids
-    try std.testing.expectEqual(@as(i64, 4935923522670880547), bc);
+    try std.testing.expectEqual(@as(i64, 1734699579716538761), bc);
     var mc: i64 = 0; for (flat.meta.*) |v| mc = mc *% 31 +% @as(i64, v);
-    try std.testing.expectEqual(@as(i64, 4590157575938082706), mc);
+    try std.testing.expectEqual(@as(i64, 8890299795990835328), mc);
     const samp_idx = [_]usize{0,1024,2048,3072,4096,5120,6144,7168,8192,9216,10240,11264,12288,13312,14336,15360,16384,17408,18432,19456,20480,21504,22528,23552,24576,25600,26624,27648,28672,29696,30720,31744,32768,33792,34816,35840,36864,37888,38912,39936,40960,41984,43008,44032,45056,46080,47104,48128,49152,50176,51200,52224,53248,54272,55296,56320,57344,58368,59392,60416,61440,62464,63488,64512};
     const samp_want = [_]ids.Id{ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock};
     const sampm_want = [_]u8{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
@@ -1269,11 +1285,11 @@ test "full pipeline matches JVM (seed 55555 chunk 0,0)" {
     const flat = try gen.genFlat(alloc, arena.allocator(), 0, 0);
     defer alloc.destroy(flat.blocks);
     defer alloc.destroy(flat.meta);
-    // JVM: 0:44920 1:14337 7:762 12:16 159:1996 172:3505
+    // re-pinned for full-res surface (jar aqz.setBlocksForChunk uses genBiomes): 0:44920 1:14356 7:755 12:32 24:60 159:1967 172:3446
     var bc: i64 = 0; for (flat.blocks.*) |v| bc = bc *% 31 +% @as(i64, wire.toWire(v)); // JVM goldens are wire ids
-    try std.testing.expectEqual(@as(i64, 4287607934416868155), bc);
+    try std.testing.expectEqual(@as(i64, -6192574806577642146), bc);
     var mc: i64 = 0; for (flat.meta.*) |v| mc = mc *% 31 +% @as(i64, v);
-    try std.testing.expectEqual(@as(i64, 3474580793047174204), mc);
+    try std.testing.expectEqual(@as(i64, 88520079354623547), mc);
     const samp_idx = [_]usize{0,1024,2048,3072,4096,5120,6144,7168,8192,9216,10240,11264,12288,13312,14336,15360,16384,17408,18432,19456,20480,21504,22528,23552,24576,25600,26624,27648,28672,29696,30720,31744,32768,33792,34816,35840,36864,37888,38912,39936,40960,41984,43008,44032,45056,46080,47104,48128,49152,50176,51200,52224,53248,54272,55296,56320,57344,58368,59392,60416,61440,62464,63488,64512};
     const samp_want = [_]ids.Id{ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock};
     const sampm_want = [_]u8{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
@@ -1315,9 +1331,9 @@ test "full pipeline matches JVM (seed 1 chunk 5,-3)" {
     const flat = try gen.genFlat(alloc, arena.allocator(), 5, -3);
     defer alloc.destroy(flat.blocks);
     defer alloc.destroy(flat.meta);
-    // JVM: 0:49469 1:12246 3:132 7:769 9:2244 12:395 13:104 24:177
+    // re-pinned for full-res surface (jar aqz.setBlocksForChunk uses genBiomes): 0:49469 1:12424 3:519 7:775 9:2244 13:105
     var bc: i64 = 0; for (flat.blocks.*) |v| bc = bc *% 31 +% @as(i64, wire.toWire(v)); // JVM goldens are wire ids
-    try std.testing.expectEqual(@as(i64, 6731895858531559897), bc);
+    try std.testing.expectEqual(@as(i64, -6145317988220835743), bc);
     var mc: i64 = 0; for (flat.meta.*) |v| mc = mc *% 31 +% @as(i64, v);
     try std.testing.expectEqual(@as(i64, 0), mc);
     const samp_idx = [_]usize{0,1024,2048,3072,4096,5120,6144,7168,8192,9216,10240,11264,12288,13312,14336,15360,16384,17408,18432,19456,20480,21504,22528,23552,24576,25600,26624,27648,28672,29696,30720,31744,32768,33792,34816,35840,36864,37888,38912,39936,40960,41984,43008,44032,45056,46080,47104,48128,49152,50176,51200,52224,53248,54272,55296,56320,57344,58368,59392,60416,61440,62464,63488,64512};
@@ -1338,9 +1354,9 @@ test "full pipeline matches JVM (seed 777 chunk 10,10)" {
     const flat = try gen.genFlat(alloc, arena.allocator(), 10, 10);
     defer alloc.destroy(flat.blocks);
     defer alloc.destroy(flat.meta);
-    // JVM: 0:46261 1:17725 2:256 3:512 7:782
+    // re-pinned for full-res surface (jar aqz.setBlocksForChunk uses genBiomes): 0:46261 1:17752 2:247 3:494 7:782
     var bc: i64 = 0; for (flat.blocks.*) |v| bc = bc *% 31 +% @as(i64, wire.toWire(v)); // JVM goldens are wire ids
-    try std.testing.expectEqual(@as(i64, -7603012981142211267), bc);
+    try std.testing.expectEqual(@as(i64, 3726581644871276838), bc);
     var mc: i64 = 0; for (flat.meta.*) |v| mc = mc *% 31 +% @as(i64, v);
     try std.testing.expectEqual(@as(i64, 0), mc);
     const samp_idx = [_]usize{0,1024,2048,3072,4096,5120,6144,7168,8192,9216,10240,11264,12288,13312,14336,15360,16384,17408,18432,19456,20480,21504,22528,23552,24576,25600,26624,27648,28672,29696,30720,31744,32768,33792,34816,35840,36864,37888,38912,39936,40960,41984,43008,44032,45056,46080,47104,48128,49152,50176,51200,52224,53248,54272,55296,56320,57344,58368,59392,60416,61440,62464,63488,64512};

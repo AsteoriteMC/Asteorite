@@ -10,9 +10,10 @@
 //!   diamond/lapis) with vanilla counts, sizes, y-ranges. Emerald (extreme
 //!   hills) is skipped.
 //! - Trees: oak (`asq`), birch (`are`), spruce (`asn`), tall-oak (`aso`
-//!   for swamp, shape-exact). Big-oak (`ard`), acacia (`ask`), jungle
-//!   giants (`asi`/`arp`/`arz`), mushrooms (`aru`) map to small-oak with
-//!   the same RNG draws consumed (documented; shapes differ).
+//!   for swamp, shape-exact), acacia (`ask`, savanna umbrella). Big-oak
+//!   (`ard`), jungle giants (`asi`/`arp`/`arz`), mushrooms (`aru`) map to
+//!   small-oak with the same RNG draws consumed (documented; shapes
+//!   differ).
 //! - Sand (`asj` sand) / clay (`arj`) / gravel (`asj` gravel) disks are
 //!   implemented (they come before trees in RNG order).
 //! - Structures, lakes, dungeons (which precede ores in `aqz.populate`)
@@ -888,6 +889,143 @@ pub fn birchTree(
     return oakTree(view, rand, wx, wy, wz, h_min, 2, 2, false, false);
 }
 
+/// Acacia (`ask`, savanna): trunk height nextInt(3)+nextInt(3)+5 with a
+/// sideways lean (dir nextInt(4), start n6-nextInt(4)-1, length
+/// 3-nextInt(3)), flat umbrella canopy (3x3 at top+1, side arms, 7x7
+/// minus corners at top), plus an optional branch (own dir, skipped
+/// when it equals the lean dir) with a smaller canopy. Logs are
+/// `log2:0`, leaves `leaves2:0`. Ports the jar `ask` exactly (draw
+/// order verified against bytecode: height, lean, canopy, branch).
+pub fn acaciaTree(view: *View, rand: *java_random.JavaRandom, wx: i32, wy: i32, wz: i32) !bool {
+    const n6: i32 = try rand.nextIntBound(3) + try rand.nextIntBound(3) + 5;
+    if (wy < 1 or wy + n6 + 1 > 256) return false;
+    var y: i32 = wy;
+    while (y <= wy + 1 + n6) : (y += 1) {
+        if (y < 0 or y >= 256) return false;
+        var n9: i32 = 1;
+        if (y == wy) n9 = 0;
+        if (y >= wy + 1 + n6 - 2) n9 = 2;
+        var x: i32 = wx - n9;
+        while (x <= wx + n9) : (x += 1) {
+            var z: i32 = wz - n9;
+            while (z <= wz + n9) : (z += 1) {
+                if (!replaceable(view.get(x, y, z))) return false;
+            }
+        }
+    }
+    const soil = view.get(wx, wy - 1, wz);
+    if (soil != ids.grass and soil != ids.dirt) return false;
+    if (wy >= 256 - n6 - 1) return false;
+    view.set(wx, wy - 1, wz, ids.dirt, 0);
+    // Lean offsets (jar `p.a` / `p.b`: SOUTH, WEST, NORTH, EAST).
+    const lean_dx = [_]i32{ 0, -1, 0, 1 };
+    const lean_dz = [_]i32{ 1, 0, -1, 0 };
+    const lean_dir: usize = @intCast(try rand.nextIntBound(4));
+    const lean_start: i32 = n6 - try rand.nextIntBound(4) - 1;
+    var lean_left: i32 = 3 - try rand.nextIntBound(3);
+    var bx: i32 = wx;
+    var bz: i32 = wz;
+    var top_y: i32 = 0;
+    var n15: i32 = 0;
+    while (n15 < n6) : (n15 += 1) {
+        if (n15 >= lean_start and lean_left > 0) {
+            bx += lean_dx[lean_dir];
+            bz += lean_dz[lean_dir];
+            lean_left -= 1;
+        }
+        const ty: i32 = wy + n15;
+        if (view.idx(bx, ty, bz)) |ix| {
+            const b = view.blocks[ix];
+            if (b == ids.air or b == ids.leaves or b == ids.leaves2) {
+                view.blocks[ix] = ids.log2;
+                view.metas[ix] = 0;
+                view.markDirty(bx, bz);
+                top_y = ty;
+            }
+        }
+    }
+    // Umbrella: 3x3 one above the top, side arms two out, 7x7 disc
+    // (minus corners) at the top.
+    var adx: i32 = -1;
+    while (adx <= 1) : (adx += 1) {
+        var adz: i32 = -1;
+        while (adz <= 1) : (adz += 1) {
+            acaciaLeaf(view, bx + adx, top_y + 1, bz + adz);
+        }
+    }
+    acaciaLeaf(view, bx + 2, top_y + 1, bz);
+    acaciaLeaf(view, bx - 2, top_y + 1, bz);
+    acaciaLeaf(view, bx, top_y + 1, bz + 2);
+    acaciaLeaf(view, bx, top_y + 1, bz - 2);
+    adx = -3;
+    while (adx <= 3) : (adx += 1) {
+        var adz: i32 = -3;
+        while (adz <= 3) : (adz += 1) {
+            if (@abs(adx) == 3 and @abs(adz) == 3) continue;
+            acaciaLeaf(view, bx + adx, top_y, bz + adz);
+        }
+    }
+    // Optional branch from the base in its own direction (skipped when
+    // it equals the lean dir), with a smaller canopy.
+    const bdir: usize = @intCast(try rand.nextIntBound(4));
+    if (bdir != lean_dir) {
+        const bstart: i32 = lean_start - try rand.nextIntBound(2) - 1;
+        var blen: i32 = 1 + try rand.nextIntBound(3);
+        var cx: i32 = wx;
+        var czz: i32 = wz;
+        var btop: i32 = 0;
+        var bi: i32 = bstart;
+        while (bi < n6 and blen > 0) : ({
+            bi += 1;
+            blen -= 1;
+        }) {
+            if (bi < 1) continue;
+            const by: i32 = wy + bi;
+            cx += lean_dx[bdir];
+            czz += lean_dz[bdir];
+            if (view.idx(cx, by, czz)) |ix| {
+                const b = view.blocks[ix];
+                if (b == ids.air or b == ids.leaves or b == ids.leaves2) {
+                    view.blocks[ix] = ids.log2;
+                    view.metas[ix] = 0;
+                    view.markDirty(cx, czz);
+                    btop = by;
+                }
+            }
+        }
+        if (btop > 0) {
+            adx = -1;
+            while (adx <= 1) : (adx += 1) {
+                var adz: i32 = -1;
+                while (adz <= 1) : (adz += 1) {
+                    acaciaLeaf(view, cx + adx, btop + 1, czz + adz);
+                }
+            }
+            adx = -2;
+            while (adx <= 2) : (adx += 1) {
+                var adz: i32 = -2;
+                while (adz <= 2) : (adz += 1) {
+                    if (@abs(adx) == 2 and @abs(adz) == 2) continue;
+                    acaciaLeaf(view, cx + adx, btop, czz + adz);
+                }
+            }
+        }
+    }
+    return true;
+}
+
+/// Acacia leaf cell (`ask` helper): `leaves2:0` over air or leaves.
+fn acaciaLeaf(view: *View, wx: i32, wy: i32, wz: i32) void {
+    if (view.idx(wx, wy, wz)) |ix| {
+        const b = view.blocks[ix];
+        if (b == ids.air or b == ids.leaves or b == ids.leaves2) {
+            view.blocks[ix] = ids.leaves2;
+            view.metas[ix] = 0;
+            view.markDirty(wx, wz);
+        }
+    }
+}
+
 /// Swamp oak (`aso`): height nextInt(4)+5, WIDER canopy (radius 2-3 via
 /// `2 - n6/2`), vines, no cocoa. Soil is grass/dirt (no farmland).
 /// Down-shift loop (`while below material==h`) skipped: our views have no
@@ -1351,6 +1489,81 @@ test "birch/spruce/swamp trees match JVM (seed 42)" {
         try std.testing.expectEqual(c.crc, crc);
         try std.testing.expectEqual(c.mcrc, mcrc);
     }
+}
+
+test "acacia tree grows umbrella canopy (seed 42)" {
+    // Savanna `ask` port (jar-verified against the 1.7.10 bytecode):
+    // lean trunk of log2:0, leaves2:0 umbrella + optional branch.
+    // Structural lock (regression counts live in the tree-scan test):
+    // every trunk is single-meta log2:0 grounded on dirt, all leaves are
+    // leaves2:0.
+    const alloc = std.testing.allocator;
+    const S: usize = 32;
+    const blocks = try alloc.alloc(ids.Id, S * 256 * S);
+    defer alloc.free(blocks);
+    const metas = try alloc.alloc(u8, S * 256 * S);
+    defer alloc.free(metas);
+    @memset(blocks, ids.air);
+    @memset(metas, 0);
+    for (0..S) |x| {
+        for (0..S) |z| {
+            for (0..70) |y| blocks[(x * S + z) * 256 + y] = ids.stone;
+            blocks[(x * S + z) * 256 + 70] = ids.grass;
+        }
+    }
+    var view = View{ .blocks = blocks, .metas = metas, .ox = -16, .oz = -16, .sx = S, .sz = S };
+    var r = java_random.JavaRandom.init(42);
+    try std.testing.expect(try acaciaTree(&view, &r, 0, 71, 0));
+    var nlog: usize = 0;
+    var nleaves: usize = 0;
+    var low_y: i32 = 256;
+    var wx: i32 = -16;
+    while (wx < 16) : (wx += 1) {
+        var wy: i32 = 66;
+        while (wy < 100) : (wy += 1) {
+            var wz: i32 = -16;
+            while (wz < 16) : (wz += 1) {
+                const id = view.get(wx, wy, wz);
+                if (id == ids.log2) {
+                    nlog += 1;
+                    try std.testing.expectEqual(@as(u8, 0), view.getMeta(wx, wy, wz));
+                    if (wy < low_y) low_y = wy;
+                }
+                if (id == ids.leaves2) {
+                    nleaves += 1;
+                    try std.testing.expectEqual(@as(u8, 0), view.getMeta(wx, wy, wz));
+                }
+            }
+        }
+    }
+    try std.testing.expect(nlog >= 4);
+    try std.testing.expect(nleaves > 0);
+    try std.testing.expectEqual(@as(i32, 71), low_y);
+    try std.testing.expectEqual(ids.dirt, view.get(0, 70, 0));
+}
+
+test "savanna selects oak or acacia (1/5 oak)" {
+    // Vanilla `ais`: nextInt(5) > 0 -> acacia, else oak. Both branches
+    // must occur; acacia dominates.
+    var oak: usize = 0;
+    var acacia: usize = 0;
+    var seed: i64 = 1;
+    while (seed <= 200) : (seed += 1) {
+        var r = java_random.JavaRandom.init(seed);
+        switch (try selectTree(&r, 35)) {
+            .oak => oak += 1,
+            .acacia => acacia += 1,
+            else => return error.TestUnexpectedResult,
+        }
+        var r2 = java_random.JavaRandom.init(seed);
+        switch (try selectTree(&r2, 36)) {
+            .oak => oak += 1,
+            .acacia => acacia += 1,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expect(oak > 0);
+    try std.testing.expect(acacia > oak);
 }
 
 test "canopy tree grows 2x2 dark oak on flat grass (seed 42)" {
@@ -2392,7 +2605,7 @@ pub fn diskCounts(biome_id: i32) struct { sand: i32, clay: i32, gravel: i32 } {
     return .{ .sand = 3, .clay = 1, .gravel = 1 };
 }
 
-pub const TreeKind = enum { oak, birch, spruce, swamp, jungle_oak, canopy };
+pub const TreeKind = enum { oak, birch, spruce, swamp, acacia, jungle_oak, canopy };
 
 /// Tree type selection per biome (replicates `ahu.a` draws; approximations
 /// documented in module header). Returns kind; caller generates.
@@ -2425,8 +2638,8 @@ pub fn selectTree(rand: *java_random.JavaRandom, biome_id: i32) !TreeKind {
             }
             return .jungle_oak;
         },
-        35, 36 => { // savanna: 1/5 oak, 4/5 acacia->oak (one draw either way)
-            _ = try rand.nextIntBound(5);
+        35, 36 => { // savanna: 1/5 oak, 4/5 acacia (`ask`; jar `ais`)
+            if (try rand.nextIntBound(5) > 0) return .acacia;
             return .oak;
         },
         29 => { // roofed forest: 2/3 canopy, else 1/5 birch else oak (jar aif.a)
@@ -2600,6 +2813,7 @@ pub fn populateOne(
             .birch => _ = try birchTree(view, rand, wx, wy, wz, false),
             .spruce => _ = try spruceTree(view, rand, wx, wy, wz),
             .swamp => _ = try swampTree(view, rand, wx, wy, wz),
+            .acacia => _ = try acaciaTree(view, rand, wx, wy, wz),
             .jungle_oak => {
                 const h_extra: i32 = try rand.nextIntBound(7);
                 _ = try oakTree(view, rand, wx, wy, wz, 4 + h_extra, 3, 3, true, true);

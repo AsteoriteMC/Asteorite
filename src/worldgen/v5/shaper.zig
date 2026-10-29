@@ -265,7 +265,9 @@ pub const Shaper = struct {
         _ = self.surf_s.grid(s, cx * 16, cz * 16, 16, 16, 0.0625, 0.0625, 1.0, 0.5);
         const bio = try scratch.alloc(i32, 256);
         defer scratch.free(bio);
-        try self.chain.getInts(scratch, self.roots[1], cx * 16, cz * 16, 16, 16, bio);
+        // Per-column surface biome: vanilla setBlocksInChunk runs on the
+        // full-res getBiomesForGeneration array (jar `aqz.d`), not voronoi.
+        try self.chain.getInts(scratch, self.roots[0], cx * 16, cz * 16, 16, 16, bio);
         var r = java_random.JavaRandom.init(0);
         // Surface rand mixes chunk coords only (no world seed — vanilla).
         // Salts shared with MapGen chunkRand (see struct/mapgen.zig).
@@ -468,9 +470,9 @@ test "mesa surface matches JVM (seed 55555 chunk -1,-1)" {
     Shaper.fillChunk(&q, &blocks);
     var meta: [BLOCKS_LEN]u8 = undefined;
     try sh.surfaceChunk(arena.allocator(), -1, -1, &blocks, &meta);
-    // JVM: 0:42769 1:14825 2:11 3:69 7:765 159:2836 172:4261
-    try std.testing.expectEqual(@as(i64, 2511227954806405139), blocksCrc(&blocks));
-    try std.testing.expectEqual(@as(i64, 4590157575938082706), metaCrc(&meta));
+    // re-pinned for full-res surface (jar aqz.setBlocksForChunk uses genBiomes): 0:42769 1:14784 3:22 7:812 12:18 24:105 159:2791 172:4235
+    try std.testing.expectEqual(@as(i64, 2054172292634844941), blocksCrc(&blocks));
+    try std.testing.expectEqual(@as(i64, 8890299795990835328), metaCrc(&meta));
     const samp_idx = [_]usize{0,1024,2048,3072,4096,5120,6144,7168,8192,9216,10240,11264,12288,13312,14336,15360,16384,17408,18432,19456,20480,21504,22528,23552,24576,25600,26624,27648,28672,29696,30720,31744,32768,33792,34816,35840,36864,37888,38912,39936,40960,41984,43008,44032,45056,46080,47104,48128,49152,50176,51200,52224,53248,54272,55296,56320,57344,58368,59392,60416,61440,62464,63488,64512};
     const samp_want = [_]ids.Id{ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock};
     const sampm_want = [_]u8{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
@@ -492,9 +494,9 @@ test "mesa surface matches JVM (seed 55555 chunk 0,0)" {
     Shaper.fillChunk(&q, &blocks);
     var meta: [BLOCKS_LEN]u8 = undefined;
     try sh.surfaceChunk(arena.allocator(), 0, 0, &blocks, &meta);
-    // JVM: 0:44644 1:14613 7:762 12:16 159:1996 172:3505
-    try std.testing.expectEqual(@as(i64, 1655173335233020359), blocksCrc(&blocks));
-    try std.testing.expectEqual(@as(i64, 3474580793047174204), metaCrc(&meta));
+    // re-pinned for full-res surface (jar aqz.setBlocksForChunk uses genBiomes): 0:44644 1:14632 7:755 12:32 24:60 159:1967 172:3446
+    try std.testing.expectEqual(@as(i64, -8825009405761489942), blocksCrc(&blocks));
+    try std.testing.expectEqual(@as(i64, 88520079354623547), metaCrc(&meta));
     const samp_idx = [_]usize{0,1024,2048,3072,4096,5120,6144,7168,8192,9216,10240,11264,12288,13312,14336,15360,16384,17408,18432,19456,20480,21504,22528,23552,24576,25600,26624,27648,28672,29696,30720,31744,32768,33792,34816,35840,36864,37888,38912,39936,40960,41984,43008,44032,45056,46080,47104,48128,49152,50176,51200,52224,53248,54272,55296,56320,57344,58368,59392,60416,61440,62464,63488,64512};
     const samp_want = [_]ids.Id{ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock,ids.bedrock};
     const sampm_want = [_]u8{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
