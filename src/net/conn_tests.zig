@@ -2049,6 +2049,31 @@ test "pre-baseline drift never disarms the login grace" {
     try std.testing.expectApproxEqAbs(@as(f64, 8.5), c.pos_x, 1e-9);
 }
 
+test "login grace adopts real landings instead of rubber-banding them" {
+    // A deep fall that LANDS (client reports on_ground) is a normal
+    // login landing on delivered ground: adopt it so the tick can run
+    // fall bookkeeping, instead of holding + resync-snapping until the
+    // timeout (the login rubber-band). Airborne falls still hold.
+    var c = mkConn(.{}, 26);
+    defer c.deinit();
+    c.state = .play;
+    c.baseline_sent = true;
+    c.pos_x = 0.5;
+    c.pos_y = 74.0;
+    c.pos_z = 0.5;
+    c.armLoginGrace();
+    // Airborne deep fall: held, no adopt, no fall damage queued.
+    c.setPos(0.5, 71.0, 0.5, 0.0, 0.0, false);
+    try std.testing.expect(c.login_grace_ms != 0);
+    try std.testing.expect(c.login_fell);
+    try std.testing.expectApproxEqAbs(@as(f64, 74.0), c.pos_y, 1e-9);
+    try std.testing.expect(c.pending_fall == null);
+    // Same spot, now landed: adopted (a 2-block landing stashes no
+    // pending fall — below damage distance — but the position moves).
+    c.setPos(0.5, 72.0, 0.5, 0.0, 0.0, true);
+    try std.testing.expectApproxEqAbs(@as(f64, 72.0), c.pos_y, 1e-9);
+}
+
 test "join packets order + fields" {
     const a = std.testing.allocator;
     var c = mkConn(.{ .gamemode = .creative }, 1);

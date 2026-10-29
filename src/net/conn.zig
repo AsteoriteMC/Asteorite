@@ -2511,14 +2511,18 @@ pub const Conn = struct {
                 if (self.baseline_sent and gdx * gdx + gdz * gdz > 0.0625) {
                     self.login_grace_ms = 0; // playing, not falling
                     self.login_grace_lapsed = false;
-                } else if (y < self.login_y - 1.0) {
-                    // Load-fall held: the client runs physics before its
-                    // burst arrives and falls through not-yet-streamed
-                    // ground (the sent-set only proves the bytes left, not
-                    // that the client processed them). Look still updates
-                    // so the client feels live; fall/landing bookkeeping
-                    // is skipped — no phantom fall damage, and the fallen
-                    // position is never adopted/persisted.
+                } else if (y < self.login_y - 1.0 and !on_ground) {
+                    // Load-fall held while airborne: the client runs physics
+                    // before its burst arrives and falls through not-yet-
+                    // streamed ground (the sent-set only proves the bytes
+                    // left, not that the client processed them). Look still
+                    // updates so the client feels live; fall/landing
+                    // bookkeeping is skipped — no phantom fall damage, and
+                    // the fallen position is never adopted/persisted.
+                    // A client reporting on_ground LANDED on delivered
+                    // ground: adopt below instead of holding, or the grace
+                    // fights every normal login landing with resync snaps
+                    // until the timeout (the login rubber-band).
                     self.login_fell = true;
                     // Holding past the deadline (serve loop resolves): mark
                     // the lapse so later packets keep holding instead of
