@@ -12,20 +12,41 @@ gate), gap (pipeline-found, tracked with evidence), todo (no harness yet).
 - `registry-biomes` — `BiomeDump` (all 256 slots) vs `biome.zig`
   names + `biomeExists` registered set (incl. the 161 dup-slot quirk).
 - `genlayer` — `LayerProbe.initializeAllBiomeGenerators` roots vs
-  `genlayer_dump` (9 cases incl. the live savanna window). Compares the
-  first w*h cells: vanilla returns an oversized reuse buffer.
+  `genlayer_dump` (13 cases incl. the live savanna window and M-rich
+  windows: seed 7 Flower Forest + Birch M, seed 21 +129, seed 9
+  Sunflower Plains). Compares the first w*h cells: vanilla returns an
+  oversized reuse buffer.
 
 ## P1 gaps (pipeline-found, with evidence)
 
-- **Mutated-biome table data**: `biomeExists` + `HEIGHTS` know the M
-  variants but the main biome table has no M entries (surface/temp for
-  129+ falls back to plains). Found by `registry-biomes`
-  (oracle lists 60 real biomes, we document 40). Needs surface rules
-  per M variant + golden re-pins.
-- **River-chain 2-cell divergence**: `genlayer` case `1 80 -48 16 16`
-  at river_mix scale shows vanilla=164 (Savanna M via river claim)
-  where we emit 36 — our river chain says no-river where vanilla says
-  river. Isolated to 2/256 cells; needs `AxrDump` parent tracing.
+- **Mutated-biome decorator data (OPEN — precise spec, `decor.zig`
+  is foreign WIP so no code touched)**. Surface tables are complete
+  (`TOP256`/`FILLER256`/`TEMPF256`/`HEIGHTS` all carry 21 explicit M
+  entries; mesa family handled). The gap is decorator counts, pinned in
+  `oracles/notes/decorator-counts.txt` (`DecoFields` oracle):
+  - Barren M (own class, fresh default decorator — trees=0):
+    130,133,134,149,151,155,156,157,158 get `{trees=0, flowers=2,
+    grass=1, rest 0, E=1, F=3}`. The `+128`-strip gives them base flora
+    (e.g. 149 grows jungle giants, vanilla grows none).
+  - 132 Flower Forest (`aif`, own config): `{trees=6, flowers=100,
+    grass=1}` vs stripped forest `{10,2,2}`.
+  - 163/164 Savanna M (`ait`, own config): `{trees=2, flowers=2,
+    grass=5}` vs stripped savanna `{1,4,20}`.
+  - 129 Sunflower Plains: identical to plains (strip correct, no change).
+  - Swamp disks: vanilla `F=sand` / `E=clay` loops give swamp
+    `{sand=3, clay=0}` (`E=0`, `F=3` in `DecoFields`); our swamp
+    `{sand=0, clay=1}` is inverted on both fields (RNG draws shift even
+    where attempts fizzle). SwamplandM (134) `E=1` matches default clay.
+  - Chain side (shore/smooth/rareBiome) verified live on M ground
+    (above), so `isJungle`/`isMesa`/`isSnowy` need no change on observed
+    behavior.
+  - Next step: promote rescued `vgold/Dec*` oracles to a T0 decor area;
+    that is the mechanism that will verify any decor-side fix.
+- **River-chain 2-cell divergence (CLOSED 2026-10-30 — same lake-flag
+  root cause)**: looked like a river-chain split, but both river parents
+  are 92077 (lake marker); the cells needed the lake-mutated fallback
+  (`35 -> 36 -> 164`), which the old river-gated code skipped. Post-fix
+  L25-vs-axr shows 0/256 diffs.
 - **Voronoi site-selection (ADJUDICATED 2026-10-30 — other agent correct)**:
   vanilla `aqz.d` surface, chunk biome array, populate run biome, and
   snow all resolve through the chunk cache (`aib.b` / `apx.a` lazy fill /
@@ -49,7 +70,7 @@ gate), gap (pipeline-found, tracked with evidence), todo (no harness yet).
   falls through to the vote. Evidence: jungle blob (156 cells 21 vs 22),
   `ChainDbg`/`AxrDump`/`Roll` oracles in `oracles/debug/`, `axr.txt`
  /`axv.txt` disassembly in `oracles/notes/`. Verified: `genlayer`
-  9/9 live-agree after the fix.
+  13/13 live-agree after the fix.
 - **Biome comment names** now match vanilla exactly (`Ice Plains`,
   `Deep Ocean`, … — 18 fixes, comment-only, no behavior change).
 
