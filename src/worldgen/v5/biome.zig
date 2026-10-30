@@ -23,7 +23,7 @@ pub const BIOMES: [40]?Biome = .{
     .{ .root_height = -0x1.0p0, .height_var = 0x1.99999ap-4, .temp = .ocean }, // 0 Ocean
     .{ .root_height = 0x1.0p-3, .height_var = 0x1.99999ap-5, .temp = .medium }, // 1 Plains
     .{ .root_height = 0x1.0p-3, .height_var = 0x1.99999ap-5, .temp = .warm }, // 2 Desert
-    .{ .root_height = 0x1.0p0, .height_var = 0x1.0p-1, .temp = .medium }, // 3 ExtremeHills
+    .{ .root_height = 0x1.0p0, .height_var = 0x1.0p-1, .temp = .medium }, // 3 Extreme Hills
     .{ .root_height = 0x1.99999ap-4, .height_var = 0x1.99999ap-3, .temp = .medium }, // 4 Forest
     .{ .root_height = 0x1.99999ap-3, .height_var = 0x1.99999ap-3, .temp = .medium }, // 5 Taiga
     .{ .root_height = -0x1.99999ap-3, .height_var = 0x1.99999ap-4, .temp = .medium }, // 6 Swampland
@@ -32,34 +32,34 @@ pub const BIOMES: [40]?Biome = .{
     .{ .root_height = 0x1.99999ap-4, .height_var = 0x1.99999ap-3, .temp = .medium }, // 9 Sky
     .{ .root_height = -0x1.0p0, .height_var = 0x1.99999ap-4, .temp = .ocean }, // 10 FrozenOcean
     .{ .root_height = -0x1.0p-1, .height_var = 0x0.0p0, .temp = .cold }, // 11 FrozenRiver
-    .{ .root_height = 0x1.0p-3, .height_var = 0x1.99999ap-5, .temp = .cold }, // 12 IcePlains
-    .{ .root_height = 0x1.ccccccp-2, .height_var = 0x1.333334p-2, .temp = .cold }, // 13 IceMountains
+    .{ .root_height = 0x1.0p-3, .height_var = 0x1.99999ap-5, .temp = .cold }, // 12 Ice Plains
+    .{ .root_height = 0x1.ccccccp-2, .height_var = 0x1.333334p-2, .temp = .cold }, // 13 Ice Mountains
     .{ .root_height = 0x1.99999ap-3, .height_var = 0x1.333334p-2, .temp = .medium }, // 14 MushroomIsland
     .{ .root_height = 0x0.0p0, .height_var = 0x1.99999ap-6, .temp = .medium }, // 15 MushroomIslandShore
     .{ .root_height = 0x0.0p0, .height_var = 0x1.99999ap-6, .temp = .medium }, // 16 Beach
     .{ .root_height = 0x1.ccccccp-2, .height_var = 0x1.333334p-2, .temp = .warm }, // 17 DesertHills
     .{ .root_height = 0x1.ccccccp-2, .height_var = 0x1.333334p-2, .temp = .medium }, // 18 ForestHills
     .{ .root_height = 0x1.ccccccp-2, .height_var = 0x1.333334p-2, .temp = .medium }, // 19 TaigaHills
-    .{ .root_height = 0x1.99999ap-1, .height_var = 0x1.333334p-2, .temp = .medium }, // 20 ExtremeHillsEdge
+    .{ .root_height = 0x1.99999ap-1, .height_var = 0x1.333334p-2, .temp = .medium }, // 20 Extreme Hills Edge
     .{ .root_height = 0x1.99999ap-4, .height_var = 0x1.99999ap-3, .temp = .medium }, // 21 Jungle
     .{ .root_height = 0x1.ccccccp-2, .height_var = 0x1.333334p-2, .temp = .medium }, // 22 JungleHills
     .{ .root_height = 0x1.99999ap-4, .height_var = 0x1.99999ap-3, .temp = .medium }, // 23 JungleEdge
-    .{ .root_height = -0x1.ccccccp0, .height_var = 0x1.99999ap-4, .temp = .ocean }, // 24 DeepOcean
-    .{ .root_height = 0x1.99999ap-4, .height_var = 0x1.99999ap-1, .temp = .medium }, // 25 StoneBeach
-    .{ .root_height = 0x0.0p0, .height_var = 0x1.99999ap-6, .temp = .cold }, // 26 ColdBeach
-    .{ .root_height = 0x1.99999ap-4, .height_var = 0x1.99999ap-3, .temp = .medium }, // 27 BirchForest
-    .{ .root_height = 0x1.ccccccp-2, .height_var = 0x1.333334p-2, .temp = .medium }, // 28 BirchForestHills
-    .{ .root_height = 0x1.99999ap-4, .height_var = 0x1.99999ap-3, .temp = .medium }, // 29 RoofedForest
-    .{ .root_height = 0x1.99999ap-3, .height_var = 0x1.99999ap-3, .temp = .cold }, // 30 ColdTaiga
-    .{ .root_height = 0x1.ccccccp-2, .height_var = 0x1.333334p-2, .temp = .cold }, // 31 ColdTaigaHills
-    .{ .root_height = 0x1.99999ap-3, .height_var = 0x1.99999ap-3, .temp = .medium }, // 32 MegaTaiga
-    .{ .root_height = 0x1.ccccccp-2, .height_var = 0x1.333334p-2, .temp = .medium }, // 33 MegaTaigaHills
-    .{ .root_height = 0x1.0p0, .height_var = 0x1.0p-1, .temp = .medium }, // 34 ExtremeHills+
+    .{ .root_height = -0x1.ccccccp0, .height_var = 0x1.99999ap-4, .temp = .ocean }, // 24 Deep Ocean
+    .{ .root_height = 0x1.99999ap-4, .height_var = 0x1.99999ap-1, .temp = .medium }, // 25 Stone Beach
+    .{ .root_height = 0x0.0p0, .height_var = 0x1.99999ap-6, .temp = .cold }, // 26 Cold Beach
+    .{ .root_height = 0x1.99999ap-4, .height_var = 0x1.99999ap-3, .temp = .medium }, // 27 Birch Forest
+    .{ .root_height = 0x1.ccccccp-2, .height_var = 0x1.333334p-2, .temp = .medium }, // 28 Birch Forest Hills
+    .{ .root_height = 0x1.99999ap-4, .height_var = 0x1.99999ap-3, .temp = .medium }, // 29 Roofed Forest
+    .{ .root_height = 0x1.99999ap-3, .height_var = 0x1.99999ap-3, .temp = .cold }, // 30 Cold Taiga
+    .{ .root_height = 0x1.ccccccp-2, .height_var = 0x1.333334p-2, .temp = .cold }, // 31 Cold Taiga Hills
+    .{ .root_height = 0x1.99999ap-3, .height_var = 0x1.99999ap-3, .temp = .medium }, // 32 Mega Taiga
+    .{ .root_height = 0x1.ccccccp-2, .height_var = 0x1.333334p-2, .temp = .medium }, // 33 Mega Taiga Hills
+    .{ .root_height = 0x1.0p0, .height_var = 0x1.0p-1, .temp = .medium }, // 34 Extreme Hills+
     .{ .root_height = 0x1.0p-3, .height_var = 0x1.99999ap-5, .temp = .warm }, // 35 Savanna
-    .{ .root_height = 0x1.8p0, .height_var = 0x1.99999ap-6, .temp = .warm }, // 36 SavannaPlateau
+    .{ .root_height = 0x1.8p0, .height_var = 0x1.99999ap-6, .temp = .warm }, // 36 Savanna Plateau
     .{ .root_height = 0x1.99999ap-4, .height_var = 0x1.99999ap-3, .temp = .warm }, // 37 Mesa
-    .{ .root_height = 0x1.8p0, .height_var = 0x1.99999ap-6, .temp = .warm }, // 38 MesaPlateauF
-    .{ .root_height = 0x1.8p0, .height_var = 0x1.99999ap-6, .temp = .warm }, // 39 MesaPlateau
+    .{ .root_height = 0x1.8p0, .height_var = 0x1.99999ap-6, .temp = .warm }, // 38 Mesa Plateau F
+    .{ .root_height = 0x1.8p0, .height_var = 0x1.99999ap-6, .temp = .warm }, // 39 Mesa Plateau
 };
 
 /// Registered biome ids (getBiomeById(x) != null). Used for the +128 mutated

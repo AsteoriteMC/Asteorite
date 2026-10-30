@@ -665,8 +665,13 @@ pub const Chain = struct {
                 const v10 = pb[dx + 1 + (dz + 1) * pw];
                 const v11 = pr[dx + 1 + (dz + 1) * pw];
                 const riverish = v11 >= 2 and @rem(v11 - 2, 29) == 1;
+                // Lake marker (vanilla axr flag): (v11-2)%29==0 drives the
+                // hills gate and the +128 mutated fallback (jar `axr`, not
+                // the river marker — a live-parity find: jungle blobs stayed
+                // jungle where the river flag upgraded them to jungleHills).
+                const lakeish = @rem(v11 - 2, 29) == 0;
                 var v13: i32 = v10;
-                if (mixEarly(st, v10, riverish, &v13)) |v| {
+                if (mixEarly(st, v10, riverish, lakeish, &v13)) |v| {
                     out[dz * w + dx] = v;
                     continue;
                 }
@@ -688,18 +693,27 @@ pub const Chain = struct {
     /// output when claimed, null to fall through to the similarity vote
     /// (writing the hills result to `v13_out` for the vote to reuse —
     /// recomputing it would draw RNG twice for plains/deepOcean).
-    /// Draw order matches vanilla exactly (nextInt(3) gate, then the
-    /// hillsVariant draws for plains/deepOcean).
-    fn mixEarly(st: *Base, v10: i32, riverish: bool, v13_out: *i32) ?i32 {
-        // Mutated (+128) variant in river areas.
-        if (v10 != 0 and riverish and v10 < 128) {
+    /// Draw order matches vanilla exactly (gate nextInt(3), then the
+    /// hillsVariant draws for plains/deepOcean). Vanilla `axr` gate and
+    /// mutated fallback both key on the LAKE marker ((v11-2)%29==0), never
+    /// the river marker: lake cells upgrade unconditionally, then revert to
+    /// the base biome when +128 has no registry entry (e.g. jungle 21 stays
+    /// 21 because 150 is unassigned). The river claim draws no roll.
+    fn mixEarly(st: *Base, v10: i32, riverish: bool, lakeish: bool, v13_out: *i32) ?i32 {
+        // River claim (no roll drawn): mutated variant when it exists, else
+        // the biome itself. Vanilla has no v10!=0 guard — ocean+river keeps
+        // 0 because +128 has no registry entry.
+        if (riverish and v10 < 128) {
             return if (biome.biomeExists(v10 + 128)) v10 + 128 else v10;
         }
         var v13 = v10;
-        if (st.nextInt(3) == 0 or riverish) {
+        if (st.nextInt(3) == 0 or lakeish) {
             v13 = hillsVariant(v10, st);
-            if (riverish and v13 != v10) {
-                return if (biome.biomeExists(v13 + 128)) v13 + 128 else v10;
+            // Mutated fallback only on lake cells (vanilla axr 648-687);
+            // a missing +128 reverts to the base biome, then vote/store below.
+            if (lakeish and v13 != v10) {
+                if (!biome.biomeExists(v13 + 128)) return v10;
+                v13 += 128;
             }
         } else {
             return v10;
