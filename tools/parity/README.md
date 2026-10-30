@@ -1,8 +1,10 @@
 # Parity pipeline (1.7.10)
 
 Live vanilla oracles vs Zig probes. Vanilla jars live in `jars/`
-(gitignored — provide `server-1.7.10.jar`; oracle build fails loudly
-without it). Oracle Java sources are checked in under
+(gitignored — never commit them: the Mojang EULA forbids
+redistribution, so bring your own copies from a game install; the
+oracle build fails loudly without them). Oracle Java sources are
+checked in under
 `mc1710/oracles/` (rescued `/tmp` harnesses + new probes), so every
 golden is regenerable from this repo.
 

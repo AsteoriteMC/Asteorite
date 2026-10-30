@@ -268,6 +268,20 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(chunk_dump_tool);
     applyBinaryOpts(chunk_dump_tool, strip, lto, gc_sections);
 
+    const noise_dump_tool = b.addExecutable(.{
+        .name = "noise_dump",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/noise_dump.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "asteorite", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(noise_dump_tool);
+    applyBinaryOpts(noise_dump_tool, strip, lto, gc_sections);
+
     const bulk_dump_tool = b.addExecutable(.{
         .name = "bulk_dump",
         .root_module = b.createModule(.{
@@ -478,7 +492,7 @@ pub fn build(b: *std.Build) void {
         mod_tests,    exe_tests,        tool_tests,       import_tests,
         wgen_tests,   seed_tests,       genlayer_tests,   check_tests,
         player_import_tests, player_dump_tests,
-        gpu_probe_tests, genq_dump_tests,
+        gpu_probe_tests, genq_dump_tests, noise_dump_tool,
     };
     for (shader_consumers) |cs| cs.step.dependOn(&spv_run.step);
 

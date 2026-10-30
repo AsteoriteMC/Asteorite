@@ -16,6 +16,10 @@ gate), gap (pipeline-found, tracked with evidence), todo (no harness yet).
   windows: seed 7 Flower Forest + Birch M, seed 21 +129, seed 9
   Sunflower Plains). Compares the first w*h cells: vanilla returns an
   oversized reuse buffer.
+- `noise` — `NoiseOracle` (Improved `awj` via `awk` octave stacks,
+  `awl` simplex octaves incl. the 8-arg 2D entry with its ignored 3rd
+  double) vs `noise_dump` (10 cases: oct 3D/2D, simplex singles/grids,
+  INT64 seeds, fractional coords). All floats as raw u64 hex: bit-exact.
 - `chunk` — `ChunkOracle` (real `aqz` base fill + surface replacement
   per chunk) vs `chunk_dump` (8 cases: plains, taiga, mesa x2, jungle,
   savanna, M-rich, live-seed savanna). Compares base/surface CRCs +
@@ -102,7 +106,8 @@ lakes, structures, registries, packets, crypto).
 
 ## Todo areas (no harness yet)
 
-Noise stacks, surface builder, tree/decor shapes, carve geometry (note:
+Noise stacks (octaves verified live; single-point Improved covered
+through them), surface builder, tree/decor shapes, carve geometry (note:
 our carver is caves-only until ravines land — a chunk-area carve stage
 waits on that), structure placement, drops tables, recipe matcher, redstone components,
 packet codecs, slot/NBT, player rows, anvil import, lighting, mob

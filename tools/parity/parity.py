@@ -319,6 +319,7 @@ AREAS = {
     "registry-biomes": {"tier": TIER_LIVE, "kind": "single"},
     "genlayer": {"tier": TIER_LIVE, "kind": "per-case"},
     "chunk": {"tier": TIER_LIVE, "kind": "per-case"},
+    "noise": {"tier": TIER_LIVE, "kind": "per-case"},
 }
 
 USE_CACHE = True
@@ -345,6 +346,25 @@ def chunk_check(otext, ptext):
     for k in ("base_counts", "surface_counts"):
         if got.get(k) != want.get(k):
             return "%s histogram mismatch" % k
+    return None
+
+
+# --- area: noise -------------------------------------------------------------------
+
+def noise_oracle(args):
+    src = [os.path.join(MC1710, "oracles", "noise", "NoiseOracle.java")]
+    classes = compile_oracle("noise", src)
+    return run_oracle("noise", "NoiseOracle", classes, args, src, USE_CACHE)
+
+
+def noise_check(otext, ptext):
+    want = parse_kv(otext)
+    got = parse_kv(ptext)
+    if set(want) != set(got):
+        return "key mismatch: oracle=%s probe=%s" % (sorted(want), sorted(got))
+    for k in sorted(want):
+        if want[k] != got[k]:
+            return "%s mismatch" % k
     return None
 
 
@@ -380,6 +400,10 @@ def run_single(area, case, regen):
         otext = chunk_oracle(case)
         ptext = sh([ensure_probe("chunk_dump")] + case)
         err = chunk_check(otext, ptext)
+    elif area == "noise":
+        otext = noise_oracle(case)
+        ptext = sh([ensure_probe("noise_dump")] + case)
+        err = noise_check(otext, ptext)
     else:
         return label(area, case), "", "unknown area"
     if err is None:
