@@ -57,9 +57,20 @@ gate), gap (pipeline-found, tracked with evidence), todo (no harness yet).
   surface/chunk/decorate were wrong (misattributed which `aib` method
   each site calls); the workdir state (roots[1] at `gen.zig:620,878`,
   `shaper.zig:269`) matches vanilla. Remaining: `decorateCenter`
-  comments still claim full-res (stale, owner's cleanup), and the
-  original mixed-leaf symptom needs re-explanation under all-voronoi
-  (likely the 3x3 merge, not the biome source).
+  comments still claim full-res (stale, owner's cleanup).
+- **Mixed-leaf symptom, re-explained (CLOSED 2026-10-30)**: the old
+  code read the run biome at chunk CENTER+8; vanilla `aqz.populate`
+  reads `ahb.a(cx*16+16, cz*16+16)` (corner, verified above). In the
+  4x4-quantized voronoi field these disagree in ~25% of chunks
+  (measured on a 961-chunk L1 window), selecting wrong-kind neighbor
+  runs at borders (birch/spruce decor inside swamp chunks, stranded
+  vine columns) — compounded by the pre-0881c10 merge smearing
+  trunk/leaf metas across the 3x3 view. The full-res layer switch was
+  not the active ingredient: the corner+16 sample point (kept) plus
+  the whole-cell merge fix account for the cure. Verified: a 9-chunk
+  `genChunk` scan over a canopy/oak/spruce border zone finds 0
+  foreign-kind trunks/leaves and 0 off-biome vines (scratch harness,
+  removed after use).
 
 ## Fixed by the pipeline (this round)
 
