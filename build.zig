@@ -254,6 +254,20 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(col_dump_tool);
     applyBinaryOpts(col_dump_tool, strip, lto, gc_sections);
 
+    const chunk_dump_tool = b.addExecutable(.{
+        .name = "chunk_dump",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/chunk_dump.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "asteorite", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(chunk_dump_tool);
+    applyBinaryOpts(chunk_dump_tool, strip, lto, gc_sections);
+
     const bulk_dump_tool = b.addExecutable(.{
         .name = "bulk_dump",
         .root_module = b.createModule(.{
@@ -460,7 +474,7 @@ pub fn build(b: *std.Build) void {
         exe,          anvil_tool,       import_tool,      wgen_tool,
         seed_tool,    genlayer_tool,    genbench_tool,    check_tool,
         player_import_tool, player_dump_tool, col_dump_tool, bulk_dump_tool,
-        chest_dump_tool, bench_tool, gpu_probe_tool, genq_dump_tool,
+        chest_dump_tool, bench_tool, gpu_probe_tool, genq_dump_tool, chunk_dump_tool,
         mod_tests,    exe_tests,        tool_tests,       import_tests,
         wgen_tests,   seed_tests,       genlayer_tests,   check_tests,
         player_import_tests, player_dump_tests,

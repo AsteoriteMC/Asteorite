@@ -1,0 +1,5 @@
+base_blocks=-1759576157432708366 base_meta=0
+base_counts {0=44644, 1=20892}
+surface_blocks=1655173335233020359 surface_meta=3474580793047174204
+surface_counts {0=44644, 1=14613, 7=762, 12=16, 159=1996, 172=3505}
+biome0=38 population=37

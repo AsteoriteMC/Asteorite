@@ -16,6 +16,12 @@ gate), gap (pipeline-found, tracked with evidence), todo (no harness yet).
   windows: seed 7 Flower Forest + Birch M, seed 21 +129, seed 9
   Sunflower Plains). Compares the first w*h cells: vanilla returns an
   oversized reuse buffer.
+- `chunk` — `ChunkOracle` (real `aqz` base fill + surface replacement
+  per chunk) vs `chunk_dump` (8 cases: plains, taiga, mesa x2, jungle,
+  savanna, M-rich, live-seed savanna). Compares base/surface CRCs +
+  histograms + corner/population biome ids. Carve excluded (ours is
+  caves-only); the oracle harness must seed the provider rand exactly
+  like `aqz.d` (a missing `setSeed` once faked a 400-cell divergence).
 
 ## P1 gaps (pipeline-found, with evidence)
 
@@ -96,8 +102,9 @@ lakes, structures, registries, packets, crypto).
 
 ## Todo areas (no harness yet)
 
-Noise stacks, surface builder, tree/decor shapes, carve geometry,
-structure placement, drops tables, recipe matcher, redstone components,
+Noise stacks, surface builder, tree/decor shapes, carve geometry (note:
+our carver is caves-only until ravines land — a chunk-area carve stage
+waits on that), structure placement, drops tables, recipe matcher, redstone components,
 packet codecs, slot/NBT, player rows, anvil import, lighting, mob
 spawning. Rescued oracle sources exist for most; each needs a corpus +
 adapter + `expected/` per the README recipe.

@@ -318,9 +318,34 @@ AREAS = {
     "registry-blocks": {"tier": TIER_LIVE, "kind": "single"},
     "registry-biomes": {"tier": TIER_LIVE, "kind": "single"},
     "genlayer": {"tier": TIER_LIVE, "kind": "per-case"},
+    "chunk": {"tier": TIER_LIVE, "kind": "per-case"},
 }
 
 USE_CACHE = True
+
+
+# --- area: chunk -----------------------------------------------------------------
+
+def chunk_oracle(args):
+    src = [os.path.join(MC1710, "oracles", "chunk", "ChunkOracle.java")]
+    classes = compile_oracle("chunk", src)
+    return run_oracle("chunk", "ChunkOracle", classes, args, src, USE_CACHE)
+
+
+def chunk_check(otext, ptext):
+    want = parse_kv(otext)
+    got = parse_kv(ptext)
+    for k in ("base_blocks", "base_meta", "surface_blocks", "surface_meta", "biome0", "population"):
+        if k not in got:
+            return "probe missing key " + k
+        if k not in want:
+            return "oracle missing key " + k
+        if got[k] != want[k]:
+            return "%s mismatch: oracle=%s probe=%s" % (k, want[k][:100], got[k][:100])
+    for k in ("base_counts", "surface_counts"):
+        if got.get(k) != want.get(k):
+            return "%s histogram mismatch" % k
+    return None
 
 
 def run_single(area, case, regen):
@@ -351,6 +376,10 @@ def run_single(area, case, regen):
         otext = genlayer_oracle(case)
         ptext = sh([ensure_probe("genlayer_dump")] + case)
         err = genlayer_check(otext, ptext, int(case[3]), int(case[4]))
+    elif area == "chunk":
+        otext = chunk_oracle(case)
+        ptext = sh([ensure_probe("chunk_dump")] + case)
+        err = chunk_check(otext, ptext)
     else:
         return label(area, case), "", "unknown area"
     if err is None:

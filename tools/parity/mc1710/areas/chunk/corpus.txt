@@ -1,0 +1,9 @@
+# seed cx cz — full chunk base+surface via ChunkOracle vs chunk_dump
+42 0 0
+42 3 -5
+55555 -1 -1
+55555 0 0
+1 5 -3
+777 10 10
+-1493931639823207632 2 -39
+7 -4 -4
