@@ -26,12 +26,19 @@ gate), gap (pipeline-found, tracked with evidence), todo (no harness yet).
   at river_mix scale shows vanilla=164 (Savanna M via river claim)
   where we emit 36 — our river chain says no-river where vanilla says
   river. Isolated to 2/256 cells; needs `AxrDump` parent tracing.
-- **Voronoi reappeared in gen wiring**: `gen.zig:620,878` and
-  `shaper.zig:269` read `roots[1]` (voronoi) for chunk biomes,
-  decorate runs, and surface columns, with a comment asserting voronoi
-  is correct. The full-res fix (jar-verified: `aqz` uses genBiomes
-  everywhere) is not in effect on those paths. Pending owner decision
-  (active refactor area — not touched by the pipeline).
+- **Voronoi site-selection (ADJUDICATED 2026-10-30 — other agent correct)**:
+  vanilla `aqz.d` surface, chunk biome array, populate run biome, and
+  snow all resolve through the chunk cache (`aib.b` / `apx.a` lazy fill /
+  `ahb.a(II)` / `ahb.r|e`), whose blocks fill once from the voronoi
+  `d`-layer (`ahz` ctor via 6-arg `false`; verified in `aqz`/`aib`/
+  `ahy`/`ahz`/`apx` bytecode). Only the density blend uses full-res
+  (`aib.a` 5-arg, field `c`). The e40e9a7/46fda38 full-res claims for
+  surface/chunk/decorate were wrong (misattributed which `aib` method
+  each site calls); the workdir state (roots[1] at `gen.zig:620,878`,
+  `shaper.zig:269`) matches vanilla. Remaining: `decorateCenter`
+  comments still claim full-res (stale, owner's cleanup), and the
+  original mixed-leaf symptom needs re-explanation under all-voronoi
+  (likely the 3x3 merge, not the biome source).
 
 ## Fixed by the pipeline (this round)
 
