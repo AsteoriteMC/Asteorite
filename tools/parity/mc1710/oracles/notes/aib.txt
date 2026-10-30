@@ -1,0 +1,611 @@
+Compiled from "SourceFile"
+public class aib {
+  private axn c;
+
+  private axn d;
+
+  private ahy e;
+
+  private java.util.List f;
+
+  protected aib();
+    Code:
+       0: aload_0
+       1: invokespecial #66                 // Method java/lang/Object."<init>":()V
+       4: aload_0
+       5: new           #21                 // class ahy
+       8: dup
+       9: aload_0
+      10: invokespecial #52                 // Method ahy."<init>":(Laib;)V
+      13: putfield      #45                 // Field e:Lahy;
+      16: aload_0
+      17: new           #31                 // class java/util/ArrayList
+      20: dup
+      21: invokespecial #69                 // Method java/util/ArrayList."<init>":()V
+      24: putfield      #46                 // Field f:Ljava/util/List;
+      27: aload_0
+      28: getfield      #46                 // Field f:Ljava/util/List;
+      31: getstatic     #41                 // Field ahu.s:Lahu;
+      34: invokeinterface #73,  2           // InterfaceMethod java/util/List.add:(Ljava/lang/Object;)Z
+      39: pop
+      40: aload_0
+      41: getfield      #46                 // Field f:Ljava/util/List;
+      44: getstatic     #40                 // Field ahu.p:Lahu;
+      47: invokeinterface #73,  2           // InterfaceMethod java/util/List.add:(Ljava/lang/Object;)Z
+      52: pop
+      53: aload_0
+      54: getfield      #46                 // Field f:Ljava/util/List;
+      57: getstatic     #42                 // Field ahu.t:Lahu;
+      60: invokeinterface #73,  2           // InterfaceMethod java/util/List.add:(Ljava/lang/Object;)Z
+      65: pop
+      66: aload_0
+      67: getfield      #46                 // Field f:Ljava/util/List;
+      70: getstatic     #37                 // Field ahu.H:Lahu;
+      73: invokeinterface #73,  2           // InterfaceMethod java/util/List.add:(Ljava/lang/Object;)Z
+      78: pop
+      79: aload_0
+      80: getfield      #46                 // Field f:Ljava/util/List;
+      83: getstatic     #36                 // Field ahu.G:Lahu;
+      86: invokeinterface #73,  2           // InterfaceMethod java/util/List.add:(Ljava/lang/Object;)Z
+      91: pop
+      92: aload_0
+      93: getfield      #46                 // Field f:Ljava/util/List;
+      96: getstatic     #38                 // Field ahu.J:Lahu;
+      99: invokeinterface #73,  2           // InterfaceMethod java/util/List.add:(Ljava/lang/Object;)Z
+     104: pop
+     105: aload_0
+     106: getfield      #46                 // Field f:Ljava/util/List;
+     109: getstatic     #39                 // Field ahu.K:Lahu;
+     112: invokeinterface #73,  2           // InterfaceMethod java/util/List.add:(Ljava/lang/Object;)Z
+     117: pop
+     118: return
+
+  public aib(long, ahm);
+    Code:
+       0: aload_0
+       1: invokespecial #56                 // Method "<init>":()V
+       4: lload_1
+       5: aload_3
+       6: invokestatic  #61                 // Method axn.a:(JLahm;)[Laxn;
+       9: astore        4
+      11: aload_0
+      12: aload         4
+      14: iconst_0
+      15: aaload
+      16: putfield      #43                 // Field c:Laxn;
+      19: aload_0
+      20: aload         4
+      22: iconst_1
+      23: aaload
+      24: putfield      #44                 // Field d:Laxn;
+      27: return
+
+  public aib(ahb);
+    Code:
+       0: aload_0
+       1: aload_1
+       2: invokevirtual #48                 // Method ahb.H:()J
+       5: aload_1
+       6: invokevirtual #49                 // Method ahb.N:()Lays;
+       9: invokevirtual #62                 // Method ays.u:()Lahm;
+      12: invokespecial #57                 // Method "<init>":(JLahm;)V
+      15: return
+
+  public java.util.List a();
+    Code:
+       0: aload_0
+       1: getfield      #46                 // Field f:Ljava/util/List;
+       4: areturn
+
+  public ahu a(int, int);
+    Code:
+       0: aload_0
+       1: getfield      #45                 // Field e:Lahy;
+       4: iload_1
+       5: iload_2
+       6: invokevirtual #54                 // Method ahy.b:(II)Lahu;
+       9: areturn
+
+  public float[] a(float[], int, int, int, int);
+    Code:
+       0: invokestatic  #59                 // Method axl.a:()V
+       3: aload_1
+       4: ifnull        17
+       7: aload_1
+       8: arraylength
+       9: iload         4
+      11: iload         5
+      13: imul
+      14: if_icmpge     25
+      17: iload         4
+      19: iload         5
+      21: imul
+      22: newarray       float
+      24: astore_1
+      25: aload_0
+      26: getfield      #44                 // Field d:Laxn;
+      29: iload_2
+      30: iload_3
+      31: iload         4
+      33: iload         5
+      35: invokevirtual #60                 // Method axn.a:(IIII)[I
+      38: astore        6
+      40: iconst_0
+      41: istore        7
+      43: iload         7
+      45: iload         4
+      47: iload         5
+      49: imul
+      50: if_icmpge     195
+      53: aload         6
+      55: iload         7
+      57: iaload
+      58: invokestatic  #50                 // Method ahu.d:(I)Lahu;
+      61: invokevirtual #51                 // Method ahu.h:()I
+      64: i2f
+      65: ldc           #1                  // float 65536.0f
+      67: fdiv
+      68: fstore        8
+      70: fload         8
+      72: fconst_1
+      73: fcmpl
+      74: ifle          80
+      77: fconst_1
+      78: fstore        8
+      80: aload_1
+      81: iload         7
+      83: fload         8
+      85: fastore
+      86: goto          189
+      89: astore        8
+      91: aload         8
+      93: ldc           #3                  // String Invalid Biome id
+      95: invokestatic  #64                 // Method b.a:(Ljava/lang/Throwable;Ljava/lang/String;)Lb;
+      98: astore        9
+     100: aload         9
+     102: ldc           #2                  // String DownfallBlock
+     104: invokevirtual #63                 // Method b.a:(Ljava/lang/String;)Lk;
+     107: astore        10
+     109: aload         10
+     111: ldc           #7                  // String biome id
+     113: iload         7
+     115: invokestatic  #65                 // Method java/lang/Integer.valueOf:(I)Ljava/lang/Integer;
+     118: invokevirtual #71                 // Method k.a:(Ljava/lang/String;Ljava/lang/Object;)V
+     121: aload         10
+     123: ldc           #9                  // String downfalls[] size
+     125: aload_1
+     126: arraylength
+     127: invokestatic  #65                 // Method java/lang/Integer.valueOf:(I)Ljava/lang/Integer;
+     130: invokevirtual #71                 // Method k.a:(Ljava/lang/String;Ljava/lang/Object;)V
+     133: aload         10
+     135: ldc           #13                 // String x
+     137: iload_2
+     138: invokestatic  #65                 // Method java/lang/Integer.valueOf:(I)Ljava/lang/Integer;
+     141: invokevirtual #71                 // Method k.a:(Ljava/lang/String;Ljava/lang/Object;)V
+     144: aload         10
+     146: ldc           #14                 // String z
+     148: iload_3
+     149: invokestatic  #65                 // Method java/lang/Integer.valueOf:(I)Ljava/lang/Integer;
+     152: invokevirtual #71                 // Method k.a:(Ljava/lang/String;Ljava/lang/Object;)V
+     155: aload         10
+     157: ldc           #12                 // String w
+     159: iload         4
+     161: invokestatic  #65                 // Method java/lang/Integer.valueOf:(I)Ljava/lang/Integer;
+     164: invokevirtual #71                 // Method k.a:(Ljava/lang/String;Ljava/lang/Object;)V
+     167: aload         10
+     169: ldc           #10                 // String h
+     171: iload         5
+     173: invokestatic  #65                 // Method java/lang/Integer.valueOf:(I)Ljava/lang/Integer;
+     176: invokevirtual #71                 // Method k.a:(Ljava/lang/String;Ljava/lang/Object;)V
+     179: new           #35                 // class s
+     182: dup
+     183: aload         9
+     185: invokespecial #72                 // Method s."<init>":(Lb;)V
+     188: athrow
+     189: iinc          7, 1
+     192: goto          43
+     195: aload_1
+     196: areturn
+    Exception table:
+       from    to  target type
+          53    86    89   Class java/lang/Throwable
+
+  public ahu[] a(ahu[], int, int, int, int);
+    Code:
+       0: invokestatic  #59                 // Method axl.a:()V
+       3: aload_1
+       4: ifnull        17
+       7: aload_1
+       8: arraylength
+       9: iload         4
+      11: iload         5
+      13: imul
+      14: if_icmpge     26
+      17: iload         4
+      19: iload         5
+      21: imul
+      22: anewarray     #20                 // class ahu
+      25: astore_1
+      26: aload_0
+      27: getfield      #43                 // Field c:Laxn;
+      30: iload_2
+      31: iload_3
+      32: iload         4
+      34: iload         5
+      36: invokevirtual #60                 // Method axn.a:(IIII)[I
+      39: astore        6
+      41: iconst_0
+      42: istore        7
+      44: iload         7
+      46: iload         4
+      48: iload         5
+      50: imul
+      51: if_icmpge     72
+      54: aload_1
+      55: iload         7
+      57: aload         6
+      59: iload         7
+      61: iaload
+      62: invokestatic  #50                 // Method ahu.d:(I)Lahu;
+      65: aastore
+      66: iinc          7, 1
+      69: goto          44
+      72: goto          163
+      75: astore        7
+      77: aload         7
+      79: ldc           #3                  // String Invalid Biome id
+      81: invokestatic  #64                 // Method b.a:(Ljava/lang/Throwable;Ljava/lang/String;)Lb;
+      84: astore        8
+      86: aload         8
+      88: ldc           #5                  // String RawBiomeBlock
+      90: invokevirtual #63                 // Method b.a:(Ljava/lang/String;)Lk;
+      93: astore        9
+      95: aload         9
+      97: ldc           #8                  // String biomes[] size
+      99: aload_1
+     100: arraylength
+     101: invokestatic  #65                 // Method java/lang/Integer.valueOf:(I)Ljava/lang/Integer;
+     104: invokevirtual #71                 // Method k.a:(Ljava/lang/String;Ljava/lang/Object;)V
+     107: aload         9
+     109: ldc           #13                 // String x
+     111: iload_2
+     112: invokestatic  #65                 // Method java/lang/Integer.valueOf:(I)Ljava/lang/Integer;
+     115: invokevirtual #71                 // Method k.a:(Ljava/lang/String;Ljava/lang/Object;)V
+     118: aload         9
+     120: ldc           #14                 // String z
+     122: iload_3
+     123: invokestatic  #65                 // Method java/lang/Integer.valueOf:(I)Ljava/lang/Integer;
+     126: invokevirtual #71                 // Method k.a:(Ljava/lang/String;Ljava/lang/Object;)V
+     129: aload         9
+     131: ldc           #12                 // String w
+     133: iload         4
+     135: invokestatic  #65                 // Method java/lang/Integer.valueOf:(I)Ljava/lang/Integer;
+     138: invokevirtual #71                 // Method k.a:(Ljava/lang/String;Ljava/lang/Object;)V
+     141: aload         9
+     143: ldc           #10                 // String h
+     145: iload         5
+     147: invokestatic  #65                 // Method java/lang/Integer.valueOf:(I)Ljava/lang/Integer;
+     150: invokevirtual #71                 // Method k.a:(Ljava/lang/String;Ljava/lang/Object;)V
+     153: new           #35                 // class s
+     156: dup
+     157: aload         8
+     159: invokespecial #72                 // Method s."<init>":(Lb;)V
+     162: athrow
+     163: aload_1
+     164: areturn
+    Exception table:
+       from    to  target type
+          41    72    75   Class java/lang/Throwable
+
+  public ahu[] b(ahu[], int, int, int, int);
+    Code:
+       0: aload_0
+       1: aload_1
+       2: iload_2
+       3: iload_3
+       4: iload         4
+       6: iload         5
+       8: iconst_1
+       9: invokevirtual #58                 // Method a:([Lahu;IIIIZ)[Lahu;
+      12: areturn
+
+  public ahu[] a(ahu[], int, int, int, int, boolean);
+    Code:
+       0: invokestatic  #59                 // Method axl.a:()V
+       3: aload_1
+       4: ifnull        17
+       7: aload_1
+       8: arraylength
+       9: iload         4
+      11: iload         5
+      13: imul
+      14: if_icmpge     26
+      17: iload         4
+      19: iload         5
+      21: imul
+      22: anewarray     #20                 // class ahu
+      25: astore_1
+      26: iload         6
+      28: ifeq          85
+      31: iload         4
+      33: bipush        16
+      35: if_icmpne     85
+      38: iload         5
+      40: bipush        16
+      42: if_icmpne     85
+      45: iload_2
+      46: bipush        15
+      48: iand
+      49: ifne          85
+      52: iload_3
+      53: bipush        15
+      55: iand
+      56: ifne          85
+      59: aload_0
+      60: getfield      #45                 // Field e:Lahy;
+      63: iload_2
+      64: iload_3
+      65: invokevirtual #55                 // Method ahy.d:(II)[Lahu;
+      68: astore        7
+      70: aload         7
+      72: iconst_0
+      73: aload_1
+      74: iconst_0
+      75: iload         4
+      77: iload         5
+      79: imul
+      80: invokestatic  #68                 // Method java/lang/System.arraycopy:(Ljava/lang/Object;ILjava/lang/Object;II)V
+      83: aload_1
+      84: areturn
+      85: aload_0
+      86: getfield      #44                 // Field d:Laxn;
+      89: iload_2
+      90: iload_3
+      91: iload         4
+      93: iload         5
+      95: invokevirtual #60                 // Method axn.a:(IIII)[I
+      98: astore        7
+     100: iconst_0
+     101: istore        8
+     103: iload         8
+     105: iload         4
+     107: iload         5
+     109: imul
+     110: if_icmpge     131
+     113: aload_1
+     114: iload         8
+     116: aload         7
+     118: iload         8
+     120: iaload
+     121: invokestatic  #50                 // Method ahu.d:(I)Lahu;
+     124: aastore
+     125: iinc          8, 1
+     128: goto          103
+     131: aload_1
+     132: areturn
+
+  public boolean a(int, int, int, java.util.List);
+    Code:
+       0: invokestatic  #59                 // Method axl.a:()V
+       3: iload_1
+       4: iload_3
+       5: isub
+       6: iconst_2
+       7: ishr
+       8: istore        5
+      10: iload_2
+      11: iload_3
+      12: isub
+      13: iconst_2
+      14: ishr
+      15: istore        6
+      17: iload_1
+      18: iload_3
+      19: iadd
+      20: iconst_2
+      21: ishr
+      22: istore        7
+      24: iload_2
+      25: iload_3
+      26: iadd
+      27: iconst_2
+      28: ishr
+      29: istore        8
+      31: iload         7
+      33: iload         5
+      35: isub
+      36: iconst_1
+      37: iadd
+      38: istore        9
+      40: iload         8
+      42: iload         6
+      44: isub
+      45: iconst_1
+      46: iadd
+      47: istore        10
+      49: aload_0
+      50: getfield      #43                 // Field c:Laxn;
+      53: iload         5
+      55: iload         6
+      57: iload         9
+      59: iload         10
+      61: invokevirtual #60                 // Method axn.a:(IIII)[I
+      64: astore        11
+      66: iconst_0
+      67: istore        12
+      69: iload         12
+      71: iload         9
+      73: iload         10
+      75: imul
+      76: if_icmpge     109
+      79: aload         11
+      81: iload         12
+      83: iaload
+      84: invokestatic  #50                 // Method ahu.d:(I)Lahu;
+      87: astore        13
+      89: aload         4
+      91: aload         13
+      93: invokeinterface #74,  2           // InterfaceMethod java/util/List.contains:(Ljava/lang/Object;)Z
+      98: ifne          103
+     101: iconst_0
+     102: ireturn
+     103: iinc          12, 1
+     106: goto          69
+     109: goto          198
+     112: astore        12
+     114: aload         12
+     116: ldc           #3                  // String Invalid Biome id
+     118: invokestatic  #64                 // Method b.a:(Ljava/lang/Throwable;Ljava/lang/String;)Lb;
+     121: astore        13
+     123: aload         13
+     125: ldc           #4                  // String Layer
+     127: invokevirtual #63                 // Method b.a:(Ljava/lang/String;)Lk;
+     130: astore        14
+     132: aload         14
+     134: ldc           #4                  // String Layer
+     136: aload_0
+     137: getfield      #43                 // Field c:Laxn;
+     140: invokevirtual #67                 // Method java/lang/Object.toString:()Ljava/lang/String;
+     143: invokevirtual #71                 // Method k.a:(Ljava/lang/String;Ljava/lang/Object;)V
+     146: aload         14
+     148: ldc           #13                 // String x
+     150: iload_1
+     151: invokestatic  #65                 // Method java/lang/Integer.valueOf:(I)Ljava/lang/Integer;
+     154: invokevirtual #71                 // Method k.a:(Ljava/lang/String;Ljava/lang/Object;)V
+     157: aload         14
+     159: ldc           #14                 // String z
+     161: iload_2
+     162: invokestatic  #65                 // Method java/lang/Integer.valueOf:(I)Ljava/lang/Integer;
+     165: invokevirtual #71                 // Method k.a:(Ljava/lang/String;Ljava/lang/Object;)V
+     168: aload         14
+     170: ldc           #11                 // String radius
+     172: iload_3
+     173: invokestatic  #65                 // Method java/lang/Integer.valueOf:(I)Ljava/lang/Integer;
+     176: invokevirtual #71                 // Method k.a:(Ljava/lang/String;Ljava/lang/Object;)V
+     179: aload         14
+     181: ldc           #6                  // String allowed
+     183: aload         4
+     185: invokevirtual #71                 // Method k.a:(Ljava/lang/String;Ljava/lang/Object;)V
+     188: new           #35                 // class s
+     191: dup
+     192: aload         13
+     194: invokespecial #72                 // Method s."<init>":(Lb;)V
+     197: athrow
+     198: iconst_1
+     199: ireturn
+    Exception table:
+       from    to  target type
+          66   102   112   Class java/lang/Throwable
+         103   109   112   Class java/lang/Throwable
+
+  public agt a(int, int, int, java.util.List, java.util.Random);
+    Code:
+       0: invokestatic  #59                 // Method axl.a:()V
+       3: iload_1
+       4: iload_3
+       5: isub
+       6: iconst_2
+       7: ishr
+       8: istore        6
+      10: iload_2
+      11: iload_3
+      12: isub
+      13: iconst_2
+      14: ishr
+      15: istore        7
+      17: iload_1
+      18: iload_3
+      19: iadd
+      20: iconst_2
+      21: ishr
+      22: istore        8
+      24: iload_2
+      25: iload_3
+      26: iadd
+      27: iconst_2
+      28: ishr
+      29: istore        9
+      31: iload         8
+      33: iload         6
+      35: isub
+      36: iconst_1
+      37: iadd
+      38: istore        10
+      40: iload         9
+      42: iload         7
+      44: isub
+      45: iconst_1
+      46: iadd
+      47: istore        11
+      49: aload_0
+      50: getfield      #43                 // Field c:Laxn;
+      53: iload         6
+      55: iload         7
+      57: iload         10
+      59: iload         11
+      61: invokevirtual #60                 // Method axn.a:(IIII)[I
+      64: astore        12
+      66: aconst_null
+      67: astore        13
+      69: iconst_0
+      70: istore        14
+      72: iconst_0
+      73: istore        15
+      75: iload         15
+      77: iload         10
+      79: iload         11
+      81: imul
+      82: if_icmpge     171
+      85: iload         6
+      87: iload         15
+      89: iload         10
+      91: irem
+      92: iadd
+      93: iconst_2
+      94: ishl
+      95: istore        16
+      97: iload         7
+      99: iload         15
+     101: iload         10
+     103: idiv
+     104: iadd
+     105: iconst_2
+     106: ishl
+     107: istore        17
+     109: aload         12
+     111: iload         15
+     113: iaload
+     114: invokestatic  #50                 // Method ahu.d:(I)Lahu;
+     117: astore        18
+     119: aload         4
+     121: aload         18
+     123: invokeinterface #74,  2           // InterfaceMethod java/util/List.contains:(Ljava/lang/Object;)Z
+     128: ifeq          165
+     131: aload         13
+     133: ifnull        148
+     136: aload         5
+     138: iload         14
+     140: iconst_1
+     141: iadd
+     142: invokevirtual #70                 // Method java/util/Random.nextInt:(I)I
+     145: ifne          165
+     148: new           #18                 // class agt
+     151: dup
+     152: iload         16
+     154: iconst_0
+     155: iload         17
+     157: invokespecial #47                 // Method agt."<init>":(III)V
+     160: astore        13
+     162: iinc          14, 1
+     165: iinc          15, 1
+     168: goto          75
+     171: aload         13
+     173: areturn
+
+  public void b();
+    Code:
+       0: aload_0
+       1: getfield      #45                 // Field e:Lahy;
+       4: invokevirtual #53                 // Method ahy.a:()V
+       7: return
+}

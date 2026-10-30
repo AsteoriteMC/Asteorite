@@ -1,0 +1,1385 @@
+Compiled from "SourceFile"
+public class aia {
+  protected ahb a;
+
+  protected java.util.Random b;
+
+  protected int c;
+
+  protected int d;
+
+  protected arn e;
+
+  protected arn f;
+
+  protected arn g;
+
+  protected arn h;
+
+  protected arn i;
+
+  protected arn j;
+
+  protected arn k;
+
+  protected arn l;
+
+  protected arn m;
+
+  protected arn n;
+
+  protected arn o;
+
+  protected aro p;
+
+  protected arn q;
+
+  protected arn r;
+
+  protected arn s;
+
+  protected arn t;
+
+  protected arn u;
+
+  protected arn v;
+
+  protected int w;
+
+  protected int x;
+
+  protected int y;
+
+  protected int z;
+
+  protected int A;
+
+  protected int B;
+
+  protected int C;
+
+  protected int D;
+
+  protected int E;
+
+  protected int F;
+
+  protected int G;
+
+  protected int H;
+
+  public boolean I;
+
+  public aia();
+    Code:
+       0: aload_0
+       1: invokespecial #108                // Method java/lang/Object."<init>":()V
+       4: aload_0
+       5: new           #10                 // class arj
+       8: dup
+       9: iconst_4
+      10: invokespecial #93                 // Method arj."<init>":(I)V
+      13: putfield      #37                 // Field e:Larn;
+      16: aload_0
+      17: new           #18                 // class asj
+      20: dup
+      21: getstatic     #68                 // Field ajn.m:Lanh;
+      24: bipush        7
+      26: invokespecial #105                // Method asj."<init>":(Laji;I)V
+      29: putfield      #38                 // Field f:Larn;
+      32: aload_0
+      33: new           #18                 // class asj
+      36: dup
+      37: getstatic     #69                 // Field ajn.n:Laji;
+      40: bipush        6
+      42: invokespecial #105                // Method asj."<init>":(Laji;I)V
+      45: putfield      #39                 // Field g:Larn;
+      48: aload_0
+      49: new           #15                 // class ase
+      52: dup
+      53: getstatic     #65                 // Field ajn.d:Laji;
+      56: bipush        32
+      58: invokespecial #101                // Method ase."<init>":(Laji;I)V
+      61: putfield      #40                 // Field h:Larn;
+      64: aload_0
+      65: new           #15                 // class ase
+      68: dup
+      69: getstatic     #69                 // Field ajn.n:Laji;
+      72: bipush        32
+      74: invokespecial #101                // Method ase."<init>":(Laji;I)V
+      77: putfield      #41                 // Field i:Larn;
+      80: aload_0
+      81: new           #15                 // class ase
+      84: dup
+      85: getstatic     #72                 // Field ajn.q:Laji;
+      88: bipush        16
+      90: invokespecial #101                // Method ase."<init>":(Laji;I)V
+      93: putfield      #42                 // Field j:Larn;
+      96: aload_0
+      97: new           #15                 // class ase
+     100: dup
+     101: getstatic     #71                 // Field ajn.p:Laji;
+     104: bipush        8
+     106: invokespecial #101                // Method ase."<init>":(Laji;I)V
+     109: putfield      #43                 // Field k:Larn;
+     112: aload_0
+     113: new           #15                 // class ase
+     116: dup
+     117: getstatic     #70                 // Field ajn.o:Laji;
+     120: bipush        8
+     122: invokespecial #101                // Method ase."<init>":(Laji;I)V
+     125: putfield      #44                 // Field l:Larn;
+     128: aload_0
+     129: new           #15                 // class ase
+     132: dup
+     133: getstatic     #64                 // Field ajn.ax:Laji;
+     136: bipush        7
+     138: invokespecial #101                // Method ase."<init>":(Laji;I)V
+     141: putfield      #45                 // Field m:Larn;
+     144: aload_0
+     145: new           #15                 // class ase
+     148: dup
+     149: getstatic     #63                 // Field ajn.ag:Laji;
+     152: bipush        7
+     154: invokespecial #101                // Method ase."<init>":(Laji;I)V
+     157: putfield      #46                 // Field n:Larn;
+     160: aload_0
+     161: new           #15                 // class ase
+     164: dup
+     165: getstatic     #73                 // Field ajn.x:Laji;
+     168: bipush        6
+     170: invokespecial #101                // Method ase."<init>":(Laji;I)V
+     173: putfield      #47                 // Field o:Larn;
+     176: aload_0
+     177: new           #13                 // class aro
+     180: dup
+     181: getstatic     #60                 // Field ajn.N:Lalc;
+     184: invokespecial #97                 // Method aro."<init>":(Laji;)V
+     187: putfield      #48                 // Field p:Laro;
+     190: aload_0
+     191: new           #13                 // class aro
+     194: dup
+     195: getstatic     #61                 // Field ajn.P:Lajr;
+     198: invokespecial #97                 // Method aro."<init>":(Laji;)V
+     201: putfield      #49                 // Field q:Larn;
+     204: aload_0
+     205: new           #13                 // class aro
+     208: dup
+     209: getstatic     #62                 // Field ajn.Q:Lajr;
+     212: invokespecial #97                 // Method aro."<init>":(Laji;)V
+     215: putfield      #50                 // Field r:Larn;
+     218: aload_0
+     219: new           #14                 // class aru
+     222: dup
+     223: invokespecial #100                // Method aru."<init>":()V
+     226: putfield      #51                 // Field s:Larn;
+     229: aload_0
+     230: new           #17                 // class ash
+     233: dup
+     234: invokespecial #104                // Method ash."<init>":()V
+     237: putfield      #52                 // Field t:Larn;
+     240: aload_0
+     241: new           #9                  // class arh
+     244: dup
+     245: invokespecial #92                 // Method arh."<init>":()V
+     248: putfield      #53                 // Field u:Larn;
+     251: aload_0
+     252: new           #5                  // class aiz
+     255: dup
+     256: invokespecial #85                 // Method aiz."<init>":()V
+     259: putfield      #54                 // Field v:Larn;
+     262: aload_0
+     263: iconst_2
+     264: putfield      #57                 // Field y:I
+     267: aload_0
+     268: iconst_1
+     269: putfield      #58                 // Field z:I
+     272: aload_0
+     273: iconst_1
+     274: putfield      #28                 // Field E:I
+     277: aload_0
+     278: iconst_3
+     279: putfield      #29                 // Field F:I
+     282: aload_0
+     283: iconst_1
+     284: putfield      #30                 // Field G:I
+     287: aload_0
+     288: iconst_1
+     289: putfield      #32                 // Field I:Z
+     292: return
+
+  public void a(ahb, java.util.Random, ahu, int, int);
+    Code:
+       0: aload_0
+       1: getfield      #33                 // Field a:Lahb;
+       4: ifnull        17
+       7: new           #22                 // class java/lang/RuntimeException
+      10: dup
+      11: ldc           #1                  // String Already decorating!!
+      13: invokespecial #109                // Method java/lang/RuntimeException."<init>":(Ljava/lang/String;)V
+      16: athrow
+      17: aload_0
+      18: aload_1
+      19: putfield      #33                 // Field a:Lahb;
+      22: aload_0
+      23: aload_2
+      24: putfield      #34                 // Field b:Ljava/util/Random;
+      27: aload_0
+      28: iload         4
+      30: putfield      #35                 // Field c:I
+      33: aload_0
+      34: iload         5
+      36: putfield      #36                 // Field d:I
+      39: aload_0
+      40: aload_3
+      41: invokevirtual #83                 // Method a:(Lahu;)V
+      44: aload_0
+      45: aconst_null
+      46: putfield      #33                 // Field a:Lahb;
+      49: aload_0
+      50: aconst_null
+      51: putfield      #34                 // Field b:Ljava/util/Random;
+      54: return
+
+  protected void a(ahu);
+    Code:
+       0: aload_0
+       1: invokevirtual #81                 // Method a:()V
+       4: iconst_0
+       5: istore_2
+       6: iload_2
+       7: aload_0
+       8: getfield      #29                 // Field F:I
+      11: if_icmpge     86
+      14: aload_0
+      15: getfield      #35                 // Field c:I
+      18: aload_0
+      19: getfield      #34                 // Field b:Ljava/util/Random;
+      22: bipush        16
+      24: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+      27: iadd
+      28: bipush        8
+      30: iadd
+      31: istore_3
+      32: aload_0
+      33: getfield      #36                 // Field d:I
+      36: aload_0
+      37: getfield      #34                 // Field b:Ljava/util/Random;
+      40: bipush        16
+      42: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+      45: iadd
+      46: bipush        8
+      48: iadd
+      49: istore        4
+      51: aload_0
+      52: getfield      #38                 // Field f:Larn;
+      55: aload_0
+      56: getfield      #33                 // Field a:Lahb;
+      59: aload_0
+      60: getfield      #34                 // Field b:Ljava/util/Random;
+      63: iload_3
+      64: aload_0
+      65: getfield      #33                 // Field a:Lahb;
+      68: iload_3
+      69: iload         4
+      71: invokevirtual #77                 // Method ahb.i:(II)I
+      74: iload         4
+      76: invokevirtual #96                 // Method arn.a:(Lahb;Ljava/util/Random;III)Z
+      79: pop
+      80: iinc          2, 1
+      83: goto          6
+      86: iconst_0
+      87: istore_2
+      88: iload_2
+      89: aload_0
+      90: getfield      #30                 // Field G:I
+      93: if_icmpge     168
+      96: aload_0
+      97: getfield      #35                 // Field c:I
+     100: aload_0
+     101: getfield      #34                 // Field b:Ljava/util/Random;
+     104: bipush        16
+     106: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+     109: iadd
+     110: bipush        8
+     112: iadd
+     113: istore_3
+     114: aload_0
+     115: getfield      #36                 // Field d:I
+     118: aload_0
+     119: getfield      #34                 // Field b:Ljava/util/Random;
+     122: bipush        16
+     124: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+     127: iadd
+     128: bipush        8
+     130: iadd
+     131: istore        4
+     133: aload_0
+     134: getfield      #37                 // Field e:Larn;
+     137: aload_0
+     138: getfield      #33                 // Field a:Lahb;
+     141: aload_0
+     142: getfield      #34                 // Field b:Ljava/util/Random;
+     145: iload_3
+     146: aload_0
+     147: getfield      #33                 // Field a:Lahb;
+     150: iload_3
+     151: iload         4
+     153: invokevirtual #77                 // Method ahb.i:(II)I
+     156: iload         4
+     158: invokevirtual #96                 // Method arn.a:(Lahb;Ljava/util/Random;III)Z
+     161: pop
+     162: iinc          2, 1
+     165: goto          88
+     168: iconst_0
+     169: istore_2
+     170: iload_2
+     171: aload_0
+     172: getfield      #28                 // Field E:I
+     175: if_icmpge     250
+     178: aload_0
+     179: getfield      #35                 // Field c:I
+     182: aload_0
+     183: getfield      #34                 // Field b:Ljava/util/Random;
+     186: bipush        16
+     188: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+     191: iadd
+     192: bipush        8
+     194: iadd
+     195: istore_3
+     196: aload_0
+     197: getfield      #36                 // Field d:I
+     200: aload_0
+     201: getfield      #34                 // Field b:Ljava/util/Random;
+     204: bipush        16
+     206: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+     209: iadd
+     210: bipush        8
+     212: iadd
+     213: istore        4
+     215: aload_0
+     216: getfield      #39                 // Field g:Larn;
+     219: aload_0
+     220: getfield      #33                 // Field a:Lahb;
+     223: aload_0
+     224: getfield      #34                 // Field b:Ljava/util/Random;
+     227: iload_3
+     228: aload_0
+     229: getfield      #33                 // Field a:Lahb;
+     232: iload_3
+     233: iload         4
+     235: invokevirtual #77                 // Method ahb.i:(II)I
+     238: iload         4
+     240: invokevirtual #96                 // Method arn.a:(Lahb;Ljava/util/Random;III)Z
+     243: pop
+     244: iinc          2, 1
+     247: goto          170
+     250: aload_0
+     251: getfield      #56                 // Field x:I
+     254: istore_2
+     255: aload_0
+     256: getfield      #34                 // Field b:Ljava/util/Random;
+     259: bipush        10
+     261: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+     264: ifne          270
+     267: iinc          2, 1
+     270: iconst_0
+     271: istore_3
+     272: iload_3
+     273: iload_2
+     274: if_icmpge     393
+     277: aload_0
+     278: getfield      #35                 // Field c:I
+     281: aload_0
+     282: getfield      #34                 // Field b:Ljava/util/Random;
+     285: bipush        16
+     287: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+     290: iadd
+     291: bipush        8
+     293: iadd
+     294: istore        4
+     296: aload_0
+     297: getfield      #36                 // Field d:I
+     300: aload_0
+     301: getfield      #34                 // Field b:Ljava/util/Random;
+     304: bipush        16
+     306: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+     309: iadd
+     310: bipush        8
+     312: iadd
+     313: istore        5
+     315: aload_0
+     316: getfield      #33                 // Field a:Lahb;
+     319: iload         4
+     321: iload         5
+     323: invokevirtual #76                 // Method ahb.f:(II)I
+     326: istore        6
+     328: aload_1
+     329: aload_0
+     330: getfield      #34                 // Field b:Ljava/util/Random;
+     333: invokevirtual #78                 // Method ahu.a:(Ljava/util/Random;)Larc;
+     336: astore        7
+     338: aload         7
+     340: dconst_1
+     341: dconst_1
+     342: dconst_1
+     343: invokevirtual #89                 // Method arc.a:(DDD)V
+     346: aload         7
+     348: aload_0
+     349: getfield      #33                 // Field a:Lahb;
+     352: aload_0
+     353: getfield      #34                 // Field b:Ljava/util/Random;
+     356: iload         4
+     358: iload         6
+     360: iload         5
+     362: invokevirtual #90                 // Method arc.a:(Lahb;Ljava/util/Random;III)Z
+     365: ifeq          387
+     368: aload         7
+     370: aload_0
+     371: getfield      #33                 // Field a:Lahb;
+     374: aload_0
+     375: getfield      #34                 // Field b:Ljava/util/Random;
+     378: iload         4
+     380: iload         6
+     382: iload         5
+     384: invokevirtual #91                 // Method arc.b:(Lahb;Ljava/util/Random;III)V
+     387: iinc          3, 1
+     390: goto          272
+     393: iconst_0
+     394: istore_3
+     395: iload_3
+     396: aload_0
+     397: getfield      #31                 // Field H:I
+     400: if_icmpge     478
+     403: aload_0
+     404: getfield      #35                 // Field c:I
+     407: aload_0
+     408: getfield      #34                 // Field b:Ljava/util/Random;
+     411: bipush        16
+     413: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+     416: iadd
+     417: bipush        8
+     419: iadd
+     420: istore        4
+     422: aload_0
+     423: getfield      #36                 // Field d:I
+     426: aload_0
+     427: getfield      #34                 // Field b:Ljava/util/Random;
+     430: bipush        16
+     432: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+     435: iadd
+     436: bipush        8
+     438: iadd
+     439: istore        5
+     441: aload_0
+     442: getfield      #51                 // Field s:Larn;
+     445: aload_0
+     446: getfield      #33                 // Field a:Lahb;
+     449: aload_0
+     450: getfield      #34                 // Field b:Ljava/util/Random;
+     453: iload         4
+     455: aload_0
+     456: getfield      #33                 // Field a:Lahb;
+     459: iload         4
+     461: iload         5
+     463: invokevirtual #76                 // Method ahb.f:(II)I
+     466: iload         5
+     468: invokevirtual #96                 // Method arn.a:(Lahb;Ljava/util/Random;III)Z
+     471: pop
+     472: iinc          3, 1
+     475: goto          395
+     478: iconst_0
+     479: istore_3
+     480: iload_3
+     481: aload_0
+     482: getfield      #57                 // Field y:I
+     485: if_icmpge     625
+     488: aload_0
+     489: getfield      #35                 // Field c:I
+     492: aload_0
+     493: getfield      #34                 // Field b:Ljava/util/Random;
+     496: bipush        16
+     498: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+     501: iadd
+     502: bipush        8
+     504: iadd
+     505: istore        4
+     507: aload_0
+     508: getfield      #36                 // Field d:I
+     511: aload_0
+     512: getfield      #34                 // Field b:Ljava/util/Random;
+     515: bipush        16
+     517: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+     520: iadd
+     521: bipush        8
+     523: iadd
+     524: istore        5
+     526: aload_0
+     527: getfield      #34                 // Field b:Ljava/util/Random;
+     530: aload_0
+     531: getfield      #33                 // Field a:Lahb;
+     534: iload         4
+     536: iload         5
+     538: invokevirtual #76                 // Method ahb.f:(II)I
+     541: bipush        32
+     543: iadd
+     544: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+     547: istore        6
+     549: aload_1
+     550: aload_0
+     551: getfield      #34                 // Field b:Ljava/util/Random;
+     554: iload         4
+     556: iload         6
+     558: iload         5
+     560: invokevirtual #79                 // Method ahu.a:(Ljava/util/Random;III)Ljava/lang/String;
+     563: astore        7
+     565: aload         7
+     567: invokestatic  #86                 // Method alc.e:(Ljava/lang/String;)Lalc;
+     570: astore        8
+     572: aload         8
+     574: invokevirtual #88                 // Method alc.o:()Lawt;
+     577: getstatic     #74                 // Field awt.a:Lawt;
+     580: if_acmpeq     619
+     583: aload_0
+     584: getfield      #48                 // Field p:Laro;
+     587: aload         8
+     589: aload         7
+     591: invokestatic  #87                 // Method alc.f:(Ljava/lang/String;)I
+     594: invokevirtual #99                 // Method aro.a:(Laji;I)V
+     597: aload_0
+     598: getfield      #48                 // Field p:Laro;
+     601: aload_0
+     602: getfield      #33                 // Field a:Lahb;
+     605: aload_0
+     606: getfield      #34                 // Field b:Ljava/util/Random;
+     609: iload         4
+     611: iload         6
+     613: iload         5
+     615: invokevirtual #98                 // Method aro.a:(Lahb;Ljava/util/Random;III)Z
+     618: pop
+     619: iinc          3, 1
+     622: goto          480
+     625: iconst_0
+     626: istore_3
+     627: iload_3
+     628: aload_0
+     629: getfield      #58                 // Field z:I
+     632: if_icmpge     731
+     635: aload_0
+     636: getfield      #35                 // Field c:I
+     639: aload_0
+     640: getfield      #34                 // Field b:Ljava/util/Random;
+     643: bipush        16
+     645: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+     648: iadd
+     649: bipush        8
+     651: iadd
+     652: istore        4
+     654: aload_0
+     655: getfield      #36                 // Field d:I
+     658: aload_0
+     659: getfield      #34                 // Field b:Ljava/util/Random;
+     662: bipush        16
+     664: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+     667: iadd
+     668: bipush        8
+     670: iadd
+     671: istore        5
+     673: aload_0
+     674: getfield      #34                 // Field b:Ljava/util/Random;
+     677: aload_0
+     678: getfield      #33                 // Field a:Lahb;
+     681: iload         4
+     683: iload         5
+     685: invokevirtual #76                 // Method ahb.f:(II)I
+     688: iconst_2
+     689: imul
+     690: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+     693: istore        6
+     695: aload_1
+     696: aload_0
+     697: getfield      #34                 // Field b:Ljava/util/Random;
+     700: invokevirtual #80                 // Method ahu.b:(Ljava/util/Random;)Larn;
+     703: astore        7
+     705: aload         7
+     707: aload_0
+     708: getfield      #33                 // Field a:Lahb;
+     711: aload_0
+     712: getfield      #34                 // Field b:Ljava/util/Random;
+     715: iload         4
+     717: iload         6
+     719: iload         5
+     721: invokevirtual #96                 // Method arn.a:(Lahb;Ljava/util/Random;III)Z
+     724: pop
+     725: iinc          3, 1
+     728: goto          627
+     731: iconst_0
+     732: istore_3
+     733: iload_3
+     734: aload_0
+     735: getfield      #24                 // Field A:I
+     738: if_icmpge     835
+     741: aload_0
+     742: getfield      #35                 // Field c:I
+     745: aload_0
+     746: getfield      #34                 // Field b:Ljava/util/Random;
+     749: bipush        16
+     751: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+     754: iadd
+     755: bipush        8
+     757: iadd
+     758: istore        4
+     760: aload_0
+     761: getfield      #36                 // Field d:I
+     764: aload_0
+     765: getfield      #34                 // Field b:Ljava/util/Random;
+     768: bipush        16
+     770: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+     773: iadd
+     774: bipush        8
+     776: iadd
+     777: istore        5
+     779: aload_0
+     780: getfield      #34                 // Field b:Ljava/util/Random;
+     783: aload_0
+     784: getfield      #33                 // Field a:Lahb;
+     787: iload         4
+     789: iload         5
+     791: invokevirtual #76                 // Method ahb.f:(II)I
+     794: iconst_2
+     795: imul
+     796: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+     799: istore        6
+     801: new           #11                 // class ark
+     804: dup
+     805: getstatic     #59                 // Field ajn.I:Lakh;
+     808: invokespecial #94                 // Method ark."<init>":(Laji;)V
+     811: aload_0
+     812: getfield      #33                 // Field a:Lahb;
+     815: aload_0
+     816: getfield      #34                 // Field b:Ljava/util/Random;
+     819: iload         4
+     821: iload         6
+     823: iload         5
+     825: invokevirtual #95                 // Method ark.a:(Lahb;Ljava/util/Random;III)Z
+     828: pop
+     829: iinc          3, 1
+     832: goto          733
+     835: iconst_0
+     836: istore_3
+     837: iload_3
+     838: aload_0
+     839: getfield      #55                 // Field w:I
+     842: if_icmpge     962
+     845: aload_0
+     846: getfield      #35                 // Field c:I
+     849: aload_0
+     850: getfield      #34                 // Field b:Ljava/util/Random;
+     853: bipush        16
+     855: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+     858: iadd
+     859: bipush        8
+     861: iadd
+     862: istore        4
+     864: aload_0
+     865: getfield      #36                 // Field d:I
+     868: aload_0
+     869: getfield      #34                 // Field b:Ljava/util/Random;
+     872: bipush        16
+     874: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+     877: iadd
+     878: bipush        8
+     880: iadd
+     881: istore        5
+     883: aload_0
+     884: getfield      #34                 // Field b:Ljava/util/Random;
+     887: aload_0
+     888: getfield      #33                 // Field a:Lahb;
+     891: iload         4
+     893: iload         5
+     895: invokevirtual #76                 // Method ahb.f:(II)I
+     898: iconst_2
+     899: imul
+     900: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+     903: istore        6
+     905: iload         6
+     907: ifle          934
+     910: aload_0
+     911: getfield      #33                 // Field a:Lahb;
+     914: iload         4
+     916: iload         6
+     918: iconst_1
+     919: isub
+     920: iload         5
+     922: invokevirtual #75                 // Method ahb.c:(III)Z
+     925: ifeq          934
+     928: iinc          6, -1
+     931: goto          905
+     934: aload_0
+     935: getfield      #54                 // Field v:Larn;
+     938: aload_0
+     939: getfield      #33                 // Field a:Lahb;
+     942: aload_0
+     943: getfield      #34                 // Field b:Ljava/util/Random;
+     946: iload         4
+     948: iload         6
+     950: iload         5
+     952: invokevirtual #96                 // Method arn.a:(Lahb;Ljava/util/Random;III)Z
+     955: pop
+     956: iinc          3, 1
+     959: goto          837
+     962: iconst_0
+     963: istore_3
+     964: iload_3
+     965: aload_0
+     966: getfield      #25                 // Field B:I
+     969: if_icmpge     1156
+     972: aload_0
+     973: getfield      #34                 // Field b:Ljava/util/Random;
+     976: iconst_4
+     977: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+     980: ifne          1056
+     983: aload_0
+     984: getfield      #35                 // Field c:I
+     987: aload_0
+     988: getfield      #34                 // Field b:Ljava/util/Random;
+     991: bipush        16
+     993: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+     996: iadd
+     997: bipush        8
+     999: iadd
+    1000: istore        4
+    1002: aload_0
+    1003: getfield      #36                 // Field d:I
+    1006: aload_0
+    1007: getfield      #34                 // Field b:Ljava/util/Random;
+    1010: bipush        16
+    1012: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1015: iadd
+    1016: bipush        8
+    1018: iadd
+    1019: istore        5
+    1021: aload_0
+    1022: getfield      #33                 // Field a:Lahb;
+    1025: iload         4
+    1027: iload         5
+    1029: invokevirtual #76                 // Method ahb.f:(II)I
+    1032: istore        6
+    1034: aload_0
+    1035: getfield      #49                 // Field q:Larn;
+    1038: aload_0
+    1039: getfield      #33                 // Field a:Lahb;
+    1042: aload_0
+    1043: getfield      #34                 // Field b:Ljava/util/Random;
+    1046: iload         4
+    1048: iload         6
+    1050: iload         5
+    1052: invokevirtual #96                 // Method arn.a:(Lahb;Ljava/util/Random;III)Z
+    1055: pop
+    1056: aload_0
+    1057: getfield      #34                 // Field b:Ljava/util/Random;
+    1060: bipush        8
+    1062: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1065: ifne          1150
+    1068: aload_0
+    1069: getfield      #35                 // Field c:I
+    1072: aload_0
+    1073: getfield      #34                 // Field b:Ljava/util/Random;
+    1076: bipush        16
+    1078: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1081: iadd
+    1082: bipush        8
+    1084: iadd
+    1085: istore        4
+    1087: aload_0
+    1088: getfield      #36                 // Field d:I
+    1091: aload_0
+    1092: getfield      #34                 // Field b:Ljava/util/Random;
+    1095: bipush        16
+    1097: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1100: iadd
+    1101: bipush        8
+    1103: iadd
+    1104: istore        5
+    1106: aload_0
+    1107: getfield      #34                 // Field b:Ljava/util/Random;
+    1110: aload_0
+    1111: getfield      #33                 // Field a:Lahb;
+    1114: iload         4
+    1116: iload         5
+    1118: invokevirtual #76                 // Method ahb.f:(II)I
+    1121: iconst_2
+    1122: imul
+    1123: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1126: istore        6
+    1128: aload_0
+    1129: getfield      #50                 // Field r:Larn;
+    1132: aload_0
+    1133: getfield      #33                 // Field a:Lahb;
+    1136: aload_0
+    1137: getfield      #34                 // Field b:Ljava/util/Random;
+    1140: iload         4
+    1142: iload         6
+    1144: iload         5
+    1146: invokevirtual #96                 // Method arn.a:(Lahb;Ljava/util/Random;III)Z
+    1149: pop
+    1150: iinc          3, 1
+    1153: goto          964
+    1156: aload_0
+    1157: getfield      #34                 // Field b:Ljava/util/Random;
+    1160: iconst_4
+    1161: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1164: ifne          1246
+    1167: aload_0
+    1168: getfield      #35                 // Field c:I
+    1171: aload_0
+    1172: getfield      #34                 // Field b:Ljava/util/Random;
+    1175: bipush        16
+    1177: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1180: iadd
+    1181: bipush        8
+    1183: iadd
+    1184: istore_3
+    1185: aload_0
+    1186: getfield      #36                 // Field d:I
+    1189: aload_0
+    1190: getfield      #34                 // Field b:Ljava/util/Random;
+    1193: bipush        16
+    1195: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1198: iadd
+    1199: bipush        8
+    1201: iadd
+    1202: istore        4
+    1204: aload_0
+    1205: getfield      #34                 // Field b:Ljava/util/Random;
+    1208: aload_0
+    1209: getfield      #33                 // Field a:Lahb;
+    1212: iload_3
+    1213: iload         4
+    1215: invokevirtual #76                 // Method ahb.f:(II)I
+    1218: iconst_2
+    1219: imul
+    1220: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1223: istore        5
+    1225: aload_0
+    1226: getfield      #49                 // Field q:Larn;
+    1229: aload_0
+    1230: getfield      #33                 // Field a:Lahb;
+    1233: aload_0
+    1234: getfield      #34                 // Field b:Ljava/util/Random;
+    1237: iload_3
+    1238: iload         5
+    1240: iload         4
+    1242: invokevirtual #96                 // Method arn.a:(Lahb;Ljava/util/Random;III)Z
+    1245: pop
+    1246: aload_0
+    1247: getfield      #34                 // Field b:Ljava/util/Random;
+    1250: bipush        8
+    1252: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1255: ifne          1337
+    1258: aload_0
+    1259: getfield      #35                 // Field c:I
+    1262: aload_0
+    1263: getfield      #34                 // Field b:Ljava/util/Random;
+    1266: bipush        16
+    1268: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1271: iadd
+    1272: bipush        8
+    1274: iadd
+    1275: istore_3
+    1276: aload_0
+    1277: getfield      #36                 // Field d:I
+    1280: aload_0
+    1281: getfield      #34                 // Field b:Ljava/util/Random;
+    1284: bipush        16
+    1286: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1289: iadd
+    1290: bipush        8
+    1292: iadd
+    1293: istore        4
+    1295: aload_0
+    1296: getfield      #34                 // Field b:Ljava/util/Random;
+    1299: aload_0
+    1300: getfield      #33                 // Field a:Lahb;
+    1303: iload_3
+    1304: iload         4
+    1306: invokevirtual #76                 // Method ahb.f:(II)I
+    1309: iconst_2
+    1310: imul
+    1311: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1314: istore        5
+    1316: aload_0
+    1317: getfield      #50                 // Field r:Larn;
+    1320: aload_0
+    1321: getfield      #33                 // Field a:Lahb;
+    1324: aload_0
+    1325: getfield      #34                 // Field b:Ljava/util/Random;
+    1328: iload_3
+    1329: iload         5
+    1331: iload         4
+    1333: invokevirtual #96                 // Method arn.a:(Lahb;Ljava/util/Random;III)Z
+    1336: pop
+    1337: iconst_0
+    1338: istore_3
+    1339: iload_3
+    1340: aload_0
+    1341: getfield      #26                 // Field C:I
+    1344: if_icmpge     1435
+    1347: aload_0
+    1348: getfield      #35                 // Field c:I
+    1351: aload_0
+    1352: getfield      #34                 // Field b:Ljava/util/Random;
+    1355: bipush        16
+    1357: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1360: iadd
+    1361: bipush        8
+    1363: iadd
+    1364: istore        4
+    1366: aload_0
+    1367: getfield      #36                 // Field d:I
+    1370: aload_0
+    1371: getfield      #34                 // Field b:Ljava/util/Random;
+    1374: bipush        16
+    1376: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1379: iadd
+    1380: bipush        8
+    1382: iadd
+    1383: istore        5
+    1385: aload_0
+    1386: getfield      #34                 // Field b:Ljava/util/Random;
+    1389: aload_0
+    1390: getfield      #33                 // Field a:Lahb;
+    1393: iload         4
+    1395: iload         5
+    1397: invokevirtual #76                 // Method ahb.f:(II)I
+    1400: iconst_2
+    1401: imul
+    1402: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1405: istore        6
+    1407: aload_0
+    1408: getfield      #52                 // Field t:Larn;
+    1411: aload_0
+    1412: getfield      #33                 // Field a:Lahb;
+    1415: aload_0
+    1416: getfield      #34                 // Field b:Ljava/util/Random;
+    1419: iload         4
+    1421: iload         6
+    1423: iload         5
+    1425: invokevirtual #96                 // Method arn.a:(Lahb;Ljava/util/Random;III)Z
+    1428: pop
+    1429: iinc          3, 1
+    1432: goto          1339
+    1435: iconst_0
+    1436: istore_3
+    1437: iload_3
+    1438: bipush        10
+    1440: if_icmpge     1531
+    1443: aload_0
+    1444: getfield      #35                 // Field c:I
+    1447: aload_0
+    1448: getfield      #34                 // Field b:Ljava/util/Random;
+    1451: bipush        16
+    1453: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1456: iadd
+    1457: bipush        8
+    1459: iadd
+    1460: istore        4
+    1462: aload_0
+    1463: getfield      #36                 // Field d:I
+    1466: aload_0
+    1467: getfield      #34                 // Field b:Ljava/util/Random;
+    1470: bipush        16
+    1472: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1475: iadd
+    1476: bipush        8
+    1478: iadd
+    1479: istore        5
+    1481: aload_0
+    1482: getfield      #34                 // Field b:Ljava/util/Random;
+    1485: aload_0
+    1486: getfield      #33                 // Field a:Lahb;
+    1489: iload         4
+    1491: iload         5
+    1493: invokevirtual #76                 // Method ahb.f:(II)I
+    1496: iconst_2
+    1497: imul
+    1498: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1501: istore        6
+    1503: aload_0
+    1504: getfield      #52                 // Field t:Larn;
+    1507: aload_0
+    1508: getfield      #33                 // Field a:Lahb;
+    1511: aload_0
+    1512: getfield      #34                 // Field b:Ljava/util/Random;
+    1515: iload         4
+    1517: iload         6
+    1519: iload         5
+    1521: invokevirtual #96                 // Method arn.a:(Lahb;Ljava/util/Random;III)Z
+    1524: pop
+    1525: iinc          3, 1
+    1528: goto          1437
+    1531: aload_0
+    1532: getfield      #34                 // Field b:Ljava/util/Random;
+    1535: bipush        32
+    1537: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1540: ifne          1625
+    1543: aload_0
+    1544: getfield      #35                 // Field c:I
+    1547: aload_0
+    1548: getfield      #34                 // Field b:Ljava/util/Random;
+    1551: bipush        16
+    1553: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1556: iadd
+    1557: bipush        8
+    1559: iadd
+    1560: istore_3
+    1561: aload_0
+    1562: getfield      #36                 // Field d:I
+    1565: aload_0
+    1566: getfield      #34                 // Field b:Ljava/util/Random;
+    1569: bipush        16
+    1571: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1574: iadd
+    1575: bipush        8
+    1577: iadd
+    1578: istore        4
+    1580: aload_0
+    1581: getfield      #34                 // Field b:Ljava/util/Random;
+    1584: aload_0
+    1585: getfield      #33                 // Field a:Lahb;
+    1588: iload_3
+    1589: iload         4
+    1591: invokevirtual #76                 // Method ahb.f:(II)I
+    1594: iconst_2
+    1595: imul
+    1596: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1599: istore        5
+    1601: new           #16                 // class asg
+    1604: dup
+    1605: invokespecial #102                // Method asg."<init>":()V
+    1608: aload_0
+    1609: getfield      #33                 // Field a:Lahb;
+    1612: aload_0
+    1613: getfield      #34                 // Field b:Ljava/util/Random;
+    1616: iload_3
+    1617: iload         5
+    1619: iload         4
+    1621: invokevirtual #103                // Method asg.a:(Lahb;Ljava/util/Random;III)Z
+    1624: pop
+    1625: iconst_0
+    1626: istore_3
+    1627: iload_3
+    1628: aload_0
+    1629: getfield      #27                 // Field D:I
+    1632: if_icmpge     1723
+    1635: aload_0
+    1636: getfield      #35                 // Field c:I
+    1639: aload_0
+    1640: getfield      #34                 // Field b:Ljava/util/Random;
+    1643: bipush        16
+    1645: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1648: iadd
+    1649: bipush        8
+    1651: iadd
+    1652: istore        4
+    1654: aload_0
+    1655: getfield      #36                 // Field d:I
+    1658: aload_0
+    1659: getfield      #34                 // Field b:Ljava/util/Random;
+    1662: bipush        16
+    1664: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1667: iadd
+    1668: bipush        8
+    1670: iadd
+    1671: istore        5
+    1673: aload_0
+    1674: getfield      #34                 // Field b:Ljava/util/Random;
+    1677: aload_0
+    1678: getfield      #33                 // Field a:Lahb;
+    1681: iload         4
+    1683: iload         5
+    1685: invokevirtual #76                 // Method ahb.f:(II)I
+    1688: iconst_2
+    1689: imul
+    1690: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1693: istore        6
+    1695: aload_0
+    1696: getfield      #53                 // Field u:Larn;
+    1699: aload_0
+    1700: getfield      #33                 // Field a:Lahb;
+    1703: aload_0
+    1704: getfield      #34                 // Field b:Ljava/util/Random;
+    1707: iload         4
+    1709: iload         6
+    1711: iload         5
+    1713: invokevirtual #96                 // Method arn.a:(Lahb;Ljava/util/Random;III)Z
+    1716: pop
+    1717: iinc          3, 1
+    1720: goto          1627
+    1723: aload_0
+    1724: getfield      #32                 // Field I:Z
+    1727: ifeq          1944
+    1730: iconst_0
+    1731: istore_3
+    1732: iload_3
+    1733: bipush        50
+    1735: if_icmpge     1832
+    1738: aload_0
+    1739: getfield      #35                 // Field c:I
+    1742: aload_0
+    1743: getfield      #34                 // Field b:Ljava/util/Random;
+    1746: bipush        16
+    1748: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1751: iadd
+    1752: bipush        8
+    1754: iadd
+    1755: istore        4
+    1757: aload_0
+    1758: getfield      #34                 // Field b:Ljava/util/Random;
+    1761: aload_0
+    1762: getfield      #34                 // Field b:Ljava/util/Random;
+    1765: sipush        248
+    1768: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1771: bipush        8
+    1773: iadd
+    1774: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1777: istore        5
+    1779: aload_0
+    1780: getfield      #36                 // Field d:I
+    1783: aload_0
+    1784: getfield      #34                 // Field b:Ljava/util/Random;
+    1787: bipush        16
+    1789: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1792: iadd
+    1793: bipush        8
+    1795: iadd
+    1796: istore        6
+    1798: new           #19                 // class asm
+    1801: dup
+    1802: getstatic     #66                 // Field ajn.i:Lalw;
+    1805: invokespecial #106                // Method asm."<init>":(Laji;)V
+    1808: aload_0
+    1809: getfield      #33                 // Field a:Lahb;
+    1812: aload_0
+    1813: getfield      #34                 // Field b:Ljava/util/Random;
+    1816: iload         4
+    1818: iload         5
+    1820: iload         6
+    1822: invokevirtual #107                // Method asm.a:(Lahb;Ljava/util/Random;III)Z
+    1825: pop
+    1826: iinc          3, 1
+    1829: goto          1732
+    1832: iconst_0
+    1833: istore_3
+    1834: iload_3
+    1835: bipush        20
+    1837: if_icmpge     1944
+    1840: aload_0
+    1841: getfield      #35                 // Field c:I
+    1844: aload_0
+    1845: getfield      #34                 // Field b:Ljava/util/Random;
+    1848: bipush        16
+    1850: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1853: iadd
+    1854: bipush        8
+    1856: iadd
+    1857: istore        4
+    1859: aload_0
+    1860: getfield      #34                 // Field b:Ljava/util/Random;
+    1863: aload_0
+    1864: getfield      #34                 // Field b:Ljava/util/Random;
+    1867: aload_0
+    1868: getfield      #34                 // Field b:Ljava/util/Random;
+    1871: sipush        240
+    1874: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1877: bipush        8
+    1879: iadd
+    1880: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1883: bipush        8
+    1885: iadd
+    1886: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1889: istore        5
+    1891: aload_0
+    1892: getfield      #36                 // Field d:I
+    1895: aload_0
+    1896: getfield      #34                 // Field b:Ljava/util/Random;
+    1899: bipush        16
+    1901: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+    1904: iadd
+    1905: bipush        8
+    1907: iadd
+    1908: istore        6
+    1910: new           #19                 // class asm
+    1913: dup
+    1914: getstatic     #67                 // Field ajn.k:Lalw;
+    1917: invokespecial #106                // Method asm."<init>":(Laji;)V
+    1920: aload_0
+    1921: getfield      #33                 // Field a:Lahb;
+    1924: aload_0
+    1925: getfield      #34                 // Field b:Ljava/util/Random;
+    1928: iload         4
+    1930: iload         5
+    1932: iload         6
+    1934: invokevirtual #107                // Method asm.a:(Lahb;Ljava/util/Random;III)Z
+    1937: pop
+    1938: iinc          3, 1
+    1941: goto          1834
+    1944: return
+
+  protected void a(int, arn, int, int);
+    Code:
+       0: iconst_0
+       1: istore        5
+       3: iload         5
+       5: iload_1
+       6: if_icmpge     81
+       9: aload_0
+      10: getfield      #35                 // Field c:I
+      13: aload_0
+      14: getfield      #34                 // Field b:Ljava/util/Random;
+      17: bipush        16
+      19: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+      22: iadd
+      23: istore        6
+      25: aload_0
+      26: getfield      #34                 // Field b:Ljava/util/Random;
+      29: iload         4
+      31: iload_3
+      32: isub
+      33: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+      36: iload_3
+      37: iadd
+      38: istore        7
+      40: aload_0
+      41: getfield      #36                 // Field d:I
+      44: aload_0
+      45: getfield      #34                 // Field b:Ljava/util/Random;
+      48: bipush        16
+      50: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+      53: iadd
+      54: istore        8
+      56: aload_2
+      57: aload_0
+      58: getfield      #33                 // Field a:Lahb;
+      61: aload_0
+      62: getfield      #34                 // Field b:Ljava/util/Random;
+      65: iload         6
+      67: iload         7
+      69: iload         8
+      71: invokevirtual #96                 // Method arn.a:(Lahb;Ljava/util/Random;III)Z
+      74: pop
+      75: iinc          5, 1
+      78: goto          3
+      81: return
+
+  protected void b(int, arn, int, int);
+    Code:
+       0: iconst_0
+       1: istore        5
+       3: iload         5
+       5: iload_1
+       6: if_icmpge     92
+       9: aload_0
+      10: getfield      #35                 // Field c:I
+      13: aload_0
+      14: getfield      #34                 // Field b:Ljava/util/Random;
+      17: bipush        16
+      19: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+      22: iadd
+      23: istore        6
+      25: aload_0
+      26: getfield      #34                 // Field b:Ljava/util/Random;
+      29: iload         4
+      31: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+      34: aload_0
+      35: getfield      #34                 // Field b:Ljava/util/Random;
+      38: iload         4
+      40: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+      43: iadd
+      44: iload_3
+      45: iload         4
+      47: isub
+      48: iadd
+      49: istore        7
+      51: aload_0
+      52: getfield      #36                 // Field d:I
+      55: aload_0
+      56: getfield      #34                 // Field b:Ljava/util/Random;
+      59: bipush        16
+      61: invokevirtual #110                // Method java/util/Random.nextInt:(I)I
+      64: iadd
+      65: istore        8
+      67: aload_2
+      68: aload_0
+      69: getfield      #33                 // Field a:Lahb;
+      72: aload_0
+      73: getfield      #34                 // Field b:Ljava/util/Random;
+      76: iload         6
+      78: iload         7
+      80: iload         8
+      82: invokevirtual #96                 // Method arn.a:(Lahb;Ljava/util/Random;III)Z
+      85: pop
+      86: iinc          5, 1
+      89: goto          3
+      92: return
+
+  protected void a();
+    Code:
+       0: aload_0
+       1: bipush        20
+       3: aload_0
+       4: getfield      #40                 // Field h:Larn;
+       7: iconst_0
+       8: sipush        256
+      11: invokevirtual #82                 // Method a:(ILarn;II)V
+      14: aload_0
+      15: bipush        10
+      17: aload_0
+      18: getfield      #41                 // Field i:Larn;
+      21: iconst_0
+      22: sipush        256
+      25: invokevirtual #82                 // Method a:(ILarn;II)V
+      28: aload_0
+      29: bipush        20
+      31: aload_0
+      32: getfield      #42                 // Field j:Larn;
+      35: iconst_0
+      36: sipush        128
+      39: invokevirtual #82                 // Method a:(ILarn;II)V
+      42: aload_0
+      43: bipush        20
+      45: aload_0
+      46: getfield      #43                 // Field k:Larn;
+      49: iconst_0
+      50: bipush        64
+      52: invokevirtual #82                 // Method a:(ILarn;II)V
+      55: aload_0
+      56: iconst_2
+      57: aload_0
+      58: getfield      #44                 // Field l:Larn;
+      61: iconst_0
+      62: bipush        32
+      64: invokevirtual #82                 // Method a:(ILarn;II)V
+      67: aload_0
+      68: bipush        8
+      70: aload_0
+      71: getfield      #45                 // Field m:Larn;
+      74: iconst_0
+      75: bipush        16
+      77: invokevirtual #82                 // Method a:(ILarn;II)V
+      80: aload_0
+      81: iconst_1
+      82: aload_0
+      83: getfield      #46                 // Field n:Larn;
+      86: iconst_0
+      87: bipush        16
+      89: invokevirtual #82                 // Method a:(ILarn;II)V
+      92: aload_0
+      93: iconst_1
+      94: aload_0
+      95: getfield      #47                 // Field o:Larn;
+      98: bipush        16
+     100: bipush        16
+     102: invokevirtual #84                 // Method b:(ILarn;II)V
+     105: return
+}

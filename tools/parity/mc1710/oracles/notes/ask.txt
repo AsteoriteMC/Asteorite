@@ -1,0 +1,493 @@
+Compiled from "SourceFile"
+public class ask extends arc {
+  public ask(boolean);
+    Code:
+       0: aload_0
+       1: iload_1
+       2: invokespecial #20                 // Method arc."<init>":(Z)V
+       5: return
+
+  public boolean a(ahb, java.util.Random, int, int, int);
+    Code:
+       0: aload_2
+       1: iconst_3
+       2: invokevirtual #26                 // Method java/util/Random.nextInt:(I)I
+       5: aload_2
+       6: iconst_3
+       7: invokevirtual #26                 // Method java/util/Random.nextInt:(I)I
+      10: iadd
+      11: iconst_5
+      12: iadd
+      13: istore        6
+      15: iconst_1
+      16: istore        7
+      18: iload         4
+      20: iconst_1
+      21: if_icmplt     37
+      24: iload         4
+      26: iload         6
+      28: iadd
+      29: iconst_1
+      30: iadd
+      31: sipush        256
+      34: if_icmple     39
+      37: iconst_0
+      38: ireturn
+      39: iload         4
+      41: istore        8
+      43: iload         8
+      45: iload         4
+      47: iconst_1
+      48: iadd
+      49: iload         6
+      51: iadd
+      52: if_icmpgt     188
+      55: iconst_1
+      56: istore        9
+      58: iload         8
+      60: iload         4
+      62: if_icmpne     68
+      65: iconst_0
+      66: istore        9
+      68: iload         8
+      70: iload         4
+      72: iconst_1
+      73: iadd
+      74: iload         6
+      76: iadd
+      77: iconst_2
+      78: isub
+      79: if_icmplt     85
+      82: iconst_2
+      83: istore        9
+      85: iload_3
+      86: iload         9
+      88: isub
+      89: istore        10
+      91: iload         10
+      93: iload_3
+      94: iload         9
+      96: iadd
+      97: if_icmpgt     182
+     100: iload         7
+     102: ifeq          182
+     105: iload         5
+     107: iload         9
+     109: isub
+     110: istore        11
+     112: iload         11
+     114: iload         5
+     116: iload         9
+     118: iadd
+     119: if_icmpgt     176
+     122: iload         7
+     124: ifeq          176
+     127: iload         8
+     129: iflt          167
+     132: iload         8
+     134: sipush        256
+     137: if_icmpge     167
+     140: aload_1
+     141: iload         10
+     143: iload         8
+     145: iload         11
+     147: invokevirtual #18                 // Method ahb.a:(III)Laji;
+     150: astore        12
+     152: aload_0
+     153: aload         12
+     155: invokevirtual #24                 // Method a:(Laji;)Z
+     158: ifne          164
+     161: iconst_0
+     162: istore        7
+     164: goto          170
+     167: iconst_0
+     168: istore        7
+     170: iinc          11, 1
+     173: goto          112
+     176: iinc          10, 1
+     179: goto          91
+     182: iinc          8, 1
+     185: goto          43
+     188: iload         7
+     190: ifne          195
+     193: iconst_0
+     194: ireturn
+     195: aload_1
+     196: iload_3
+     197: iload         4
+     199: iconst_1
+     200: isub
+     201: iload         5
+     203: invokevirtual #18                 // Method ahb.a:(III)Laji;
+     206: astore        8
+     208: aload         8
+     210: getstatic     #10                 // Field ajn.c:Lalh;
+     213: if_acmpeq     224
+     216: aload         8
+     218: getstatic     #11                 // Field ajn.d:Laji;
+     221: if_acmpne     237
+     224: iload         4
+     226: sipush        256
+     229: iload         6
+     231: isub
+     232: iconst_1
+     233: isub
+     234: if_icmplt     239
+     237: iconst_0
+     238: ireturn
+     239: aload_0
+     240: aload_1
+     241: iload_3
+     242: iload         4
+     244: iconst_1
+     245: isub
+     246: iload         5
+     248: getstatic     #11                 // Field ajn.d:Laji;
+     251: invokevirtual #22                 // Method a:(Lahb;IIILaji;)V
+     254: aload_2
+     255: iconst_4
+     256: invokevirtual #26                 // Method java/util/Random.nextInt:(I)I
+     259: istore        9
+     261: iload         6
+     263: aload_2
+     264: iconst_4
+     265: invokevirtual #26                 // Method java/util/Random.nextInt:(I)I
+     268: isub
+     269: iconst_1
+     270: isub
+     271: istore        10
+     273: iconst_3
+     274: aload_2
+     275: iconst_3
+     276: invokevirtual #26                 // Method java/util/Random.nextInt:(I)I
+     279: isub
+     280: istore        11
+     282: iload_3
+     283: istore        12
+     285: iload         5
+     287: istore        13
+     289: iconst_0
+     290: istore        14
+     292: iconst_0
+     293: istore        15
+     295: iload         15
+     297: iload         6
+     299: if_icmpge     405
+     302: iload         4
+     304: iload         15
+     306: iadd
+     307: istore        16
+     309: iload         15
+     311: iload         10
+     313: if_icmplt     346
+     316: iload         11
+     318: ifle          346
+     321: iload         12
+     323: getstatic     #16                 // Field p.a:[I
+     326: iload         9
+     328: iaload
+     329: iadd
+     330: istore        12
+     332: iload         13
+     334: getstatic     #17                 // Field p.b:[I
+     337: iload         9
+     339: iaload
+     340: iadd
+     341: istore        13
+     343: iinc          11, -1
+     346: aload_1
+     347: iload         12
+     349: iload         16
+     351: iload         13
+     353: invokevirtual #18                 // Method ahb.a:(III)Laji;
+     356: astore        17
+     358: aload         17
+     360: invokevirtual #19                 // Method aji.o:()Lawt;
+     363: getstatic     #14                 // Field awt.a:Lawt;
+     366: if_acmpeq     380
+     369: aload         17
+     371: invokevirtual #19                 // Method aji.o:()Lawt;
+     374: getstatic     #15                 // Field awt.j:Lawt;
+     377: if_acmpne     399
+     380: aload_0
+     381: aload_1
+     382: iload         12
+     384: iload         16
+     386: iload         13
+     388: getstatic     #12                 // Field ajn.s:Laji;
+     391: iconst_0
+     392: invokevirtual #23                 // Method a:(Lahb;IIILaji;I)V
+     395: iload         16
+     397: istore        14
+     399: iinc          15, 1
+     402: goto          295
+     405: iconst_m1
+     406: istore        15
+     408: iload         15
+     410: iconst_1
+     411: if_icmpgt     454
+     414: iconst_m1
+     415: istore        16
+     417: iload         16
+     419: iconst_1
+     420: if_icmpgt     448
+     423: aload_0
+     424: aload_1
+     425: iload         12
+     427: iload         15
+     429: iadd
+     430: iload         14
+     432: iconst_1
+     433: iadd
+     434: iload         13
+     436: iload         16
+     438: iadd
+     439: invokespecial #21                 // Method a:(Lahb;III)V
+     442: iinc          16, 1
+     445: goto          417
+     448: iinc          15, 1
+     451: goto          408
+     454: aload_0
+     455: aload_1
+     456: iload         12
+     458: iconst_2
+     459: iadd
+     460: iload         14
+     462: iconst_1
+     463: iadd
+     464: iload         13
+     466: invokespecial #21                 // Method a:(Lahb;III)V
+     469: aload_0
+     470: aload_1
+     471: iload         12
+     473: iconst_2
+     474: isub
+     475: iload         14
+     477: iconst_1
+     478: iadd
+     479: iload         13
+     481: invokespecial #21                 // Method a:(Lahb;III)V
+     484: aload_0
+     485: aload_1
+     486: iload         12
+     488: iload         14
+     490: iconst_1
+     491: iadd
+     492: iload         13
+     494: iconst_2
+     495: iadd
+     496: invokespecial #21                 // Method a:(Lahb;III)V
+     499: aload_0
+     500: aload_1
+     501: iload         12
+     503: iload         14
+     505: iconst_1
+     506: iadd
+     507: iload         13
+     509: iconst_2
+     510: isub
+     511: invokespecial #21                 // Method a:(Lahb;III)V
+     514: bipush        -3
+     516: istore        15
+     518: iload         15
+     520: iconst_3
+     521: if_icmpgt     584
+     524: bipush        -3
+     526: istore        16
+     528: iload         16
+     530: iconst_3
+     531: if_icmpgt     578
+     534: iload         15
+     536: invokestatic  #25                 // Method java/lang/Math.abs:(I)I
+     539: iconst_3
+     540: if_icmpne     555
+     543: iload         16
+     545: invokestatic  #25                 // Method java/lang/Math.abs:(I)I
+     548: iconst_3
+     549: if_icmpne     555
+     552: goto          572
+     555: aload_0
+     556: aload_1
+     557: iload         12
+     559: iload         15
+     561: iadd
+     562: iload         14
+     564: iload         13
+     566: iload         16
+     568: iadd
+     569: invokespecial #21                 // Method a:(Lahb;III)V
+     572: iinc          16, 1
+     575: goto          528
+     578: iinc          15, 1
+     581: goto          518
+     584: iload_3
+     585: istore        12
+     587: iload         5
+     589: istore        13
+     591: aload_2
+     592: iconst_4
+     593: invokevirtual #26                 // Method java/util/Random.nextInt:(I)I
+     596: istore        15
+     598: iload         15
+     600: iload         9
+     602: if_icmpeq     869
+     605: iload         10
+     607: aload_2
+     608: iconst_2
+     609: invokevirtual #26                 // Method java/util/Random.nextInt:(I)I
+     612: isub
+     613: iconst_1
+     614: isub
+     615: istore        16
+     617: iconst_1
+     618: aload_2
+     619: iconst_3
+     620: invokevirtual #26                 // Method java/util/Random.nextInt:(I)I
+     623: iadd
+     624: istore        17
+     626: iconst_0
+     627: istore        14
+     629: iload         16
+     631: istore        18
+     633: iload         18
+     635: iload         6
+     637: if_icmpge     745
+     640: iload         17
+     642: ifle          745
+     645: iload         18
+     647: iconst_1
+     648: if_icmpge     654
+     651: goto          736
+     654: iload         4
+     656: iload         18
+     658: iadd
+     659: istore        19
+     661: iload         12
+     663: getstatic     #16                 // Field p.a:[I
+     666: iload         15
+     668: iaload
+     669: iadd
+     670: istore        12
+     672: iload         13
+     674: getstatic     #17                 // Field p.b:[I
+     677: iload         15
+     679: iaload
+     680: iadd
+     681: istore        13
+     683: aload_1
+     684: iload         12
+     686: iload         19
+     688: iload         13
+     690: invokevirtual #18                 // Method ahb.a:(III)Laji;
+     693: astore        20
+     695: aload         20
+     697: invokevirtual #19                 // Method aji.o:()Lawt;
+     700: getstatic     #14                 // Field awt.a:Lawt;
+     703: if_acmpeq     717
+     706: aload         20
+     708: invokevirtual #19                 // Method aji.o:()Lawt;
+     711: getstatic     #15                 // Field awt.j:Lawt;
+     714: if_acmpne     736
+     717: aload_0
+     718: aload_1
+     719: iload         12
+     721: iload         19
+     723: iload         13
+     725: getstatic     #12                 // Field ajn.s:Laji;
+     728: iconst_0
+     729: invokevirtual #23                 // Method a:(Lahb;IIILaji;I)V
+     732: iload         19
+     734: istore        14
+     736: iinc          18, 1
+     739: iinc          17, -1
+     742: goto          633
+     745: iload         14
+     747: ifle          869
+     750: iconst_m1
+     751: istore        18
+     753: iload         18
+     755: iconst_1
+     756: if_icmpgt     799
+     759: iconst_m1
+     760: istore        19
+     762: iload         19
+     764: iconst_1
+     765: if_icmpgt     793
+     768: aload_0
+     769: aload_1
+     770: iload         12
+     772: iload         18
+     774: iadd
+     775: iload         14
+     777: iconst_1
+     778: iadd
+     779: iload         13
+     781: iload         19
+     783: iadd
+     784: invokespecial #21                 // Method a:(Lahb;III)V
+     787: iinc          19, 1
+     790: goto          762
+     793: iinc          18, 1
+     796: goto          753
+     799: bipush        -2
+     801: istore        18
+     803: iload         18
+     805: iconst_2
+     806: if_icmpgt     869
+     809: bipush        -2
+     811: istore        19
+     813: iload         19
+     815: iconst_2
+     816: if_icmpgt     863
+     819: iload         18
+     821: invokestatic  #25                 // Method java/lang/Math.abs:(I)I
+     824: iconst_2
+     825: if_icmpne     840
+     828: iload         19
+     830: invokestatic  #25                 // Method java/lang/Math.abs:(I)I
+     833: iconst_2
+     834: if_icmpne     840
+     837: goto          857
+     840: aload_0
+     841: aload_1
+     842: iload         12
+     844: iload         18
+     846: iadd
+     847: iload         14
+     849: iload         13
+     851: iload         19
+     853: iadd
+     854: invokespecial #21                 // Method a:(Lahb;III)V
+     857: iinc          19, 1
+     860: goto          813
+     863: iinc          18, 1
+     866: goto          803
+     869: iconst_1
+     870: ireturn
+
+  private void a(ahb, int, int, int);
+    Code:
+       0: aload_1
+       1: iload_2
+       2: iload_3
+       3: iload         4
+       5: invokevirtual #18                 // Method ahb.a:(III)Laji;
+       8: astore        5
+      10: aload         5
+      12: invokevirtual #19                 // Method aji.o:()Lawt;
+      15: getstatic     #14                 // Field awt.a:Lawt;
+      18: if_acmpeq     32
+      21: aload         5
+      23: invokevirtual #19                 // Method aji.o:()Lawt;
+      26: getstatic     #15                 // Field awt.j:Lawt;
+      29: if_acmpne     45
+      32: aload_0
+      33: aload_1
+      34: iload_2
+      35: iload_3
+      36: iload         4
+      38: getstatic     #13                 // Field ajn.u:Lalt;
+      41: iconst_0
+      42: invokevirtual #23                 // Method a:(Lahb;IIILaji;I)V
+      45: return
+}

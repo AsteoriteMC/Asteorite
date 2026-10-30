@@ -1,0 +1,139 @@
+Compiled from "SourceFile"
+public class axv extends axn {
+  private axn c;
+
+  private axn d;
+
+  public axv(long, axn, axn);
+    Code:
+       0: aload_0
+       1: lload_1
+       2: invokespecial #17                 // Method axn."<init>":(J)V
+       5: aload_0
+       6: aload_3
+       7: putfield      #14                 // Field c:Laxn;
+      10: aload_0
+      11: aload         4
+      13: putfield      #15                 // Field d:Laxn;
+      16: return
+
+  public void a(long);
+    Code:
+       0: aload_0
+       1: getfield      #14                 // Field c:Laxn;
+       4: lload_1
+       5: invokevirtual #19                 // Method axn.a:(J)V
+       8: aload_0
+       9: getfield      #15                 // Field d:Laxn;
+      12: lload_1
+      13: invokevirtual #19                 // Method axn.a:(J)V
+      16: aload_0
+      17: lload_1
+      18: invokespecial #19                 // Method axn.a:(J)V
+      21: return
+
+  public int[] a(int, int, int, int);
+    Code:
+       0: aload_0
+       1: getfield      #14                 // Field c:Laxn;
+       4: iload_1
+       5: iload_2
+       6: iload_3
+       7: iload         4
+       9: invokevirtual #18                 // Method axn.a:(IIII)[I
+      12: astore        5
+      14: aload_0
+      15: getfield      #15                 // Field d:Laxn;
+      18: iload_1
+      19: iload_2
+      20: iload_3
+      21: iload         4
+      23: invokevirtual #18                 // Method axn.a:(IIII)[I
+      26: astore        6
+      28: iload_3
+      29: iload         4
+      31: imul
+      32: invokestatic  #16                 // Method axl.a:(I)[I
+      35: astore        7
+      37: iconst_0
+      38: istore        8
+      40: iload         8
+      42: iload_3
+      43: iload         4
+      45: imul
+      46: if_icmpge     207
+      49: aload         5
+      51: iload         8
+      53: iaload
+      54: getstatic     #11                 // Field ahu.o:Lahu;
+      57: getfield      #10                 // Field ahu.ay:I
+      60: if_icmpeq     77
+      63: aload         5
+      65: iload         8
+      67: iaload
+      68: getstatic     #9                  // Field ahu.M:Lahu;
+      71: getfield      #10                 // Field ahu.ay:I
+      74: if_icmpne     90
+      77: aload         7
+      79: iload         8
+      81: aload         5
+      83: iload         8
+      85: iaload
+      86: iastore
+      87: goto          201
+      90: aload         6
+      92: iload         8
+      94: iaload
+      95: getstatic     #12                 // Field ahu.v:Lahu;
+      98: getfield      #10                 // Field ahu.ay:I
+     101: if_icmpne     191
+     104: aload         5
+     106: iload         8
+     108: iaload
+     109: getstatic     #6                  // Field ahu.A:Lahu;
+     112: getfield      #10                 // Field ahu.ay:I
+     115: if_icmpne     132
+     118: aload         7
+     120: iload         8
+     122: getstatic     #13                 // Field ahu.z:Lahu;
+     125: getfield      #10                 // Field ahu.ay:I
+     128: iastore
+     129: goto          201
+     132: aload         5
+     134: iload         8
+     136: iaload
+     137: getstatic     #7                  // Field ahu.C:Lahu;
+     140: getfield      #10                 // Field ahu.ay:I
+     143: if_icmpeq     160
+     146: aload         5
+     148: iload         8
+     150: iaload
+     151: getstatic     #8                  // Field ahu.D:Lahu;
+     154: getfield      #10                 // Field ahu.ay:I
+     157: if_icmpne     174
+     160: aload         7
+     162: iload         8
+     164: getstatic     #8                  // Field ahu.D:Lahu;
+     167: getfield      #10                 // Field ahu.ay:I
+     170: iastore
+     171: goto          201
+     174: aload         7
+     176: iload         8
+     178: aload         6
+     180: iload         8
+     182: iaload
+     183: sipush        255
+     186: iand
+     187: iastore
+     188: goto          201
+     191: aload         7
+     193: iload         8
+     195: aload         5
+     197: iload         8
+     199: iaload
+     200: iastore
+     201: iinc          8, 1
+     204: goto          40
+     207: aload         7
+     209: areturn
+}

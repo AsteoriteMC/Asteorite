@@ -1,0 +1,476 @@
+Compiled from "SourceFile"
+public class axr extends axn {
+  private static final org.apache.logging.log4j.Logger c;
+
+  private axn d;
+
+  public axr(long, axn, axn);
+    Code:
+       0: aload_0
+       1: lload_1
+       2: invokespecial #42                 // Method axn."<init>":(J)V
+       5: aload_0
+       6: aload_3
+       7: putfield      #37                 // Field a:Laxn;
+      10: aload_0
+      11: aload         4
+      13: putfield      #39                 // Field d:Laxn;
+      16: return
+
+  public int[] a(int, int, int, int);
+    Code:
+       0: aload_0
+       1: getfield      #37                 // Field a:Laxn;
+       4: iload_1
+       5: iconst_1
+       6: isub
+       7: iload_2
+       8: iconst_1
+       9: isub
+      10: iload_3
+      11: iconst_2
+      12: iadd
+      13: iload         4
+      15: iconst_2
+      16: iadd
+      17: invokevirtual #43                 // Method axn.a:(IIII)[I
+      20: astore        5
+      22: aload_0
+      23: getfield      #39                 // Field d:Laxn;
+      26: iload_1
+      27: iconst_1
+      28: isub
+      29: iload_2
+      30: iconst_1
+      31: isub
+      32: iload_3
+      33: iconst_2
+      34: iadd
+      35: iload         4
+      37: iconst_2
+      38: iadd
+      39: invokevirtual #43                 // Method axn.a:(IIII)[I
+      42: astore        6
+      44: iload_3
+      45: iload         4
+      47: imul
+      48: invokestatic  #41                 // Method axl.a:(I)[I
+      51: astore        7
+      53: iconst_0
+      54: istore        8
+      56: iload         8
+      58: iload         4
+      60: if_icmpge     904
+      63: iconst_0
+      64: istore        9
+      66: iload         9
+      68: iload_3
+      69: if_icmpge     898
+      72: aload_0
+      73: iload         9
+      75: iload_1
+      76: iadd
+      77: i2l
+      78: iload         8
+      80: iload_2
+      81: iadd
+      82: i2l
+      83: invokevirtual #46                 // Method a:(JJ)V
+      86: aload         5
+      88: iload         9
+      90: iconst_1
+      91: iadd
+      92: iload         8
+      94: iconst_1
+      95: iadd
+      96: iload_3
+      97: iconst_2
+      98: iadd
+      99: imul
+     100: iadd
+     101: iaload
+     102: istore        10
+     104: aload         6
+     106: iload         9
+     108: iconst_1
+     109: iadd
+     110: iload         8
+     112: iconst_1
+     113: iadd
+     114: iload_3
+     115: iconst_2
+     116: iadd
+     117: imul
+     118: iadd
+     119: iaload
+     120: istore        11
+     122: iload         11
+     124: iconst_2
+     125: isub
+     126: bipush        29
+     128: irem
+     129: ifne          136
+     132: iconst_1
+     133: goto          137
+     136: iconst_0
+     137: istore        12
+     139: iload         10
+     141: sipush        255
+     144: if_icmple     175
+     147: getstatic     #38                 // Field c:Lorg/apache/logging/log4j/Logger;
+     150: new           #7                  // class java/lang/StringBuilder
+     153: dup
+     154: invokespecial #47                 // Method java/lang/StringBuilder."<init>":()V
+     157: ldc           #1                  // String old!
+     159: invokevirtual #49                 // Method java/lang/StringBuilder.append:(Ljava/lang/String;)Ljava/lang/StringBuilder;
+     162: iload         10
+     164: invokevirtual #48                 // Method java/lang/StringBuilder.append:(I)Ljava/lang/StringBuilder;
+     167: invokevirtual #50                 // Method java/lang/StringBuilder.toString:()Ljava/lang/String;
+     170: invokeinterface #52,  2           // InterfaceMethod org/apache/logging/log4j/Logger.debug:(Ljava/lang/String;)V
+     175: iload         10
+     177: ifeq          251
+     180: iload         11
+     182: iconst_2
+     183: if_icmplt     251
+     186: iload         11
+     188: iconst_2
+     189: isub
+     190: bipush        29
+     192: irem
+     193: iconst_1
+     194: if_icmpne     251
+     197: iload         10
+     199: sipush        128
+     202: if_icmpge     251
+     205: iload         10
+     207: sipush        128
+     210: iadd
+     211: invokestatic  #40                 // Method ahu.d:(I)Lahu;
+     214: ifnull        236
+     217: aload         7
+     219: iload         9
+     221: iload         8
+     223: iload_3
+     224: imul
+     225: iadd
+     226: iload         10
+     228: sipush        128
+     231: iadd
+     232: iastore
+     233: goto          892
+     236: aload         7
+     238: iload         9
+     240: iload         8
+     242: iload_3
+     243: imul
+     244: iadd
+     245: iload         10
+     247: iastore
+     248: goto          892
+     251: aload_0
+     252: iconst_3
+     253: invokevirtual #44                 // Method a:(I)I
+     256: ifeq          264
+     259: iload         12
+     261: ifeq          880
+     264: iload         10
+     266: istore        13
+     268: iload         10
+     270: getstatic     #33                 // Field ahu.q:Lahu;
+     273: getfield      #30                 // Field ahu.ay:I
+     276: if_icmpne     290
+     279: getstatic     #12                 // Field ahu.F:Lahu;
+     282: getfield      #30                 // Field ahu.ay:I
+     285: istore        13
+     287: goto          648
+     290: iload         10
+     292: getstatic     #35                 // Field ahu.s:Lahu;
+     295: getfield      #30                 // Field ahu.ay:I
+     298: if_icmpne     312
+     301: getstatic     #13                 // Field ahu.G:Lahu;
+     304: getfield      #30                 // Field ahu.ay:I
+     307: istore        13
+     309: goto          648
+     312: iload         10
+     314: getstatic     #18                 // Field ahu.P:Lahu;
+     317: getfield      #30                 // Field ahu.ay:I
+     320: if_icmpne     334
+     323: getstatic     #19                 // Field ahu.Q:Lahu;
+     326: getfield      #30                 // Field ahu.ay:I
+     329: istore        13
+     331: goto          648
+     334: iload         10
+     336: getstatic     #20                 // Field ahu.R:Lahu;
+     339: getfield      #30                 // Field ahu.ay:I
+     342: if_icmpne     356
+     345: getstatic     #32                 // Field ahu.p:Lahu;
+     348: getfield      #30                 // Field ahu.ay:I
+     351: istore        13
+     353: goto          648
+     356: iload         10
+     358: getstatic     #36                 // Field ahu.t:Lahu;
+     361: getfield      #30                 // Field ahu.ay:I
+     364: if_icmpne     378
+     367: getstatic     #14                 // Field ahu.H:Lahu;
+     370: getfield      #30                 // Field ahu.ay:I
+     373: istore        13
+     375: goto          648
+     378: iload         10
+     380: getstatic     #23                 // Field ahu.U:Lahu;
+     383: getfield      #30                 // Field ahu.ay:I
+     386: if_icmpne     400
+     389: getstatic     #24                 // Field ahu.V:Lahu;
+     392: getfield      #30                 // Field ahu.ay:I
+     395: istore        13
+     397: goto          648
+     400: iload         10
+     402: getstatic     #21                 // Field ahu.S:Lahu;
+     405: getfield      #30                 // Field ahu.ay:I
+     408: if_icmpne     422
+     411: getstatic     #22                 // Field ahu.T:Lahu;
+     414: getfield      #30                 // Field ahu.ay:I
+     417: istore        13
+     419: goto          648
+     422: iload         10
+     424: getstatic     #32                 // Field ahu.p:Lahu;
+     427: getfield      #30                 // Field ahu.ay:I
+     430: if_icmpne     463
+     433: aload_0
+     434: iconst_3
+     435: invokevirtual #44                 // Method a:(I)I
+     438: ifne          452
+     441: getstatic     #13                 // Field ahu.G:Lahu;
+     444: getfield      #30                 // Field ahu.ay:I
+     447: istore        13
+     449: goto          648
+     452: getstatic     #35                 // Field ahu.s:Lahu;
+     455: getfield      #30                 // Field ahu.ay:I
+     458: istore        13
+     460: goto          648
+     463: iload         10
+     465: getstatic     #10                 // Field ahu.A:Lahu;
+     468: getfield      #30                 // Field ahu.ay:I
+     471: if_icmpne     485
+     474: getstatic     #11                 // Field ahu.B:Lahu;
+     477: getfield      #30                 // Field ahu.ay:I
+     480: istore        13
+     482: goto          648
+     485: iload         10
+     487: getstatic     #15                 // Field ahu.J:Lahu;
+     490: getfield      #30                 // Field ahu.ay:I
+     493: if_icmpne     507
+     496: getstatic     #16                 // Field ahu.K:Lahu;
+     499: getfield      #30                 // Field ahu.ay:I
+     502: istore        13
+     504: goto          648
+     507: iload         10
+     509: getstatic     #31                 // Field ahu.o:Lahu;
+     512: getfield      #30                 // Field ahu.ay:I
+     515: if_icmpne     529
+     518: getstatic     #17                 // Field ahu.M:Lahu;
+     521: getfield      #30                 // Field ahu.ay:I
+     524: istore        13
+     526: goto          648
+     529: iload         10
+     531: getstatic     #34                 // Field ahu.r:Lahu;
+     534: getfield      #30                 // Field ahu.ay:I
+     537: if_icmpne     551
+     540: getstatic     #25                 // Field ahu.W:Lahu;
+     543: getfield      #30                 // Field ahu.ay:I
+     546: istore        13
+     548: goto          648
+     551: iload         10
+     553: getstatic     #26                 // Field ahu.X:Lahu;
+     556: getfield      #30                 // Field ahu.ay:I
+     559: if_icmpne     573
+     562: getstatic     #27                 // Field ahu.Y:Lahu;
+     565: getfield      #30                 // Field ahu.ay:I
+     568: istore        13
+     570: goto          648
+     573: iload         10
+     575: getstatic     #29                 // Field ahu.aa:Lahu;
+     578: getfield      #30                 // Field ahu.ay:I
+     581: invokestatic  #45                 // Method a:(II)Z
+     584: ifeq          598
+     587: getstatic     #28                 // Field ahu.Z:Lahu;
+     590: getfield      #30                 // Field ahu.ay:I
+     593: istore        13
+     595: goto          648
+     598: iload         10
+     600: getstatic     #17                 // Field ahu.M:Lahu;
+     603: getfield      #30                 // Field ahu.ay:I
+     606: if_icmpne     648
+     609: aload_0
+     610: iconst_3
+     611: invokevirtual #44                 // Method a:(I)I
+     614: ifne          648
+     617: aload_0
+     618: iconst_2
+     619: invokevirtual #44                 // Method a:(I)I
+     622: istore        14
+     624: iload         14
+     626: ifne          640
+     629: getstatic     #32                 // Field ahu.p:Lahu;
+     632: getfield      #30                 // Field ahu.ay:I
+     635: istore        13
+     637: goto          648
+     640: getstatic     #35                 // Field ahu.s:Lahu;
+     643: getfield      #30                 // Field ahu.ay:I
+     646: istore        13
+     648: iload         12
+     650: ifeq          687
+     653: iload         13
+     655: iload         10
+     657: if_icmpeq     687
+     660: iload         13
+     662: sipush        128
+     665: iadd
+     666: invokestatic  #40                 // Method ahu.d:(I)Lahu;
+     669: ifnull        683
+     672: iload         13
+     674: sipush        128
+     677: iadd
+     678: istore        13
+     680: goto          687
+     683: iload         10
+     685: istore        13
+     687: iload         13
+     689: iload         10
+     691: if_icmpne     709
+     694: aload         7
+     696: iload         9
+     698: iload         8
+     700: iload_3
+     701: imul
+     702: iadd
+     703: iload         10
+     705: iastore
+     706: goto          877
+     709: aload         5
+     711: iload         9
+     713: iconst_1
+     714: iadd
+     715: iload         8
+     717: iconst_1
+     718: iadd
+     719: iconst_1
+     720: isub
+     721: iload_3
+     722: iconst_2
+     723: iadd
+     724: imul
+     725: iadd
+     726: iaload
+     727: istore        14
+     729: aload         5
+     731: iload         9
+     733: iconst_1
+     734: iadd
+     735: iconst_1
+     736: iadd
+     737: iload         8
+     739: iconst_1
+     740: iadd
+     741: iload_3
+     742: iconst_2
+     743: iadd
+     744: imul
+     745: iadd
+     746: iaload
+     747: istore        15
+     749: aload         5
+     751: iload         9
+     753: iconst_1
+     754: iadd
+     755: iconst_1
+     756: isub
+     757: iload         8
+     759: iconst_1
+     760: iadd
+     761: iload_3
+     762: iconst_2
+     763: iadd
+     764: imul
+     765: iadd
+     766: iaload
+     767: istore        16
+     769: aload         5
+     771: iload         9
+     773: iconst_1
+     774: iadd
+     775: iload         8
+     777: iconst_1
+     778: iadd
+     779: iconst_1
+     780: iadd
+     781: iload_3
+     782: iconst_2
+     783: iadd
+     784: imul
+     785: iadd
+     786: iaload
+     787: istore        17
+     789: iconst_0
+     790: istore        18
+     792: iload         14
+     794: iload         10
+     796: invokestatic  #45                 // Method a:(II)Z
+     799: ifeq          805
+     802: iinc          18, 1
+     805: iload         15
+     807: iload         10
+     809: invokestatic  #45                 // Method a:(II)Z
+     812: ifeq          818
+     815: iinc          18, 1
+     818: iload         16
+     820: iload         10
+     822: invokestatic  #45                 // Method a:(II)Z
+     825: ifeq          831
+     828: iinc          18, 1
+     831: iload         17
+     833: iload         10
+     835: invokestatic  #45                 // Method a:(II)Z
+     838: ifeq          844
+     841: iinc          18, 1
+     844: iload         18
+     846: iconst_3
+     847: if_icmplt     865
+     850: aload         7
+     852: iload         9
+     854: iload         8
+     856: iload_3
+     857: imul
+     858: iadd
+     859: iload         13
+     861: iastore
+     862: goto          877
+     865: aload         7
+     867: iload         9
+     869: iload         8
+     871: iload_3
+     872: imul
+     873: iadd
+     874: iload         10
+     876: iastore
+     877: goto          892
+     880: aload         7
+     882: iload         9
+     884: iload         8
+     886: iload_3
+     887: imul
+     888: iadd
+     889: iload         10
+     891: iastore
+     892: iinc          9, 1
+     895: goto          66
+     898: iinc          8, 1
+     901: goto          56
+     904: aload         7
+     906: areturn
+
+  static {};
+    Code:
+       0: invokestatic  #51                 // Method org/apache/logging/log4j/LogManager.getLogger:()Lorg/apache/logging/log4j/Logger;
+       3: putstatic     #38                 // Field c:Lorg/apache/logging/log4j/Logger;
+       6: return
+}

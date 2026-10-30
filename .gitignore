@@ -8,8 +8,13 @@ server_rsa.der
 tmp_rsa_gen.pem
 .serena
 __pycache__/
+tools/parity/.state/
+tools/parity/mc1710/oracles/**/build/
+tools/parity/mc1710/oracles/**/*.class
 .opencode/
 ops.json
 banned-players.json
 banned-ips.json
 whitelist.json
+jars/
+screenshots/

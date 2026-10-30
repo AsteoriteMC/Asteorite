@@ -1,0 +1,9 @@
+# seeds (one per line); probe runs `worldgen_dump <seed> 0 0`, oracle runs RndProbe
+42
+0
+-1
+1
+12345
+-1493931639823207632
+9223372036854775807
+-9223372036854775808
